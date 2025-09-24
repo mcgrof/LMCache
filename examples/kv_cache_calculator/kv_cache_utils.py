@@ -197,15 +197,31 @@ def select_representative_models(configs):
         "mistralai/Mistral-7B-Instruct-v0.2": configs["mistralai/Mistral-7B-Instruct-v0.2"],
         "meta-llama/Llama-3.1-8B-Instruct": configs["meta-llama/Llama-3.1-8B-Instruct"],
         "Qwen/Qwen2.5-7B-Instruct": configs["Qwen/Qwen2.5-7B-Instruct"],
+        "google/gemma-2-9b": configs["google/gemma-2-9b"],
 
-        # Large models (>10B)
-        "meta-llama/Llama-3.1-70B-Instruct": configs["meta-llama/Llama-3.1-70B-Instruct"],
-        "mistralai/Mistral-Large-Instruct-2407": configs["mistralai/Mistral-Large-Instruct-2407"],
+        # Large models (10B-50B)
+        "Qwen/Qwen2.5-14B-Instruct": configs["Qwen/Qwen2.5-14B-Instruct"],
+        "google/gemma-2-27b": configs["google/gemma-2-27b"],
+        "Qwen/Qwen2.5-32B-Instruct": configs["Qwen/Qwen2.5-32B-Instruct"],
         "Qwen/Qwen3-32B": configs["Qwen/Qwen3-32B"],
+
+        # Very large models (50B+)
+        "meta-llama/Llama-3.1-70B-Instruct": configs["meta-llama/Llama-3.1-70B-Instruct"],
+        "Qwen/Qwen2.5-72B-Instruct": configs["Qwen/Qwen2.5-72B-Instruct"],
+        "mistralai/Mistral-Large-Instruct-2407": configs["mistralai/Mistral-Large-Instruct-2407"],
 
         # Ultra-large models
         "meta-llama/Llama-3.1-405B": configs["meta-llama/Llama-3.1-405B"],
         "deepseek-ai/DeepSeek-V3": configs["deepseek-ai/DeepSeek-V3"],
+
+        # MOE models (showing different expert counts and architectures)
+        "mistralai/Mixtral-8x7B-Instruct-v0.1": configs["mistralai/Mixtral-8x7B-Instruct-v0.1"],
+        "mistralai/Mixtral-8x22B-v0.1": configs["mistralai/Mixtral-8x22B-v0.1"],
+        "microsoft/Phi-3.5-MoE-instruct": configs["microsoft/Phi-3.5-MoE-instruct"],
+
+        # Advanced architectures
+        "Qwen/Qwen3-Next-80B-A3B-Instruct": configs["Qwen/Qwen3-Next-80B-A3B-Instruct"],
+        "Qwen/Qwen3-Omni-30B-A3B-Instruct": configs["Qwen/Qwen3-Omni-30B-A3B-Instruct"],
     }
     return selected
 
