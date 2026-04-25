@@ -384,11 +384,17 @@ def deserialize_header(buf: bytes) -> EncodedKV:
             f"computed {crc_computed:#x}"
         )
 
+    try:
+        scope_enum = ScaleScope(scale_scope)
+    except ValueError as e:
+        raise CorruptEncodedKVError(
+            f"unknown scale_scope index {scale_scope} in encoded header"
+        ) from None
     enc = EncodedKV(
         k_dtype=_int_to_dtype(k_dtype_id),
         v_dtype=_int_to_dtype(v_dtype_id),
         scale_dtype=_int_to_dtype(scale_dtype_id),
-        scale_scope=ScaleScope(scale_scope),
+        scale_scope=scope_enum,
         hashes=hashes,
         layer_id=layer_id,
         chunk_id=chunk_id,

@@ -86,6 +86,52 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "env_converter": str,
     },
     "remote_serde": {"type": Optional[str], "default": "naive", "env_converter": str},
+    # Asymmetric KV cache codec config (see
+    # docs/lmcache_asymmetric_plan.md in knlp).  Four orthogonal
+    # axes, each with a sane default; existing setups continue to
+    # work without setting any of these.
+    "kv_storage_codec": {
+        # Codec used to encode KV bytes on disk:
+        #   "naive" — pass-through, K and V both at native dtype
+        #   "asym_k16_v8_e4m3" — K stays at native dtype, V is FP8 e4m3
+        #   "cachegen" / "kivi" — existing options
+        "type": Optional[str],
+        "default": "naive",
+        "env_converter": str,
+    },
+    "kv_runtime_layout": {
+        # What the deserializer hands back to the runtime:
+        #   "fp16"               — legacy single-dtype path (default)
+        #   "storage_only_dequant" — asymmetric on disk, dequantized
+        #                            back to fp16/bf16 on read.  Saves
+        #                            disk + IO; does NOT save HBM.
+        #   "native_asym"        — K bytes + V FP8 bytes + scales
+        #                            handed to the runtime as-is.
+        #                            Saves disk + HBM.  Phase 4.
+        "type": Optional[str],
+        "default": "fp16",
+        "env_converter": str,
+    },
+    "kv_scale_scope": {
+        # Granularity of V scales:
+        #   "per_tensor"     — one scalar per V tensor
+        #   "per_layer_head" — one scalar per (layer, head)
+        #   "per_page_head"  — one scalar per (page, head); recommended
+        #                      default for asymmetric paged caches
+        "type": Optional[str],
+        "default": "per_tensor",
+        "env_converter": str,
+    },
+    "kv_placement_policy": {
+        # Where K and V chunks live (Phase 5):
+        #   "all_nvme"           — both halves on the configured disk
+        #   "all_cpu"            — both halves in CPU pinned memory
+        #   "split_k_cpu_v_nvme" — K in CPU pinned, V on NVMe; the
+        #                          K-hot/V-cold split-tier headline
+        "type": Optional[str],
+        "default": "all_nvme",
+        "env_converter": str,
+    },
     # Feature toggles
     "use_layerwise": {
         "type": bool,

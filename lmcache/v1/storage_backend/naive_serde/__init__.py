@@ -5,6 +5,10 @@ from typing import Optional, Tuple
 # First Party
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.storage_backend.naive_serde.asym_serde import (
+    AsymK16V8Deserializer,
+    AsymK16V8Serializer,
+)
 from lmcache.v1.storage_backend.naive_serde.cachegen_decoder import CacheGenDeserializer
 from lmcache.v1.storage_backend.naive_serde.cachegen_encoder import CacheGenSerializer
 from lmcache.v1.storage_backend.naive_serde.kivi_serde import (
@@ -35,6 +39,13 @@ def CreateSerde(
             CacheGenSerializer(config, metadata),
             CacheGenDeserializer(config, metadata),
         )
+    elif serde_type == "asym_k16_v8_e4m3":
+        # Storage-only mode: V is FP8 on disk, dequantized back to
+        # the input dtype on read.  Native_asym mode is Phase 4.
+        s, d = (
+            AsymK16V8Serializer(config, metadata),
+            AsymK16V8Deserializer(config, metadata),
+        )
     else:
         raise ValueError(f"Invalid type: {serde_type}")
 
@@ -46,5 +57,7 @@ __all__ = [
     "Deserializer",
     "KIVISerializer",
     "KIVIDeserializer",
+    "AsymK16V8Serializer",
+    "AsymK16V8Deserializer",
     "CreateSerde",
 ]

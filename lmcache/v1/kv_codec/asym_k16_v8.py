@@ -323,9 +323,20 @@ class AsymK16V8Codec:
         # Ensure all payloads are contiguous and CPU for the byte
         # write.  The caller may be on GPU; serialize_header runs on
         # CPU bytes either way.
-        k_bytes = bytes(k.detach().to("cpu").contiguous().untyped_storage())
-        v_bytes = bytes(v_quant.detach().to("cpu").contiguous().untyped_storage())
-        s_bytes = bytes(v_scales.detach().to("cpu").contiguous().untyped_storage())
+        #
+        # `clone()` is mandatory: when the input K (or V) is a slice
+        # of a larger tensor (e.g. `tensor[0]` of a `[2, ...]` KV
+        # tensor), `untyped_storage()` returns the underlying storage
+        # which includes the OTHER half too.  `.contiguous()` alone
+        # may return the same storage if the slice happens to already
+        # be contiguous.  `clone()` forces a fresh storage that
+        # contains exactly the slice's bytes.
+        k_cpu = k.detach().to("cpu").contiguous().clone()
+        v_cpu = v_quant.detach().to("cpu").contiguous().clone()
+        s_cpu = v_scales.detach().to("cpu").contiguous().clone()
+        k_bytes = bytes(k_cpu.untyped_storage())
+        v_bytes = bytes(v_cpu.untyped_storage())
+        s_bytes = bytes(s_cpu.untyped_storage())
 
         enc = EncodedKV(
             k_dtype=k.dtype,
