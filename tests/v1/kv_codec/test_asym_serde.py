@@ -212,15 +212,15 @@ def test_cross_model_read_rejected():
         des_b.deserialize(encoded)
 
 
-def test_native_asym_runtime_layout_not_yet_implemented():
-    """Phase 2 ships only storage_only_dequant; native_asym must
-    fail loud, not silently fall back to FP16."""
-    with pytest.raises(NotImplementedError, match="Phase 4"):
-        AsymK16V8Serializer(
-            _FakeConfig(),
-            _FakeMetadata(),
-            runtime_layout="native_asym",
-        )
+def test_native_asym_runtime_layout_constructible():
+    """Phase 4: native_asym is implemented.  Construction succeeds.
+    The contract for what it does is in test_native_asym.py."""
+    ser = AsymK16V8Serializer(
+        _FakeConfig(),
+        _FakeMetadata(),
+        runtime_layout="native_asym",
+    )
+    assert ser.runtime_layout == "native_asym"
 
 
 def test_unknown_runtime_layout_rejected():

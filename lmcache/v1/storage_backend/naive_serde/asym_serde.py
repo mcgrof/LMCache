@@ -56,6 +56,111 @@ from lmcache.v1.storage_backend.naive_serde.serde import Deserializer, Serialize
 logger = init_logger(__name__)
 
 
+class AsymKVView:
+    """Lightweight container the runtime hands to the serializer in
+    native_asym mode.  Carries K (fp16/bf16), V (already FP8) and
+    V scales.  This is NOT a MemoryObj — it sits *inside* one via
+    the `.asym_view` attribute on the input MemoryObj."""
+
+    __slots__ = ("k", "v_fp8", "v_scales")
+
+    def __init__(
+        self,
+        k: torch.Tensor,
+        v_fp8: torch.Tensor,
+        v_scales: torch.Tensor,
+    ):
+        self.k = k
+        self.v_fp8 = v_fp8
+        self.v_scales = v_scales
+
+
+class AsymKVMemoryObj:
+    """MemoryObj-shaped wrapper for a (K_fp16/bf16, V_fp8, scales)
+    triple coming back from native_asym deserialize.
+
+    Deliberately NOT a MemoryObj subclass — the existing MemoryObj
+    contract assumes a single dtype.  Anything that consumes this
+    object must check `isinstance(obj, AsymKVMemoryObj)` and use
+    the typed fields directly.  This is the contract the GPU
+    connector hooks into in Phase 4 GPU work to write K and V
+    bytes into vLLM's native asymmetric paged cache without
+    materializing a full FP16 V tensor.
+
+    The fact that this is NOT a torch.Tensor wrapper is the load-
+    bearing design choice: anybody who tries to `.tensor` it gets
+    None, so accidental "treat it like fp16" code paths break
+    loudly rather than silently dequantizing on the hot path.
+    """
+
+    __slots__ = ("k", "v_fp8", "v_scales", "valid")
+
+    def __init__(
+        self,
+        k: torch.Tensor,
+        v_fp8: torch.Tensor,
+        v_scales: torch.Tensor,
+    ):
+        self.k = k
+        self.v_fp8 = v_fp8
+        self.v_scales = v_scales
+        self.valid = True
+
+    @property
+    def tensor(self):
+        # Intentionally None: forces callers to use .k / .v_fp8 /
+        # .v_scales explicitly, preventing silent dequant on the
+        # hot path.
+        return None
+
+    def is_valid(self) -> bool:
+        return self.valid
+
+    def get_size(self) -> int:
+        """Total bytes across K, V_fp8, and scales."""
+        return (
+            self.k.numel() * self.k.element_size()
+            + self.v_fp8.numel() * self.v_fp8.element_size()
+            + self.v_scales.numel() * self.v_scales.element_size()
+        )
+
+    def get_dtypes(self) -> list:
+        # Plural form so the rest of LMCache's plural-aware code
+        # paths get accurate type information.
+        return [self.k.dtype, self.v_fp8.dtype]
+
+    def get_shapes(self) -> list:
+        return [self.k.shape, self.v_fp8.shape]
+
+    def ref_count_up(self):
+        pass
+
+    def ref_count_down(self):
+        pass
+
+
+def detect_native_asym_capability(attention_layer: Any) -> bool:
+    """Return True iff the given vLLM attention layer exposes the
+    metadata required for the native_asym passthrough path.
+
+    The asymmetric-kv-plumbing branch exposes:
+      - `kv_cache_dtype` as a tuple (K_dtype, V_dtype) when asym
+      - `_v_scale_float` (per-layer per-head FP scales)
+
+    A symmetric vLLM has `kv_cache_dtype` as a string and no
+    `_v_scale_float`.  Returning False here means the caller must
+    fall back to storage_only or refuse to start.
+    """
+    kv_cache_dtype = getattr(attention_layer, "kv_cache_dtype", None)
+    if not isinstance(kv_cache_dtype, tuple):
+        return False
+    if len(kv_cache_dtype) != 2:
+        return False
+    if not hasattr(attention_layer, "_v_scale_float"):
+        return False
+    return True
+
+
 # Shared by the asymmetric serializer/deserializer pair.  The codec
 # is stateless aside from configuration; one instance handles all
 # serialize/deserialize calls within an engine.
@@ -77,11 +182,6 @@ class _AsymK16V8SerdeBase:
             raise ValueError(
                 f"AsymK16V8 serde: unknown runtime_layout {runtime_layout!r}; "
                 f"expected 'storage_only_dequant' or 'native_asym'"
-            )
-        if runtime_layout == "native_asym":
-            raise NotImplementedError(
-                "native_asym runtime layout is Phase 4; this is Phase 2. "
-                "Use storage_only_dequant for now."
             )
         self.runtime_layout = runtime_layout
         self.codec = AsymK16V8Codec(scale_scope=scale_scope)
@@ -110,6 +210,23 @@ class AsymK16V8Serializer(_AsymK16V8SerdeBase, Serializer):
     """
 
     def serialize(self, memory_obj: MemoryObj) -> MemoryObj:
+        # native_asym path: the input MemoryObj carries (K_fp16,
+        # V_fp8, scales) already, supplied via the asym_view
+        # protocol below.  We bypass the quantization step entirely
+        # and copy bytes directly into the encoded blob.
+        asym_view = getattr(memory_obj, "asym_view", None)
+        if self.runtime_layout == "native_asym":
+            if asym_view is None:
+                raise ValueError(
+                    "AsymK16V8Serializer(native_asym): input MemoryObj has "
+                    "no `.asym_view` attribute.  Native passthrough requires "
+                    "the runtime to expose K (fp16/bf16), V (fp8), and V "
+                    "scales separately; see AsymKVMemoryObj."
+                )
+            return self._serialize_native_asym(asym_view, memory_obj.metadata)
+
+        # storage_only_dequant path: input is a single FP16/BF16 [2, ...]
+        # tensor.  Quantize V here, write asymmetric blob.
         tensor = memory_obj.tensor
         if tensor is None:
             raise ValueError(
@@ -152,6 +269,54 @@ class AsymK16V8Serializer(_AsymK16V8SerdeBase, Serializer):
         )
         return BytesBufferMemoryObj(raw_bytes=blob, metadata=bytes_meta)
 
+    def _serialize_native_asym(
+        self,
+        view: "AsymKVView",
+        in_meta: MemoryObjMetadata,
+    ) -> MemoryObj:
+        """Native passthrough serialize: copy K bytes, V FP8 bytes,
+        and V scales into an EncodedKV blob without re-quantizing.
+
+        The view object owns the K/V tensors and the scale tensor;
+        this serializer never materializes a full FP16 V buffer.
+        """
+        if view.k.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                f"AsymK16V8Serializer(native_asym): K dtype "
+                f"{view.k.dtype} not in (fp16, bf16)"
+            )
+        if view.v_fp8.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"AsymK16V8Serializer(native_asym): V dtype "
+                f"{view.v_fp8.dtype} != float8_e4m3fn"
+            )
+        encoded = self.codec.encode(
+            view.k,
+            # Pass v.shape only as a placeholder — the actual bytes
+            # come from precomputed_v_quant.  We need a tensor of
+            # the same shape for shape-validation purposes.
+            torch.zeros(view.v_fp8.shape, dtype=view.k.dtype),
+            hashes=self.expected_hashes,
+            precomputed_v_quant=view.v_fp8,
+            precomputed_v_scales=view.v_scales,
+        )
+        blob = self.codec.to_bytes(encoded)
+        # Logical shape on disk: prepend a leading-2 K/V split for
+        # consistency with storage_only mode.
+        logical_shape = torch.Size([2, *view.k.shape])
+        bytes_meta = MemoryObjMetadata(
+            shape=torch.Size([len(blob), 0, 0, 0]),
+            dtype=None,
+            address=0,
+            phy_size=0,
+            ref_count=1,
+            pin_count=0,
+            fmt=MemoryFormat.BINARY_BUFFER,
+            shapes=[logical_shape],
+            dtypes=[view.k.dtype],
+        )
+        return BytesBufferMemoryObj(raw_bytes=blob, metadata=bytes_meta)
+
 
 class AsymK16V8Deserializer(_AsymK16V8SerdeBase, Deserializer):
     """Deserializer for asymmetric K16/V8 cache layout.
@@ -184,7 +349,37 @@ class AsymK16V8Deserializer(_AsymK16V8SerdeBase, Deserializer):
             # to evict or fail the read.
             raise
 
+        if self.runtime_layout == "native_asym":
+            return self._materialize_native_asym(encoded, memory_obj.metadata)
         return self._materialize_storage_only(encoded, memory_obj.metadata)
+
+    def _materialize_native_asym(
+        self,
+        encoded: EncodedKV,
+        in_meta: MemoryObjMetadata,
+    ) -> MemoryObj:
+        """Native passthrough deserialize: return K, V_fp8, and
+        scales as a special MemoryObj that DOES NOT materialize a
+        full FP16 V buffer.
+
+        This is the hot-path restore: the runtime is expected to
+        write these tensors directly into vLLM's asymmetric paged
+        cache via decode_into / equivalent.
+        """
+        # Decode without out_v_dtype: V comes back as native FP8.
+        k, v_fp8, scales = self.codec.decode(encoded, out_v_dtype=None)
+
+        # Reshape K to per-half logical shape; V already at FP8 has
+        # the same per-element count.
+        if in_meta.shapes and len(in_meta.shapes) >= 1:
+            target_shape = in_meta.shapes[0]
+        else:
+            target_shape = torch.Size([2, k.numel()])
+        per_half_shape = torch.Size(list(target_shape)[1:])
+        k = k.reshape(per_half_shape)
+        v_fp8 = v_fp8.reshape(per_half_shape)
+
+        return AsymKVMemoryObj(k=k, v_fp8=v_fp8, v_scales=scales)
 
     def _materialize_storage_only(
         self,
