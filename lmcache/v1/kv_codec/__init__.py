@@ -45,6 +45,13 @@ from lmcache.v1.kv_codec.errors import (
     CorruptEncodedKVError,
     UnsupportedConfigError,
 )
+from lmcache.v1.kv_codec.split_tier import (
+    PlacementPolicy,
+    SplitTierByteCounts,
+    SplitTierFull,
+    SplitTierLayout,
+    SplitTierStore,
+)
 
 
 __all__ = [
@@ -67,4 +74,10 @@ __all__ = [
     # Header serialization (exposed for low-level tests)
     "serialize_header",
     "deserialize_header",
+    # Split-tier placement (Phase 5 headline)
+    "PlacementPolicy",
+    "SplitTierByteCounts",
+    "SplitTierFull",
+    "SplitTierLayout",
+    "SplitTierStore",
 ]

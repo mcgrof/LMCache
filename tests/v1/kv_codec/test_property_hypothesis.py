@@ -29,7 +29,12 @@ from lmcache.v1.kv_codec import (
 # Bound Phase 1 tests to under 30s wall time total; tight settings.
 _SETTINGS = settings(
     max_examples=25,
-    deadline=2000,  # ms per case
+    # Bumped from 2s — under contended CI load, large-shape cases
+    # (e.g., D=128, H=8) can exceed 2s on CPU even though the median
+    # case runs in ~50 ms.  We're fuzzing for correctness, not
+    # performance; the wall-time budget is enforced by the suite-
+    # level cap, not per-case.
+    deadline=8000,  # ms per case
     suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
 )
 
