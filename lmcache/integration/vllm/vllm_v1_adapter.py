@@ -728,7 +728,25 @@ class LMCacheConnectorV1Impl:
     # Worker side APIs
     ####################
     @_lmcache_nvtx_annotate
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+    def register_kv_caches(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        attention_layers: "Optional[dict[str, Any]]" = None,
+    ):
+        """Register vLLM's per-layer KV caches with LMCache.
+
+        Args:
+            kv_caches: dict mapping layer name to its KV tensor
+                (or, on the asymmetric-kv-plumbing branch, a
+                tuple of (K, V) tensors with different dtypes).
+            attention_layers: optional dict mapping layer name to
+                the corresponding vLLM Attention object.  When set,
+                LMCache records each layer's reference so that the
+                save path can look up `_v_scale_float` /
+                `_v_scale` and build an AsymKVView for the
+                native_asym runtime layout.  Symmetric vLLM
+                callers should leave this None.
+        """
         logger.info("Registering KV caches")
         # TODO(chunxiaozheng): `_init_kv_caches_from_forward_context` is
         #  not called, we should consider removing it.
@@ -736,6 +754,33 @@ class LMCacheConnectorV1Impl:
         self.kv_caches = kv_caches
         self._build_kv_layer_groups()
         self._manager.post_init()
+
+        # Populate the asymmetric-kv attention-layer registry so the
+        # save_kv_layer hook can build AsymKVViews when the engine
+        # is configured for kv_runtime_layout=native_asym.  Safe to
+        # call regardless of runtime_layout — the registry is only
+        # consulted when build_asym_kv_view_for_layer is invoked
+        # downstream.  Symmetric callers pass attention_layers=None
+        # and the registry stays empty.
+        if attention_layers:
+            try:
+                # First Party
+                from lmcache.integration.vllm.asym_kv_view_builder import (
+                    register_attention_layer,
+                )
+
+                for layer_name, attn in attention_layers.items():
+                    register_attention_layer(layer_name, attn)
+                logger.info(
+                    "Registered %d attention layer references for "
+                    "asymmetric KV plumbing",
+                    len(attention_layers),
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to register attention layers for "
+                    "asymmetric KV (continuing without): %s", e
+                )
 
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:

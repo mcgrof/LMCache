@@ -47,6 +47,54 @@ from lmcache.v1.storage_backend.naive_serde.asym_serde import (
 logger = init_logger(__name__)
 
 
+# A tiny registry the connector populates at register_kv_caches time
+# and consumes at save_kv_layer time.  Public attribute so the
+# vLLM v1 adapter can read/write it without crossing a private
+# barrier.  Module-global is fine because each engine process has
+# its own attention layers; if/when LMCache supports multiple
+# concurrent engines per process we'd want to namespace by engine
+# id but that's not the case today.
+ATTENTION_LAYER_REGISTRY: dict = {}
+
+
+def register_attention_layer(layer_name: str, attention_layer: Any) -> None:
+    """Hook the v1 adapter calls during `register_kv_caches` to
+    record per-layer attention-module references.  The save path
+    later looks these up by layer_name to build AsymKVViews.
+
+    Idempotent — re-registering the same name overrides the
+    previous reference.  Safe to call regardless of whether
+    runtime_layout is native_asym; the registry is only consulted
+    when build_asym_kv_view_for_layer is called downstream.
+    """
+    ATTENTION_LAYER_REGISTRY[layer_name] = attention_layer
+
+
+def clear_attention_layer_registry() -> None:
+    """Reset the registry — used at engine teardown and in tests."""
+    ATTENTION_LAYER_REGISTRY.clear()
+
+
+def build_asym_kv_view_for_layer(
+    layer_name: str,
+    kv_layer: Any,
+    attn_metadata: Any = None,
+) -> Optional[AsymKVView]:
+    """Look up the attention layer for `layer_name` in the registry
+    and call `build_asym_kv_view`.  Returns None if the layer
+    wasn't registered (which is fine — caller falls back to the
+    regular FP16 path).
+
+    This is the function that the v1 adapter's save_kv_layer hook
+    should call.  Keeping the lookup separate from the build means
+    tests can drive the build path directly without populating the
+    registry."""
+    attn = ATTENTION_LAYER_REGISTRY.get(layer_name)
+    if attn is None:
+        return None
+    return build_asym_kv_view(attn, kv_layer, attn_metadata)
+
+
 def build_asym_kv_view(
     attention_layer: Any,
     kv_layer: torch.Tensor,

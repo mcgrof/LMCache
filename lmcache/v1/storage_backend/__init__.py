@@ -191,7 +191,66 @@ def CreateStorageBackends(
             NixlStorageBackend.CreateNixlStorageBackend(config, loop, metadata)
         )
 
-    if (
+    # SplitTierStorageBackend: K in CPU pinned memory, V FP8 on
+    # NVMe.  Only activates when kv_placement_policy is
+    # "split_k_cpu_v_nvme" (set in config.py).  Replaces the
+    # LocalDiskBackend slot on the same disk path because the two
+    # would collide on key ownership otherwise.
+    use_split_tier = (
+        getattr(config, "kv_placement_policy", "all_nvme")
+        == "split_k_cpu_v_nvme"
+        and config.local_disk
+        and config.max_local_disk_size > 0
+        and "SplitTierStorageBackend" not in _skip
+    )
+
+    if use_split_tier:
+        # First Party
+        from lmcache.v1.storage_backend.split_tier_backend import (
+            SplitTierStorageBackend,
+        )
+        from lmcache.v1.kv_codec import (
+            AsymK16V8Codec,
+            CodecHashes,
+            PlacementPolicy,
+        )
+
+        assert local_cpu_backend is not None
+        # Use the first configured local_disk path as the split-tier
+        # root.  Ignore subsequent paths for now (path-sharding inside
+        # split-tier is Phase 6+ work).
+        root = str(config.local_disk).split(",")[0].strip()
+
+        # Hash gates that travel with each blob.  Pull what we can
+        # from metadata; any field left empty is a wildcard on read.
+        hashes = CodecHashes(
+            model_id=getattr(metadata, "model_name", "") or "",
+            attention_backend="",
+            kv_layout="lmcache_kv_2ltd",
+        )
+        # CPU pinned budget defaults to the configured local_cpu
+        # size when set, else 16 GiB.
+        cpu_budget_bytes = int(
+            getattr(config, "max_local_cpu_size", 0) * 1e9
+        ) or 16 * 1024 * 1024 * 1024
+        on_cpu_full = (
+            "demote_k_to_nvme"
+            if getattr(config, "split_tier_demote_k", False)
+            else "raise"
+        )
+        split_tier = SplitTierStorageBackend(
+            root=root,
+            local_cpu_backend=local_cpu_backend,
+            codec=AsymK16V8Codec(),
+            policy=PlacementPolicy.SPLIT_K_CPU_V_NVME,
+            cpu_pinned_budget_bytes=cpu_budget_bytes,
+            on_cpu_full=on_cpu_full,
+            expected_hashes=hashes,
+            dst_device=dst_device,
+        )
+        storage_backends["SplitTierStorageBackend"] = split_tier
+
+    elif (
         config.local_disk
         and config.max_local_disk_size > 0
         and "LocalDiskBackend" not in _skip

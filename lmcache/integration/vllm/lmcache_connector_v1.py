@@ -47,15 +47,24 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
     # ==============================
     # Worker-side methods
     # ==============================
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+    def register_kv_caches(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        attention_layers: Optional[dict[str, Any]] = None,
+    ):
         """
         Initialize with the KV caches. Useful for pre-registering the
         KV Caches in the KVConnector (e.g. for NIXL).
 
-        Args: kv_caches:
-            dictionary of layer names, kv cache
+        Args:
+            kv_caches: dictionary of layer name -> KV tensor.
+            attention_layers: optional dictionary of layer name ->
+                vLLM Attention object.  When set, LMCache records
+                per-layer references so the save path can build
+                AsymKVViews for the native_asym runtime layout.
+                Symmetric vLLM callers should pass None (default).
         """
-        self._lmcache_engine.register_kv_caches(kv_caches)
+        self._lmcache_engine.register_kv_caches(kv_caches, attention_layers)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """
