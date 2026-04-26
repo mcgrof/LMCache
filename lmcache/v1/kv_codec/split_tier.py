@@ -36,7 +36,10 @@ from typing import Optional, Tuple
 import torch
 
 # First Party
-from lmcache.v1.kv_codec.asym_k16_v8 import AsymK16V8Codec
+from lmcache.v1.kv_codec.asym_k16_v8 import (
+    AsymK16V8Codec,
+    _tensor_to_bytes_fast,
+)
 from lmcache.v1.kv_codec.encoded_kv import (
     CodecHashes,
     EncodedKV,
@@ -319,7 +322,7 @@ class SplitTierStore:
             demoted_path = layout.chunk_dir / "K.demoted.bin"
             layout.chunk_dir.mkdir(parents=True, exist_ok=True)
             k_cpu = k.detach().to("cpu").contiguous().clone()
-            demoted_path.write_bytes(bytes(k_cpu.untyped_storage()))
+            demoted_path.write_bytes(_tensor_to_bytes_fast(k_cpu))
             return
         self._k_store.put(cache_key, layer_id, chunk_id, k)
 
@@ -385,7 +388,7 @@ class SplitTierStore:
                 k_bytes = demoted.read_bytes()
                 bytes_read.nvme_bytes += len(k_bytes)
             else:
-                k_bytes = bytes(k_tensor.contiguous().untyped_storage())
+                k_bytes = _tensor_to_bytes_fast(k_tensor.contiguous())
                 bytes_read.cpu_bytes += len(k_bytes)
             assert layout.v_path is not None
             v_plus_scales = layout.v_path.read_bytes()
@@ -421,9 +424,9 @@ class SplitTierStore:
                 f"ALL_CPU chunk missing in store: "
                 f"{cache_key}/layer_{layer_id}/chunk_{chunk_id}"
             )
-        k_bytes = bytes(k.contiguous().untyped_storage())
-        v_bytes = bytes(v.contiguous().untyped_storage())
-        s_bytes = bytes(s.contiguous().untyped_storage())
+        k_bytes = _tensor_to_bytes_fast(k.contiguous())
+        v_bytes = _tensor_to_bytes_fast(v.contiguous())
+        s_bytes = _tensor_to_bytes_fast(s.contiguous())
         bytes_read.cpu_bytes = len(k_bytes) + len(v_bytes) + len(s_bytes)
         full_blob = header + k_bytes + v_bytes + s_bytes
         encoded = deserialize_header(full_blob)
