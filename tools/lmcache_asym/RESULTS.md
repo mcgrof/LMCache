@@ -58,19 +58,53 @@ PYTHONPATH=. python3 tools/lmcache_asym/bench_codec_bytes.py \
 cat bench_codec_bytes.json | jq '.storage_ratio_vs_fp16, .split_vs_all_nvme_ratio'
 ```
 
-## Phases not measured here
+## GPU memory snapshot (H100)
 
-This file covers the byte-accounting metrics that are decided at
-the codec / placement layer.  Three more measurement axes need
-GPU + a real model and live in the Phase 6 GPU follow-up:
+Run on a real H100 80GB on 2026-04-25.  The load-bearing test from
+the Phase 4 plan: CUDA allocation snapshot during native_asym
+decode confirms no FP16 V buffer is materialized.
+
+Configuration: shape (16, 64, 32, 128), 4,194,304 elements, FP16.
+
+```
+legitimate_total:   K_fp16 + V_fp8 + scales = 12,582,916 bytes
+observed peak:                                12,583,424 bytes
+overhead:           +508 bytes  (allocator alignment)
+silent-fp16-V:                                20,971,524 bytes
+```
+
+Peak / legitimate ratio = **1.000**.  The codec's native_asym
+decode allocates exactly K + V_fp8 + scales on the GPU; nothing
+extra.  Silent FP16 V materialization would cost an additional
+8.4 MB and is not observed.
+
+Also verified on H100:
+
+- CPU and CUDA FP8 quantization produce **bit-identical** FP8
+  bytes for the same input.  This is what makes the CPU test
+  ladder valid as a stand-in for GPU behavior.
+- `codec.decode(device=cuda)` lands tensors on the requested
+  device; no silent CPU fallback.
+
+## What is still GPU-pending (vLLM connector integration)
+
+This file's measurements cover the codec layer.  Three more axes
+require the LMCache-vLLM connector glue (Phase 4 GPU integration
+still to land), and live as follow-up work:
 
 - **Cache-hit TTFT** (p50/p95/p99) for FP16 vs asym all-NVMe vs
-  split-tier under W1–W5 workloads.  Needs vLLM + a real model.
+  split-tier under W1–W5 workloads.  Needs the connector calling
+  the codec on hit.
 - **Restore latency per layer** — distinguishes disk-read from
-  GPU-copy from dequant.  Needs CUDA timing.
+  GPU-copy from dequant.  Needs CUDA timing inside the connector.
 - **Quality preservation** vs in-memory asymmetric:
   WikiText-2 PPL on Qwen2.5-7B and NIAH 16K/32K on Qwen2.5-7B and
   Llama-3.1-8B.  Already measured for the in-memory path in
   `prune:/data/knlp-key-results/qwen-fragility-bundled-20260425/`;
   the cache-hit path needs to reproduce those numbers when the
   KV comes from LMCache rather than fresh prefill.
+
+The codec, serde, native_asym mode, capability detection,
+AsymKVMemoryObj, AsymKVView, SplitTierStore, byte-counts API, and
+the GPU memory-snapshot test are all in place; the remaining work
+is connector wiring.
