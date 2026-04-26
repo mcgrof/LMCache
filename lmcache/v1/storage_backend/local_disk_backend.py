@@ -279,6 +279,8 @@ class LocalDiskBackend(StorageBackendInterface):
         dtype: torch.dtype,
         fmt: MemoryFormat,
         cached_positions: Optional[torch.Tensor] = None,
+        shapes: Optional[list] = None,
+        dtypes: Optional[list] = None,
     ) -> None:
         path = self._key_to_path(key)
 
@@ -289,8 +291,20 @@ class LocalDiskBackend(StorageBackendInterface):
                 self.cache_policy.update_on_hit(key, self.dict)
                 has_stored = True
             else:
+                # `shapes` / `dtypes` are plural fallbacks for the
+                # asymmetric KV codec where K and V have different
+                # dtypes; readers prefer them over the singular
+                # `shape` / `dtype` when set.
                 self.dict[key] = DiskCacheMetadata(
-                    path, size, shape, dtype, cached_positions, fmt, 0
+                    path=path,
+                    size=size,
+                    shape=shape,
+                    dtype=dtype,
+                    cached_positions=cached_positions,
+                    fmt=fmt,
+                    pin_count=0,
+                    shapes=shapes,
+                    dtypes=dtypes,
                 )
 
         # Push kv admit msg with batching
@@ -535,9 +549,20 @@ class LocalDiskBackend(StorageBackendInterface):
         dtype = memory_obj.metadata.dtype
         fmt = memory_obj.metadata.fmt
         cached_positions = memory_obj.metadata.cached_positions
+        # Asymmetric KV codecs (e.g., asym_k16_v8_e4m3) ship a
+        # BytesBufferMemoryObj whose singular dtype is None but whose
+        # plural metadata.dtypes carries [K_dtype, V_dtype].  Forward
+        # both so the read path can reconstruct the encoded layout.
+        shapes = memory_obj.metadata.shapes
+        dtypes = memory_obj.metadata.dtypes
         memory_obj.ref_count_down()
 
-        self.insert_key(key, size, shape, dtype, fmt, cached_positions=cached_positions)
+        self.insert_key(
+            key, size, shape, dtype, fmt,
+            cached_positions=cached_positions,
+            shapes=shapes,
+            dtypes=dtypes,
+        )
 
         self.disk_worker.remove_put_task(key)
 

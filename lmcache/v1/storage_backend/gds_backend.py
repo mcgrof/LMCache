@@ -692,9 +692,20 @@ class GdsBackend(AllocatorBackendInterface):
         shape = memory_obj.metadata.shape
         dtype = memory_obj.metadata.dtype
         fmt = memory_obj.metadata.fmt
+        # Asymmetric KV codecs ship a BytesBufferMemoryObj whose
+        # singular dtype is None but whose plural metadata.dtypes
+        # carries [K_dtype, V_dtype].  Forward both so the GDS read
+        # path can reconstruct the encoded layout when the codec
+        # is asymmetric.
+        shapes = memory_obj.metadata.shapes
+        dtypes = memory_obj.metadata.dtypes
         with self.hot_lock:
             # TODO(Jiayi): need to support `cached_positions`.
-            self.hot_cache[key] = DiskCacheMetadata(path, size, shape, dtype, None, fmt)
+            self.hot_cache[key] = DiskCacheMetadata(
+                path=path, size=size, shape=shape, dtype=dtype,
+                cached_positions=None, fmt=fmt,
+                shapes=shapes, dtypes=dtypes,
+            )
 
     def submit_prefetch_task(
         self,

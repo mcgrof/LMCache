@@ -264,6 +264,14 @@ class DiskCacheMetadata:
     cached_positions: Optional[torch.Tensor] = None
     fmt: Optional[MemoryFormat] = None
     pin_count: int = 0
+    # Plural variants for asymmetric KV caches where K and V have
+    # different dtypes (and potentially different shapes).  When set,
+    # readers should prefer these over the singular `shape` / `dtype`
+    # fields above.  See MemoryObjMetadata.shapes / .dtypes for the
+    # upstream source.  The two halves of `dtypes` are
+    # `[K_dtype, V_dtype]` for the asymmetric K16/V8 codec.
+    shapes: Optional[list[torch.Size]] = None
+    dtypes: Optional[list[torch.dtype]] = None
 
     def pin(self) -> bool:
         self.pin_count += 1
