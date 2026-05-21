@@ -966,6 +966,17 @@ def get_dtype(
         return kv_caches[layer_idx].dtype
     elif gpu_kv_format == lmc_ops.GPUKVFormat.TWO_X_NL_X_NBBS_NH_HS:
         return kv_caches[0][layer_idx].dtype
+    elif (
+        gpu_kv_format
+        == lmc_ops.GPUKVFormat.NL_X_TWO_PER_LAYER_NB_BS_NH_HS_ASYM
+    ):
+        # Asym caller has distinct K/V dtypes per layer.  Callers that
+        # mean "the K-side dtype" get index 2*layer_idx; callers that
+        # mean V get 2*layer_idx + 1.  Default to K, matching the
+        # convention of the existing helpers (block layout, num_blocks,
+        # ...): they all probe the K-side tensor and the V-side mirrors
+        # the same paged shape.
+        return kv_caches[2 * layer_idx].dtype
     else:
         raise ValueError(f"Unknown GPU KV Format: {gpu_kv_format}")
 
@@ -1022,6 +1033,14 @@ def get_group_data_ptrs(
     ):
         layers = cast(list[torch.Tensor], kv_caches)
         return [layers[i].data_ptr() for i in layer_indices]
+    if gpu_kv_format == F.NL_X_TWO_PER_LAYER_NB_BS_NH_HS_ASYM:
+        # K and V are separate entries; K[i] = 2*i, V[i] = 2*i+1.
+        # Match the SGLang TWO_X path's "K's first then V's" grouping
+        # so kernel side can index them consistently.
+        layers = cast(list[torch.Tensor], kv_caches)
+        ptrs_k = [layers[2 * i].data_ptr() for i in layer_indices]
+        ptrs_v = [layers[2 * i + 1].data_ptr() for i in layer_indices]
+        return ptrs_k + ptrs_v
     raise ValueError(f"Unknown GPU KV Format: {gpu_kv_format}")
 
 
