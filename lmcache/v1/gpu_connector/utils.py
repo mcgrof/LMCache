@@ -70,12 +70,21 @@ class LayoutHints(TypedDict, total=False):
             reshape its 4-D pool tensor into the canonical 6-D form.
         tokens_per_block: Tokens per paged block. Used by TRT-LLM (same).
         head_dim: Per-head dimension. Used by TRT-LLM (same).
+        kv_asymmetric: Set ``True`` when the engine produces per-layer
+            (K, V) tuples of 4-D tensors at potentially different
+            dtypes (e.g. K=bf16, V=fp8 for V-only split-tier).  The
+            wrap step flattens the tuples into a list whose
+            ``list_depth == 1`` and per-tensor ``ndim == 4``; this hint
+            is what tells the format detector to pick
+            ``NL_X_TWO_PER_LAYER_NB_BS_NH_HS_ASYM`` rather than
+            rejecting the (otherwise unrecognized) shape.
     """
 
     kv_layout: Literal["NHD", "HND"]
     num_kv_heads: int
     tokens_per_block: int
     head_dim: int
+    kv_asymmetric: bool
 
 
 def attempt_permute_to_contiguous_view(
