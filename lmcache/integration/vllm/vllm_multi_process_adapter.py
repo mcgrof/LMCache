@@ -33,8 +33,24 @@ DEFAULT_HEARTBEAT_INTERVAL: float = 10.0
 
 
 def wrap_kv_caches(kv_caches: dict[str, torch.Tensor]) -> KVCache:
+    """IPC-wrap each layer's KV cache for the LMCache server.
+
+    Asymmetric K/V: vLLM-asym's `_reshape_kv_cache` hands the layer's
+    KV cache as a 2-tuple `(k_cache, v_cache)` when K and V carry
+    different dtypes (e.g., K=bf16, V=fp8 for the V-only split-tier
+    mode).  Flatten the tuple into the wrapper list so the server
+    receives both halves; the per-layer ordering is K0, V0, K1, V1, ...
+    Symmetric callers (single tensor per layer) are unchanged.
+    """
     logger.info("KV caches keys are %s", list(kv_caches.keys()))
-    return [CudaIPCWrapper(tensor) for tensor in kv_caches.values()]
+    wrappers: list = []
+    for v in kv_caches.values():
+        if isinstance(v, tuple):
+            for t in v:
+                wrappers.append(CudaIPCWrapper(t))
+        else:
+            wrappers.append(CudaIPCWrapper(v))
+    return wrappers
 
 
 def send_lmcache_request(
