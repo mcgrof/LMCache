@@ -201,6 +201,8 @@ def get_gpu_kv_shape_description(gpu_kv_format: "lmc_ops.GPUKVFormat") -> str:
         lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS: "NL x [2, NB, NH, BS, HS]",
         lmc_ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS: "NL x [NB, 2, NH, BS, HS]",
         lmc_ops.GPUKVFormat.NB_NL_TWO_NH_BS_HS: "[NB, NL, 2, NH, BS, HS]",
+        lmc_ops.GPUKVFormat.NL_X_TWO_PER_LAYER_NB_BS_NH_HS_ASYM:
+            "(NL pairs) [K_i, V_i] each [NB, BS, NH, HS] (asym K/V)",
     }
     return _SHAPE_DESCRIPTIONS.get(gpu_kv_format, f"Unknown ({gpu_kv_format})")
 
@@ -223,6 +225,8 @@ def get_attention_backend(gpu_kv_format: "lmc_ops.GPUKVFormat") -> str:
             "vLLM non-MLA flash infer (HND layout)"
         ),
         lmc_ops.GPUKVFormat.NB_NL_TWO_NH_BS_HS: "TRT-LLM cross-layer (HND layout)",
+        lmc_ops.GPUKVFormat.NL_X_TWO_PER_LAYER_NB_BS_NH_HS_ASYM:
+            "vLLM asymmetric K/V (V-only split-tier, FlashInfer)",
     }
     return _ATTENTION_BACKENDS.get(gpu_kv_format, f"Unknown ({gpu_kv_format})")
 
@@ -444,6 +448,19 @@ def normalize_kv_and_discover_format(
                         detected_format = lmc_ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS
                     else:
                         detected_format = lmc_ops.GPUKVFormat.NL_X_NB_TWO_BS_NH_HS
+            elif tensor_dim == 4:
+                # vllm asymmetric K/V: wrap_kv_caches flattens
+                # [(K0, V0), (K1, V1), ...] into a single list of 4D
+                # tensors at potentially different dtypes.  Detected
+                # only when layout_hints announces an even-length list
+                # AND the asymmetry flag.  Even an even-length list
+                # without the flag is rejected so we don't silently
+                # mis-route some future 4D format here.
+                kv_asymmetric = bool(layout_hints.get("kv_asymmetric", False))
+                if kv_asymmetric and list_dims[0] % 2 == 0:
+                    detected_format = (
+                        lmc_ops.GPUKVFormat.NL_X_TWO_PER_LAYER_NB_BS_NH_HS_ASYM
+                    )
             elif tensor_dim == 3:
                 # vllm MLA
                 detected_format = lmc_ops.GPUKVFormat.NL_X_NB_BS_HS
@@ -489,6 +506,12 @@ def get_num_layers(
         return len(kv_caches[0])
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_NBBS_ONE_HS:
         return len(kv_caches)
+    elif (
+        gpu_kv_format
+        == lmc_ops.GPUKVFormat.NL_X_TWO_PER_LAYER_NB_BS_NH_HS_ASYM
+    ):
+        # Flat list of [K0, V0, K1, V1, ...] -- two entries per layer.
+        return len(kv_caches) // 2
     else:
         raise ValueError(f"Unknown GPU KV Format: {gpu_kv_format}")
 
@@ -522,6 +545,13 @@ def get_num_blocks(
         raise ValueError(_ATTRIBUTE_NOT_EXIST_ERROR.format(format=gpu_kv_format))
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_NBBS_ONE_HS:
         raise ValueError(_ATTRIBUTE_NOT_EXIST_ERROR.format(format=gpu_kv_format))
+    elif (
+        gpu_kv_format
+        == lmc_ops.GPUKVFormat.NL_X_TWO_PER_LAYER_NB_BS_NH_HS_ASYM
+    ):
+        # Asym layout per-tensor shape is [num_blocks, bs, nh, hd];
+        # K and V share num_blocks by construction.
+        return kv_caches[0].shape[0]
     else:
         raise ValueError(f"Unknown GPU KV Format: {gpu_kv_format}")
 
@@ -555,6 +585,12 @@ def get_block_size(
         raise ValueError(_ATTRIBUTE_NOT_EXIST_ERROR.format(format=gpu_kv_format))
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_NBBS_ONE_HS:
         raise ValueError(_ATTRIBUTE_NOT_EXIST_ERROR.format(format=gpu_kv_format))
+    elif (
+        gpu_kv_format
+        == lmc_ops.GPUKVFormat.NL_X_TWO_PER_LAYER_NB_BS_NH_HS_ASYM
+    ):
+        # Asym per-tensor shape is [num_blocks, block_size, num_heads, head_size]
+        return kv_caches[0].shape[1]
     else:
         raise ValueError(f"Unknown GPU KV Format: {gpu_kv_format}")
 
@@ -594,6 +630,12 @@ def get_page_buffer_size(
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_NBBS_ONE_HS:
         # list[num_layers] of [page_buffer_size, 1, head_size]
         return kv_caches[0].shape[0]
+    elif (
+        gpu_kv_format
+        == lmc_ops.GPUKVFormat.NL_X_TWO_PER_LAYER_NB_BS_NH_HS_ASYM
+    ):
+        # Asym per-tensor shape is [num_blocks, block_size, num_heads, head_size]
+        return kv_caches[0].shape[0] * kv_caches[0].shape[1]
     else:
         raise ValueError(f"Unknown GPU KV Format: {gpu_kv_format}")
 
@@ -630,6 +672,13 @@ def get_num_heads(
         return kv_caches[0][layer_idx].shape[1]
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_NBBS_ONE_HS:
         return kv_caches[layer_idx].shape[1]
+    elif (
+        gpu_kv_format
+        == lmc_ops.GPUKVFormat.NL_X_TWO_PER_LAYER_NB_BS_NH_HS_ASYM
+    ):
+        # Per-K-or-V tensor is [num_blocks, block_size, num_heads, head_size].
+        # Flat list pairing is K0,V0,K1,V1,...; K and V share num_heads.
+        return kv_caches[2 * layer_idx].shape[2]
     else:
         raise ValueError(f"Unknown GPU KV Format: {gpu_kv_format}")
 
@@ -665,6 +714,15 @@ def get_hidden_dim_size(
         return kv_caches[0][layer_idx].shape[1] * kv_caches[0][layer_idx].shape[2]
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_NBBS_ONE_HS:
         return kv_caches[layer_idx].shape[2]
+    elif (
+        gpu_kv_format
+        == lmc_ops.GPUKVFormat.NL_X_TWO_PER_LAYER_NB_BS_NH_HS_ASYM
+    ):
+        # Per-K-or-V tensor: [num_blocks, block_size, num_heads, head_size];
+        # hidden = num_heads * head_size.
+        return (
+            kv_caches[2 * layer_idx].shape[2] * kv_caches[2 * layer_idx].shape[3]
+        )
     else:
         raise ValueError(f"Unknown GPU KV Format: {gpu_kv_format}")
 
@@ -696,6 +754,12 @@ def get_head_size(
         return kv_caches[0][layer_idx].shape[2]
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_NBBS_ONE_HS:
         return kv_caches[layer_idx].shape[2]
+    elif (
+        gpu_kv_format
+        == lmc_ops.GPUKVFormat.NL_X_TWO_PER_LAYER_NB_BS_NH_HS_ASYM
+    ):
+        # Per-K-or-V tensor: [num_blocks, block_size, num_heads, head_size]
+        return kv_caches[2 * layer_idx].shape[3]
     else:
         raise ValueError(f"Unknown GPU KV Format: {gpu_kv_format}")
 
@@ -740,6 +804,13 @@ def get_tokens_per_layer(
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_NBBS_ONE_HS:
         # list[num_layers] of [page_buffer_size, 1, head_size]
         return kv_caches[0].shape[0]
+    elif (
+        gpu_kv_format
+        == lmc_ops.GPUKVFormat.NL_X_TWO_PER_LAYER_NB_BS_NH_HS_ASYM
+    ):
+        # Per-K-or-V tensor: [num_blocks, block_size, num_heads, head_size];
+        # tokens = NB * BS.
+        return kv_caches[0].shape[0] * kv_caches[0].shape[1]
     else:
         raise ValueError(f"Unknown GPU KV Format: {gpu_kv_format}")
 
@@ -790,6 +861,14 @@ def get_elements_per_layer(
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_NBBS_ONE_HS:
         # list[num_layers] of [page_buffer_size, 1, head_size] (MLA)
         return kv_caches[0].numel()
+    elif (
+        gpu_kv_format
+        == lmc_ops.GPUKVFormat.NL_X_TWO_PER_LAYER_NB_BS_NH_HS_ASYM
+    ):
+        # Per-layer storage spans two 4D tensors (K and V).  K and V
+        # may carry different dtypes, so "elements" is K-elements +
+        # V-elements measured in their own dtypes.
+        return kv_caches[0].numel() + kv_caches[1].numel()
     else:
         raise ValueError(f"Unknown GPU KV Format: {gpu_kv_format}")
 

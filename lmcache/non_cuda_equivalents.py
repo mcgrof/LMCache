@@ -275,6 +275,13 @@ class GPUKVFormat(IntEnum):
     # used by: TRT-LLM cross-layer (HND layout)
     NB_NL_TWO_NH_BS_HS = 8
 
+    # used by: vLLM asymmetric K/V (V-only split-tier).  Per-layer K and
+    # V live in separate 4D tensors at potentially different dtypes
+    # (e.g. K=bf16, V=fp8_e4m3); wrap_kv_caches flattens
+    # [(K0, V0), (K1, V1), ...] into a single list and the (K, V)
+    # pairing is implicit in K-then-V ordering.
+    NL_X_TWO_PER_LAYER_NB_BS_NH_HS_ASYM = 9
+
 
 class PageBufferShapeDesc:
     """Python stand-in for the C++ ``PageBufferShapeDesc`` struct.

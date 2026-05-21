@@ -92,6 +92,20 @@ enum class GPUKVFormat : int {
   - TRT-LLM cross-layer (HND layout)
   physical shape: [num_blocks, num_layers, 2, num_heads, block_size, head_size]
   */
+
+  NL_X_TWO_PER_LAYER_NB_BS_NH_HS_ASYM = 9,
+  /*
+  used by:
+  - vLLM asymmetric K/V (V-only split-tier), where K and V live in
+    separate per-layer tensors with potentially different dtypes
+    (e.g. K=bf16, V=fp8_e4m3).  wrap_kv_caches flattens the
+    [(K0,V0), (K1,V1), ...] tuples into a single list whose
+    list_depth == 1 and per-tensor ndim == 4; the (K, V) pairing
+    is implicit in the K-then-V ordering (index 2*i is K of layer
+    i, 2*i+1 is V of layer i).  This format is detected only when
+    the vLLM serving engine reports asymmetric KV dtypes via
+    layout_hints (kv_asymmetric == True).
+  */
 };
 
 void multi_layer_kv_transfer(

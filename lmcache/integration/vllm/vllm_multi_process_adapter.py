@@ -774,6 +774,16 @@ class LMCacheMPWorkerAdapter:
         logger.info("Registering kv caches")
 
         layout_hints = vllm_layout_hints()
+        # Asymmetric K/V: signal the server-side format detector so it
+        # picks the asym 4D-pair layout rather than rejecting an
+        # unknown list_depth/tensor_dim combination.  An asym kv_cache
+        # is delivered as per-layer (K, V) tuples by vLLM-asym's
+        # _reshape_kv_cache; wrap_kv_caches flattens them, doubling
+        # the list length, so we set the flag when we see any tuple
+        # value.
+        if any(isinstance(v, tuple) for v in kv_caches.values()):
+            layout_hints = dict(layout_hints)
+            layout_hints["kv_asymmetric"] = True
         self.kv_caches = kv_caches
 
         future = send_lmcache_request(
