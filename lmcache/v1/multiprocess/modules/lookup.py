@@ -257,6 +257,11 @@ class LookupModule:
             )
             return
 
+        # Adapt the transfer-side packed layout to the canonical L1 shape so
+        # the prefetch destination matches the multi-output serde's
+        # expectations (no-op for the default PACKED layout).
+        layout_desc = self._ctx.storage_manager.apply_layout_policy(layout_desc)
+
         extra_count = compute_extra_count(tp_size, world_size)
 
         chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(list(key.token_ids))
