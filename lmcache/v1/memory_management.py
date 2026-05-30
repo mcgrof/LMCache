@@ -702,31 +702,55 @@ class TensorMemoryObj(MemoryObj):
     def set_used_size(self, n: int) -> None:
         """Narrow the logical size to ``n`` bytes after a write.
 
-        After this call, ``get_size()`` returns ``n`` and ``byte_array``
-        exposes exactly ``n`` bytes from the start of ``raw_data``.  The
-        physical allocation (``get_physical_size``) and ``raw_data``
-        buffer are unchanged.  Allocator reuse resets this override to
-        ``None`` so a recycled block returns to its layout-derived size.
+        After this call, ``get_size()`` returns ``n``, ``byte_array``
+        exposes exactly ``n`` bytes from the start of ``raw_data``,
+        and the ``tensor`` property reshapes coherently (the underlying
+        ``meta.shape`` / ``meta.shapes`` / ``group_prefix_sum`` are all
+        updated to match the narrower view).  The physical allocation
+        (``get_physical_size``) and the ``raw_data`` buffer itself are
+        unchanged.  Allocator reuse resets this override to ``None`` so
+        a recycled block returns to its layout-derived size.
 
-        Note: the ``tensor`` property still derives its shape from
-        ``meta.shape``, so accessing ``.tensor`` on a buffer narrowed
-        below its layout size will fail to reshape.  Use ``byte_array``
-        (or read ``raw_data[: get_size()]`` directly) for downstream
-        I/O that must honor the narrowed size.
+        Supported only on flat single-byte (uint8) buffers -- the serde
+        temp buffers the async processor narrows.  Multi-byte dtypes or
+        multi-group layouts would need a non-trivial reinterpretation
+        and are rejected explicitly; the caller can fall back to
+        ``byte_array`` for raw byte access.
 
         Args:
             n: bytes actually written.  Must satisfy
                 ``0 <= n <= get_physical_size()``.
 
         Raises:
-            ValueError: if ``n`` is outside the allowed range.
+            ValueError: if ``n`` is outside the allowed range, the
+                buffer is multi-group, or the buffer's dtype is not
+                ``torch.uint8``.
         """
         if n < 0 or n > self.meta.phy_size:
             raise ValueError(
                 f"set_used_size: n={n} out of range [0, {self.meta.phy_size}]"
             )
         with self.lock:
+            if self.meta.shapes is not None and len(self.meta.shapes) > 1:
+                raise ValueError(
+                    "set_used_size is only valid on single-group buffers; "
+                    f"this buffer has {len(self.meta.shapes)} groups"
+                )
+            if self.meta.dtype is None or self.meta.dtype.itemsize != 1:
+                raise ValueError(
+                    "set_used_size: only single-byte (uint8) buffers are "
+                    f"supported; this buffer has dtype {self.meta.dtype}"
+                )
             self._used_size_override = n
+            # Keep meta.shape / shapes / group_prefix_sum coherent so the
+            # ``tensor`` property (which does
+            # raw_data[:get_size()].view(dtype).view(shape)) reshapes
+            # correctly into the narrowed view.
+            new_shape = torch.Size((n,))
+            self.meta.shape = new_shape
+            if self.meta.shapes is not None:
+                self.meta.shapes = [new_shape]
+            self.group_prefix_sum = [0, n]
 
     # TODO(chunxiaozheng): use get_shapes and get_dtypes to replace
     #  get_shape and get_dtype
