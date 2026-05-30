@@ -98,11 +98,7 @@ def derive_storage_layout_mode(
             continue
         processor = create_serde_processor(sc)
         try:
-            # A multi-output serde declares its component split via
-            # ``input_slot_mapping``; single-tensor serdes (fp8, etc.) do
-            # not carry the method and map to the PACKED identity layout.
-            mapping_fn = getattr(processor, "input_slot_mapping", None)
-            mapping = mapping_fn() if mapping_fn is not None else None
+            mapping = processor.input_slot_mapping()
         finally:
             processor.close()
         if mapping is None:
