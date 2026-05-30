@@ -1046,6 +1046,13 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         self._ctx.chunk_size,
                         object_group_id=obj_group_id,
                     )
+                    # Adapt the transfer-side packed layout to the canonical
+                    # L1 shape: PACKED stays as-is; KV_COMPONENT_GROUPS splits
+                    # each [2, ...] group into separate K and V component
+                    # groups so a multi-output serde can dispatch.
+                    layout_desc = self._ctx.storage_manager.apply_layout_policy(
+                        layout_desc
+                    )
                     reserved_dict = self._ctx.storage_manager.reserve_write(
                         obj_keys, layout_desc, "new"
                     )
