@@ -53,6 +53,7 @@ from lmcache.v1.distributed.serde import (
     make_temp_key,
     serialized_layout_desc,
 )
+from lmcache.v1.distributed.serde.multi import GroupSlotView, MemoryObjGroup
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.platform import consume_fd, create_event_notifier
 
@@ -199,7 +200,11 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
         try:
             with self._lock:
                 self._store_tasks[wrapped_id] = state
-                serde_task_id = self._serde.submit_serialize(objects, temp_objs)
+                serde_src = self._build_serde_src_inputs(objects)
+                serde_task_id = self._serde.submit_serialize(
+                    serde_src,  # type: ignore[arg-type]
+                    temp_objs,
+                )
                 self._serde_to_store[serde_task_id] = wrapped_id
         except Exception:
             logger.exception(
@@ -528,7 +533,11 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
 
             state.load_bitmap = bitmap
             try:
-                serde_id = self._serde.submit_deserialize(src_objs, dst_objs)
+                serde_dst = self._build_serde_dst_outputs(dst_objs)
+                serde_id = self._serde.submit_deserialize(
+                    src_objs,
+                    serde_dst,  # type: ignore[arg-type]
+                )
             except Exception:
                 logger.exception(
                     "Serde wrapper: submit_deserialize raised for task %d",
@@ -627,6 +636,56 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
             self._l1_manager.delete(temp_keys)
         except Exception:
             logger.exception("Serde wrapper: failed releasing write-locked temps")
+
+    # ------------------------------------------------------------------
+    # Multi-output dispatch: build per-slot GroupSlotView tuples when
+    # the underlying serde is multi-output (e.g. AsymK16V8Multi*), or
+    # pass MemoryObjs through unchanged for single-tensor serdes.  The
+    # mapping is queried from the SerdeProcessor (default ``None`` means
+    # single-tensor; a non-None tuple defines the per-slot ↔ parent-group
+    # routing -- e.g. identity ``(0, 1)`` for storage-only Mode 1,
+    # ``(None, 1)`` for V-only Mode 2).
+    # ------------------------------------------------------------------
+
+    def _build_serde_src_inputs(
+        self, objects: list[MemoryObj]
+    ) -> "list[MemoryObj] | list[MemoryObjGroup]":
+        """Adapt source ``objects`` to the shape the serde expects.
+
+        Returns the input list unchanged for single-tensor serdes.  For
+        multi-output serdes, returns a parallel list of
+        :data:`MemoryObjGroup` tuples whose slots are
+        :class:`GroupSlotView` instances over the parent's groups (or
+        ``None`` for slots the mapping marks absent).
+        """
+        mapping = self._serde.input_slot_mapping()
+        if mapping is None:
+            return objects
+        return [
+            tuple(
+                GroupSlotView(obj, idx) if idx is not None else None
+                for idx in mapping
+            )
+            for obj in objects
+        ]
+
+    def _build_serde_dst_outputs(
+        self, dst_objs: list[MemoryObj]
+    ) -> "list[MemoryObj] | list[MemoryObjGroup]":
+        """Adapt destination ``dst_objs`` to the shape the deserializer
+        expects.  Symmetric to :meth:`_build_serde_src_inputs` for the
+        load path.
+        """
+        mapping = self._serde.output_slot_mapping()
+        if mapping is None:
+            return dst_objs
+        return [
+            tuple(
+                GroupSlotView(obj, idx) if idx is not None else None
+                for idx in mapping
+            )
+            for obj in dst_objs
+        ]
 
     def _finalize_store(
         self,

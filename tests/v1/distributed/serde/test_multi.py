@@ -447,3 +447,145 @@ def test_single_to_multi_deserializer_treats_none_slot_as_skip() -> None:
     src = _byte_buffer(8)
     # Deliberately skip the only output: must not raise.
     multi_d.deserialize(src, (None,))  # type: ignore[arg-type]
+
+
+# =============================================================================
+# Slot-mapping + GroupSlotView + layout_desc_to_group
+# =============================================================================
+
+
+def test_multi_serializer_default_input_slot_mapping_is_identity() -> None:
+    """A MultiSerializer that doesn't override input_slot_mapping returns
+    the identity tuple ``(0, 1, ..., group_size - 1)`` — slot i ↔
+    parent group i.  The wrapper relies on this default for storage-only
+    serdes that want the conventional ``(K_group_0, V_group_1)``
+    layout."""
+    # First Party
+    from lmcache.v1.distributed.serde.multi import MultiSerializer
+
+    class _G3(MultiSerializer):
+        @property
+        def group_size(self) -> int:
+            return 3
+
+        def serialize(self, src, dst) -> int:  # type: ignore[override]
+            return 0
+
+        def estimate_serialized_size(self, layout_descs) -> int:  # type: ignore[override]
+            return 0
+
+    assert _G3().input_slot_mapping() == (0, 1, 2)
+
+
+def test_multi_deserializer_default_output_slot_mapping_is_identity() -> None:
+    """Symmetric to the serializer default test."""
+    # First Party
+    from lmcache.v1.distributed.serde.multi import MultiDeserializer
+
+    class _D2(MultiDeserializer):
+        @property
+        def group_size(self) -> int:
+            return 2
+
+        def deserialize(self, src, dst) -> None:  # type: ignore[override]
+            pass
+
+    assert _D2().output_slot_mapping() == (0, 1)
+
+
+def test_group_slot_view_exposes_parent_tensor_view() -> None:
+    """``GroupSlotView`` reads ``parent.get_tensor(index)`` so its
+    ``.tensor`` is a view over the parent's buffer.  Writes through
+    the view propagate to the parent (storage aliasing).  This is what
+    lets the wrapper hand serdes per-slot views without copying or
+    reallocating."""
+    # Third Party
+    # First Party
+    from lmcache.v1.distributed.serde.multi import GroupSlotView
+    from lmcache.v1.memory_management import (
+        MemoryFormat,
+        MemoryObjMetadata,
+        TensorMemoryObj,
+    )
+
+    # Build a 2-group MemoryObj: group 0 = 4 bf16, group 1 = 6 fp8.
+    k_shape = torch.Size([4])
+    v_shape = torch.Size([6])
+    k_bytes = 4 * 2  # bf16
+    v_bytes = 6 * 1  # fp8 (1 byte/elem)
+    total = k_bytes + v_bytes
+    raw = torch.zeros(total, dtype=torch.uint8)
+    meta = MemoryObjMetadata(
+        shape=k_shape,
+        dtype=torch.bfloat16,
+        address=0,
+        phy_size=total,
+        ref_count=1,
+        pin_count=0,
+        fmt=MemoryFormat.BINARY_BUFFER,
+        shapes=[k_shape, v_shape],
+        dtypes=[torch.bfloat16, torch.float8_e4m3fn],
+    )
+    parent = TensorMemoryObj(raw_data=raw, metadata=meta, parent_allocator=None)
+
+    view_k = GroupSlotView(parent, 0)
+    view_v = GroupSlotView(parent, 1)
+    assert view_k.tensor.shape == k_shape
+    assert view_k.tensor.dtype == torch.bfloat16
+    assert view_v.tensor.shape == v_shape
+    assert view_v.tensor.dtype == torch.float8_e4m3fn
+
+    # Writes through the view alias the parent's buffer.
+    view_k.tensor.fill_(7.0)
+    assert int(parent.get_tensor(0)[0].item()) == 7
+
+
+def test_layout_desc_to_group_identity_mapping() -> None:
+    """Identity mapping ``(0, 1)`` splits a 2-group parent layout into
+    two single-group descriptors in order."""
+    # First Party
+    from lmcache.v1.distributed.serde.multi import layout_desc_to_group
+
+    parent = MemoryLayoutDesc(
+        shapes=[torch.Size([4]), torch.Size([6])],
+        dtypes=[torch.bfloat16, torch.float8_e4m3fn],
+    )
+    group = layout_desc_to_group(parent, (0, 1))
+    assert len(group) == 2
+    assert group[0] is not None
+    assert group[0].shapes == [torch.Size([4])]
+    assert group[0].dtypes == [torch.bfloat16]
+    assert group[1] is not None
+    assert group[1].shapes == [torch.Size([6])]
+    assert group[1].dtypes == [torch.float8_e4m3fn]
+
+
+def test_layout_desc_to_group_v_only_mapping() -> None:
+    """V-only mapping ``(None, 1)`` returns None for slot 0 and the
+    V layout for slot 1.  The wrapper uses this to feed
+    ``AsymK16V8VOnlyMultiSerializer.estimate_serialized_size`` a layout
+    group that mirrors the absent-K contract."""
+    # First Party
+    from lmcache.v1.distributed.serde.multi import layout_desc_to_group
+
+    parent = MemoryLayoutDesc(
+        shapes=[torch.Size([4]), torch.Size([6])],
+        dtypes=[torch.bfloat16, torch.float8_e4m3fn],
+    )
+    group = layout_desc_to_group(parent, (None, 1))
+    assert len(group) == 2
+    assert group[0] is None
+    assert group[1] is not None
+    assert group[1].shapes == [torch.Size([6])]
+
+
+def test_layout_desc_to_group_rejects_slot_out_of_range() -> None:
+    # First Party
+    from lmcache.v1.distributed.serde.multi import layout_desc_to_group
+
+    parent = MemoryLayoutDesc(
+        shapes=[torch.Size([4])],
+        dtypes=[torch.bfloat16],
+    )
+    with pytest.raises(ValueError, match="parent group 1"):
+        layout_desc_to_group(parent, (0, 1))

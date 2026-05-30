@@ -138,8 +138,70 @@ class AsyncSerdeProcessor(SerdeProcessor):
     # ----- Size estimation (delegates to sync serializer) -----
 
     def estimate_serialized_size(self, layout_desc: MemoryLayoutDesc) -> int:
-        """Delegate to the sync serializer's estimate (includes margin)."""
+        """Delegate to the sync serializer's estimate (includes margin).
+
+        For single-tensor serializers, the layout descriptor is passed
+        through unchanged.  For multi-output serializers, the parent
+        layout's group entries are split into a
+        :data:`LayoutDescGroup` using the serializer's
+        ``input_slot_mapping`` so the multi-output estimate sees the
+        per-slot descriptors it expects.
+        """
+        # First Party
+        from lmcache.v1.distributed.serde.multi import (
+            MultiSerializer,
+            layout_desc_to_group,
+        )
+
+        if isinstance(self._serializer, MultiSerializer):
+            mapping = self._serializer.input_slot_mapping()
+            group = layout_desc_to_group(layout_desc, mapping)
+            return self._serializer.estimate_serialized_size(group)
         return self._serializer.estimate_serialized_size(layout_desc)
+
+    # ----- Multi-output dispatch hooks -----
+
+    def input_slot_mapping(self) -> "tuple[int | None, ...] | None":
+        """Delegate to the wrapped serializer's ``input_slot_mapping``
+        if it is a multi-output serializer; ``None`` otherwise.
+
+        Allows :class:`SerdeL2AdapterWrapper` to dispatch a grouped
+        ``MemoryObj`` through a tuple of per-slot views without
+        instantiating the serializer here.
+        """
+        # Late import to avoid circular dep at module load.
+        # First Party
+        from lmcache.v1.distributed.serde.multi import MultiSerializer
+
+        if isinstance(self._serializer, MultiSerializer):
+            return self._serializer.input_slot_mapping()
+        return None
+
+    def output_slot_mapping(self) -> "tuple[int | None, ...] | None":
+        """Symmetric to :meth:`input_slot_mapping` for the deserialize
+        path."""
+        # First Party
+        from lmcache.v1.distributed.serde.multi import MultiDeserializer
+
+        if isinstance(self._deserializer, MultiDeserializer):
+            return self._deserializer.output_slot_mapping()
+        return None
+
+    def serializer_group_size(self) -> "int | None":
+        # First Party
+        from lmcache.v1.distributed.serde.multi import MultiSerializer
+
+        if isinstance(self._serializer, MultiSerializer):
+            return self._serializer.group_size
+        return None
+
+    def deserializer_group_size(self) -> "int | None":
+        # First Party
+        from lmcache.v1.distributed.serde.multi import MultiDeserializer
+
+        if isinstance(self._deserializer, MultiDeserializer):
+            return self._deserializer.group_size
+        return None
 
     # ----- Lifecycle -----
 
