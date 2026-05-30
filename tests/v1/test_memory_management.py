@@ -1174,6 +1174,53 @@ class TestSetUsedSize:
         with pytest.raises(ValueError):
             obj.set_used_size(obj.get_physical_size() + 1)
 
+    @staticmethod
+    def _make_kv_layout_buffer(groups: int) -> TensorMemoryObj:
+        """Construct a bf16 KV-layout TensorMemoryObj with ``groups``
+        component groups -- the kind of fixed-layout destination the
+        plain (no-serde) FS L2 load path reads into."""
+        shape = torch.Size([2, 4, 8])
+        nbytes = shape.numel() * torch.bfloat16.itemsize
+        raw = torch.zeros(shape.numel() * groups, dtype=torch.bfloat16)
+        meta = MemoryObjMetadata(
+            shape=shape,
+            dtype=torch.bfloat16,
+            address=0,
+            phy_size=nbytes * groups,
+            ref_count=1,
+            pin_count=0,
+            fmt=MemoryFormat.KV_2LTD,
+            shapes=[shape] * groups,
+            dtypes=[torch.bfloat16] * groups,
+        )
+        return TensorMemoryObj(raw_data=raw, metadata=meta, parent_allocator=None)
+
+    @pytest.mark.parametrize("groups", [1, 2])
+    def test_set_used_size_full_size_is_noop_on_kv_layout(self, groups: int) -> None:
+        """A full-size call (n == get_size()) must be a no-op for ANY
+        layout. The plain (no-serde) FS L2 load path reads the whole
+        on-disk object into a fixed-layout bf16 destination and then
+        reports the read size via set_used_size -- rejecting that call
+        (as the narrowing-only validation would) failed every vanilla
+        FS load."""
+        obj = self._make_kv_layout_buffer(groups)
+        size = obj.get_size()
+        obj.set_used_size(size)  # must not raise
+        assert obj.get_size() == size
+        # No override recorded: the layout-derived view is untouched.
+        assert obj._used_size_override is None
+
+    @pytest.mark.parametrize("groups", [1, 2])
+    def test_set_used_size_narrowing_kv_layout_still_rejected(
+        self, groups: int
+    ) -> None:
+        """Actually narrowing a non-uint8 or multi-group buffer is
+        still an error: reinterpreting a partial fixed-layout object
+        would silently serve truncated KV data."""
+        obj = self._make_kv_layout_buffer(groups)
+        with pytest.raises(ValueError):
+            obj.set_used_size(obj.get_size() - torch.bfloat16.itemsize)
+
     def _paged_byte_allocator(
         self, n_pages: int, page_bytes: int
     ) -> "PagedTensorMemoryAllocator":
