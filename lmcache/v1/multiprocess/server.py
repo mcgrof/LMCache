@@ -630,6 +630,11 @@ class MPCacheEngine:
             reserved_dict: dict = {}
             try:
                 layout_desc = get_layout_desc(gpu_context, self.chunk_size)
+                # Adapt the transfer-side packed layout to the canonical
+                # L1 shape (PACKED stays as-is; KV_COMPONENT_GROUPS
+                # splits each [2, ...] group into separate K and V
+                # component groups so multi-output serdes can dispatch).
+                layout_desc = self.storage_manager.apply_layout_policy(layout_desc)
                 reserved_dict = self.storage_manager.reserve_write(
                     obj_keys, layout_desc, "new"
                 )
@@ -971,6 +976,11 @@ class MPCacheEngine:
                 model_name,
                 world_size,
             )
+        else:
+            # Adapt the transfer-side packed layout to the canonical L1
+            # shape so the prefetch destination matches the multi-output
+            # serde's expectations (no-op for PACKED).
+            layout_desc = self.storage_manager.apply_layout_policy(layout_desc)
             self._register_prefetch_job(
                 _PrefetchJob(
                     handle=PrefetchHandle(
