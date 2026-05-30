@@ -44,6 +44,11 @@ from lmcache.v1.distributed.storage_controllers.store_policy import (
     AdapterDescriptor,
     create_store_policy,
 )
+from lmcache.v1.distributed.storage_layout import (
+    StorageLayoutMode,
+    apply_layout_policy as _apply_layout_policy,
+    derive_storage_layout_mode,
+)
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
@@ -69,6 +74,15 @@ class StorageManager:
             eviction_config=config.eviction_config,
         )
         self._eviction_controller.start()
+
+        # Canonical L1 storage layout mode, derived from the configured
+        # L2 adapters' serdes.  All adapters must share one mode; mixing
+        # a single-tensor serde (e.g. ``fp8``) with a multi-output serde
+        # (e.g. ``asym_k16_v8``) on the same StorageManager is rejected
+        # at config time.  See lmcache/v1/distributed/storage_layout.py.
+        self._storage_layout_mode = derive_storage_layout_mode(
+            config.l2_adapter_config.adapters
+        )
 
         # L2 adapters and store controller. When an adapter config carries
         # a ``serde_config``, the adapter is wrapped with
@@ -169,6 +183,42 @@ class StorageManager:
         )
 
     # External APIs for serving engine integration code to call
+
+    @property
+    def storage_layout_mode(self) -> StorageLayoutMode:
+        """The canonical L1 ``MemoryObj`` shape this StorageManager uses.
+
+        Derived once at construction from the configured L2 adapters'
+        serdes.  Integration layers (vLLM / SGLang connectors, MP
+        server) should call :meth:`apply_layout_policy` on the
+        transfer-side packed layout before :meth:`reserve_write` so the
+        canonical shape is reached regardless of which serde is wired.
+        """
+        return self._storage_layout_mode
+
+    def apply_layout_policy(self, layout_desc: MemoryLayoutDesc) -> MemoryLayoutDesc:
+        """Adapt a transfer-side packed layout to this StorageManager's
+        canonical L1 shape.
+
+        For the default ``PACKED`` mode this is a no-op pass-through;
+        for ``KV_COMPONENT_GROUPS`` (selected when a multi-output serde
+        is configured) this splits each input group's leading-``2`` K|V
+        dim into separate K and V component groups so multi-output
+        serdes see K and V as distinct typed sub-objects via
+        ``TensorMemoryObj.get_tensor(0)`` / ``get_tensor(1)``.
+
+        Total bytes are unchanged.  The transfer kernel writes K bytes
+        followed by V bytes either way; only the typed view changes.
+
+        Args:
+            layout_desc: Packed layout as produced by the transfer side
+                (each input group has leading dim 2 for the K|V pair).
+
+        Returns:
+            Layout to pass to :meth:`reserve_write`.
+        """
+        return _apply_layout_policy(layout_desc, self._storage_layout_mode)
+
     @enable_tracing()
     def reserve_write(
         self,
