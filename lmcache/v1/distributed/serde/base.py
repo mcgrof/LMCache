@@ -207,6 +207,46 @@ class SerdeProcessor(abc.ABC):
         """
         raise NotImplementedError
 
+    # ----- Multi-output dispatch hooks (None for single-tensor) -----
+
+    def input_slot_mapping(self) -> "tuple[int | None, ...] | None":
+        """Mapping from a multi-output serializer's slots to the parent
+        grouped-``MemoryObj``'s group indexes, or ``None`` for
+        single-tensor serializers.
+
+        Used by :class:`SerdeL2AdapterWrapper` to decide whether to
+        build per-slot views over the source ``MemoryObj`` before
+        invoking the serializer.  Default returns ``None``
+        (single-tensor path).  Multi-output processors override to
+        delegate to their wrapped serializer's
+        :meth:`MultiSerializer.input_slot_mapping`.
+        """
+        return None
+
+    def output_slot_mapping(self) -> "tuple[int | None, ...] | None":
+        """Mapping from a multi-output deserializer's slots to the
+        destination grouped-``MemoryObj``'s group indexes, or ``None``
+        for single-tensor deserializers.
+
+        Symmetric to :meth:`input_slot_mapping` for the load path.
+        """
+        return None
+
+    def serializer_group_size(self) -> "int | None":
+        """Group length expected by the underlying multi-output
+        serializer, or ``None`` for single-tensor serializers.
+
+        Cheap accessor that callers can use to validate per-key input
+        shape before submitting a batch.
+        """
+        return None
+
+    def deserializer_group_size(self) -> "int | None":
+        """Group length expected by the underlying multi-output
+        deserializer, or ``None`` for single-tensor deserializers.
+        """
+        return None
+
     # ----- Lifecycle -----
 
     @abc.abstractmethod

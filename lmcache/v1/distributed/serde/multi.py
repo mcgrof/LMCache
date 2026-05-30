@@ -104,6 +104,33 @@ class MultiSerializer(abc.ABC):
         """
         raise NotImplementedError
 
+    def input_slot_mapping(self) -> Tuple[Optional[int], ...]:
+        """Mapping from this serializer's slots to the parent
+        grouped-:class:`MemoryObj`'s group indexes.
+
+        The :class:`~lmcache.v1.distributed.l2_adapters.serde_wrapper.SerdeL2AdapterWrapper`
+        receives a list of single grouped ``MemoryObj`` per key (the
+        canonical LMCache shape: one ``MemoryObj`` carries all groups
+        for a logical KV chunk).  Multi-output serdes need a tuple of
+        per-slot views over those groups.  This method declares which
+        parent group, if any, feeds each of the serializer's slots:
+
+        * ``input_slot_mapping()[i] = j`` (an int) — slot ``i`` reads
+          parent group ``j``.
+        * ``input_slot_mapping()[i] = None`` — slot ``i`` is absent
+          (the serializer must tolerate ``None`` at that position;
+          typically the data lives outside this serde's path, e.g.
+          K kept in L1 for split-tier V-only).
+
+        Default is the identity mapping ``(0, 1, ..., group_size - 1)``
+        — the common case where slot ``i`` is exactly parent group
+        ``i``.  Subclasses that skip slots (e.g. V-only) override.
+
+        Returns:
+            Tuple of length :attr:`group_size`.
+        """
+        return tuple(range(self.group_size))
+
     @abc.abstractmethod
     def serialize(self, src: MemoryObjGroup, dst: MemoryObj) -> int:
         """Serialize ``src`` group into ``dst`` byte buffer.
@@ -158,6 +185,24 @@ class MultiDeserializer(abc.ABC):
     def group_size(self) -> int:
         """Fixed output-tuple length produced by this deserializer."""
         raise NotImplementedError
+
+    def output_slot_mapping(self) -> Tuple[Optional[int], ...]:
+        """Mapping from this deserializer's slots to the destination
+        grouped-:class:`MemoryObj`'s group indexes.
+
+        Mirrors :meth:`MultiSerializer.input_slot_mapping` for the
+        load side: the wrapper materializes a destination grouped
+        ``MemoryObj`` per key, and this method declares which parent
+        group each slot writes back to.
+
+        Default is the identity mapping.  Subclasses that leave a slot
+        absent (e.g. V-only deserialize that returns only V, leaving
+        K alone in L1) override.
+
+        Returns:
+            Tuple of length :attr:`group_size`.
+        """
+        return tuple(range(self.group_size))
 
     @abc.abstractmethod
     def deserialize(self, src: MemoryObj, dst: MemoryObjGroup) -> None:
@@ -268,6 +313,88 @@ def single_to_multi_deserializer(inner: Deserializer) -> MultiDeserializer:
     ``None`` is treated as a deliberate skip rather than an error.
     """
     return _SingleAsMultiDeserializer(inner)
+
+
+def layout_desc_to_group(
+    layout_desc: MemoryLayoutDesc,
+    slot_mapping: Tuple[Optional[int], ...],
+) -> LayoutDescGroup:
+    """Convert a multi-group :class:`MemoryLayoutDesc` into a
+    :data:`LayoutDescGroup` using a slot mapping.
+
+    The parent ``layout_desc`` carries ``shapes`` / ``dtypes`` lists with
+    one entry per group (the canonical LMCache shape: one
+    ``MemoryLayoutDesc`` per logical KV chunk, with groups for K and V).
+    Multi-output serializers want a tuple of single-group descriptors
+    matching their slots, with ``None`` for absent slots.
+
+    Args:
+        layout_desc: Parent layout with one entry per group in its
+            ``shapes`` and ``dtypes`` lists.
+        slot_mapping: Per-slot index into the parent's groups, or
+            ``None`` for absent slots.  Length defines the returned
+            group's length.
+
+    Returns:
+        Tuple of :class:`MemoryLayoutDesc`-or-``None`` matching
+        ``slot_mapping``.
+
+    Raises:
+        ValueError: if a slot index is out of range for the parent
+            layout's groups.
+    """
+    n_groups = len(layout_desc.shapes)
+    result: list[Optional[MemoryLayoutDesc]] = []
+    for slot_idx in slot_mapping:
+        if slot_idx is None:
+            result.append(None)
+            continue
+        if slot_idx < 0 or slot_idx >= n_groups:
+            raise ValueError(
+                f"slot mapping references parent group {slot_idx} but "
+                f"parent layout has only {n_groups} groups"
+            )
+        result.append(
+            MemoryLayoutDesc(
+                shapes=[layout_desc.shapes[slot_idx]],
+                dtypes=[layout_desc.dtypes[slot_idx]],
+            )
+        )
+    return tuple(result)
+
+
+class GroupSlotView:
+    """Minimal MemoryObj-shaped view over a single group slot of a
+    parent grouped :class:`MemoryObj`.
+
+    Used by :class:`SerdeL2AdapterWrapper` to construct
+    :data:`MemoryObjGroup` tuples for multi-output serdes without
+    allocating new :class:`MemoryObj` instances.  Exposes only the
+    ``.tensor`` property -- the multi-output serializers and
+    deserializers in this module only read or write that attribute.
+    Writes via ``tensor.copy_(...)`` share storage with the parent's
+    ``raw_data`` (the typed tensor view returned by
+    ``parent.get_tensor(i)`` aliases the parent's buffer).
+
+    Lifecycle: the parent ``MemoryObj`` owns the buffer; this view
+    holds only a back-reference and an index.  No ref count, no
+    pin, no allocator parent -- the wrapper retains the parent for
+    the duration of the serde task.
+
+    Not a registered :class:`MemoryObj` subclass -- duck typing is
+    sufficient because the only attribute the multi-output serdes
+    access on group slots is ``.tensor``.
+    """
+
+    __slots__ = ("_parent", "_index")
+
+    def __init__(self, parent: MemoryObj, group_index: int) -> None:
+        self._parent = parent
+        self._index = group_index
+
+    @property
+    def tensor(self):
+        return self._parent.get_tensor(self._index)
 
 
 def validate_group_size(
