@@ -67,6 +67,13 @@ except Exception:  # pragma: no cover - import guard for the xfail lane
 @dataclass
 class _FakeMemoryObj:
     tensor: Optional[torch.Tensor]
+    # Recorded by set_used_size — the contract the async processor must
+    # honor after a successful ``serialize`` (so L2 stores the bytes
+    # actually written, not the over-allocated upper bound).
+    used_size: Optional[int] = None
+
+    def set_used_size(self, n: int) -> None:
+        self.used_size = n
 
 
 def _byte_buffer(num_bytes: int) -> _FakeMemoryObj:
@@ -315,10 +322,27 @@ def test_multi_output_through_async_processor_roundtrip() -> None:
         layout = tuple(
             MemoryLayoutDesc(shapes=[o.tensor.shape], dtypes=[o.tensor.dtype]) for o in src
         )
-        buf = _byte_buffer(s.estimate_serialized_size(layout))
+        # Intentionally over-allocate the destination by 1024 bytes so
+        # the test can prove the processor narrows ``buf`` down to the
+        # bytes actually written. This mirrors the real-world case: the
+        # AsymK16V8 serde sizes its destination from
+        # ``estimate_serialized_size`` (an upper bound that includes a
+        # header allowance), and serialize() returns the actual ``n``.
+        exact_size = s.estimate_serialized_size(layout)
+        overprovision = 1024
+        buf = _byte_buffer(exact_size + overprovision)
         sid = proc.submit_serialize([src], [buf])  # group as a single work item
         assert _wait_for_fd(proc.get_serialize_event_fd()), "serialize fd never signaled"
         assert proc.query_serialize_result(sid) is True
+        # Contract pin: the processor must propagate the actual ``n``
+        # from serialize() back to the destination via set_used_size, so
+        # the downstream L2 adapter writes exactly the bytes used -- not
+        # the over-allocated upper bound. Without this, every store
+        # would pay the over-allocation as wasted L2 bytes.
+        assert buf.used_size == exact_size, (
+            f"async processor did not narrow buf to actual n: "
+            f"used_size={buf.used_size}, expected {exact_size}"
+        )
 
         out = tuple(_byte_buffer(nbytes) for _, nbytes, _ in (_K, _V))
         did = proc.submit_deserialize([buf], [out])
