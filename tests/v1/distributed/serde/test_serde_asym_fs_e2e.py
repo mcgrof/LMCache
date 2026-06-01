@@ -45,6 +45,7 @@ from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import FSL2AdapterConfig
 from lmcache.v1.distributed.serde import SerdeConfig
 from lmcache.v1.distributed.storage_layout import StorageLayoutMode
 from lmcache.v1.distributed.storage_manager import StorageManager
+from lmcache.v1.distributed.storage_placement import StoragePlacementMode
 
 
 # =============================================================================
@@ -90,6 +91,72 @@ def wait_for_prefetch_status(sm, handle, timeout=15.0, poll_interval=0.1):
 class TestAsymK16V8SerdeFsRoundTrip:
     """Full disk-backed asym K16/V8 serde round-trip through StorageManager
     with the KV-component-groups layout policy."""
+
+    def test_storage_placement_mode_resolves_to_kv_together(self) -> None:
+        """asym_k16_v8 Mode 1 packs K + V into one stored blob; the
+        placement mode is KV_TOGETHER (orthogonal to the layout mode
+        which is KV_COMPONENT_GROUPS)."""
+        disk_path = tempfile.mkdtemp(prefix="lmcache_asym_placement_test_")
+        try:
+            fs_cfg = FSL2AdapterConfig(
+                base_path=disk_path,
+                relative_tmp_dir=None,
+                read_ahead_size=None,
+                use_odirect=False,
+            )
+            fs_cfg.serde_config = SerdeConfig(type="asym_k16_v8")
+            sm_cfg = StorageManagerConfig(
+                l1_manager_config=L1ManagerConfig(
+                    memory_config=L1MemoryManagerConfig(
+                        size_in_bytes=4 << 30,
+                        use_lazy=True,
+                        init_size_in_bytes=1 << 30,
+                    ),
+                ),
+                eviction_config=EvictionConfig(eviction_policy="LRU"),
+                l2_adapter_config=L2AdaptersConfig(adapters=[fs_cfg]),  # type: ignore[list-item]
+            )
+            sm = StorageManager(sm_cfg)
+            try:
+                assert sm.storage_placement_mode == StoragePlacementMode.KV_TOGETHER
+            finally:
+                sm.close()
+        finally:
+            shutil.rmtree(disk_path, ignore_errors=True)
+
+    def test_v_only_placement_mode_resolves_to_kv_split_tier(self) -> None:
+        """asym_k16_v8_v_only's (None, 1) slot mapping marks K absent
+        from the L2 path, so the StorageManager resolves placement to
+        KV_SPLIT_TIER (split-tier placement drives the state machine)."""
+        disk_path = tempfile.mkdtemp(prefix="lmcache_vonly_placement_test_")
+        try:
+            fs_cfg = FSL2AdapterConfig(
+                base_path=disk_path,
+                relative_tmp_dir=None,
+                read_ahead_size=None,
+                use_odirect=False,
+            )
+            fs_cfg.serde_config = SerdeConfig(type="asym_k16_v8_v_only")
+            sm_cfg = StorageManagerConfig(
+                l1_manager_config=L1ManagerConfig(
+                    memory_config=L1MemoryManagerConfig(
+                        size_in_bytes=4 << 30,
+                        use_lazy=True,
+                        init_size_in_bytes=1 << 30,
+                    ),
+                ),
+                eviction_config=EvictionConfig(eviction_policy="LRU"),
+                l2_adapter_config=L2AdaptersConfig(adapters=[fs_cfg]),  # type: ignore[list-item]
+            )
+            sm = StorageManager(sm_cfg)
+            try:
+                assert (
+                    sm.storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER
+                )
+            finally:
+                sm.close()
+        finally:
+            shutil.rmtree(disk_path, ignore_errors=True)
 
     def test_storage_layout_mode_resolved_to_kv_component_groups(self) -> None:
         """An asym_k16_v8 serde_config on the L2 adapter must resolve to
