@@ -33,6 +33,60 @@ L2TaskId = int
 _EMPTY_BY_CACHE_SALT: Mapping[str, int] = MappingProxyType({})
 
 
+class EarlyReleaseStoreAdapter(ABC):
+    """Optional protocol an L2 adapter may implement to release the
+    StoreController's read locks on selected logical keys *before* the
+    inner L2 store completes.
+
+    The default contract: read locks held by the StoreController across
+    a store task are released in :meth:`StoreController._finalize_store`
+    once the L2 write acks.  An adapter that *internally* copies the
+    source bytes to private buffers before submitting the underlying
+    inner store no longer needs the caller to hold those logical keys
+    alive in L1 -- the adapter has everything it needs from them.
+
+    Implementations of this protocol expose ``claim_early_release_keys``
+    so the StoreController can:
+
+    * release the caller's read locks immediately after
+      ``submit_store_task`` returns, and
+    * (for split-tier placement) delete the original logical L1 entries
+      that have been superseded by their K-child / V-child residents.
+
+    Keys returned from ``claim_early_release_keys`` MUST also be removed
+    from any tracked ``read_locked_keys`` list so the L2-completion
+    finalize path doesn't try to release them a second time.
+
+    Why a protocol and not a method on every adapter: keeps the default
+    ``L2AdapterInterface`` contract narrow (most adapters don't need
+    this), while making it an explicit / discoverable hook for the few
+    that do (today: :class:`SerdeL2AdapterWrapper` in split-tier mode).
+    """
+
+    @abstractmethod
+    def claim_early_release_keys(self, task_id: L2TaskId) -> list[ObjectKey]:
+        """Return the set of logical keys whose read locks can be
+        released *now* (before the underlying L2 store completes).
+
+        Called exactly once per task by the StoreController right
+        after :meth:`L2AdapterInterface.submit_store_task` returns.
+        Subsequent calls for the same ``task_id`` return an empty
+        list (the contract is single-claim, not idempotent
+        re-reporting).
+
+        Args:
+            task_id: The task id returned by
+                ``submit_store_task`` for the store the controller
+                is about to track.
+
+        Returns:
+            A (possibly empty) list of logical keys to release
+            immediately.  An empty list signals "nothing to release
+            early"; the controller then follows the default lifecycle.
+        """
+        raise NotImplementedError
+
+
 @dataclass(frozen=True)
 class AdapterUsage:
     """Unified usage report for an L2 adapter.
