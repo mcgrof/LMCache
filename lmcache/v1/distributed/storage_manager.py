@@ -109,6 +109,8 @@ class StorageManager:
                     inner=adapter,
                     serde=create_serde_processor(ac.serde_config),
                     l1_manager=self._l1_manager,
+                    placement_mode=self._storage_placement_mode,
+                    split_tier_manifest=self._split_tier_manifest,
                 )
             self._l2_adapters.append(adapter)
 
@@ -164,6 +166,7 @@ class StorageManager:
             l2_adapters=self._l2_adapters,
             adapter_descriptors=adapter_descriptors,
             policy=create_store_policy(config.store_policy),
+            split_tier_manifest=self._split_tier_manifest,
         )
         self._store_controller.start()
 

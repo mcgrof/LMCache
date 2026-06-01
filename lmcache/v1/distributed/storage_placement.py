@@ -180,9 +180,22 @@ class SplitTierManifest:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._entries: dict[ObjectKey, SplitTierState] = {}
+        # Side set of currently-tracked K child keys, populated when
+        # the wrapper registers a logical key as STORE_IN_FLIGHT.  The
+        # StoreController consults this set to skip K_child write
+        # completions (K_child is L1-only by design; it must never be
+        # routed to L2, otherwise the wrapper's finish_write triggers
+        # a recursive submit_store_task that fails on the K-only
+        # single-shape MemoryObj).
+        self._k_child_keys: set[ObjectKey] = set()
 
     def register_pending(self, logical_key: ObjectKey) -> None:
         """Mark a logical key as ``STORE_IN_FLIGHT``.
+
+        Also records the derived K-child key in
+        :meth:`is_k_child_key`'s lookup set so the StoreController
+        can suppress L2 routing for that K child (the K stays in L1
+        as the canonical tier).
 
         Raises:
             ValueError: if the key is already tracked (a duplicate
@@ -196,6 +209,9 @@ class SplitTierManifest:
                     f"tracked in state {self._entries[logical_key].name}"
                 )
             self._entries[logical_key] = SplitTierState.STORE_IN_FLIGHT
+            self._k_child_keys.add(
+                derive_component_key(logical_key, "k")
+            )
 
     def mark_complete(self, logical_key: ObjectKey) -> None:
         """Transition ``STORE_IN_FLIGHT`` → ``COMPLETE``.
@@ -260,10 +276,27 @@ class SplitTierManifest:
         """Remove the manifest entry for ``logical_key``.
 
         Called after physical cleanup completes; no further state
-        transitions are possible.  Idempotent.
+        transitions are possible.  Idempotent.  Also drops the
+        side-set entry for the K-child key.
         """
         with self._lock:
             self._entries.pop(logical_key, None)
+            self._k_child_keys.discard(
+                derive_component_key(logical_key, "k")
+            )
+
+    def is_k_child_key(self, key: ObjectKey) -> bool:
+        """``True`` iff ``key`` is currently tracked as a K-child of
+        a logical key in this manifest.
+
+        The StoreController consults this to skip L2 routing for
+        K-child write completions -- the K child is L1-canonical
+        and must never be sent to L2 (the wrapper's
+        ``submit_store_task`` would re-enter with a single-shape
+        K-only object and fail the multi-group sanity check).
+        """
+        with self._lock:
+            return key in self._k_child_keys
 
     def lookup(self, logical_key: ObjectKey) -> Optional["SplitTierState"]:
         """Return the manifest state for ``logical_key``, or ``None``.
