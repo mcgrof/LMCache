@@ -243,6 +243,34 @@ def test_create_asym_k16_v8_honors_custom_kwargs() -> None:
         processor.close()
 
 
+def test_create_asym_k16_v8_defaults_max_workers_to_4() -> None:
+    """The factory defaults to a multi-threaded drainer because the
+    codec is CPU-bound.  Phase 1.5 confirmed that the AsyncSerdeProcessor
+    base default of 1 causes a 20x p99 regression at single-producer
+    load (the drainer becomes the bottleneck, not the codec itself).
+    The asym factory overrides to 4 so the default config does not
+    silently land users on the slow path."""
+    processor = create_serde_processor(SerdeConfig(type="asym_k16_v8"))
+    try:
+        assert isinstance(processor, AsyncSerdeProcessor)
+        # ThreadPoolExecutor exposes _max_workers; pin the contract so a
+        # future refactor doesn't silently flip back to 1.
+        assert processor._pool._max_workers == 4  # type: ignore[attr-defined]
+    finally:
+        processor.close()
+
+
+def test_create_asym_k16_v8_v_only_defaults_max_workers_to_4() -> None:
+    """V-only carries the same single-thread-drainer footgun as the
+    storage-only variant, so the factory default is 4 there too."""
+    processor = create_serde_processor(SerdeConfig(type="asym_k16_v8_v_only"))
+    try:
+        assert isinstance(processor, AsyncSerdeProcessor)
+        assert processor._pool._max_workers == 4  # type: ignore[attr-defined]
+    finally:
+        processor.close()
+
+
 def test_create_asym_k16_v8_rejects_unknown_fp8_dtype() -> None:
     """A typo'd fp8 dtype is rejected at factory time with a clear
     error, not deferred to first use."""
