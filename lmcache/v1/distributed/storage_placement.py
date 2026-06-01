@@ -156,6 +156,49 @@ def derive_component_key(logical_key: ObjectKey, role: str) -> ObjectKey:
     )
 
 
+def reverse_component_key(
+    child_key: ObjectKey,
+) -> Optional[tuple[ObjectKey, str]]:
+    """Inverse of :func:`derive_component_key`.
+
+    Given a possibly-child :class:`ObjectKey`, return
+    ``(logical_key, role)`` if its trailing byte matches a known
+    role marker, otherwise return ``None``.  Used by the L1
+    eviction controller to identify K-child victims and look up
+    the matching V child for paired cleanup.
+
+    The contract: a logical key's ``chunk_hash`` never carries a
+    role marker as its trailing byte, so length is the
+    discriminator -- a 33-byte hash ending in 0x01 or 0x02 is
+    unambiguously a child key; anything else is a logical key
+    (or a stray hash from another mode).
+
+    Args:
+        child_key: A key that may or may not be a derived child.
+
+    Returns:
+        ``(logical, role)`` if ``child_key`` is a recognizable
+        K or V child; otherwise ``None``.
+    """
+    h = child_key.chunk_hash
+    if len(h) < 2:
+        return None
+    marker = h[-1:]
+    if marker == _K_CHILD_MARKER:
+        role = "k"
+    elif marker == _V_CHILD_MARKER:
+        role = "v"
+    else:
+        return None
+    logical = ObjectKey(
+        chunk_hash=h[:-1],
+        model_name=child_key.model_name,
+        kv_rank=child_key.kv_rank,
+        cache_salt=child_key.cache_salt,
+    )
+    return logical, role
+
+
 class SplitTierManifest:
     """Thread-safe manifest of split-tier state per logical
     :class:`ObjectKey`.
