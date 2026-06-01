@@ -677,6 +677,152 @@ def test_register_external_memory_provider_idempotent() -> None:
     slab.free(o)
 
 
+# =============================================================================
+# manifest-aware is_key_evictable — STORE_IN_FLIGHT K-children pinned
+# =============================================================================
+
+
+def _build_l1_with_manifest():
+    """Helper: fresh L1Manager + SplitTierManifest wired together,
+    plus a slab + a registered K-child key.
+
+    Returns ``(l1, manifest, k_child_key, logical_key)``.
+    """
+    from lmcache.v1.distributed.api import ObjectKey
+    from lmcache.v1.distributed.config import (
+        L1ManagerConfig,
+        L1MemoryManagerConfig,
+    )
+    from lmcache.v1.distributed.l1_manager import L1Manager
+    from lmcache.v1.distributed.l2_adapters.serde_wrapper import _KChildSlab
+    from lmcache.v1.distributed.storage_placement import (
+        SplitTierManifest,
+        derive_component_key,
+    )
+
+    cfg = L1ManagerConfig(
+        memory_config=L1MemoryManagerConfig(
+            size_in_bytes=1 << 20,
+            use_lazy=False,
+            init_size_in_bytes=1 << 20,
+        )
+    )
+    l1 = L1Manager(cfg)
+    manifest = SplitTierManifest()
+    l1.set_split_tier_manifest(manifest)
+
+    logical = ObjectKey(
+        chunk_hash=b"\x42" * 32,
+        model_name="m",
+        kv_rank=0,
+        cache_salt="c",
+    )
+    k_child = derive_component_key(logical, "k")
+    slab = _KChildSlab(
+        shape=torch.Size([4]), dtype=torch.float16, max_slots=2
+    )
+    objs = slab.batched_allocate(None, None, batch_size=1)
+    l1.reserve_external_writes([k_child], objs)
+    l1.finish_write([k_child])
+    return l1, manifest, k_child, logical
+
+
+def test_kchild_pinned_during_store_in_flight() -> None:
+    """K-child in STORE_IN_FLIGHT must NOT be evictable, otherwise
+    the LRU policy can pull the K-child out from under an active V
+    codec / L2 write (a same-pod sweep reproducer)."""
+    l1, manifest, k_child, logical = _build_l1_with_manifest()
+    manifest.register_pending(logical)
+    assert l1.is_key_evictable(k_child) is False
+
+
+def test_kchild_evictable_when_complete() -> None:
+    """K-child in COMPLETE state is fair game for LRU eviction --
+    paired eviction kicks in afterwards."""
+    l1, manifest, k_child, logical = _build_l1_with_manifest()
+    manifest.register_pending(logical)
+    manifest.mark_complete(logical)
+    assert l1.is_key_evictable(k_child) is True
+
+
+def test_kchild_evictable_when_manifest_absent_orphan() -> None:
+    """No manifest entry at all means the K-child is an orphan
+    (manifest was dropped post-INVALIDATED).  Safe to evict."""
+    l1, _manifest, k_child, _logical = _build_l1_with_manifest()
+    # No register_pending: manifest has no entry for this logical.
+    assert l1.is_key_evictable(k_child) is True
+
+
+def test_non_kchild_keys_unaffected_by_manifest() -> None:
+    """A plain logical key (not a derived child) goes through the
+    legacy lock-only path even when a manifest is wired."""
+    from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+    from lmcache.v1.distributed.config import (
+        L1ManagerConfig,
+        L1MemoryManagerConfig,
+    )
+    from lmcache.v1.distributed.l1_manager import L1Manager
+    from lmcache.v1.distributed.storage_placement import SplitTierManifest
+
+    cfg = L1ManagerConfig(
+        memory_config=L1MemoryManagerConfig(
+            size_in_bytes=1 << 20,
+            use_lazy=False,
+            init_size_in_bytes=1 << 20,
+        )
+    )
+    l1 = L1Manager(cfg)
+    l1.set_split_tier_manifest(SplitTierManifest())
+
+    logical = ObjectKey(
+        chunk_hash=b"\xab" * 32, model_name="m", kv_rank=0, cache_salt="c"
+    )
+    layout = MemoryLayoutDesc(
+        shapes=[torch.Size([4])], dtypes=[torch.float16]
+    )
+    l1.reserve_write([logical], [False], layout, mode="new")
+    l1.finish_write([logical])
+    # Logical key was never written to manifest; eviction gate falls
+    # through to the lock-only check.
+    assert l1.is_key_evictable(logical) is True
+
+
+def test_no_manifest_wired_legacy_behavior_preserved() -> None:
+    """Without ``set_split_tier_manifest``, ``is_key_evictable``
+    behaves exactly as before -- K-child keys aren't gated."""
+    from lmcache.v1.distributed.config import (
+        L1ManagerConfig,
+        L1MemoryManagerConfig,
+    )
+    from lmcache.v1.distributed.l1_manager import L1Manager
+    from lmcache.v1.distributed.l2_adapters.serde_wrapper import _KChildSlab
+    from lmcache.v1.distributed.storage_placement import derive_component_key
+    from lmcache.v1.distributed.api import ObjectKey
+
+    cfg = L1ManagerConfig(
+        memory_config=L1MemoryManagerConfig(
+            size_in_bytes=1 << 20,
+            use_lazy=False,
+            init_size_in_bytes=1 << 20,
+        )
+    )
+    l1 = L1Manager(cfg)
+    # Note: no set_split_tier_manifest call.
+    logical = ObjectKey(
+        chunk_hash=b"\xcd" * 32, model_name="m", kv_rank=0, cache_salt="c"
+    )
+    k_child = derive_component_key(logical, "k")
+    slab = _KChildSlab(
+        shape=torch.Size([4]), dtype=torch.float16, max_slots=2
+    )
+    objs = slab.batched_allocate(None, None, batch_size=1)
+    l1.reserve_external_writes([k_child], objs)
+    l1.finish_write([k_child])
+    # Without a manifest wired, even a K-child is evictable -- the
+    # caller (KV_TOGETHER deployments) doesn't have manifest state.
+    assert l1.is_key_evictable(k_child) is True
+
+
 def test_register_rejects_non_protocol_object() -> None:
     from lmcache.v1.distributed.config import L1MemoryManagerConfig
     from lmcache.v1.distributed.memory_manager import L1MemoryManager
