@@ -24,6 +24,7 @@ import pytest
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.serde import SerdeConfig
 from lmcache.v1.distributed.storage_placement import (
+    SplitTierManifest,
     SplitTierState,
     StoragePlacementMode,
     derive_component_key,
@@ -225,3 +226,170 @@ def test_split_tier_state_names_are_documented() -> None:
         "INVALIDATED",
         "DELETE_IN_FLIGHT",
     }
+
+
+# =============================================================================
+# SplitTierManifest
+# =============================================================================
+
+
+def test_manifest_lookup_unregistered_returns_none() -> None:
+    m = SplitTierManifest()
+    assert m.lookup(_make_key()) is None
+    assert not m.is_complete(_make_key())
+
+
+def test_manifest_register_then_complete() -> None:
+    m = SplitTierManifest()
+    k = _make_key()
+    m.register_pending(k)
+    assert m.lookup(k) == SplitTierState.STORE_IN_FLIGHT
+    assert not m.is_complete(k)
+    m.mark_complete(k)
+    assert m.lookup(k) == SplitTierState.COMPLETE
+    assert m.is_complete(k)
+
+
+def test_manifest_register_rejects_duplicate() -> None:
+    """A second register_pending under the same logical key is a
+    wrapper bug -- surface it loudly rather than silently overwriting."""
+    m = SplitTierManifest()
+    k = _make_key()
+    m.register_pending(k)
+    with pytest.raises(ValueError, match="already tracked"):
+        m.register_pending(k)
+
+
+def test_manifest_mark_complete_rejects_wrong_state() -> None:
+    m = SplitTierManifest()
+    k = _make_key()
+    # Untracked
+    with pytest.raises(ValueError, match="UNTRACKED"):
+        m.mark_complete(k)
+    # In INVALIDATED
+    m.register_pending(k)
+    m.mark_invalidated(k)
+    with pytest.raises(ValueError, match="INVALIDATED"):
+        m.mark_complete(k)
+
+
+def test_manifest_mark_invalidated_from_any_state_is_idempotent() -> None:
+    """Invalidation must be tolerant of repeat calls and of any
+    starting state (including STORE_IN_FLIGHT for a failed store)."""
+    m = SplitTierManifest()
+    k = _make_key()
+    # Untracked: no-op.
+    m.mark_invalidated(k)
+    assert m.lookup(k) is None
+    # From STORE_IN_FLIGHT: valid (failed-store cleanup path).
+    m.register_pending(k)
+    m.mark_invalidated(k)
+    assert m.lookup(k) == SplitTierState.INVALIDATED
+    # Idempotent repeat.
+    m.mark_invalidated(k)
+    assert m.lookup(k) == SplitTierState.INVALIDATED
+
+
+def test_manifest_delete_in_flight_requires_invalidated() -> None:
+    m = SplitTierManifest()
+    k = _make_key()
+    m.register_pending(k)
+    m.mark_complete(k)
+    # Not yet invalidated.
+    with pytest.raises(ValueError, match="INVALIDATED"):
+        m.mark_delete_in_flight(k)
+    m.mark_invalidated(k)
+    m.mark_delete_in_flight(k)
+    assert m.lookup(k) == SplitTierState.DELETE_IN_FLIGHT
+
+
+def test_manifest_drop_removes_entry() -> None:
+    m = SplitTierManifest()
+    k = _make_key()
+    m.register_pending(k)
+    m.mark_complete(k)
+    m.mark_invalidated(k)
+    m.mark_delete_in_flight(k)
+    m.drop(k)
+    assert m.lookup(k) is None
+    # Idempotent.
+    m.drop(k)
+
+
+def test_manifest_distinct_keys_dont_interfere() -> None:
+    """Two logical keys evolve independently through the state
+    machine -- no cross-key state leakage."""
+    m = SplitTierManifest()
+    k1 = _make_key(chunk_hash=b"\x11" * 32)
+    k2 = _make_key(chunk_hash=b"\x22" * 32)
+    m.register_pending(k1)
+    m.register_pending(k2)
+    m.mark_complete(k1)
+    assert m.lookup(k1) == SplitTierState.COMPLETE
+    assert m.lookup(k2) == SplitTierState.STORE_IN_FLIGHT
+    m.mark_invalidated(k1)
+    assert m.lookup(k1) == SplitTierState.INVALIDATED
+    assert m.lookup(k2) == SplitTierState.STORE_IN_FLIGHT
+
+
+def test_manifest_len_tracks_outstanding_keys() -> None:
+    m = SplitTierManifest()
+    assert len(m) == 0
+    k1 = _make_key(chunk_hash=b"\x11" * 32)
+    k2 = _make_key(chunk_hash=b"\x22" * 32)
+    m.register_pending(k1)
+    assert len(m) == 1
+    m.register_pending(k2)
+    assert len(m) == 2
+    m.drop(k1)
+    assert len(m) == 1
+
+
+def test_storage_manager_exposes_split_tier_manifest() -> None:
+    """Sanity: every StorageManager has a manifest (empty by default).
+    This is the integration point the wrapper depends on."""
+    # Standard
+    import shutil
+    import tempfile
+
+    # First Party
+    from lmcache.v1.distributed.config import (
+        EvictionConfig,
+        L1ManagerConfig,
+        L1MemoryManagerConfig,
+        StorageManagerConfig,
+    )
+    from lmcache.v1.distributed.l2_adapters.config import L2AdaptersConfig
+    from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import FSL2AdapterConfig
+    from lmcache.v1.distributed.serde import SerdeConfig
+    from lmcache.v1.distributed.storage_manager import StorageManager
+
+    disk_path = tempfile.mkdtemp(prefix="lmcache_manifest_test_")
+    try:
+        fs_cfg = FSL2AdapterConfig(
+            base_path=disk_path,
+            relative_tmp_dir=None,
+            read_ahead_size=None,
+            use_odirect=False,
+        )
+        fs_cfg.serde_config = SerdeConfig(type="asym_k16_v8_v_only")
+        sm_cfg = StorageManagerConfig(
+            l1_manager_config=L1ManagerConfig(
+                memory_config=L1MemoryManagerConfig(
+                    size_in_bytes=4 << 30,
+                    use_lazy=True,
+                    init_size_in_bytes=1 << 30,
+                ),
+            ),
+            eviction_config=EvictionConfig(eviction_policy="LRU"),
+            l2_adapter_config=L2AdaptersConfig(adapters=[fs_cfg]),  # type: ignore[list-item]
+        )
+        sm = StorageManager(sm_cfg)
+        try:
+            manifest = sm.split_tier_manifest
+            assert isinstance(manifest, SplitTierManifest)
+            assert len(manifest) == 0
+        finally:
+            sm.close()
+    finally:
+        shutil.rmtree(disk_path, ignore_errors=True)
