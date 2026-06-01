@@ -30,6 +30,7 @@ invariants don't need to change.
 from __future__ import annotations
 
 # Standard
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import enum
 import select
@@ -167,6 +168,19 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
             if split_tier_manifest is None
             else split_tier_manifest
         )
+
+        # Thread pool used to parallelize the per-key K-bytes copy in
+        # _alloc_split_tier_children.  Sized to 4 by default; the
+        # actual work is a torch tensor copy_ which releases the GIL,
+        # so this scales with CPU count up to the producer batch
+        # size.  Only allocated when split-tier placement is active
+        # so KV_TOGETHER incurs zero overhead.
+        self._split_tier_copy_pool: ThreadPoolExecutor | None = None
+        if placement_mode == StoragePlacementMode.KV_SPLIT_TIER:
+            self._split_tier_copy_pool = ThreadPoolExecutor(
+                max_workers=4,
+                thread_name_prefix="serde-l2-st-kcopy",
+            )
 
         # Our own notifiers for store/load completion. Lookup passes the
         # inner adapter's fd straight through (no chaining needed there).
@@ -492,6 +506,9 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
     def close(self) -> None:
         self._stop_flag.set()
         self._thread.join()
+        if self._split_tier_copy_pool is not None:
+            self._split_tier_copy_pool.shutdown(wait=True)
+            self._split_tier_copy_pool = None
 
         # Shut down the inner adapter and serde processor BEFORE
         # releasing temp buffers. Both ``close()`` calls block until
@@ -930,20 +947,31 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
             return [], []
 
         # Copy K bytes from each staging object's group-0 tensor into
-        # the K child.  Both share the same shape/dtype so .copy_()
-        # is the right primitive.
-        for src_obj, k_child_key in zip(objects, k_child_keys, strict=True):
-            k_child_obj = results[k_child_key][1]
+        # the K child.  torch's .copy_() between CPU tensors releases
+        # the GIL, so we fan the per-key copies across a small thread
+        # pool to overlap them on multi-CPU hosts (the StoreController
+        # submits batched calls so N>1 is common).
+        def _copy_one(idx: int) -> bool:
+            k_child_obj = results[k_child_keys[idx]][1]
             if k_child_obj is None:
-                # Shouldn't happen (we filtered above) but defensive.
-                self._release_split_tier_k_children(successful)
-                return [], []
-            src_k = src_obj.get_tensor(0)
+                return False
+            src_k = objects[idx].get_tensor(0)
             dst_k = k_child_obj.get_tensor(0)
             if src_k is None or dst_k is None:
-                self._release_split_tier_k_children(successful)
-                return [], []
+                return False
             dst_k.copy_(src_k)
+            return True
+
+        if self._split_tier_copy_pool is not None and len(keys) > 1:
+            ok_list = list(
+                self._split_tier_copy_pool.map(_copy_one, range(len(keys)))
+            )
+        else:
+            # Single-key batch or no pool: avoid the dispatch overhead.
+            ok_list = [_copy_one(i) for i in range(len(keys))]
+        if not all(ok_list):
+            self._release_split_tier_k_children(successful)
+            return [], []
 
         # Register the manifest BEFORE finish_write so the
         # StoreController's listener filter (is_k_child_key) sees
