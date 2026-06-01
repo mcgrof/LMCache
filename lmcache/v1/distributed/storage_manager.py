@@ -177,6 +177,7 @@ class StorageManager:
             l2_adapters=list(self._l2_adapters.values()),
             adapter_descriptors=list(self._adapter_descriptors.values()),
             policy=create_store_policy(config.store_policy),
+            split_tier_manifest=self._split_tier_manifest,
         )
         self._store_controller.start()
 
@@ -1229,6 +1230,8 @@ class StorageManager:
                 inner=adapter,
                 serde=create_serde_processor(config.serde_config),
                 l1_manager=self._l1_manager,
+                placement_mode=self._storage_placement_mode,
+                split_tier_manifest=self._split_tier_manifest,
             )
         descriptor = AdapterDescriptor(index=adapter_id, config=config)
         # Stamp the registered type name so the adapter's cache events on
