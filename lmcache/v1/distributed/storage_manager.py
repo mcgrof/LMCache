@@ -42,6 +42,10 @@ from lmcache.v1.distributed.storage_layout import (
     apply_layout_policy as _apply_layout_policy,
     derive_storage_layout_mode,
 )
+from lmcache.v1.distributed.storage_placement import (
+    StoragePlacementMode,
+    derive_storage_placement_mode,
+)
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
@@ -72,6 +76,16 @@ class StorageManager:
         # (e.g. ``asym_k16_v8``) on the same StorageManager is rejected
         # at config time.  See lmcache/v1/distributed/storage_layout.py.
         self._storage_layout_mode = derive_storage_layout_mode(
+            config.l2_adapter_config.adapters
+        )
+
+        # Canonical L1 placement / lifecycle mode, derived alongside the
+        # layout mode.  Determines whether the wrapper packs K + V into
+        # one stored blob (KV_TOGETHER) or splits them into separately
+        # keyed children with K retained in L1 and V routed to L2
+        # (KV_SPLIT_TIER, the Mode 2 V-only path).  Mixed configurations
+        # are rejected.
+        self._storage_placement_mode = derive_storage_placement_mode(
             config.l2_adapter_config.adapters
         )
 
@@ -157,6 +171,22 @@ class StorageManager:
         self._prefetch_controller.start()
 
     # External APIs for serving engine integration code to call
+
+    @property
+    def storage_placement_mode(self) -> StoragePlacementMode:
+        """The canonical placement / lifecycle mode for this
+        StorageManager.
+
+        :attr:`StoragePlacementMode.KV_TOGETHER` packs K + V into one
+        stored blob (the default for ``fp8`` and asym Mode 1 K16/V8).
+        :attr:`StoragePlacementMode.KV_SPLIT_TIER` drives the V-only
+        state machine: K child retained in L1, V child stored to L2,
+        original logical staging object deleted in L1.  Derived once
+        at construction from the configured serdes; orthogonal to
+        :attr:`storage_layout_mode` (which decides the L1 *shape*,
+        not the lifecycle).
+        """
+        return self._storage_placement_mode
 
     @property
     def storage_layout_mode(self) -> StorageLayoutMode:
