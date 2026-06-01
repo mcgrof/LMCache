@@ -28,6 +28,7 @@ from lmcache.v1.distributed.storage_controllers.adapter_lifecycle import (
     AddAdapterOp,
     RemoveAdapterOp,
 )
+from lmcache.v1.distributed.storage_placement import SplitTierManifest  # noqa: F401
 from lmcache.v1.distributed.storage_controllers.store_policy import (
     AdapterDescriptor,
     StorePolicy,
@@ -229,6 +230,7 @@ class StoreController(StorageControllerInterface):
         l2_adapters: list[L2AdapterInterface],
         adapter_descriptors: list[AdapterDescriptor],
         policy: StorePolicy,
+        split_tier_manifest: "SplitTierManifest | None" = None,
     ) -> None:
         self._l1_manager = l1_manager
         self._l2_adapters: dict[int, L2AdapterInterface] = {
@@ -239,6 +241,14 @@ class StoreController(StorageControllerInterface):
             desc.index: desc for desc in adapter_descriptors
         }
         self._policy = policy
+        # Optional split-tier manifest.  When set, K-child write
+        # completions in the listener queue are filtered out before
+        # the policy sees them -- K children are L1-canonical and
+        # must never be routed to L2 (the wrapper's
+        # submit_store_task would re-enter with a single-shape
+        # K-only object).  None preserves the legacy behavior
+        # (every write_finished key is a store candidate).
+        self._split_tier_manifest = split_tier_manifest
 
         # Adapters that are being drained and will be removed after all
         # the in-flight operations are done.
@@ -467,6 +477,18 @@ class StoreController(StorageControllerInterface):
                 try:
                     if fd == listener_efd:
                         keys = self._listener.pop_pending_keys()
+                        # Filter K-child writes: they are L1-only.
+                        # The wrapper writes them as part of the
+                        # split-tier store transition and they MUST
+                        # NOT trigger an L2 store (re-entry would
+                        # fail the multi-group sanity check on a
+                        # single-shape K-only buffer).
+                        if keys and self._split_tier_manifest is not None:
+                            keys = [
+                                k
+                                for k in keys
+                                if not self._split_tier_manifest.is_k_child_key(k)
+                            ]
                         if keys:
                             self._process_new_keys(keys)
                     else:
@@ -760,6 +782,21 @@ class StoreController(StorageControllerInterface):
                 len(task.keys),
             )
             delete_keys = self._policy.select_l1_deletions(task.keys)
+            # Split-tier additionally deletes the original logical L1
+            # entries (full K+V staging) after the L2 V store completes.
+            # K bytes are preserved under the K-child key; V is on L2
+            # under the V-child key; the original staging is now
+            # redundant and deleting it is what drops the L1 footprint
+            # per cached chunk to K-only (the core L1 win for V-only).
+            if self._split_tier_manifest is not None:
+                split_tier_logicals = [
+                    k for k in task.keys
+                    if self._split_tier_manifest.lookup(k) is not None
+                ]
+                if split_tier_logicals:
+                    delete_keys = list(
+                        set(delete_keys) | set(split_tier_logicals)
+                    )
             if delete_keys:
                 l1_mgr.delete(delete_keys)
         else:
