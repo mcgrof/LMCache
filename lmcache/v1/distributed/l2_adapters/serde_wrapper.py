@@ -54,6 +54,11 @@ from lmcache.v1.distributed.serde import (
     serialized_layout_desc,
 )
 from lmcache.v1.distributed.serde.multi import GroupSlotView, MemoryObjGroup
+from lmcache.v1.distributed.storage_placement import (
+    SplitTierManifest,
+    StoragePlacementMode,
+    derive_component_key,
+)
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.platform import consume_fd, create_event_notifier
 
@@ -77,6 +82,23 @@ class _StoreTaskState:
     """SERIALIZE while temps are write-locked; INNER_STORE after the
     serialize→store transition. Only read on shutdown to pick the right
     lock-release path; assignment is done under ``self._lock``."""
+
+    # ---- split-tier (KV_SPLIT_TIER placement) extras ----
+    is_split_tier: bool = False
+    """True iff this store is being routed through the V-only state
+    machine.  When set, ``k_child_keys`` and ``v_child_keys`` are
+    populated and used in place of the default logical-key flow."""
+
+    k_child_keys: list[ObjectKey] = field(default_factory=list)
+    """K child keys in L1 (one per logical key).  Allocated and
+    written synchronously in ``submit_store_task``; survive after
+    the inner L2 store completes (they are the canonical L1
+    residents for V-only mode)."""
+
+    v_child_keys: list[ObjectKey] = field(default_factory=list)
+    """V child keys passed to the inner L2 adapter in place of the
+    logical keys.  Derived deterministically from the logical keys
+    via ``derive_component_key(logical, 'v')``."""
 
 
 @dataclass
@@ -108,11 +130,27 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
         inner: L2AdapterInterface,
         serde: SerdeProcessor,
         l1_manager: L1Manager,
+        placement_mode: StoragePlacementMode = StoragePlacementMode.KV_TOGETHER,
+        split_tier_manifest: SplitTierManifest | None = None,
     ) -> None:
         super().__init__()
         self._inner = inner
         self._serde = serde
         self._l1_manager = l1_manager
+        self._placement_mode = placement_mode
+        # Always constructed; empty + unused when placement is
+        # KV_TOGETHER.  When KV_SPLIT_TIER, the wrapper drives the
+        # state-machine transitions on this manifest during store
+        # and (PR-2c') load.
+        # NB: use `is None` not `or` -- SplitTierManifest implements
+        # __len__, so an empty manifest is falsy and `or` would
+        # silently mint a fresh local manifest instead of using the
+        # caller-provided one.  The bug bit Phase 2 pod testing.
+        self._split_tier_manifest = (
+            SplitTierManifest()
+            if split_tier_manifest is None
+            else split_tier_manifest
+        )
 
         # Our own notifiers for store/load completion. Lookup passes the
         # inner adapter's fd straight through (no chaining needed there).
@@ -172,10 +210,37 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
         All-or-nothing: if temp alloc fails for any key or serialize
         submission raises, the whole task is marked failed and the
         caller's next ``pop_completed_store_tasks`` call sees it.
+
+        For :attr:`StoragePlacementMode.KV_SPLIT_TIER`, the path
+        diverges: a K-only L1 child object is allocated and populated
+        synchronously before the V serialize is submitted, the
+        manifest enters STORE_IN_FLIGHT, and the inner L2 store is
+        invoked with V child keys (not logical keys).  On completion,
+        the manifest transitions to COMPLETE and the original logical
+        L1 entry is deleted so the L1 footprint drops to K-only.
         """
         with self._lock:
             wrapped_id = self._next_task_id
             self._next_task_id += 1
+
+        is_split_tier = (
+            self._placement_mode == StoragePlacementMode.KV_SPLIT_TIER
+        )
+        k_child_keys: list[ObjectKey] = []
+        v_child_keys: list[ObjectKey] = []
+        if is_split_tier:
+            k_child_keys, v_child_keys = self._alloc_split_tier_children(
+                keys, objects
+            )
+            if not k_child_keys:
+                # K-child alloc failed (out of L1 or non-grouped input).
+                logger.warning(
+                    "Serde wrapper: split-tier K-child alloc failed for "
+                    "store task %d",
+                    wrapped_id,
+                )
+                self._finalize_store(wrapped_id, success=False)
+                return wrapped_id
 
         temp_keys, temp_objs = self._alloc_temp_buffers(keys, objects)
         if temp_objs is None:
@@ -183,8 +248,16 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
                 "Serde wrapper: temp alloc failed for store task %d",
                 wrapped_id,
             )
+            if k_child_keys:
+                # Release the K-children we just allocated; they would
+                # otherwise leak L1 with no V partner to back them.
+                self._release_split_tier_k_children(k_child_keys)
             self._finalize_store(wrapped_id, success=False)
             return wrapped_id
+
+        # NB: register_pending was already called inside
+        # _alloc_split_tier_children (before K-child finish_write
+        # fires the L1 listener), so we don't repeat it here.
 
         # Hold the wrapper lock across submit + reverse-map registration
         # so the internal drain thread cannot observe a half-state where
@@ -196,6 +269,9 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
             temp_keys=temp_keys,
             temp_objs=temp_objs,
             phase=_StorePhase.SERIALIZE,
+            is_split_tier=is_split_tier,
+            k_child_keys=k_child_keys,
+            v_child_keys=v_child_keys,
         )
         try:
             with self._lock:
@@ -457,8 +533,17 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
             # Serialize succeeded — transition temps write → read so inner
             # can safely read them during the store.
             self._l1_manager.finish_write_and_reserve_read(state.temp_keys)
+            # For KV_SPLIT_TIER the inner adapter sees V child keys, not
+            # logical keys, so V lives under a deterministic derived
+            # name on L2 that the load path will re-derive.  For
+            # KV_TOGETHER it's the logical keys as today.
+            inner_store_keys = (
+                state.v_child_keys if state.is_split_tier else state.keys
+            )
             try:
-                inner_id = self._inner.submit_store_task(state.keys, state.temp_objs)
+                inner_id = self._inner.submit_store_task(
+                    inner_store_keys, state.temp_objs
+                )
             except Exception:
                 logger.exception(
                     "Serde wrapper: inner.submit_store_task raised for task %d",
@@ -467,6 +552,8 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
                 # Temps are now read-locked and temporary — finish_read
                 # is enough; the entries auto-delete.
                 self._l1_manager.finish_read(state.temp_keys)
+                if state.is_split_tier:
+                    self._invalidate_split_tier_pending(state)
                 self._finalize_store(wrapped_id, success=False)
                 continue
 
@@ -479,7 +566,17 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
 
     def _drain_inner_store(self) -> None:
         """Drain inner store completions; release temp read locks (auto-
-        delete) and finalize the wrapped tasks."""
+        delete) and finalize the wrapped tasks.
+
+        For :attr:`StoragePlacementMode.KV_SPLIT_TIER`, additionally
+        mark the manifest entries COMPLETE on success (which makes
+        future lookup return composite hits) and delete the original
+        logical L1 entries (K is preserved in the K child; V is on
+        L2; the full K+V staging is now redundant -- this is what
+        delivers the L1 footprint win for V-only).  On failure,
+        invalidate the manifest entries and release the K children
+        we reserved up-front so they don't orphan in L1.
+        """
         completed = self._inner.pop_completed_store_tasks()
         for inner_id, result in completed.items():
             with self._lock:
@@ -497,6 +594,11 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
                 continue
             if state is not None:
                 self._l1_manager.finish_read(state.temp_keys)
+                if state.is_split_tier:
+                    if result.is_successful():
+                        self._finalize_split_tier_success(state)
+                    else:
+                        self._invalidate_split_tier_pending(state)
             self._finalize_store(
                 wrapped_id, result.is_successful(), result.bytes_transferred()
             )
@@ -646,6 +748,178 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
     # routing -- e.g. identity ``(0, 1)`` for storage-only Mode 1,
     # ``(None, 1)`` for V-only Mode 2).
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Split-tier (KV_SPLIT_TIER placement) helpers.  Only invoked when
+    # ``self._placement_mode == KV_SPLIT_TIER``; the KV_TOGETHER path
+    # never touches these.
+    # ------------------------------------------------------------------
+
+    def _alloc_split_tier_children(
+        self,
+        keys: list[ObjectKey],
+        objects: list[MemoryObj],
+    ) -> tuple[list[ObjectKey], list[ObjectKey]]:
+        """Allocate K-only L1 child entries + derive V child keys.
+
+        For each logical key:
+
+        * Derive ``K_child_key = derive_component_key(logical, "k")``
+          and ``V_child_key = derive_component_key(logical, "v")``.
+        * Allocate a K-only L1 ``MemoryObj`` under the K child key
+          (single-group: ``meta.shapes[0]`` / ``meta.dtypes[0]`` from
+          the producer's grouped staging object).
+        * Synchronously copy K bytes from the staging object's
+          group-0 tensor into the K child's tensor.
+        * Commit the K child write so it persists as the canonical
+          L1 resident.
+
+        Returns ``(k_child_keys, v_child_keys)`` on success.  Returns
+        ``([], [])`` if any L1 allocation fails or the input
+        ``objects`` aren't grouped (sanity check -- shouldn't happen
+        if placement is correctly KV_SPLIT_TIER, but raises a clear
+        error instead of corrupting L1).
+        """
+        if not objects:
+            return [], []
+        # Sanity: V-only placement requires grouped K/V layout in L1.
+        # Use the public get_shapes/get_dtypes API (not meta.shapes
+        # directly) so this works across all MemoryObj subclasses /
+        # allocators.
+        first = objects[0]
+        try:
+            shapes = first.get_shapes()
+            dtypes = first.get_dtypes()
+        except Exception:
+            shapes = None
+            dtypes = None
+        if shapes is None or dtypes is None or len(shapes) < 2:
+            logger.error(
+                "Serde wrapper: split-tier requires grouped (K, V) "
+                "input; got non-grouped MemoryObj (shapes=%r, "
+                "dtypes=%r).  This is a placement / layout config "
+                "mismatch.",
+                shapes,
+                dtypes,
+            )
+            return [], []
+
+        k_child_keys = [derive_component_key(k, "k") for k in keys]
+        v_child_keys = [derive_component_key(k, "v") for k in keys]
+
+        # K-only layout descriptor (group 0 of the staging object).
+        k_layout = MemoryLayoutDesc(
+            shapes=[shapes[0]],
+            dtypes=[dtypes[0]],
+        )
+
+        results = self._l1_manager.reserve_write(
+            keys=k_child_keys,
+            is_temporary=[False] * len(k_child_keys),
+            layout_desc=k_layout,
+            mode="new",
+        )
+        # All-or-nothing on K-child allocations.
+        successful: list[ObjectKey] = []
+        for k_child_key in k_child_keys:
+            r = results.get(k_child_key)
+            if r is not None and r[0] == L1Error.SUCCESS:
+                successful.append(k_child_key)
+        if len(successful) != len(k_child_keys):
+            # Partial success -- release the partials and fail the
+            # whole task (the caller has not yet registered the
+            # manifest entries).
+            self._release_split_tier_k_children(successful)
+            return [], []
+
+        # Copy K bytes from each staging object's group-0 tensor into
+        # the K child.  Both share the same shape/dtype so .copy_()
+        # is the right primitive.
+        for src_obj, k_child_key in zip(objects, k_child_keys, strict=True):
+            k_child_obj = results[k_child_key][1]
+            if k_child_obj is None:
+                # Shouldn't happen (we filtered above) but defensive.
+                self._release_split_tier_k_children(successful)
+                return [], []
+            src_k = src_obj.get_tensor(0)
+            dst_k = k_child_obj.get_tensor(0)
+            if src_k is None or dst_k is None:
+                self._release_split_tier_k_children(successful)
+                return [], []
+            dst_k.copy_(src_k)
+
+        # Register the manifest BEFORE finish_write so the
+        # StoreController's listener filter (is_k_child_key) sees
+        # the K-child key when the L1 manager's on_l1_keys_write_finished
+        # fires.  Otherwise the K-child key races into the pending
+        # queue and gets routed back into submit_store_task as a
+        # bare 1-shape MemoryObj, failing the multi-group check
+        # (Phase 2 pod regression discovered 2026-05-31).
+        for logical_key in keys:
+            self._split_tier_manifest.register_pending(logical_key)
+
+        # Commit the K-child writes.  After this they are read-only
+        # cache residents under their child keys.
+        self._l1_manager.finish_write(k_child_keys)
+        return k_child_keys, v_child_keys
+
+    def _release_split_tier_k_children(self, k_child_keys: list[ObjectKey]) -> None:
+        """Release K-child L1 entries.  Used on a partial / failed
+        store path so K children don't orphan in L1 with no V partner."""
+        if not k_child_keys:
+            return
+        try:
+            self._l1_manager.finish_write(k_child_keys)
+        except Exception:
+            # If finish_write fails some children may not have been in
+            # write phase -- the delete below is still authoritative.
+            logger.debug(
+                "Serde wrapper split-tier release: finish_write raised; "
+                "continuing to delete %d K children",
+                len(k_child_keys),
+            )
+        try:
+            self._l1_manager.delete(k_child_keys)
+        except Exception:
+            logger.exception(
+                "Serde wrapper split-tier release: delete raised for "
+                "%d K children",
+                len(k_child_keys),
+            )
+
+    def _finalize_split_tier_success(self, state: _StoreTaskState) -> None:
+        """Inner L2 V-store succeeded for a split-tier task.
+
+        Mark all logical keys COMPLETE in the manifest.  The
+        physical deletion of the original logical-key L1 entries
+        (full K+V staging) is driven by the StoreController in
+        ``_finalize_store`` after it releases the read lock the
+        controller acquired on those keys -- attempting to delete
+        them here would race the lock and fail with KEY_IS_LOCKED.
+        """
+        for logical_key in state.keys:
+            try:
+                self._split_tier_manifest.mark_complete(logical_key)
+            except ValueError:
+                # Pre-empted by an invalidate from the eviction
+                # controller (PR-3').  The K child + manifest entry
+                # cleanup happens through the invalidation path; here
+                # we just refuse to mark COMPLETE on an INVALIDATED key.
+                logger.debug(
+                    "Serde wrapper split-tier: logical key already "
+                    "invalidated before COMPLETE; skipping"
+                )
+
+    def _invalidate_split_tier_pending(self, state: _StoreTaskState) -> None:
+        """Inner L2 V-store failed (or serialize failed) for a
+        split-tier task: invalidate the manifest and release the K
+        children we reserved.
+
+        Idempotent on the manifest side via :meth:`SplitTierManifest.mark_invalidated`.
+        """
+        for logical_key in state.keys:
+            self._split_tier_manifest.mark_invalidated(logical_key)
+        self._release_split_tier_k_children(state.k_child_keys)
 
     def _build_serde_src_inputs(
         self, objects: list[MemoryObj]
