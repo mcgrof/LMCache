@@ -23,6 +23,11 @@ from lmcache.v1.distributed.memory_manager import (
 from lmcache.v1.distributed.memory_manager.devdax_l1_memory_manager import (
     DevDaxL1MemoryManager,
 )
+from lmcache.v1.distributed.storage_placement import (
+    SplitTierManifest,
+    SplitTierState,
+    reverse_component_key,
+)
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
@@ -208,6 +213,12 @@ class L1Manager:
 
         self._registered_listeners: list[L1ManagerListener] = []
 
+        # Optional split-tier manifest; when wired, ``is_key_evictable``
+        # consults it for K-child keys so the LRU policy can't evict a
+        # K-child whose store is still in flight.  ``None`` outside
+        # split-tier deployments.
+        self._split_tier_manifest: "SplitTierManifest | None" = None
+
         self._event_bus = get_event_bus()
 
         L1Manager._gauge_target = self
@@ -238,6 +249,29 @@ class L1Manager:
         """
         with self._lock:
             self._registered_listeners.append(listener)
+
+    def set_split_tier_manifest(
+        self, manifest: "SplitTierManifest | None"
+    ) -> None:
+        """Wire a split-tier manifest so :meth:`is_key_evictable` can
+        gate K-child evictions on the manifest state.
+
+        Without this hook, the LRU eviction policy can pick a K-child
+        whose manifest state is :class:`SplitTierState.STORE_IN_FLIGHT`
+        (the V codec / inner L2 store is still running).  Evicting it
+        breaks the active store path, the manifest goes to
+        ``INVALIDATED``, paired-eviction queues V-child delete on L2,
+        and producers stall on retry loops -- the failure mode the
+        a same-pod pressure run reproduced as ``submitted=0`` at
+        a 256 MiB L1 cap.
+
+        Args:
+            manifest: The manifest instance shared with the
+                ``SerdeL2AdapterWrapper``, or ``None`` to clear.
+                Idempotent; the manifest is just a reference, not
+                owned by the L1Manager.
+        """
+        self._split_tier_manifest = manifest
 
     def register_external_memory_provider(self, provider) -> None:
         """Register an auxiliary memory provider with the underlying
@@ -913,17 +947,45 @@ class L1Manager:
         L1Manager.delete() will check again and safely reject a key
         that became locked between the check and the actual deletion.
 
+        Split-tier extension: when a manifest is wired via
+        :meth:`set_split_tier_manifest`, K-child keys are additionally
+        gated by manifest state.  Only :class:`SplitTierState.COMPLETE`
+        K-children are evictable.  A K-child in
+        :class:`SplitTierState.STORE_IN_FLIGHT` is held by an active
+        store path (the V codec / inner L2 store hasn't finished yet);
+        evicting it silently corrupts the in-flight write and stalls
+        the producer.  V-children live on L2 and are not subject to
+        L1 eviction; they bypass this gate.
+
         Args:
             key: The object key to check.
 
         Returns:
-            True if the key exists and is not locked (neither read-locked
-            nor write-locked), False otherwise.
+            True if the key exists, is not locked, and -- for
+            split-tier K-children -- has a manifest state of
+            ``COMPLETE``.  False otherwise.
         """
         entry = self._objects.get(key, None)
         if entry is None:
             return False
-        return not entry.read_lock.is_locked() and not entry.write_lock.is_locked()
+        if entry.read_lock.is_locked() or entry.write_lock.is_locked():
+            return False
+
+        manifest = self._split_tier_manifest
+        if manifest is not None:
+            decomposed = reverse_component_key(key)
+            if decomposed is not None and decomposed[1] == "k":
+                logical_key = decomposed[0]
+                state = manifest.lookup(logical_key)
+                # STORE_IN_FLIGHT: an active store path holds this K
+                # child as its L1-resident half; evicting now corrupts
+                # the in-flight V codec / L2 store.
+                # None: paired-eviction or post-INVALIDATED cleanup has
+                # already dropped the manifest entry; the K child is
+                # an orphan and safe to evict.
+                if state is SplitTierState.STORE_IN_FLIGHT:
+                    return False
+        return True
 
     def get_memory_usage(self) -> tuple[int, int]:
         """Get the current memory usage of L1 cache.
