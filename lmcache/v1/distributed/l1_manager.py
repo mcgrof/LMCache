@@ -222,6 +222,26 @@ class L1Manager:
         with self._lock:
             self._registered_listeners.append(listener)
 
+    def register_external_memory_provider(self, provider) -> None:
+        """Register an auxiliary memory provider with the underlying
+        :class:`L1MemoryManager`.
+
+        Bytes contributed by the provider count toward
+        :meth:`get_memory_usage`, which feeds the LRU eviction
+        policy's pressure ratio.  Without this hook, slab-style
+        providers (e.g. ``SerdeL2AdapterWrapper``'s K-child slab)
+        hold real L1 bytes that the eviction policy treats as
+        absent, and eviction never fires on those entries.
+
+        See :class:`lmcache.v1.distributed.memory_manager.L1MemoryUsageProvider`
+        for the protocol shape.
+        """
+        self._memory_manager.register_external_memory_provider(provider)
+
+    def unregister_external_memory_provider(self, provider) -> None:
+        """Mirror of :meth:`register_external_memory_provider`."""
+        self._memory_manager.unregister_external_memory_provider(provider)
+
     @l1_mgr_synchronized
     def reserve_read(
         self,
@@ -503,6 +523,99 @@ class L1Manager:
                 self._objects[key].write_lock.lock()
                 ret[key] = (L1Error.SUCCESS, mem_obj)
                 successful_keys.append(key)
+
+        for listener in self._registered_listeners:
+            listener.on_l1_keys_reserved_write(successful_keys)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L1_WRITE_RESERVED,
+                metadata={"keys": successful_keys},
+            )
+        )
+        return ret
+
+    @l1_mgr_synchronized
+    def reserve_external_writes(
+        self,
+        keys: list[ObjectKey],
+        memory_objs: list[MemoryObj],
+        is_temporary: list[bool] | None = None,
+    ) -> dict[ObjectKey, L1OperationResult]:
+        """Register externally-provided memory objects into the L1 catalog.
+
+        This is the slab / kmem_cache-style entry point: the caller has
+        already obtained ``MemoryObj`` backing buffers from its own pool
+        (today, :class:`SerdeL2AdapterWrapper`'s K-child slab) and just
+        needs the L1 state-dict bookkeeping done.  Compared to
+        :meth:`reserve_write`, this skips ``self._memory_manager.allocate``
+        entirely -- no address-manager scan, no free-block coalescing,
+        no per-call ``TensorMemoryAllocator`` work.  The global mutex is
+        still held across the state-dict insert (no per-key fan-out),
+        so this is not a sharding fix; it is a "shorten the critical
+        section" fix.
+
+        Semantics match :meth:`reserve_write` for the new-key path:
+
+        * Each ``key`` not already in ``self._objects`` becomes a new
+          entry with the supplied ``memory_obj``, fresh TTL write +
+          read locks, ``is_temporary`` per index (default False), and
+          its write lock acquired.
+        * Each ``key`` already present is reported
+          ``L1Error.KEY_NOT_WRITABLE`` (this is the "new"-mode
+          equivalent; updating a pre-existing entry with a different
+          backing buffer would change its address and break readers).
+
+        Listeners + the L1_WRITE_RESERVED event fire as usual so
+        downstream observers (StoreController, observability) see the
+        same shape as a normal :meth:`reserve_write`.
+
+        Args:
+            keys: Logical keys to register.
+            memory_objs: Backing buffers, one per key, parallel to
+                ``keys``.  The caller's pool owns the memory; the
+                ``MemoryObj.parent_allocator`` is expected to point at
+                the pool so :meth:`delete` / GC returns the underlying
+                buffer to the free-list instead of releasing it back
+                to ``L1MemoryManager``.
+            is_temporary: Per-key temporary flag (``None`` defaults to
+                all-False).  Same semantics as :meth:`reserve_write`.
+
+        Returns:
+            Dictionary mapping each key to ``(L1Error, MemoryObj)``.
+            ``L1Error.KEY_NOT_WRITABLE`` for keys that collided with an
+            existing entry; ``L1Error.SUCCESS`` for the new
+            registrations.
+        """
+        if len(keys) != len(memory_objs):
+            raise ValueError(
+                "L1Manager.reserve_external_writes: keys and memory_objs "
+                "must have the same length"
+            )
+        if is_temporary is None:
+            is_temporary = [False] * len(keys)
+        elif len(is_temporary) != len(keys):
+            raise ValueError(
+                "L1Manager.reserve_external_writes: is_temporary length "
+                "must match keys length"
+            )
+
+        ret: dict[ObjectKey, L1OperationResult] = {}
+        successful_keys: list[ObjectKey] = []
+        for key, mem_obj, is_temp in zip(
+            keys, memory_objs, is_temporary, strict=True
+        ):
+            if key in self._objects:
+                ret[key] = (L1Error.KEY_NOT_WRITABLE, None)
+                continue
+            self._objects[key] = L1ObjectState(
+                memory_obj=mem_obj,
+                write_lock=TTLLock(self._write_ttl_seconds),
+                read_lock=TTLLock(self._read_ttl_seconds),
+                is_temporary=is_temp,
+            )
+            self._objects[key].write_lock.lock()
+            ret[key] = (L1Error.SUCCESS, mem_obj)
+            successful_keys.append(key)
 
         for listener in self._registered_listeners:
             listener.on_l1_keys_reserved_write(successful_keys)
