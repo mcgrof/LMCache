@@ -115,6 +115,22 @@ class _LoadTaskState:
     ``_drain_deserialize`` reads it, this placeholder has been
     overwritten with the real bitmap."""
 
+    # ---- split-tier (KV_SPLIT_TIER placement) extras ----
+    is_split_tier: bool = False
+    """True iff this load is going through the V-only state machine
+    (inner adapter is loading V child blobs from L2; K child bytes
+    are sourced from L1 and copied into the dst by the wrapper)."""
+
+    k_child_keys: list[ObjectKey] = field(default_factory=list)
+    """K child keys to look up in L1.  Derived deterministically
+    from the caller's logical keys via ``derive_component_key`` so
+    the load path can reassemble without requiring an explicit
+    manifest pointer."""
+
+    v_child_keys: list[ObjectKey] = field(default_factory=list)
+    """V child keys passed to the inner L2 adapter in place of the
+    logical keys."""
+
 
 class SerdeL2AdapterWrapper(L2AdapterInterface):
     """L2 adapter that adds transparent serde on top of an inner adapter.
@@ -311,16 +327,40 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
         return result
 
     # ------------------------------------------------------------------
-    # Lookup / unlock (pure delegation)
+    # Lookup / unlock
     # ------------------------------------------------------------------
 
     def submit_lookup_and_lock_task(self, keys: list[ObjectKey]) -> L2TaskId:
+        """Submit a lookup-and-lock for the given logical keys.
+
+        For :attr:`StoragePlacementMode.KV_SPLIT_TIER`, translate
+        logical keys → V child keys before delegating to the inner
+        adapter (V lives on L2 under derived names).  The caller's
+        view stays logical; the wrapper's
+        :meth:`query_lookup_and_lock_result` combines inner's V-hit
+        bitmap with the manifest's ``COMPLETE`` state so a logical
+        key resolves as a composite hit only when both children are
+        addressable.
+        """
+        if self._placement_mode == StoragePlacementMode.KV_SPLIT_TIER:
+            v_child_keys = [derive_component_key(k, "v") for k in keys]
+            return self._inner.submit_lookup_and_lock_task(v_child_keys)
         return self._inner.submit_lookup_and_lock_task(keys)
 
     def query_lookup_and_lock_result(self, task_id: L2TaskId) -> Bitmap | None:
+        # For KV_TOGETHER the inner result is the final answer.  For
+        # KV_SPLIT_TIER the caller-visible bitmap is the intersection
+        # of inner's V-on-L2 hit AND the manifest's COMPLETE state;
+        # we cannot mask here without the original logical keys, so
+        # the load path takes care of the manifest gate on read.  The
+        # inner result is forwarded as-is (callers that need strict
+        # manifest semantics should rely on submit_load_task's bitmap).
         return self._inner.query_lookup_and_lock_result(task_id)
 
     def submit_unlock(self, keys: list[ObjectKey]) -> None:
+        if self._placement_mode == StoragePlacementMode.KV_SPLIT_TIER:
+            self._inner.submit_unlock([derive_component_key(k, "v") for k in keys])
+            return
         self._inner.submit_unlock(keys)
 
     # ------------------------------------------------------------------
@@ -336,10 +376,27 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
 
         All-or-nothing: if temp alloc or inner submission fails, the
         caller gets an all-zeros bitmap on next ``query_load_result``.
+
+        For :attr:`StoragePlacementMode.KV_SPLIT_TIER`, the inner
+        adapter is asked for V child blobs (derived V child keys),
+        and ``_drain_inner_load`` composes the result by copying K
+        bytes out of the L1 K children before submitting deserialize.
+        Manifest entries that are not ``COMPLETE`` are masked off
+        before the inner call so the load returns a miss for those
+        keys.
         """
         with self._lock:
             wrapped_id = self._next_task_id
             self._next_task_id += 1
+
+        is_split_tier = (
+            self._placement_mode == StoragePlacementMode.KV_SPLIT_TIER
+        )
+        k_child_keys: list[ObjectKey] = []
+        v_child_keys: list[ObjectKey] = []
+        if is_split_tier:
+            k_child_keys = [derive_component_key(k, "k") for k in keys]
+            v_child_keys = [derive_component_key(k, "v") for k in keys]
 
         temp_keys, temp_objs = self._alloc_temp_buffers(keys, objects)
         if temp_objs is None:
@@ -360,11 +417,18 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
             dst_objs=list(objects),
             temp_keys=temp_keys,
             temp_objs=temp_objs,
+            is_split_tier=is_split_tier,
+            k_child_keys=k_child_keys,
+            v_child_keys=v_child_keys,
         )
+        # Inner sees V child keys for split-tier; logical keys otherwise.
+        inner_load_keys = v_child_keys if is_split_tier else keys
         try:
             with self._lock:
                 self._load_tasks[wrapped_id] = state
-                inner_task_id = self._inner.submit_load_task(keys, temp_objs)
+                inner_task_id = self._inner.submit_load_task(
+                    inner_load_keys, temp_objs
+                )
                 self._inner_to_load[inner_task_id] = wrapped_id
         except Exception:
             logger.exception(
@@ -595,7 +659,17 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
 
     def _drain_inner_load(self) -> None:
         """Drain inner load completions; on per-key success submit
-        deserialize, otherwise fail the keys immediately."""
+        deserialize, otherwise fail the keys immediately.
+
+        For :attr:`StoragePlacementMode.KV_SPLIT_TIER`, gate each
+        per-key success on the manifest being ``COMPLETE`` AND the
+        K child being readable in L1, then synchronously copy K
+        bytes from the K child into the dst's group-0 view before
+        submitting deserialize for V.  Keys whose K child has been
+        evicted in the meantime get masked off in the bitmap so the
+        caller sees them as miss (the inner-loaded V blob is
+        discarded with the rest of the L1 temp on finalize).
+        """
         with self._lock:
             pending = list(self._inner_to_load.keys())
         for inner_id in pending:
@@ -609,6 +683,18 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
                 )
             if wrapped_id is None or state is None:
                 continue
+
+            if state.is_split_tier:
+                # Mask non-COMPLETE manifest entries to miss before
+                # bothering with K-from-L1 lookups.
+                for i, logical_key in enumerate(state.keys):
+                    if bitmap.test(i) and not self._split_tier_manifest.is_complete(
+                        logical_key
+                    ):
+                        bitmap.clear(i)
+                # Compose K from L1: for each surviving idx, read the
+                # K child + copy K bytes into the dst's group-0 view.
+                self._compose_split_tier_k_from_l1(state, bitmap)
 
             src_objs: list[MemoryObj] = []
             dst_objs: list[MemoryObj] = []
@@ -910,6 +996,68 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
         for logical_key in state.keys:
             self._split_tier_manifest.mark_invalidated(logical_key)
         self._release_split_tier_k_children(state.k_child_keys)
+
+    def _compose_split_tier_k_from_l1(
+        self,
+        state: _LoadTaskState,
+        bitmap: "Bitmap",
+    ) -> None:
+        """Copy K bytes from the L1 K children into each surviving
+        dst's group-0 view.
+
+        Reads are reserved per surviving index, the copy happens
+        synchronously (cheap CPU memcpy; runs in the wrapper's poll
+        loop), then the read locks are released.  Any K child whose
+        ``reserve_read`` fails (KEY_NOT_EXIST -- evicted between
+        manifest check and load) is masked off in the bitmap so the
+        caller sees that key as miss.  The wrapper does not eagerly
+        invalidate the manifest entry here -- PR-3' (paired
+        eviction) is responsible for that lifecycle.
+        """
+        # Surviving indices = those still set in the bitmap after the
+        # manifest mask.
+        surviving = [
+            i for i in range(len(state.keys)) if bitmap.test(i)
+        ]
+        if not surviving:
+            return
+        k_keys_to_read = [state.k_child_keys[i] for i in surviving]
+        results = self._l1_manager.reserve_read(k_keys_to_read)
+        successful_k_keys: list[ObjectKey] = []
+        for idx, k_key in zip(surviving, k_keys_to_read, strict=True):
+            r = results.get(k_key)
+            if r is None or r[0] != L1Error.SUCCESS or r[1] is None:
+                # K child missing or unreadable -- mask the key off
+                # so the deserialize path skips it and the caller
+                # sees a miss.
+                bitmap.clear(idx)
+                continue
+            k_child_obj = r[1]
+            successful_k_keys.append(k_key)
+            try:
+                src_k = k_child_obj.get_tensor(0)
+                dst_k = state.dst_objs[idx].get_tensor(0)
+                if src_k is None or dst_k is None:
+                    bitmap.clear(idx)
+                    continue
+                dst_k.copy_(src_k)
+            except Exception:
+                logger.exception(
+                    "Serde wrapper split-tier load: K copy failed for "
+                    "logical key %s",
+                    state.keys[idx],
+                )
+                bitmap.clear(idx)
+        # Release K read locks (idempotent on already-released keys).
+        if successful_k_keys:
+            try:
+                self._l1_manager.finish_read(successful_k_keys)
+            except Exception:
+                logger.exception(
+                    "Serde wrapper split-tier load: finish_read raised "
+                    "for %d K children",
+                    len(successful_k_keys),
+                )
 
     def _build_serde_src_inputs(
         self, objects: list[MemoryObj]
