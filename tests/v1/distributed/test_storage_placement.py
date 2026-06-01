@@ -29,6 +29,7 @@ from lmcache.v1.distributed.storage_placement import (
     StoragePlacementMode,
     derive_component_key,
     derive_storage_placement_mode,
+    reverse_component_key,
 )
 
 
@@ -121,6 +122,62 @@ def test_derive_component_key_deterministic() -> None:
     logical = _make_key(chunk_hash=b"\x11" * 32, salt="t")
     assert derive_component_key(logical, "k") == derive_component_key(logical, "k")
     assert derive_component_key(logical, "v") == derive_component_key(logical, "v")
+
+
+# =============================================================================
+# reverse_component_key
+# =============================================================================
+
+
+def test_reverse_component_key_round_trip_k() -> None:
+    """A K child round-trips back to (logical, 'k')."""
+    logical = _make_key(chunk_hash=b"\x77" * 32, salt="rev")
+    k = derive_component_key(logical, "k")
+    result = reverse_component_key(k)
+    assert result is not None
+    rev_logical, role = result
+    assert role == "k"
+    assert rev_logical == logical
+
+
+def test_reverse_component_key_round_trip_v() -> None:
+    """A V child round-trips back to (logical, 'v')."""
+    logical = _make_key(chunk_hash=b"\x88" * 32)
+    v = derive_component_key(logical, "v")
+    result = reverse_component_key(v)
+    assert result is not None
+    rev_logical, role = result
+    assert role == "v"
+    assert rev_logical == logical
+
+
+def test_reverse_component_key_returns_none_for_logical_key() -> None:
+    """A non-child key (logical key with no role marker) is not a
+    child -- reverse returns None and the eviction controller's
+    paired logic skips it."""
+    logical = _make_key(chunk_hash=b"\xaa" * 32)
+    assert reverse_component_key(logical) is None
+
+
+def test_reverse_component_key_returns_none_for_unknown_marker() -> None:
+    """A 33-byte hash whose trailing byte isn't 0x01 or 0x02 (the K
+    and V markers) is treated as a logical key, not a child."""
+    weird = ObjectKey(
+        chunk_hash=b"\xab" * 32 + b"\xff",
+        model_name="t",
+        kv_rank=0,
+        cache_salt="",
+    )
+    assert reverse_component_key(weird) is None
+
+
+def test_reverse_component_key_handles_empty_hash() -> None:
+    """A pathologically empty / very-short chunk_hash returns None
+    rather than crashing."""
+    empty = ObjectKey(chunk_hash=b"", model_name="t", kv_rank=0, cache_salt="")
+    one = ObjectKey(chunk_hash=b"\x01", model_name="t", kv_rank=0, cache_salt="")
+    assert reverse_component_key(empty) is None
+    assert reverse_component_key(one) is None
 
 
 # =============================================================================

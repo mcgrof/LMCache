@@ -114,6 +114,20 @@ class StorageManager:
                 )
             self._l2_adapters.append(adapter)
 
+        # PR-3' wire-up: attach the manifest + L2 adapters to the L1
+        # eviction controller (constructed earlier so its L1 listener
+        # was registered before any allocate event).  When placement
+        # is KV_SPLIT_TIER, this lets the controller drive paired
+        # cleanup (mark INVALIDATED, enqueue V child delete to L2)
+        # for K-child evictions.  Safe to call always: KV_TOGETHER
+        # mode skips the paired path because no K-child keys are in
+        # the eviction-candidate set.
+        if self._storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER:
+            self._eviction_controller.set_split_tier_paired_eviction(
+                self._split_tier_manifest,
+                self._l2_adapters,
+            )
+
         # Per-cache_salt quota registry. Shared across the L2 eviction
         # controller (reads quotas each cycle) and the HTTP quota
         # endpoints (CRUD). Present even when no adapter uses

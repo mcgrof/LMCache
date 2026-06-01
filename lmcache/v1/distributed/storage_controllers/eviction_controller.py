@@ -22,6 +22,12 @@ from lmcache.v1.distributed.internal_api import (
 from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface
 from lmcache.v1.distributed.storage_controller import StorageControllerInterface
+from lmcache.v1.distributed.storage_placement import (
+    SplitTierManifest,
+    SplitTierState,
+    derive_component_key,
+    reverse_component_key,
+)
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
 
@@ -97,6 +103,8 @@ class L1EvictionController(EvictionController):
         self,
         l1_manager: L1Manager,
         eviction_config: EvictionConfig,
+        split_tier_manifest: "SplitTierManifest | None" = None,
+        l2_adapters: "list[L2AdapterInterface] | None" = None,
     ):
         super().__init__()
         self._eviction_config = eviction_config
@@ -105,6 +113,31 @@ class L1EvictionController(EvictionController):
         self._listener = L1EvictionPolicy(self._eviction_policy)
         self._l1_manager.register_listener(self._listener)
         self._event_bus = get_event_bus()
+        # Phase 2 (PR-3') paired-eviction wiring.  ``None`` for both
+        # preserves the legacy DISCARD-only behavior; callers that wire
+        # KV_SPLIT_TIER pass both so the controller can drive the
+        # INVALIDATED -> DELETE_IN_FLIGHT lifecycle and enqueue V child
+        # deletes against the L2 adapters.
+        self._split_tier_manifest = split_tier_manifest
+        self._l2_adapters = list(l2_adapters or [])
+
+    def set_split_tier_paired_eviction(
+        self,
+        manifest: "SplitTierManifest",
+        l2_adapters: "list[L2AdapterInterface]",
+    ) -> None:
+        """Wire paired-eviction state post-construction.
+
+        The L1EvictionController is constructed before the L2 adapters
+        in the StorageManager init order (the L1 manager wants its
+        listener registered before any allocate event fires).  This
+        setter lets the StorageManager attach the manifest + L2
+        adapters once they exist.  Calling more than once replaces the
+        previous wiring; passing empty adapters reverts to legacy
+        DISCARD-only behavior.
+        """
+        self._split_tier_manifest = manifest
+        self._l2_adapters = list(l2_adapters)
 
     def report_status(self) -> dict:
         return {
@@ -173,11 +206,103 @@ class L1EvictionController(EvictionController):
 
     def execute_eviction_action(self, action: EvictionAction):
         if action.destination == EvictionDestination.DISCARD:
-            self._l1_manager.delete(action.keys)
+            self._evict_with_split_tier_pairing(action.keys)
         else:
             logger.error("Unsupported eviction destination: %s", action.destination)
             logger.error("Treating it as DISCARD.")
-            self._l1_manager.delete(action.keys)
+            self._evict_with_split_tier_pairing(action.keys)
+
+    def _evict_with_split_tier_pairing(
+        self, keys: "list[ObjectKey]"
+    ) -> None:
+        """Discard L1 keys; for split-tier K children, also invalidate
+        the manifest and enqueue the paired V child for L2 deletion.
+
+        The order matters for correctness (codex correction: logical
+        invalidation FIRST, physical cleanup second).  For each key
+        that looks like a K child:
+
+          1. Resolve the logical key via :func:`reverse_component_key`.
+          2. Mark the manifest INVALIDATED (lookup returns miss
+             immediately; the load path masks any in-flight reader's
+             bitmap to miss for this key).
+          3. Enqueue the V child delete against every configured L2
+             adapter (best-effort; adapters whose ``delete()`` is a
+             no-op leave the V orphan as tolerable cold-tier waste).
+          4. Transition the manifest to DELETE_IN_FLIGHT.
+
+        After the per-key paired step, the actual L1 ``delete()`` runs
+        on the original ``keys`` list so the K child (and any
+        non-split-tier keys in the same batch) get removed in one
+        call.  Manifest entries are dropped only after the L2 delete
+        future settles -- but since the L2 ``delete()`` API is
+        fire-and-forget, we drop the manifest entry here once
+        DELETE_IN_FLIGHT is set (the V child is no longer addressable
+        through this StorageManager regardless of whether the L2
+        adapter physically purged it).
+        """
+        if self._split_tier_manifest is None or not self._l2_adapters:
+            # Legacy DISCARD-only path; no split-tier semantics wired.
+            self._l1_manager.delete(keys)
+            return
+
+        for k in keys:
+            decomposed = reverse_component_key(k)
+            if decomposed is None:
+                # Not a derived child key; nothing to pair.
+                continue
+            logical_key, role = decomposed
+            if role != "k":
+                # Only K-child evictions trigger the paired cleanup.
+                # V-children live on L2; the L2 eviction controller
+                # handles them via its own policy.
+                continue
+            state = self._split_tier_manifest.lookup(logical_key)
+            if state is None:
+                # Manifest already cleaned up; nothing to do.
+                continue
+            if state in (
+                SplitTierState.INVALIDATED,
+                SplitTierState.DELETE_IN_FLIGHT,
+            ):
+                # Idempotent on repeat eviction of the same K child.
+                continue
+            # Step 1+2: logical invalidation first.  Lookup returns
+            # miss from here on; readers observe consistent state.
+            self._split_tier_manifest.mark_invalidated(logical_key)
+            # Step 3: enqueue V child delete against every L2
+            # adapter.  Best-effort; default ``delete()`` is no-op
+            # on adapters that don't support eviction, which leaves
+            # the V orphan as tolerable cold-tier waste.
+            v_child_key = derive_component_key(logical_key, "v")
+            for adapter in self._l2_adapters:
+                try:
+                    adapter.delete([v_child_key])
+                except Exception:
+                    logger.exception(
+                        "L1EvictionController paired-evict: "
+                        "adapter %s delete(v_child) raised for "
+                        "logical %s",
+                        type(adapter).__name__,
+                        logical_key,
+                    )
+            # Step 4: transition to DELETE_IN_FLIGHT then drop the
+            # manifest entry (the V child is no longer addressable
+            # through us regardless of L2 physical purge).
+            try:
+                self._split_tier_manifest.mark_delete_in_flight(logical_key)
+            except ValueError:
+                # Lost a race against a concurrent invalidation /
+                # delete; the manifest is already INVALIDATED or
+                # DELETE_IN_FLIGHT.  Idempotent.
+                pass
+            self._split_tier_manifest.drop(logical_key)
+
+        # Physical cleanup of K child (and any other K_TOGETHER keys
+        # in the batch).  Runs after the manifest invalidations so
+        # readers never observe the K child gone while the manifest
+        # still says COMPLETE.
+        self._l1_manager.delete(keys)
 
 
 class L2AdapterEvictionState:
