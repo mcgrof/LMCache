@@ -4,6 +4,10 @@
 # Standard
 from multiprocessing import shared_memory
 
+# Standard
+from typing import Protocol, runtime_checkable
+import threading
+
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
@@ -16,6 +20,33 @@ from lmcache.v1.memory_management import (
     MemoryAllocatorInterface,
     MemoryObj,
 )
+
+
+@runtime_checkable
+class L1MemoryUsageProvider(Protocol):
+    """Auxiliary memory providers (e.g. SerdeL2AdapterWrapper's K-child
+    slab) that hold L1-resident bytes outside ``L1MemoryManager``'s own
+    allocator implement this protocol so :meth:`L1MemoryManager.get_memory_usage`
+    can aggregate the true L1 footprint.
+
+    Without this, slab K-children -- which bypass
+    ``L1MemoryManager.allocate`` -- are invisible to the LRU eviction
+    policy, and under sustained L1 pressure eviction never fires on
+    those entries even though they occupy real memory.
+    """
+
+    def get_used_capacity_bytes(self) -> tuple[int, int]:
+        """Return ``(used_bytes, capacity_bytes)`` for this provider.
+
+        Returns:
+            ``used_bytes``: bytes currently held by live MemoryObjs the
+                provider owns (i.e. *not* sitting on its free list).
+            ``capacity_bytes``: the provider's configured upper bound.
+                Used by the eviction policy as the denominator of its
+                pressure ratio.  May be larger than the bytes actually
+                allocated so far if the provider grows lazily.
+        """
+        ...
 
 logger = init_logger(__name__)
 
@@ -102,6 +133,13 @@ class L1MemoryManager:
         self._allocator = create_memory_allocator(config)
         self._size_in_bytes = config.size_in_bytes
         self._align_bytes = config.align_bytes
+        # External usage providers (e.g. SerdeL2AdapterWrapper's K-child
+        # slab) registered via :meth:`register_external_memory_provider`.
+        # Their bytes get summed into the reading returned by
+        # :meth:`get_memory_usage` so the eviction policy sees true L1
+        # pressure rather than the address-manager subset.
+        self._external_providers: list[L1MemoryUsageProvider] = []
+        self._external_lock = threading.Lock()
 
     def allocate(
         self, layout_desc: MemoryLayoutDesc, count: int
@@ -177,7 +215,68 @@ class L1MemoryManager:
         free_size = address_manager.get_free_size()
         total_size = address_manager.get_heap_size()
         used_size = total_size - free_size
+
+        # Aggregate external providers (slabs etc.).  Held briefly so a
+        # late register/unregister can't race a concurrent read; each
+        # provider's own accounting is responsible for thread safety on
+        # the actual counters.
+        with self._external_lock:
+            providers = list(self._external_providers)
+        for provider in providers:
+            try:
+                p_used, p_total = provider.get_used_capacity_bytes()
+            except Exception:
+                # A misbehaving provider must not crash the eviction
+                # decision loop; treat as zero contribution and move on.
+                logger.exception(
+                    "L1MemoryManager: external provider %r raised in "
+                    "get_used_capacity_bytes; skipping",
+                    type(provider).__name__,
+                )
+                continue
+            used_size += p_used
+            total_size += p_total
         return used_size, total_size
+
+    def register_external_memory_provider(
+        self, provider: L1MemoryUsageProvider
+    ) -> None:
+        """Register an auxiliary memory provider whose bytes count
+        toward :meth:`get_memory_usage`.
+
+        Use case: ``SerdeL2AdapterWrapper`` carries slab pools
+        (`_KChildSlab`) that hold L1-resident bytes outside
+        ``L1MemoryManager``'s own allocator.  Without this hook those
+        bytes are invisible to the LRU eviction policy.
+
+        Idempotent: re-registering the same provider is a no-op.
+
+        Args:
+            provider: Anything implementing :class:`L1MemoryUsageProvider`
+                — duck-typed via ``runtime_checkable``.
+        """
+        if not isinstance(provider, L1MemoryUsageProvider):
+            raise TypeError(
+                f"register_external_memory_provider: {provider!r} does "
+                "not implement L1MemoryUsageProvider "
+                "(get_used_capacity_bytes())"
+            )
+        with self._external_lock:
+            if provider not in self._external_providers:
+                self._external_providers.append(provider)
+
+    def unregister_external_memory_provider(
+        self, provider: L1MemoryUsageProvider
+    ) -> None:
+        """Remove a provider previously registered via
+        :meth:`register_external_memory_provider`.  Idempotent: no-op
+        when the provider was never registered.
+        """
+        with self._external_lock:
+            try:
+                self._external_providers.remove(provider)
+            except ValueError:
+                pass
 
     def get_l1_memory_desc(self) -> L1MemoryDesc:
         """
