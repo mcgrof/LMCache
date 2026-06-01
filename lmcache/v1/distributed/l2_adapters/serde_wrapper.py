@@ -30,11 +30,16 @@ invariants don't need to change.
 from __future__ import annotations
 
 # Standard
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import enum
+import math
 import select
 import threading
+
+# Third Party
+import torch
 
 # First Party
 from lmcache.logging import init_logger
@@ -45,6 +50,7 @@ from lmcache.v1.distributed.internal_api import L2AdapterListener, L2StoreResult
 from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.l2_adapters.base import (
     AdapterUsage,
+    EarlyReleaseStoreAdapter,
     L2AdapterInterface,
     L2TaskId,
 )
@@ -66,6 +72,129 @@ from lmcache.v1.platform import consume_fd, create_event_notifier
 logger = init_logger(__name__)
 
 _POLL_TIMEOUT_MS = 500
+
+
+class _VScratchSlab:
+    """Linux-kernel-slab-style pool of CPU V-scratch tensors.
+
+    Used by split-tier store to hold a private copy of V bytes
+    extracted from the producer-side logical L1 entry.  The copy
+    lets the wrapper release the logical's read lock the moment
+    ``submit_store_task`` returns; the V codec then encodes from
+    the private scratch tensor instead of reading V directly out
+    of L1.
+
+    Why a slab and not L1Manager.reserve_write: the L1Manager's
+    global mutex would serialize every alloc/free; the slab is a
+    fixed-size pre-allocated pool with a lock-free deque hot path,
+    so the producer side scales with CPU count instead of
+    L1Manager lock contention (the next bottleneck visible after
+    PR-6' parallel K-copy).
+
+    The pool starts empty and lazily allocates tensors on demand
+    up to ``max_slots``.  Once a tensor is freed it goes back to
+    the deque for reuse.  ``max_slots`` is sized at construction
+    time; over-subscription is logged but not fatal (we just
+    allocate a one-shot tensor outside the pool).
+    """
+
+    def __init__(self, shape: torch.Size, dtype: torch.dtype, max_slots: int) -> None:
+        """Construct a slab.
+
+        Args:
+            shape: Shape of each pooled tensor (the V tensor shape from
+                the producer-side logical L1 layout).
+            dtype: Dtype of each pooled tensor (typically bf16 / fp16,
+                matching the producer-side V).
+            max_slots: Upper bound on the number of tensors the pool
+                will lazily allocate.  Beyond this, ``acquire`` returns
+                a one-shot tensor (allocated, never returned to the
+                pool); a debug log notes the over-subscription.
+        """
+        self._shape = shape
+        self._dtype = dtype
+        self._max_slots = max_slots
+        # ``deque`` is thread-safe for popleft / append in CPython
+        # (atomic under the GIL).  No explicit lock needed on the hot
+        # path.
+        self._free: deque[torch.Tensor] = deque()
+        self._allocated_count = 0
+        self._over_subscriptions = 0
+        # Guards the lazy-alloc / count update; never held across a
+        # tensor allocation under a higher lock so contention is
+        # bounded to the slab refill path.
+        self._alloc_lock = threading.Lock()
+
+    def acquire(self) -> torch.Tensor:
+        """Pop a tensor from the free deque, or allocate a fresh one.
+
+        Returns:
+            A torch.Tensor on CPU with the configured shape + dtype.
+            The buffer is uninitialized; callers should overwrite
+            with ``copy_`` before reading.
+        """
+        try:
+            return self._free.popleft()
+        except IndexError:
+            pass
+        with self._alloc_lock:
+            if self._allocated_count < self._max_slots:
+                self._allocated_count += 1
+                return torch.empty(self._shape, dtype=self._dtype, device="cpu")
+            self._over_subscriptions += 1
+        # Over-subscription: allocate a one-shot tensor that won't be
+        # returned to the pool.  The slab will grow effectively but
+        # the one-shot is freed by Python GC once the caller drops
+        # the reference.
+        return torch.empty(self._shape, dtype=self._dtype, device="cpu")
+
+    def release(self, tensor: torch.Tensor) -> None:
+        """Return a tensor to the pool for reuse.
+
+        Args:
+            tensor: A tensor previously acquired via :meth:`acquire`.
+                Shape / dtype mismatches are silently dropped (treated
+                as one-shot tensors -- they GC normally).
+        """
+        if tensor.shape != self._shape or tensor.dtype != self._dtype:
+            return
+        # Cap the queue at ``max_slots``; anything beyond gets dropped
+        # so a transient burst doesn't grow the pool permanently.
+        if len(self._free) >= self._max_slots:
+            return
+        self._free.append(tensor)
+
+    def stats(self) -> dict[str, int]:
+        """Snapshot of pool counters for diagnostic logging.
+
+        Returns:
+            ``{"allocated": N, "free": N, "over_subscriptions": N}``.
+            Counters are non-atomic snapshots; treat as advisory.
+        """
+        return {
+            "allocated": self._allocated_count,
+            "free": len(self._free),
+            "over_subscriptions": self._over_subscriptions,
+        }
+
+
+class _VScratchSlot:
+    """MemoryObj-like adapter exposing a slab-borrowed tensor.
+
+    Lightweight: just exposes ``.tensor`` so the V-only codec can
+    read V bytes off it without touching the underlying logical L1
+    entry.  No allocator hooks, no ref-counting -- the slab owns
+    the lifecycle.
+    """
+
+    __slots__ = ("_tensor",)
+
+    def __init__(self, tensor: torch.Tensor) -> None:
+        self._tensor = tensor
+
+    @property
+    def tensor(self) -> torch.Tensor:
+        return self._tensor
 
 
 class _StorePhase(enum.Enum):
@@ -101,6 +230,28 @@ class _StoreTaskState:
     logical keys.  Derived deterministically from the logical keys
     via ``derive_component_key(logical, 'v')``."""
 
+    early_release_keys: list[ObjectKey] = field(default_factory=list)
+    """Logical keys whose StoreController read locks can be released
+    immediately after ``submit_store_task`` returns.  Set only in
+    split-tier placement, where the wrapper extracts both K and V
+    into private buffers before the codec runs and so no longer
+    needs the caller-side L1 entry to stay alive across the L2
+    write.  Drained by ``claim_early_release_keys`` on the
+    ``EarlyReleaseStoreAdapter`` protocol."""
+
+    early_release_claimed: bool = False
+    """Latched true the first time ``claim_early_release_keys``
+    consumes ``early_release_keys``.  Single-claim semantics keep
+    the StoreController from accidentally releasing the same locks
+    twice on a retry / poll loop."""
+
+    v_scratch_tensors: list[torch.Tensor] = field(default_factory=list)
+    """Slab-borrowed V tensors holding a private copy of V bytes
+    extracted from the producer-side logical entries.  Held alive
+    here so the V-only codec can read from them after the logical
+    L1 entries are released; returned to the slab in
+    ``_drain_inner_store`` once the inner L2 store acks."""
+
 
 @dataclass
 class _LoadTaskState:
@@ -133,8 +284,14 @@ class _LoadTaskState:
     logical keys."""
 
 
-class SerdeL2AdapterWrapper(L2AdapterInterface):
+class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
     """L2 adapter that adds transparent serde on top of an inner adapter.
+
+    Implements :class:`EarlyReleaseStoreAdapter` so the StoreController
+    can release the caller's read locks on split-tier logical keys as
+    soon as the wrapper has extracted K and V into private buffers --
+    well before the inner L2 store completes.  See
+    :meth:`claim_early_release_keys`.
 
     Args:
         inner: The wrapped L2 adapter doing the actual storage.
@@ -149,6 +306,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
         l1_manager: L1Manager,
         placement_mode: StoragePlacementMode = StoragePlacementMode.KV_TOGETHER,
         split_tier_manifest: SplitTierManifest | None = None,
+        v_scratch_max_slots: int = 64,
     ) -> None:
         super().__init__()
         self._inner = inner
@@ -181,6 +339,16 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
                 max_workers=4,
                 thread_name_prefix="serde-l2-st-kcopy",
             )
+
+        # V-scratch slab is sized lazily on first split-tier store
+        # (we don't know V shape / dtype until the first batch arrives,
+        # since the producer-side layout is config-dependent).  ``None``
+        # outside split-tier; ``None`` until first store inside split-
+        # tier.  ``_v_scratch_max_slots`` is captured here so the slab
+        # honors the caller-configured upper bound when it materializes.
+        self._v_scratch_slab: _VScratchSlab | None = None
+        self._v_scratch_max_slots = max(1, v_scratch_max_slots)
+        self._v_scratch_init_lock = threading.Lock()
 
         # Our own notifiers for store/load completion. Lookup passes the
         # inner adapter's fd straight through (no chaining needed there).
@@ -258,6 +426,8 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
         )
         k_child_keys: list[ObjectKey] = []
         v_child_keys: list[ObjectKey] = []
+        v_scratch_tensors: list[torch.Tensor] = []
+        early_release_keys: list[ObjectKey] = []
         if is_split_tier:
             k_child_keys, v_child_keys = self._alloc_split_tier_children(
                 keys, objects
@@ -272,6 +442,31 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
                 self._finalize_store(wrapped_id, success=False)
                 return wrapped_id
 
+            # Extract V into a private slab-borrowed scratch buffer so
+            # the logical L1 entries can be released the moment this
+            # method returns (instead of staying read-locked across the
+            # V codec + L2 write).  Once K + V both live in wrapper-
+            # private buffers, the producer-side L1 entry is redundant;
+            # releasing it immediately drops the steady-state L1
+            # footprint per chunk from ~1.5× (K+V logical + K-child) to
+            # ~0.5× (K-child only), which is the predicted V-only L1
+            # capacity win that the L2-completion-time delete alone
+            # could not realize (see eval4_eval2_vonly_report.md).
+            v_scratch_tensors = self._alloc_v_scratch_and_copy(objects)
+            if not v_scratch_tensors:
+                # V-extract failed (no V tensor on input objects).
+                logger.warning(
+                    "Serde wrapper: split-tier V-scratch extract failed "
+                    "for store task %d",
+                    wrapped_id,
+                )
+                self._release_split_tier_k_children(k_child_keys)
+                self._finalize_store(wrapped_id, success=False)
+                return wrapped_id
+            # Logical keys can be released immediately by the
+            # StoreController via claim_early_release_keys().
+            early_release_keys = list(keys)
+
         temp_keys, temp_objs = self._alloc_temp_buffers(keys, objects)
         if temp_objs is None:
             logger.warning(
@@ -282,6 +477,8 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
                 # Release the K-children we just allocated; they would
                 # otherwise leak L1 with no V partner to back them.
                 self._release_split_tier_k_children(k_child_keys)
+            if v_scratch_tensors:
+                self._return_v_scratch(v_scratch_tensors)
             self._finalize_store(wrapped_id, success=False)
             return wrapped_id
 
@@ -302,11 +499,22 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
             is_split_tier=is_split_tier,
             k_child_keys=k_child_keys,
             v_child_keys=v_child_keys,
+            early_release_keys=early_release_keys,
+            v_scratch_tensors=v_scratch_tensors,
         )
         try:
             with self._lock:
                 self._store_tasks[wrapped_id] = state
-                serde_src = self._build_serde_src_inputs(objects)
+                if is_split_tier and v_scratch_tensors:
+                    # V-only codec reads V from src[i][1].tensor; route it
+                    # to the slab-borrowed scratch tensor instead of the
+                    # logical L1 entry (which the StoreController is about
+                    # to release).
+                    serde_src = [
+                        (None, _VScratchSlot(t)) for t in v_scratch_tensors
+                    ]
+                else:
+                    serde_src = self._build_serde_src_inputs(objects)
                 serde_task_id = self._serde.submit_serialize(
                     serde_src,  # type: ignore[arg-type]
                     temp_objs,
@@ -320,9 +528,44 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
             with self._lock:
                 self._store_tasks.pop(wrapped_id, None)
             self._release_write_temps(temp_keys)
+            if v_scratch_tensors:
+                self._return_v_scratch(v_scratch_tensors)
+            if k_child_keys:
+                self._release_split_tier_k_children(k_child_keys)
             self._finalize_store(wrapped_id, success=False)
             return wrapped_id
         return wrapped_id
+
+    def claim_early_release_keys(self, task_id: L2TaskId) -> list[ObjectKey]:
+        """Hand the StoreController the set of logical keys whose read
+        locks can be released right now (before the inner L2 store
+        completes).
+
+        In :attr:`StoragePlacementMode.KV_SPLIT_TIER`, the wrapper has
+        already copied K into the K-child L1 slot and V into a slab-
+        borrowed scratch buffer before this method is called, so the
+        caller-side logical L1 entry is redundant for the rest of the
+        task's lifetime.
+
+        Single-claim: subsequent calls for the same ``task_id`` return
+        ``[]`` so the StoreController does not double-release on retry
+        / re-poll.
+
+        Args:
+            task_id: The task id returned by ``submit_store_task``.
+
+        Returns:
+            Logical keys to early-release.  Empty for
+            ``KV_TOGETHER`` placement (the inner store reads K+V from
+            the caller's objects, so the caller must keep them
+            read-locked across the L2 write).
+        """
+        with self._lock:
+            state = self._store_tasks.get(task_id)
+            if state is None or state.early_release_claimed:
+                return []
+            state.early_release_claimed = True
+            return list(state.early_release_keys)
 
     def pop_completed_store_tasks(self) -> dict[L2TaskId, L2StoreResult]:
         with self._lock:
@@ -594,6 +837,11 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
 
             if not result:
                 self._release_write_temps(state.temp_keys)
+                if state.is_split_tier:
+                    self._invalidate_split_tier_pending(state)
+                if state.v_scratch_tensors:
+                    self._return_v_scratch(state.v_scratch_tensors)
+                    state.v_scratch_tensors = []
                 self._finalize_store(wrapped_id, success=False)
                 continue
 
@@ -621,6 +869,9 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
                 self._l1_manager.finish_read(state.temp_keys)
                 if state.is_split_tier:
                     self._invalidate_split_tier_pending(state)
+                if state.v_scratch_tensors:
+                    self._return_v_scratch(state.v_scratch_tensors)
+                    state.v_scratch_tensors = []
                 self._finalize_store(wrapped_id, success=False)
                 continue
 
@@ -666,6 +917,11 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
                         self._finalize_split_tier_success(state)
                     else:
                         self._invalidate_split_tier_pending(state)
+                # Return V-scratch tensors to the slab regardless of
+                # success: the codec finished with them either way.
+                if state.v_scratch_tensors:
+                    self._return_v_scratch(state.v_scratch_tensors)
+                    state.v_scratch_tensors = []
             self._finalize_store(
                 wrapped_id, result.is_successful(), result.bytes_transferred()
             )
@@ -962,6 +1218,89 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
         # cache residents under their child keys.
         self._l1_manager.finish_write(k_child_keys)
         return k_child_keys, v_child_keys
+
+    def _alloc_v_scratch_and_copy(
+        self,
+        objects: list[MemoryObj],
+    ) -> list[torch.Tensor]:
+        """Borrow V-scratch tensors from the slab and copy V bytes from
+        each producer-side logical entry's group-1 tensor.
+
+        After this returns successfully, V is no longer needed from the
+        logical L1 entries -- the V codec will read V exclusively from
+        the slab tensors via :class:`_VScratchSlot`.
+
+        Args:
+            objects: Producer-side logical L1 ``MemoryObj`` instances
+                that ``submit_store_task`` received.  Each must have a
+                group-1 (V) tensor; the wrapper has already validated
+                grouping in :meth:`_alloc_split_tier_children`.
+
+        Returns:
+            A list of CPU torch tensors (one per input object) holding
+            a private copy of V.  Returns ``[]`` if any object's V
+            tensor is unavailable; partial copies are returned to the
+            slab before the failure path.
+        """
+        if not objects:
+            return []
+        # Probe V shape / dtype from the first object so the slab can
+        # be sized on first use.  All split-tier batches in a single
+        # wrapper instance share one layout (the producer-side L1
+        # config is fixed across the wrapper's lifetime).
+        first_v = objects[0].get_tensor(1)
+        if first_v is None:
+            return []
+        slab = self._ensure_v_scratch_slab(first_v.shape, first_v.dtype)
+        out: list[torch.Tensor] = []
+        for obj in objects:
+            v = obj.get_tensor(1)
+            if v is None:
+                # Partial failure -- return what we borrowed.
+                self._return_v_scratch(out)
+                return []
+            scratch = slab.acquire()
+            try:
+                scratch.copy_(v)
+            except Exception:
+                slab.release(scratch)
+                self._return_v_scratch(out)
+                return []
+            out.append(scratch)
+        return out
+
+    def _ensure_v_scratch_slab(
+        self,
+        shape: torch.Size,
+        dtype: torch.dtype,
+    ) -> _VScratchSlab:
+        """Build the V-scratch slab on first split-tier store.
+
+        The slab is shape-/dtype-pinned at first use; later batches
+        with a different V shape would over-subscribe (one-shot
+        allocation, slab still tracks for reuse of matching shapes).
+        Reasonable because a wrapper instance serves one producer
+        configuration in practice.
+        """
+        slab = self._v_scratch_slab
+        if slab is not None:
+            return slab
+        with self._v_scratch_init_lock:
+            if self._v_scratch_slab is None:
+                self._v_scratch_slab = _VScratchSlab(
+                    shape=shape,
+                    dtype=dtype,
+                    max_slots=self._v_scratch_max_slots,
+                )
+            return self._v_scratch_slab
+
+    def _return_v_scratch(self, tensors: list[torch.Tensor]) -> None:
+        """Return slab-borrowed V-scratch tensors after the codec is done."""
+        slab = self._v_scratch_slab
+        if slab is None or not tensors:
+            return
+        for t in tensors:
+            slab.release(t)
 
     def _release_split_tier_k_children(self, k_child_keys: list[ObjectKey]) -> None:
         """Release K-child L1 entries.  Used on a partial / failed

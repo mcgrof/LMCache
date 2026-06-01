@@ -11,7 +11,7 @@ The controller runs a background thread with an event-driven loop that:
 
 # Standard
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import enum
 import select
 import threading
@@ -22,7 +22,11 @@ from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L1ManagerListener
 from lmcache.v1.distributed.l1_manager import L1Manager
-from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
+from lmcache.v1.distributed.l2_adapters.base import (
+    EarlyReleaseStoreAdapter,
+    L2AdapterInterface,
+    L2TaskId,
+)
 from lmcache.v1.distributed.storage_controller import StorageControllerInterface
 from lmcache.v1.distributed.storage_placement import SplitTierManifest  # noqa: F401
 from lmcache.v1.distributed.storage_controllers.store_policy import (
@@ -179,6 +183,13 @@ class InFlightStoreTask:
     read_locked_keys: list[ObjectKey]
     """The subset of keys for which reserve_read succeeded
     (i.e., keys holding an L1 read lock that must be released)."""
+
+    early_released_logicals: list[ObjectKey] = field(default_factory=list)
+    """Logical keys whose read locks + L1 entries were released
+    immediately after ``submit_store_task`` returned, via the
+    :class:`EarlyReleaseStoreAdapter` protocol.  Used to skip the
+    redundant split-tier logical-delete on ``_finalize_store``
+    (those entries are gone already)."""
 
     l2_store_result: bool | None = None
     """L2 outcome (True=success, False=failure, None=still in flight)."""
@@ -510,10 +521,65 @@ class StoreController(StorageControllerInterface):
             adapter = self._l2_adapters[adapter_index]
             task_id = adapter.submit_store_task(successful_keys, successful_objs)
 
+            # Adapters that have already extracted everything they need
+            # from the caller-side ``successful_objs`` (split-tier via
+            # SerdeL2AdapterWrapper today) hand back the subset of keys
+            # whose read locks should drop *now* instead of at L2
+            # completion.  Releasing earlier removes the per-chunk K+V
+            # logical from L1 immediately, leaving only the K-child as
+            # the L1 resident -- the steady-state L1 footprint per
+            # split-tier chunk drops from ~1.5× (logical + K-child) to
+            # ~0.5× (K-child only).
+            early_release: list[ObjectKey] = []
+            if isinstance(adapter, EarlyReleaseStoreAdapter):
+                try:
+                    early_release = adapter.claim_early_release_keys(task_id)
+                except Exception:
+                    logger.exception(
+                        "Adapter %d claim_early_release_keys raised "
+                        "for task %d; falling back to default lifecycle",
+                        adapter_index,
+                        task_id,
+                    )
+                    early_release = []
+
+            remaining_read_locked = list(successful_keys)
+            if early_release:
+                early_set = set(early_release)
+                remaining_read_locked = [
+                    k for k in successful_keys if k not in early_set
+                ]
+                released = [
+                    k for k in successful_keys if k in early_set
+                ]
+                if released:
+                    self._l1_manager.finish_read(released)
+                    # Split-tier additionally deletes the original
+                    # logical L1 entry now that K is mirrored to the
+                    # K-child and V is on its way to L2.  Outside split-
+                    # tier the policy decides (today nothing else uses
+                    # early-release).
+                    if self._split_tier_manifest is not None:
+                        split_tier_logicals = [
+                            k for k in released
+                            if self._split_tier_manifest.lookup(k) is not None
+                        ]
+                        if split_tier_logicals:
+                            try:
+                                self._l1_manager.delete(split_tier_logicals)
+                            except Exception:
+                                logger.exception(
+                                    "Early-release split-tier logical "
+                                    "delete raised for task %d (%d keys)",
+                                    task_id,
+                                    len(split_tier_logicals),
+                                )
+
             self._in_flight_tasks[(adapter_index, task_id)] = InFlightStoreTask(
                 adapter_index=adapter_index,
                 keys=successful_keys,
-                read_locked_keys=list(successful_keys),
+                read_locked_keys=remaining_read_locked,
+                early_released_logicals=list(early_release),
             )
             self._status_in_flight_count += 1
 
@@ -622,9 +688,11 @@ class StoreController(StorageControllerInterface):
             # redundant and deleting it is what drops the L1 footprint
             # per cached chunk to K-only (the core L1 win for V-only).
             if self._split_tier_manifest is not None:
+                already_released = set(task.early_released_logicals)
                 split_tier_logicals = [
                     k for k in task.keys
-                    if self._split_tier_manifest.lookup(k) is not None
+                    if k not in already_released
+                    and self._split_tier_manifest.lookup(k) is not None
                 ]
                 if split_tier_logicals:
                     delete_keys = list(
