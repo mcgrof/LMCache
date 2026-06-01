@@ -66,7 +66,13 @@ from lmcache.v1.distributed.storage_placement import (
     StoragePlacementMode,
     derive_component_key,
 )
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.memory_management import (
+    MemoryAllocatorInterface,
+    MemoryFormat,
+    MemoryObj,
+    MemoryObjMetadata,
+    TensorMemoryObj,
+)
 from lmcache.v1.platform import consume_fd, create_event_notifier
 
 logger = init_logger(__name__)
@@ -114,12 +120,21 @@ class _VScratchSlab:
         self._shape = shape
         self._dtype = dtype
         self._max_slots = max_slots
+        self._element_size = torch.tensor([], dtype=dtype).element_size()
+        self._phy_size = math.prod(shape) * self._element_size
         # ``deque`` is thread-safe for popleft / append in CPython
         # (atomic under the GIL).  No explicit lock needed on the hot
         # path.
         self._free: deque[torch.Tensor] = deque()
         self._allocated_count = 0
         self._over_subscriptions = 0
+        # In-flight count: tensors handed out via ``acquire`` that
+        # haven't been returned via ``release`` yet.  Includes both
+        # pool-backed and over-subscription one-shot allocations, so
+        # ``get_used_capacity_bytes`` reflects true memory pressure
+        # rather than just the pooled subset (the PR-9 measurement
+        # showed the LRU was blind to one-shots).
+        self._in_flight = 0
         # Guards the lazy-alloc / count update; never held across a
         # tensor allocation under a higher lock so contention is
         # bounded to the slab refill path.
@@ -134,18 +149,23 @@ class _VScratchSlab:
             with ``copy_`` before reading.
         """
         try:
-            return self._free.popleft()
+            t = self._free.popleft()
+            # GIL-atomic increment; no lock needed for a single += 1.
+            self._in_flight += 1
+            return t
         except IndexError:
             pass
         with self._alloc_lock:
             if self._allocated_count < self._max_slots:
                 self._allocated_count += 1
+                self._in_flight += 1
                 return torch.empty(self._shape, dtype=self._dtype, device="cpu")
             self._over_subscriptions += 1
         # Over-subscription: allocate a one-shot tensor that won't be
         # returned to the pool.  The slab will grow effectively but
         # the one-shot is freed by Python GC once the caller drops
         # the reference.
+        self._in_flight += 1
         return torch.empty(self._shape, dtype=self._dtype, device="cpu")
 
     def release(self, tensor: torch.Tensor) -> None:
@@ -158,6 +178,11 @@ class _VScratchSlab:
         """
         if tensor.shape != self._shape or tensor.dtype != self._dtype:
             return
+        # Decrement before the deque-cap check so an over-subscription
+        # tensor we drop on the floor still gets accounted for.  Under
+        # races this can briefly go negative; the read in
+        # ``get_used_capacity_bytes`` clamps at zero.
+        self._in_flight -= 1
         # Cap the queue at ``max_slots``; anything beyond gets dropped
         # so a transient burst doesn't grow the pool permanently.
         if len(self._free) >= self._max_slots:
@@ -168,14 +193,254 @@ class _VScratchSlab:
         """Snapshot of pool counters for diagnostic logging.
 
         Returns:
-            ``{"allocated": N, "free": N, "over_subscriptions": N}``.
-            Counters are non-atomic snapshots; treat as advisory.
+            ``{"allocated": N, "free": N, "over_subscriptions": N,
+                "in_flight": N}``.  Counters are non-atomic snapshots;
+            treat as advisory.
         """
         return {
             "allocated": self._allocated_count,
             "free": len(self._free),
             "over_subscriptions": self._over_subscriptions,
+            "in_flight": self._in_flight,
         }
+
+    # ----- L1MemoryUsageProvider protocol -----
+
+    def get_used_capacity_bytes(self) -> tuple[int, int]:
+        """Live tensor bytes + configured pool cap.
+
+        ``used`` counts *every* outstanding acquire — pool-backed and
+        over-subscription one-shots — so the LRU policy sees true
+        V-scratch memory pressure, not just the pooled subset.
+
+        ``capacity`` is the configured upper bound for the pool's
+        in-pool tensors.  Under heavy over-subscription, ``used`` may
+        exceed ``capacity`` and the policy's used/capacity ratio
+        crosses 1.0 — that correctly signals "evict harder".
+        """
+        used = max(0, self._in_flight) * self._phy_size
+        capacity = self._max_slots * self._phy_size
+        return used, capacity
+
+
+class _KChildSlab(MemoryAllocatorInterface):
+    """K-child memory provider: kmem_cache-style pool of pre-allocated
+    K-shaped backing buffers.
+
+    The K-children for split-tier stores are the canonical L1 residents
+    for V-only mode and live for the duration of a cached chunk's
+    lifetime in L1.  Today they are allocated through
+    ``L1Manager.reserve_write`` -> ``L1MemoryManager.allocate`` ->
+    ``TensorMemoryAllocator.batched_allocate``, which under a busy
+    producer scans the free-block list of the address manager on every
+    call.  As the workload fragments the address space (mixed-size
+    allocations from logical chunks vs. K-children) the scan cost
+    grows.
+
+    The slab pre-allocates ``max_slots`` torch tensors of the K shape
+    at first use; ``allocate`` / ``batched_allocate`` pop a pre-built
+    ``TensorMemoryObj`` off a free deque (O(1), GIL-atomic).  On
+    ``free`` the object is returned to the deque -- the underlying
+    tensor never goes back to the address manager.  Combined with
+    :meth:`L1Manager.reserve_external_writes` (which takes a pre-
+    allocated ``MemoryObj`` and skips ``L1MemoryManager.allocate``),
+    the K-child store path stops paying the address-manager cost while
+    still living inside the L1 catalog so paired eviction + load +
+    eviction policy work unchanged.
+
+    Lifecycle:
+
+    * ``acquire`` / ``allocate``: pop from deque or lazily allocate up
+      to ``max_slots``; over-subscription returns a one-shot object
+      (not pooled).
+    * ``free``: rebind the ``MemoryObj`` for reuse (reset
+      ``valid`` / ``ref_count`` / ``_used_size_override``) and push
+      back to the deque.  Capped at ``max_slots`` so a transient burst
+      doesn't grow the deque permanently.
+
+    Thread safety: ``deque`` is GIL-atomic on ``popleft`` / ``append``;
+    the lazy-alloc path uses a dedicated lock so the slab can refill
+    without contending against the wrapper's other locks.
+
+    Conformance with :class:`MemoryAllocatorInterface`: ``allocate``
+    ignores ``shapes`` / ``dtypes`` (the slab's shape / dtype are
+    pinned at construction).  Mismatched requests fall back to the
+    one-shot over-subscription path so the slab never lies about
+    shape; ``free`` is shape-aware via the per-object reset.
+    """
+
+    def __init__(self, shape: torch.Size, dtype: torch.dtype, max_slots: int) -> None:
+        """Construct a K-child slab.
+
+        Args:
+            shape: K tensor shape (single-group; the slab does not
+                serve multi-group layouts).
+            dtype: K tensor dtype.
+            max_slots: Pool upper bound.  Beyond this, ``allocate``
+                returns one-shot objects that are GC'd, not pooled.
+        """
+        self._shape = shape
+        self._dtype = dtype
+        self._max_slots = max_slots
+        self._element_size = torch.tensor([], dtype=dtype).element_size()
+        self._phy_size = math.prod(shape) * self._element_size
+        self._free: deque[TensorMemoryObj] = deque()
+        self._allocated_count = 0
+        self._over_subscriptions = 0
+        # In-flight count covers every outstanding MemoryObj — pooled
+        # and one-shot.  Without it, ``get_used_capacity_bytes``
+        # under-reports during over-subscription bursts and the LRU
+        # policy can't see real K-child pressure (PR-9 measurement
+        # confirmed this).
+        self._in_flight = 0
+        self._alloc_lock = threading.Lock()
+
+    def _build_memory_obj(self) -> TensorMemoryObj:
+        """Allocate a fresh CPU tensor + wrap as a TensorMemoryObj."""
+        tensor = torch.empty(self._shape, dtype=self._dtype, device="cpu")
+        raw_data = tensor.view(torch.uint8).flatten()
+        metadata = MemoryObjMetadata(
+            shape=self._shape,
+            dtype=self._dtype,
+            address=tensor.data_ptr(),
+            phy_size=self._phy_size,
+            ref_count=1,
+            pin_count=0,
+            fmt=MemoryFormat.KV_2LTD,
+            shapes=[self._shape],
+            dtypes=[self._dtype],
+        )
+        return TensorMemoryObj(
+            raw_data=raw_data,
+            metadata=metadata,
+            parent_allocator=self,
+        )
+
+    def _rebind_for_reuse(self, obj: TensorMemoryObj) -> TensorMemoryObj:
+        """Reset per-allocation metadata on a recycled MemoryObj."""
+        obj.valid = True
+        obj.meta.ref_count = 1
+        obj.meta.pin_count = 0
+        obj._used_size_override = None
+        # group_prefix_sum + shape are pinned at construction (single-
+        # shape slab); nothing else to reset.
+        return obj
+
+    # ----- MemoryAllocatorInterface API -----
+
+    def allocate(
+        self,
+        shapes,
+        dtypes,
+        fmt: MemoryFormat = MemoryFormat.UNDEFINED,
+        allocator_type=None,
+    ) -> TensorMemoryObj | None:
+        """Return a single MemoryObj for one K-child slot."""
+        return self._allocate_one()
+
+    def batched_allocate(
+        self,
+        shapes,
+        dtypes,
+        batch_size: int,
+        fmt: MemoryFormat = MemoryFormat.UNDEFINED,
+        allocator_type=None,
+    ) -> list[TensorMemoryObj]:
+        """Return a list of MemoryObjs for ``batch_size`` K-child slots.
+
+        Always returns ``batch_size`` items: pool hits are O(1),
+        over-subscription allocates fresh one-shot objects.  Callers
+        get the same length list they asked for; never ``None``.
+        """
+        return [self._allocate_one() for _ in range(batch_size)]
+
+    def _allocate_one(self) -> TensorMemoryObj:
+        try:
+            obj = self._free.popleft()
+            # GIL-atomic single-bytecode increment; no lock needed.
+            self._in_flight += 1
+            return self._rebind_for_reuse(obj)
+        except IndexError:
+            pass
+        with self._alloc_lock:
+            if self._allocated_count < self._max_slots:
+                self._allocated_count += 1
+                self._in_flight += 1
+                return self._build_memory_obj()
+            self._over_subscriptions += 1
+        # Over-subscription: fresh one-shot, not pooled.  Still counts
+        # toward in-flight so the LRU sees the real memory it holds.
+        self._in_flight += 1
+        return self._build_memory_obj()
+
+    def free(self, memory_obj: MemoryObj, allocator_type=None) -> None:
+        """Return a slab-borrowed MemoryObj to the deque.
+
+        No-op if the deque is already at ``max_slots`` (one-shot
+        objects GC naturally).  Marks the object invalid before
+        pooling so :meth:`TensorMemoryObj.__del__`'s safety-net
+        ``parent_allocator.free`` call doesn't re-enter and re-pool.
+        """
+        if not isinstance(memory_obj, TensorMemoryObj):
+            return
+        if memory_obj.meta.shapes != [self._shape]:
+            return
+        memory_obj.valid = False
+        # Drop ``in_flight`` for every freed object, pooled or one-shot.
+        # Brief races can take it negative; the read in
+        # ``get_used_capacity_bytes`` clamps.
+        self._in_flight -= 1
+        if len(self._free) >= self._max_slots:
+            return
+        self._free.append(memory_obj)
+
+    def batched_free(
+        self,
+        memory_objs: list[MemoryObj],
+        allocator_type=None,
+        update_stats: bool = True,
+    ) -> None:
+        for obj in memory_objs:
+            self.free(obj)
+
+    def close(self) -> None:
+        """Drop all pooled MemoryObjs; the slab cannot be reused after."""
+        self._free.clear()
+        self._allocated_count = 0
+
+    def memcheck(self) -> bool:
+        return True
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "allocated": self._allocated_count,
+            "free": len(self._free),
+            "over_subscriptions": self._over_subscriptions,
+            "in_flight": self._in_flight,
+        }
+
+    # ----- L1MemoryUsageProvider protocol -----
+
+    def get_used_capacity_bytes(self) -> tuple[int, int]:
+        """Bytes held by live K-child MemoryObjs + the configured cap.
+
+        ``used`` counts every outstanding ``allocate`` -- pool-backed
+        and over-subscription one-shots -- so the LRU policy sees true
+        K-child memory pressure, not just the pooled subset.  The PR-9
+        pod measurement showed the prior formula
+        (allocated_count - free_count) silently dropped the one-shots,
+        leaving the eviction policy blind to most of the K-child
+        footprint under heavy producer load.
+
+        ``capacity`` is the configured pool upper bound.  Under
+        over-subscription, ``used`` may exceed ``capacity`` and the
+        policy's used/capacity ratio crosses 1.0 -- this correctly
+        signals "evict harder" rather than papering over the
+        pressure.
+        """
+        used = max(0, self._in_flight) * self._phy_size
+        capacity = self._max_slots * self._phy_size
+        return used, capacity
 
 
 class _VScratchSlot:
@@ -307,6 +572,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         placement_mode: StoragePlacementMode = StoragePlacementMode.KV_TOGETHER,
         split_tier_manifest: SplitTierManifest | None = None,
         v_scratch_max_slots: int = 64,
+        k_child_max_slots: int = 256,
     ) -> None:
         super().__init__()
         self._inner = inner
@@ -349,6 +615,15 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         self._v_scratch_slab: _VScratchSlab | None = None
         self._v_scratch_max_slots = max(1, v_scratch_max_slots)
         self._v_scratch_init_lock = threading.Lock()
+
+        # K-child slab (lazy-init, same shape-pinning model as the V
+        # scratch slab).  Pre-allocated K-shape ``TensorMemoryObj``s
+        # registered into L1Manager via ``reserve_external_writes``;
+        # skips ``L1MemoryManager.allocate``'s address-manager scan on
+        # every K-child store.  ``None`` outside split-tier.
+        self._k_child_slab: _KChildSlab | None = None
+        self._k_child_max_slots = max(1, k_child_max_slots)
+        self._k_child_init_lock = threading.Lock()
 
         # Our own notifiers for store/load completion. Lookup passes the
         # inner adapter's fd straight through (no chaining needed there).
@@ -730,6 +1005,17 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         if self._split_tier_copy_pool is not None:
             self._split_tier_copy_pool.shutdown(wait=True)
             self._split_tier_copy_pool = None
+
+        # Unregister both slabs from L1's usage aggregation so the
+        # L1Manager doesn't keep stale references after the wrapper
+        # goes away.  Idempotent if the slab was never registered.
+        for slab in (self._k_child_slab, self._v_scratch_slab):
+            if slab is None:
+                continue
+            try:
+                self._l1_manager.unregister_external_memory_provider(slab)
+            except AttributeError:
+                pass
 
         # Shut down the inner adapter and serde processor BEFORE
         # releasing temp buffers. Both ``close()`` calls block until
@@ -1158,12 +1444,40 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
             dtypes=[dtypes[0]],
         )
 
-        results = self._l1_manager.reserve_write(
-            keys=k_child_keys,
-            is_temporary=[False] * len(k_child_keys),
-            layout_desc=k_layout,
-            mode="new",
-        )
+        # Try the K-child slab first.  The slab carries pre-allocated
+        # K-shape ``TensorMemoryObj``s with itself as parent_allocator,
+        # so L1Manager skips ``L1MemoryManager.allocate``'s address-
+        # manager scan and the eventual L1Manager.delete returns the
+        # buffer to the slab's deque (no fragmentation in the address
+        # manager).  Falls back to the default reserve_write path if
+        # the slab is exhausted or shape-mismatched.
+        slab = self._ensure_k_child_slab(shapes[0], dtypes[0])
+        slab_objs = slab.batched_allocate(
+            [shapes[0]], [dtypes[0]], len(k_child_keys)
+        ) if slab is not None else None
+        if slab_objs is not None and len(slab_objs) == len(k_child_keys):
+            results = self._l1_manager.reserve_external_writes(
+                keys=k_child_keys,
+                memory_objs=slab_objs,
+                is_temporary=[False] * len(k_child_keys),
+            )
+            # If reserve_external_writes hit a collision on any key
+            # (KEY_NOT_WRITABLE -- the K-child already exists from a
+            # prior incomplete store), recycle the unused slab objects
+            # so they don't leak.
+            for k_child_key, obj in zip(
+                k_child_keys, slab_objs, strict=True
+            ):
+                r = results.get(k_child_key)
+                if r is None or r[0] != L1Error.SUCCESS:
+                    slab.free(obj)
+        else:
+            results = self._l1_manager.reserve_write(
+                keys=k_child_keys,
+                is_temporary=[False] * len(k_child_keys),
+                layout_desc=k_layout,
+                mode="new",
+            )
         # All-or-nothing on K-child allocations.
         successful: list[ObjectKey] = []
         for k_child_key in k_child_keys:
@@ -1269,6 +1583,57 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
             out.append(scratch)
         return out
 
+    def _ensure_k_child_slab(
+        self,
+        shape: torch.Size,
+        dtype: torch.dtype,
+    ) -> _KChildSlab | None:
+        """Build the K-child slab on first split-tier store.
+
+        Shape-pinned at first use; subsequent batches with the same
+        K shape hit the slab, others fall through to the regular
+        reserve_write path (the slab's :meth:`_KChildSlab.allocate`
+        ignores the requested shape because we *also* check
+        ``shapes[0]`` matches the slab's pinned shape here -- a
+        mismatch returns ``None`` to make the caller take the regular
+        path).
+        """
+        slab = self._k_child_slab
+        if slab is not None:
+            if slab._shape == shape and slab._dtype == dtype:
+                return slab
+            # Shape mismatch (a fresh wrapper would see one shape for
+            # its lifetime; this branch is defensive).
+            return None
+        with self._k_child_init_lock:
+            if self._k_child_slab is None:
+                self._k_child_slab = _KChildSlab(
+                    shape=shape,
+                    dtype=dtype,
+                    max_slots=self._k_child_max_slots,
+                )
+                # Make the slab's bytes visible to L1's get_memory_usage
+                # so the eviction policy reads true L1 pressure (the
+                # slab provides backing for K-child residents that
+                # bypass L1Manager's own allocator -- without this hook
+                # those bytes are invisible to LRU and eviction never
+                # fires under K-child pressure).
+                try:
+                    self._l1_manager.register_external_memory_provider(
+                        self._k_child_slab
+                    )
+                except Exception:
+                    # Older L1Manager without the hook -- log and
+                    # continue.  The slab still functions; only the
+                    # accounting visibility is lost.
+                    logger.warning(
+                        "Serde wrapper: L1Manager has no "
+                        "register_external_memory_provider hook; "
+                        "K-child slab bytes will not be visible to "
+                        "the eviction policy"
+                    )
+            return self._k_child_slab
+
     def _ensure_v_scratch_slab(
         self,
         shape: torch.Size,
@@ -1292,6 +1657,22 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
                     dtype=dtype,
                     max_slots=self._v_scratch_max_slots,
                 )
+                # Register V-scratch with L1's usage aggregation too.
+                # V-scratch tensors live for the duration of the V codec
+                # + L2 write; under saturation a meaningful number are
+                # in flight at once (~1.5 GiB at 3000 chunks * 512 KiB),
+                # and the LRU policy needs to see them as L1 pressure.
+                try:
+                    self._l1_manager.register_external_memory_provider(
+                        self._v_scratch_slab
+                    )
+                except Exception:
+                    logger.warning(
+                        "Serde wrapper: L1Manager has no "
+                        "register_external_memory_provider hook; "
+                        "V-scratch slab bytes will not be visible to "
+                        "the eviction policy"
+                    )
             return self._v_scratch_slab
 
     def _return_v_scratch(self, tensors: list[torch.Tensor]) -> None:
