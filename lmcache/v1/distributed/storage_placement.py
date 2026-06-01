@@ -79,7 +79,8 @@ from __future__ import annotations
 
 # Standard
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
+import threading
 
 # First Party
 from lmcache.v1.distributed.api import ObjectKey
@@ -153,6 +154,134 @@ def derive_component_key(logical_key: ObjectKey, role: str) -> ObjectKey:
         kv_rank=logical_key.kv_rank,
         cache_salt=logical_key.cache_salt,
     )
+
+
+class SplitTierManifest:
+    """Thread-safe manifest of split-tier state per logical
+    :class:`ObjectKey`.
+
+    Owned by :class:`StorageManager` (codex: lives there, not in the
+    wrapper, so it composes with eviction and quota accounting).
+    The wrapper queries / mutates it through the StorageManager's
+    interface during store and load.
+
+    Operations are linear-forward (mirrors :class:`SplitTierState`):
+    ``STORE_IN_FLIGHT`` → ``COMPLETE`` → ``INVALIDATED`` →
+    ``DELETE_IN_FLIGHT``.  A key never moves to an earlier state;
+    invalid transitions raise :class:`ValueError` so a race in the
+    wrapper surfaces immediately rather than silently corrupting
+    the lifecycle.
+
+    Lookup against an unregistered logical key returns ``None``;
+    callers MUST treat that as "miss" (the composite cache entry
+    does not exist).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: dict[ObjectKey, SplitTierState] = {}
+
+    def register_pending(self, logical_key: ObjectKey) -> None:
+        """Mark a logical key as ``STORE_IN_FLIGHT``.
+
+        Raises:
+            ValueError: if the key is already tracked (a duplicate
+                store under the same logical key would be a wrapper
+                bug; surface it loudly).
+        """
+        with self._lock:
+            if logical_key in self._entries:
+                raise ValueError(
+                    f"SplitTierManifest.register_pending: key already "
+                    f"tracked in state {self._entries[logical_key].name}"
+                )
+            self._entries[logical_key] = SplitTierState.STORE_IN_FLIGHT
+
+    def mark_complete(self, logical_key: ObjectKey) -> None:
+        """Transition ``STORE_IN_FLIGHT`` → ``COMPLETE``.
+
+        The inner L2 store has acknowledged; lookup may now resolve
+        as a composite hit.
+
+        Raises:
+            ValueError: if the key is not in ``STORE_IN_FLIGHT``.
+        """
+        with self._lock:
+            cur = self._entries.get(logical_key)
+            if cur != SplitTierState.STORE_IN_FLIGHT:
+                raise ValueError(
+                    f"SplitTierManifest.mark_complete: key in state "
+                    f"{cur.name if cur else 'UNTRACKED'}; expected "
+                    f"STORE_IN_FLIGHT"
+                )
+            self._entries[logical_key] = SplitTierState.COMPLETE
+
+    def mark_invalidated(self, logical_key: ObjectKey) -> None:
+        """Mark a logical key as ``INVALIDATED``.
+
+        Lookup returns "miss" from this point on; physical cleanup
+        (K child in L1 + V child on L2) proceeds in the background
+        per the eviction controller's policy.  Acceptable to
+        invalidate from any state (including ``STORE_IN_FLIGHT``
+        if a failed store needs to clean up).
+        """
+        with self._lock:
+            if logical_key not in self._entries:
+                return
+            cur = self._entries[logical_key]
+            if cur in (SplitTierState.INVALIDATED, SplitTierState.DELETE_IN_FLIGHT):
+                # Already invalidated / being deleted; idempotent.
+                return
+            self._entries[logical_key] = SplitTierState.INVALIDATED
+
+    def mark_delete_in_flight(self, logical_key: ObjectKey) -> None:
+        """Transition ``INVALIDATED`` → ``DELETE_IN_FLIGHT``.
+
+        K child deletion in L1 has completed; the V child delete is
+        enqueued against the L2 adapter.  The manifest entry is
+        removed via :meth:`drop` after the L2 delete acknowledges
+        (or after a cleanup timeout for adapters without ``delete()``;
+        the V orphan is tolerable cold-tier waste).
+
+        Raises:
+            ValueError: if the key is not in ``INVALIDATED``.
+        """
+        with self._lock:
+            cur = self._entries.get(logical_key)
+            if cur != SplitTierState.INVALIDATED:
+                raise ValueError(
+                    f"SplitTierManifest.mark_delete_in_flight: key in "
+                    f"state {cur.name if cur else 'UNTRACKED'}; expected "
+                    f"INVALIDATED"
+                )
+            self._entries[logical_key] = SplitTierState.DELETE_IN_FLIGHT
+
+    def drop(self, logical_key: ObjectKey) -> None:
+        """Remove the manifest entry for ``logical_key``.
+
+        Called after physical cleanup completes; no further state
+        transitions are possible.  Idempotent.
+        """
+        with self._lock:
+            self._entries.pop(logical_key, None)
+
+    def lookup(self, logical_key: ObjectKey) -> Optional["SplitTierState"]:
+        """Return the manifest state for ``logical_key``, or ``None``.
+
+        Threadsafe snapshot; callers that need to act on the result
+        atomically should call :meth:`mark_*` immediately (the
+        transitions are themselves atomic and locked).
+        """
+        with self._lock:
+            return self._entries.get(logical_key)
+
+    def is_complete(self, logical_key: ObjectKey) -> bool:
+        """Convenience: ``True`` iff lookup resolves to a composite hit."""
+        return self.lookup(logical_key) == SplitTierState.COMPLETE
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
 
 
 class SplitTierState(Enum):

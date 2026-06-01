@@ -55,6 +55,7 @@ from lmcache.v1.distributed.storage_layout import (
     derive_storage_layout_mode,
 )
 from lmcache.v1.distributed.storage_placement import (
+    SplitTierManifest,
     StoragePlacementMode,
     derive_storage_placement_mode,
 )
@@ -103,6 +104,12 @@ class StorageManager:
         self._storage_placement_mode = derive_storage_placement_mode(
             config.l2_adapter_config.adapters
         )
+
+        # Per-logical-key state machine for KV_SPLIT_TIER.  Always
+        # constructed (cheap; empty when placement is KV_TOGETHER).
+        # The wrapper queries and mutates this manifest as part of
+        # the V-only store / load composition.
+        self._split_tier_manifest = SplitTierManifest()
 
         # L2 adapters and store controller. When an adapter config carries
         # a ``serde_config``, the adapter is wrapped with
@@ -195,6 +202,20 @@ class StorageManager:
         )
 
     # External APIs for serving engine integration code to call
+
+    @property
+    def split_tier_manifest(self) -> SplitTierManifest:
+        """The per-logical-key state machine for KV_SPLIT_TIER mode.
+
+        Always present (empty when placement is :attr:`KV_TOGETHER`).
+        The wrapper drives transitions during store / load; the
+        eviction controller drives invalidation + delete-in-flight
+        transitions during paired cleanup.
+
+        Exposed as a property so the wrapper can hold a reference
+        without needing the whole StorageManager.
+        """
+        return self._split_tier_manifest
 
     @property
     def storage_placement_mode(self) -> StoragePlacementMode:
