@@ -67,17 +67,13 @@ def test_derive_storage_layout_mode_fp8_returns_packed() -> None:
 def test_derive_storage_layout_mode_asym_returns_kv_component_groups() -> None:
     """A multi-output asym_k16_v8 serde -> KV_COMPONENT_GROUPS."""
     cfgs = [_FakeAdapterCfg(serde_config=SerdeConfig(type="asym_k16_v8"))]
-    assert (
-        derive_storage_layout_mode(cfgs) == StorageLayoutMode.KV_COMPONENT_GROUPS
-    )
+    assert derive_storage_layout_mode(cfgs) == StorageLayoutMode.KV_COMPONENT_GROUPS
 
 
 def test_derive_storage_layout_mode_asym_v_only_returns_kv_component_groups() -> None:
     """The V-only variant is also multi-output -> KV_COMPONENT_GROUPS."""
     cfgs = [_FakeAdapterCfg(serde_config=SerdeConfig(type="asym_k16_v8_v_only"))]
-    assert (
-        derive_storage_layout_mode(cfgs) == StorageLayoutMode.KV_COMPONENT_GROUPS
-    )
+    assert derive_storage_layout_mode(cfgs) == StorageLayoutMode.KV_COMPONENT_GROUPS
 
 
 def test_derive_storage_layout_mode_all_packed_returns_packed() -> None:
@@ -98,9 +94,7 @@ def test_derive_storage_layout_mode_all_kv_components_returns_kv_components() ->
         _FakeAdapterCfg(serde_config=SerdeConfig(type="asym_k16_v8")),
         _FakeAdapterCfg(serde_config=SerdeConfig(type="asym_k16_v8_v_only")),
     ]
-    assert (
-        derive_storage_layout_mode(cfgs) == StorageLayoutMode.KV_COMPONENT_GROUPS
-    )
+    assert derive_storage_layout_mode(cfgs) == StorageLayoutMode.KV_COMPONENT_GROUPS
 
 
 def test_derive_storage_layout_mode_mixed_rejected() -> None:
@@ -150,8 +144,12 @@ def test_apply_kv_component_split_preserves_total_bytes() -> None:
         dtypes=[torch.bfloat16],
     )
     split = apply_kv_component_split(packed)
-    packed_bytes = sum(s.numel() * d.itemsize for s, d in zip(packed.shapes, packed.dtypes))
-    split_bytes = sum(s.numel() * d.itemsize for s, d in zip(split.shapes, split.dtypes))
+    packed_bytes = sum(
+        s.numel() * d.itemsize for s, d in zip(packed.shapes, packed.dtypes)
+    )
+    split_bytes = sum(
+        s.numel() * d.itemsize for s, d in zip(split.shapes, split.dtypes)
+    )
     assert packed_bytes == split_bytes
 
 

@@ -111,6 +111,15 @@ class GDSL1MemoryManager:
         total_size = self._address_manager.get_heap_size()
         return total_size - free_size, total_size
 
+    def register_external_memory_provider(self, provider: object) -> None:
+        """No-op: the GDS slab tier has no external-provider accounting
+        (the serde slab pool augments the CPU DRAM tier, not GDS)."""
+        return
+
+    def unregister_external_memory_provider(self, provider: object) -> None:
+        """No-op counterpart to :meth:`register_external_memory_provider`."""
+        return
+
     def get_l1_memory_desc(self) -> Optional[L1MemoryDesc]:
         """Return ``None``: the GDS L1 medium is the slab file, not a buffer.
 

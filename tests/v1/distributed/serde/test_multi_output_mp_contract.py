@@ -250,7 +250,9 @@ def test_single_output_bridge_backcompat() -> None:
     md = single_to_multi_deserializer(_IdentityDeserializer())
     assert ms.group_size == 1 and md.group_size == 1
     payload = _sentinel_obj(1024, 0x5A)
-    layout = (MemoryLayoutDesc(shapes=[payload.tensor.shape], dtypes=[payload.tensor.dtype]),)
+    layout = (
+        MemoryLayoutDesc(shapes=[payload.tensor.shape], dtypes=[payload.tensor.dtype]),
+    )
     buf = _byte_buffer(ms.estimate_serialized_size(layout))
     ms.serialize((payload,), buf)
     out = (_byte_buffer(1024),)
@@ -313,16 +315,21 @@ def test_multi_output_through_async_processor_roundtrip() -> None:
     try:
         src = tuple(_sentinel_obj(nbytes, fill) for _, nbytes, fill in (_K, _V))
         layout = tuple(
-            MemoryLayoutDesc(shapes=[o.tensor.shape], dtypes=[o.tensor.dtype]) for o in src
+            MemoryLayoutDesc(shapes=[o.tensor.shape], dtypes=[o.tensor.dtype])
+            for o in src
         )
         buf = _byte_buffer(s.estimate_serialized_size(layout))
         sid = proc.submit_serialize([src], [buf])  # group as a single work item
-        assert _wait_for_fd(proc.get_serialize_event_fd()), "serialize fd never signaled"
+        assert _wait_for_fd(proc.get_serialize_event_fd()), (
+            "serialize fd never signaled"
+        )
         assert proc.query_serialize_result(sid) is True
 
         out = tuple(_byte_buffer(nbytes) for _, nbytes, _ in (_K, _V))
         did = proc.submit_deserialize([buf], [out])
-        assert _wait_for_fd(proc.get_deserialize_event_fd()), "deserialize fd never signaled"
+        assert _wait_for_fd(proc.get_deserialize_event_fd()), (
+            "deserialize fd never signaled"
+        )
         assert proc.query_deserialize_result(did) is True
         for (_, _, fill), o in zip((_K, _V), out):
             assert torch.all(o.tensor == fill)
