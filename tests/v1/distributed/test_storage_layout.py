@@ -13,12 +13,16 @@ Covers:
 # Future
 from __future__ import annotations
 
+# Standard
+from typing import cast
+
 # Third Party
 import pytest
 import torch
 
 # First Party
 from lmcache.v1.distributed.api import MemoryLayoutDesc
+from lmcache.v1.distributed.l2_adapters.config import L2AdapterConfigBase
 from lmcache.v1.distributed.serde import SerdeConfig
 from lmcache.v1.distributed.storage_layout import (
     StorageLayoutMode,
@@ -42,6 +46,11 @@ class _FakeAdapterCfg:
         self.serde_config = serde_config
 
 
+def _cfgs(*cfgs: _FakeAdapterCfg) -> list[L2AdapterConfigBase]:
+    """Cast test stand-ins to the production adapter-config list type."""
+    return cast("list[L2AdapterConfigBase]", list(cfgs))
+
+
 # =============================================================================
 # derive_storage_layout_mode
 # =============================================================================
@@ -55,25 +64,31 @@ def test_derive_storage_layout_mode_empty_returns_packed() -> None:
 def test_derive_storage_layout_mode_no_serde_returns_packed() -> None:
     """An adapter without a serde_config -> packed."""
     cfgs = [_FakeAdapterCfg(serde_config=None)]
-    assert derive_storage_layout_mode(cfgs) == StorageLayoutMode.PACKED
+    assert derive_storage_layout_mode(_cfgs(*cfgs)) == StorageLayoutMode.PACKED
 
 
 def test_derive_storage_layout_mode_fp8_returns_packed() -> None:
     """The built-in single-tensor fp8 serde -> packed."""
     cfgs = [_FakeAdapterCfg(serde_config=SerdeConfig(type="fp8"))]
-    assert derive_storage_layout_mode(cfgs) == StorageLayoutMode.PACKED
+    assert derive_storage_layout_mode(_cfgs(*cfgs)) == StorageLayoutMode.PACKED
 
 
 def test_derive_storage_layout_mode_asym_returns_kv_component_groups() -> None:
     """A multi-output asym_k16_v8 serde -> KV_COMPONENT_GROUPS."""
     cfgs = [_FakeAdapterCfg(serde_config=SerdeConfig(type="asym_k16_v8"))]
-    assert derive_storage_layout_mode(cfgs) == StorageLayoutMode.KV_COMPONENT_GROUPS
+    assert (
+        derive_storage_layout_mode(_cfgs(*cfgs))
+        == StorageLayoutMode.KV_COMPONENT_GROUPS
+    )
 
 
 def test_derive_storage_layout_mode_asym_v_only_returns_kv_component_groups() -> None:
     """The V-only variant is also multi-output -> KV_COMPONENT_GROUPS."""
     cfgs = [_FakeAdapterCfg(serde_config=SerdeConfig(type="asym_k16_v8_v_only"))]
-    assert derive_storage_layout_mode(cfgs) == StorageLayoutMode.KV_COMPONENT_GROUPS
+    assert (
+        derive_storage_layout_mode(_cfgs(*cfgs))
+        == StorageLayoutMode.KV_COMPONENT_GROUPS
+    )
 
 
 def test_derive_storage_layout_mode_all_packed_returns_packed() -> None:
@@ -84,7 +99,7 @@ def test_derive_storage_layout_mode_all_packed_returns_packed() -> None:
         _FakeAdapterCfg(serde_config=SerdeConfig(type="fp8")),
         _FakeAdapterCfg(serde_config=None),
     ]
-    assert derive_storage_layout_mode(cfgs) == StorageLayoutMode.PACKED
+    assert derive_storage_layout_mode(_cfgs(*cfgs)) == StorageLayoutMode.PACKED
 
 
 def test_derive_storage_layout_mode_all_kv_components_returns_kv_components() -> None:
@@ -94,7 +109,10 @@ def test_derive_storage_layout_mode_all_kv_components_returns_kv_components() ->
         _FakeAdapterCfg(serde_config=SerdeConfig(type="asym_k16_v8")),
         _FakeAdapterCfg(serde_config=SerdeConfig(type="asym_k16_v8_v_only")),
     ]
-    assert derive_storage_layout_mode(cfgs) == StorageLayoutMode.KV_COMPONENT_GROUPS
+    assert (
+        derive_storage_layout_mode(_cfgs(*cfgs))
+        == StorageLayoutMode.KV_COMPONENT_GROUPS
+    )
 
 
 def test_derive_storage_layout_mode_mixed_rejected() -> None:
@@ -105,7 +123,7 @@ def test_derive_storage_layout_mode_mixed_rejected() -> None:
         _FakeAdapterCfg(serde_config=SerdeConfig(type="asym_k16_v8")),
     ]
     with pytest.raises(ValueError, match="Incompatible L2 adapter storage layout"):
-        derive_storage_layout_mode(cfgs)
+        derive_storage_layout_mode(_cfgs(*cfgs))
 
 
 def test_derive_storage_layout_mode_mixed_no_serde_and_multi_rejected() -> None:
@@ -116,7 +134,7 @@ def test_derive_storage_layout_mode_mixed_no_serde_and_multi_rejected() -> None:
         _FakeAdapterCfg(serde_config=SerdeConfig(type="asym_k16_v8")),
     ]
     with pytest.raises(ValueError, match="Incompatible L2 adapter storage layout"):
-        derive_storage_layout_mode(cfgs)
+        derive_storage_layout_mode(_cfgs(*cfgs))
 
 
 # =============================================================================
@@ -146,10 +164,10 @@ def test_apply_kv_component_split_preserves_total_bytes() -> None:
     split = apply_kv_component_split(packed)
     packed_bytes = sum(
         s.numel() * d.itemsize
-        for s, d in zip(packed.shapes, packed.dtypes, strict=False)
+        for s, d in zip(packed.shapes, packed.dtypes, strict=True)
     )
     split_bytes = sum(
-        s.numel() * d.itemsize for s, d in zip(split.shapes, split.dtypes, strict=False)
+        s.numel() * d.itemsize for s, d in zip(split.shapes, split.dtypes, strict=True)
     )
     assert packed_bytes == split_bytes
 
