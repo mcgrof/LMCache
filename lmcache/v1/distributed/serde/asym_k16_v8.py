@@ -580,9 +580,7 @@ def _resolve_scale_scope(name: str) -> ScaleScope:
         return ScaleScope[name]
     except KeyError as e:
         valid = ", ".join(s.name for s in ScaleScope)
-        raise ValueError(
-            f"Unknown ScaleScope {name!r}. Valid: {valid}"
-        ) from e
+        raise ValueError(f"Unknown ScaleScope {name!r}. Valid: {valid}") from e
 
 
 def _create_asym_k16_v8_serde(kwargs: dict[str, object]) -> SerdeProcessor:
