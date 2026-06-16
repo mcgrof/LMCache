@@ -250,9 +250,7 @@ class L1Manager:
         with self._lock:
             self._registered_listeners.append(listener)
 
-    def set_split_tier_manifest(
-        self, manifest: "SplitTierManifest | None"
-    ) -> None:
+    def set_split_tier_manifest(self, manifest: "SplitTierManifest | None") -> None:
         """Wire a split-tier manifest so :meth:`is_key_evictable` can
         gate K-child evictions on the manifest state.
 
@@ -652,9 +650,7 @@ class L1Manager:
 
         ret: dict[ObjectKey, L1OperationResult] = {}
         successful_keys: list[ObjectKey] = []
-        for key, mem_obj, is_temp in zip(
-            keys, memory_objs, is_temporary, strict=True
-        ):
+        for key, mem_obj, is_temp in zip(keys, memory_objs, is_temporary, strict=True):
             if key in self._objects:
                 ret[key] = (L1Error.KEY_NOT_WRITABLE, None)
                 continue

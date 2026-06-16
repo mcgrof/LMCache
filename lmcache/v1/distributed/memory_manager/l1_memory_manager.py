@@ -48,6 +48,7 @@ class L1MemoryUsageProvider(Protocol):
         """
         ...
 
+
 logger = init_logger(__name__)
 
 

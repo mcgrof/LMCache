@@ -145,9 +145,7 @@ def derive_component_key(logical_key: ObjectKey, role: str) -> ObjectKey:
     elif role == "v":
         marker = _V_CHILD_MARKER
     else:
-        raise ValueError(
-            f"derive_component_key: role must be 'k' or 'v', got {role!r}"
-        )
+        raise ValueError(f"derive_component_key: role must be 'k' or 'v', got {role!r}")
     return ObjectKey(
         chunk_hash=logical_key.chunk_hash + marker,
         model_name=logical_key.model_name,
@@ -252,9 +250,7 @@ class SplitTierManifest:
                     f"tracked in state {self._entries[logical_key].name}"
                 )
             self._entries[logical_key] = SplitTierState.STORE_IN_FLIGHT
-            self._k_child_keys.add(
-                derive_component_key(logical_key, "k")
-            )
+            self._k_child_keys.add(derive_component_key(logical_key, "k"))
 
     def mark_complete(self, logical_key: ObjectKey) -> None:
         """Transition ``STORE_IN_FLIGHT`` → ``COMPLETE``.
@@ -324,9 +320,7 @@ class SplitTierManifest:
         """
         with self._lock:
             self._entries.pop(logical_key, None)
-            self._k_child_keys.discard(
-                derive_component_key(logical_key, "k")
-            )
+            self._k_child_keys.discard(derive_component_key(logical_key, "k"))
 
     def is_k_child_key(self, key: ObjectKey) -> bool:
         """``True`` iff ``key`` is currently tracked as a K-child of

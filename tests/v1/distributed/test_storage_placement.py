@@ -187,46 +187,32 @@ def test_reverse_component_key_handles_empty_hash() -> None:
 
 def test_derive_placement_mode_empty_returns_kv_together() -> None:
     """No adapters -> default kv_together."""
-    assert (
-        derive_storage_placement_mode([]) == StoragePlacementMode.KV_TOGETHER
-    )
+    assert derive_storage_placement_mode([]) == StoragePlacementMode.KV_TOGETHER
 
 
 def test_derive_placement_mode_no_serde_returns_kv_together() -> None:
     cfgs = [_FakeAdapterCfg(serde_config=None)]
-    assert (
-        derive_storage_placement_mode(cfgs)
-        == StoragePlacementMode.KV_TOGETHER
-    )
+    assert derive_storage_placement_mode(cfgs) == StoragePlacementMode.KV_TOGETHER
 
 
 def test_derive_placement_mode_fp8_returns_kv_together() -> None:
     """Single-tensor serdes (no slot mapping) place K+V together."""
     cfgs = [_FakeAdapterCfg(serde_config=SerdeConfig(type="fp8"))]
-    assert (
-        derive_storage_placement_mode(cfgs)
-        == StoragePlacementMode.KV_TOGETHER
-    )
+    assert derive_storage_placement_mode(cfgs) == StoragePlacementMode.KV_TOGETHER
 
 
 def test_derive_placement_mode_asym_mode_1_returns_kv_together() -> None:
     """asym_k16_v8 storage-only: identity mapping (0, 1), no None
     slots -> both children in one blob (kv_together)."""
     cfgs = [_FakeAdapterCfg(serde_config=SerdeConfig(type="asym_k16_v8"))]
-    assert (
-        derive_storage_placement_mode(cfgs)
-        == StoragePlacementMode.KV_TOGETHER
-    )
+    assert derive_storage_placement_mode(cfgs) == StoragePlacementMode.KV_TOGETHER
 
 
 def test_derive_placement_mode_asym_v_only_returns_kv_split_tier() -> None:
     """asym_k16_v8_v_only: mapping (None, 1), so slot 0 (K) is
     absent from the L2 path -> split-tier placement."""
     cfgs = [_FakeAdapterCfg(serde_config=SerdeConfig(type="asym_k16_v8_v_only"))]
-    assert (
-        derive_storage_placement_mode(cfgs)
-        == StoragePlacementMode.KV_SPLIT_TIER
-    )
+    assert derive_storage_placement_mode(cfgs) == StoragePlacementMode.KV_SPLIT_TIER
 
 
 def test_derive_placement_mode_mixed_rejected() -> None:
@@ -257,10 +243,7 @@ def test_derive_placement_mode_two_v_only_adapters_returns_split_tier() -> None:
         _FakeAdapterCfg(serde_config=SerdeConfig(type="asym_k16_v8_v_only")),
         _FakeAdapterCfg(serde_config=SerdeConfig(type="asym_k16_v8_v_only")),
     ]
-    assert (
-        derive_storage_placement_mode(cfgs)
-        == StoragePlacementMode.KV_SPLIT_TIER
-    )
+    assert derive_storage_placement_mode(cfgs) == StoragePlacementMode.KV_SPLIT_TIER
 
 
 # =============================================================================

@@ -210,7 +210,9 @@ def test_create_asym_k16_v8_returns_async_processor_with_identity_mapping() -> N
         processor.close()
 
 
-def test_create_asym_k16_v8_v_only_returns_async_processor_with_skip_k_mapping() -> None:
+def test_create_asym_k16_v8_v_only_returns_async_processor_with_skip_k_mapping() -> (
+    None
+):
     """V-only Mode 2: (None, 1) slot mapping — slot 0 is absent (K stays
     in L1), slot 1 reads parent group 1 (V)."""
     processor = create_serde_processor(SerdeConfig(type="asym_k16_v8_v_only"))

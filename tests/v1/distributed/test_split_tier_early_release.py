@@ -54,9 +54,7 @@ def test_slab_acquire_returns_tensor_with_configured_shape_dtype() -> None:
 
 
 def test_slab_release_makes_tensor_reusable() -> None:
-    slab = _VScratchSlab(
-        shape=torch.Size([2]), dtype=torch.float16, max_slots=2
-    )
+    slab = _VScratchSlab(shape=torch.Size([2]), dtype=torch.float16, max_slots=2)
     t1 = slab.acquire()
     slab.release(t1)
     t2 = slab.acquire()
@@ -65,9 +63,7 @@ def test_slab_release_makes_tensor_reusable() -> None:
 
 
 def test_slab_over_subscription_returns_one_shot_tensor() -> None:
-    slab = _VScratchSlab(
-        shape=torch.Size([2]), dtype=torch.float16, max_slots=1
-    )
+    slab = _VScratchSlab(shape=torch.Size([2]), dtype=torch.float16, max_slots=1)
     # First acquire fills the slab to cap; second over-subscribes.
     t1 = slab.acquire()
     t2 = slab.acquire()
@@ -79,9 +75,7 @@ def test_slab_over_subscription_returns_one_shot_tensor() -> None:
 
 
 def test_slab_release_rejects_mismatched_shape() -> None:
-    slab = _VScratchSlab(
-        shape=torch.Size([4]), dtype=torch.float16, max_slots=4
-    )
+    slab = _VScratchSlab(shape=torch.Size([4]), dtype=torch.float16, max_slots=4)
     foreign = torch.empty(2, dtype=torch.float16)
     slab.release(foreign)  # silently dropped, must not raise
     stats = slab.stats()
@@ -89,9 +83,7 @@ def test_slab_release_rejects_mismatched_shape() -> None:
 
 
 def test_slab_release_caps_queue_at_max_slots() -> None:
-    slab = _VScratchSlab(
-        shape=torch.Size([2]), dtype=torch.float16, max_slots=2
-    )
+    slab = _VScratchSlab(shape=torch.Size([2]), dtype=torch.float16, max_slots=2)
     # Release more than max_slots distinct tensors -- extras silently
     # drop instead of growing the queue beyond the configured bound.
     for _ in range(5):
@@ -118,6 +110,7 @@ def test_v_scratch_slot_exposes_tensor() -> None:
 @dataclass
 class _Capture:
     """Records calls to L1Manager + inner adapter for assertions."""
+
     finish_read_calls: list[list]
     delete_calls: list[list]
     inner_submit_calls: list[tuple]
@@ -140,6 +133,7 @@ class _FakeL1Manager:
 
     def reserve_write(self, keys, is_temporary, layout_desc, mode):
         from lmcache.v1.distributed.error import L1Error
+
         # Allocate a tiny placeholder MemoryObj-like per key.
         out = {}
         for k in keys:
@@ -154,10 +148,9 @@ class _FakeL1Manager:
 
     def reserve_read(self, keys):
         from lmcache.v1.distributed.error import L1Error
+
         return {
-            k: (L1Error.SUCCESS, self._objects[k])
-            for k in keys
-            if k in self._objects
+            k: (L1Error.SUCCESS, self._objects[k]) for k in keys if k in self._objects
         }
 
     def finish_read(self, keys) -> None:
@@ -223,6 +216,7 @@ class _FakeInnerAdapter:
     def __init__(self, capture: _Capture) -> None:
         self._capture = capture
         from lmcache.v1.platform import create_event_notifier
+
         self._efd = create_event_notifier()
 
     def get_store_event_fd(self) -> int:
@@ -231,12 +225,14 @@ class _FakeInnerAdapter:
     def get_load_event_fd(self) -> int:
         # Distinct fd to satisfy the wrapper's poll-loop invariant.
         from lmcache.v1.platform import create_event_notifier
+
         if not hasattr(self, "_load_efd"):
             self._load_efd = create_event_notifier()
         return self._load_efd.fileno()
 
     def get_lookup_and_lock_event_fd(self) -> int:
         from lmcache.v1.platform import create_event_notifier
+
         if not hasattr(self, "_lookup_efd"):
             self._lookup_efd = create_event_notifier()
         return self._lookup_efd.fileno()
@@ -274,6 +270,7 @@ class _FakeSerdeProcessor:
 
     def __init__(self) -> None:
         from lmcache.v1.platform import create_event_notifier
+
         self._efd = create_event_notifier()
         self._next_id = 0
 
@@ -282,6 +279,7 @@ class _FakeSerdeProcessor:
 
     def get_deserialize_event_fd(self) -> int:
         from lmcache.v1.platform import create_event_notifier
+
         if not hasattr(self, "_d_efd"):
             self._d_efd = create_event_notifier()
         return self._d_efd.fileno()
@@ -310,6 +308,7 @@ class _FakeSerdeProcessor:
 
     def serialized_layout_desc(self, layout_desc):
         from lmcache.v1.distributed.api import MemoryLayoutDesc
+
         return MemoryLayoutDesc(
             shapes=[torch.Size([1024])],
             dtypes=[torch.uint8],
@@ -324,6 +323,7 @@ class _FakeSerdeProcessor:
 
 def test_wrapper_implements_early_release_protocol() -> None:
     from lmcache.v1.distributed.storage_placement import StoragePlacementMode
+
     wrapper, *_ = _make_wrapper(StoragePlacementMode.KV_SPLIT_TIER)
     try:
         assert isinstance(wrapper, EarlyReleaseStoreAdapter)
@@ -333,6 +333,7 @@ def test_wrapper_implements_early_release_protocol() -> None:
 
 def test_kv_together_claims_nothing() -> None:
     from lmcache.v1.distributed.storage_placement import StoragePlacementMode
+
     wrapper, *_ = _make_wrapper(StoragePlacementMode.KV_TOGETHER)
     try:
         # No task has been submitted -- claim returns [] regardless.
@@ -351,9 +352,7 @@ def test_kchild_slab_allocate_returns_tensor_memory_obj() -> None:
     from lmcache.v1.distributed.l2_adapters.serde_wrapper import _KChildSlab
     from lmcache.v1.memory_management import TensorMemoryObj
 
-    slab = _KChildSlab(
-        shape=torch.Size([4, 8]), dtype=torch.float16, max_slots=4
-    )
+    slab = _KChildSlab(shape=torch.Size([4, 8]), dtype=torch.float16, max_slots=4)
     obj = slab.allocate(None, None)
     assert isinstance(obj, TensorMemoryObj)
     assert obj.meta.shape == torch.Size([4, 8])
@@ -365,9 +364,7 @@ def test_kchild_slab_allocate_returns_tensor_memory_obj() -> None:
 def test_kchild_slab_batched_allocate_returns_n_objects() -> None:
     from lmcache.v1.distributed.l2_adapters.serde_wrapper import _KChildSlab
 
-    slab = _KChildSlab(
-        shape=torch.Size([4]), dtype=torch.float16, max_slots=4
-    )
+    slab = _KChildSlab(shape=torch.Size([4]), dtype=torch.float16, max_slots=4)
     objs = slab.batched_allocate(None, None, batch_size=3)
     assert len(objs) == 3
     # Each backing tensor is distinct memory.
@@ -378,9 +375,7 @@ def test_kchild_slab_batched_allocate_returns_n_objects() -> None:
 def test_kchild_slab_free_pools_for_reuse() -> None:
     from lmcache.v1.distributed.l2_adapters.serde_wrapper import _KChildSlab
 
-    slab = _KChildSlab(
-        shape=torch.Size([4]), dtype=torch.float16, max_slots=2
-    )
+    slab = _KChildSlab(shape=torch.Size([4]), dtype=torch.float16, max_slots=2)
     o1 = slab.allocate(None, None)
     orig_data = o1.raw_data.data_ptr()
     slab.free(o1)
@@ -396,9 +391,7 @@ def test_kchild_slab_free_pools_for_reuse() -> None:
 def test_kchild_slab_over_subscription_not_pooled() -> None:
     from lmcache.v1.distributed.l2_adapters.serde_wrapper import _KChildSlab
 
-    slab = _KChildSlab(
-        shape=torch.Size([4]), dtype=torch.float16, max_slots=1
-    )
+    slab = _KChildSlab(shape=torch.Size([4]), dtype=torch.float16, max_slots=1)
     o1 = slab.allocate(None, None)
     o2 = slab.allocate(None, None)
     # Both valid, distinct objects; over-subscription counted.
@@ -408,11 +401,13 @@ def test_kchild_slab_over_subscription_not_pooled() -> None:
 
 def test_kchild_slab_free_rejects_mismatched_shape() -> None:
     from lmcache.v1.distributed.l2_adapters.serde_wrapper import _KChildSlab
-    from lmcache.v1.memory_management import TensorMemoryObj, MemoryObjMetadata, MemoryFormat
-
-    slab = _KChildSlab(
-        shape=torch.Size([4]), dtype=torch.float16, max_slots=2
+    from lmcache.v1.memory_management import (
+        TensorMemoryObj,
+        MemoryObjMetadata,
+        MemoryFormat,
     )
+
+    slab = _KChildSlab(shape=torch.Size([4]), dtype=torch.float16, max_slots=2)
     # Build a TensorMemoryObj with the WRONG shape and try to free it
     # into the slab.  The slab silently drops it (doesn't add to free
     # deque) so a foreign object never gets handed back later.
@@ -458,9 +453,7 @@ def test_reserve_external_writes_registers_keys() -> None:
         )
     )
     l1 = L1Manager(cfg)
-    slab = _KChildSlab(
-        shape=torch.Size([4]), dtype=torch.float16, max_slots=4
-    )
+    slab = _KChildSlab(shape=torch.Size([4]), dtype=torch.float16, max_slots=4)
     keys = ["k0", "k1"]
     objs = slab.batched_allocate(None, None, batch_size=2)
     results = l1.reserve_external_writes(keys, objs)
@@ -494,9 +487,7 @@ def test_reserve_external_writes_rejects_existing_key() -> None:
         )
     )
     l1 = L1Manager(cfg)
-    slab = _KChildSlab(
-        shape=torch.Size([4]), dtype=torch.float16, max_slots=4
-    )
+    slab = _KChildSlab(shape=torch.Size([4]), dtype=torch.float16, max_slots=4)
     keys = ["k0"]
     o1 = slab.batched_allocate(None, None, batch_size=1)
     l1.reserve_external_writes(keys, o1)
@@ -516,9 +507,7 @@ def test_slab_implements_l1_memory_usage_provider_protocol() -> None:
     from lmcache.v1.distributed.l2_adapters.serde_wrapper import _KChildSlab
     from lmcache.v1.distributed.memory_manager import L1MemoryUsageProvider
 
-    slab = _KChildSlab(
-        shape=torch.Size([4]), dtype=torch.float16, max_slots=4
-    )
+    slab = _KChildSlab(shape=torch.Size([4]), dtype=torch.float16, max_slots=4)
     assert isinstance(slab, L1MemoryUsageProvider)
 
 
@@ -532,9 +521,7 @@ def test_kchild_slab_in_flight_tracks_one_shots() -> None:
     """
     from lmcache.v1.distributed.l2_adapters.serde_wrapper import _KChildSlab
 
-    slab = _KChildSlab(
-        shape=torch.Size([4]), dtype=torch.float16, max_slots=2
-    )
+    slab = _KChildSlab(shape=torch.Size([4]), dtype=torch.float16, max_slots=2)
     # Empty.
     assert slab.get_used_capacity_bytes() == (0, 16)
     o1 = slab.allocate(None, None)
@@ -559,18 +546,14 @@ def test_v_scratch_slab_implements_provider_protocol() -> None:
     from lmcache.v1.distributed.l2_adapters.serde_wrapper import _VScratchSlab
     from lmcache.v1.distributed.memory_manager import L1MemoryUsageProvider
 
-    slab = _VScratchSlab(
-        shape=torch.Size([4]), dtype=torch.float16, max_slots=2
-    )
+    slab = _VScratchSlab(shape=torch.Size([4]), dtype=torch.float16, max_slots=2)
     assert isinstance(slab, L1MemoryUsageProvider)
 
 
 def test_v_scratch_slab_in_flight_tracks_one_shots() -> None:
     from lmcache.v1.distributed.l2_adapters.serde_wrapper import _VScratchSlab
 
-    slab = _VScratchSlab(
-        shape=torch.Size([4]), dtype=torch.float16, max_slots=2
-    )
+    slab = _VScratchSlab(shape=torch.Size([4]), dtype=torch.float16, max_slots=2)
     assert slab.get_used_capacity_bytes() == (0, 16)
     t1 = slab.acquire()
     t2 = slab.acquire()
@@ -586,9 +569,7 @@ def test_v_scratch_slab_in_flight_tracks_one_shots() -> None:
 def test_slab_get_used_capacity_bytes_tracks_live_objects() -> None:
     from lmcache.v1.distributed.l2_adapters.serde_wrapper import _KChildSlab
 
-    slab = _KChildSlab(
-        shape=torch.Size([4]), dtype=torch.float16, max_slots=4
-    )
+    slab = _KChildSlab(shape=torch.Size([4]), dtype=torch.float16, max_slots=4)
     # Empty pool: nothing live, full capacity.
     used, capacity = slab.get_used_capacity_bytes()
     assert used == 0
@@ -626,9 +607,7 @@ def test_l1_memory_manager_aggregates_external_provider() -> None:
         init_size_in_bytes=1 << 20,
     )
     mm = L1MemoryManager(cfg)
-    slab = _KChildSlab(
-        shape=torch.Size([4]), dtype=torch.float16, max_slots=4
-    )
+    slab = _KChildSlab(shape=torch.Size([4]), dtype=torch.float16, max_slots=4)
 
     used_before, cap_before = mm.get_memory_usage()
     mm.register_external_memory_provider(slab)
@@ -663,9 +642,7 @@ def test_register_external_memory_provider_idempotent() -> None:
         init_size_in_bytes=1 << 20,
     )
     mm = L1MemoryManager(cfg)
-    slab = _KChildSlab(
-        shape=torch.Size([4]), dtype=torch.float16, max_slots=4
-    )
+    slab = _KChildSlab(shape=torch.Size([4]), dtype=torch.float16, max_slots=4)
     mm.register_external_memory_provider(slab)
     mm.register_external_memory_provider(slab)  # second add is no-op
     _, cap_once = mm.get_memory_usage()
@@ -719,9 +696,7 @@ def _build_l1_with_manifest():
         cache_salt="c",
     )
     k_child = derive_component_key(logical, "k")
-    slab = _KChildSlab(
-        shape=torch.Size([4]), dtype=torch.float16, max_slots=2
-    )
+    slab = _KChildSlab(shape=torch.Size([4]), dtype=torch.float16, max_slots=2)
     objs = slab.batched_allocate(None, None, batch_size=1)
     l1.reserve_external_writes([k_child], objs)
     l1.finish_write([k_child])
@@ -778,9 +753,7 @@ def test_non_kchild_keys_unaffected_by_manifest() -> None:
     logical = ObjectKey(
         chunk_hash=b"\xab" * 32, model_name="m", kv_rank=0, cache_salt="c"
     )
-    layout = MemoryLayoutDesc(
-        shapes=[torch.Size([4])], dtypes=[torch.float16]
-    )
+    layout = MemoryLayoutDesc(shapes=[torch.Size([4])], dtypes=[torch.float16])
     l1.reserve_write([logical], [False], layout, mode="new")
     l1.finish_write([logical])
     # Logical key was never written to manifest; eviction gate falls
@@ -813,9 +786,7 @@ def test_no_manifest_wired_legacy_behavior_preserved() -> None:
         chunk_hash=b"\xcd" * 32, model_name="m", kv_rank=0, cache_salt="c"
     )
     k_child = derive_component_key(logical, "k")
-    slab = _KChildSlab(
-        shape=torch.Size([4]), dtype=torch.float16, max_slots=2
-    )
+    slab = _KChildSlab(shape=torch.Size([4]), dtype=torch.float16, max_slots=2)
     objs = slab.batched_allocate(None, None, batch_size=1)
     l1.reserve_external_writes([k_child], objs)
     l1.finish_write([k_child])
@@ -858,9 +829,7 @@ def test_reserve_external_writes_validates_lengths() -> None:
         )
     )
     l1 = L1Manager(cfg)
-    slab = _KChildSlab(
-        shape=torch.Size([4]), dtype=torch.float16, max_slots=4
-    )
+    slab = _KChildSlab(shape=torch.Size([4]), dtype=torch.float16, max_slots=4)
     objs = slab.batched_allocate(None, None, batch_size=2)
     with pytest.raises(ValueError):
         l1.reserve_external_writes(["k0"], objs)  # 1 key, 2 objs

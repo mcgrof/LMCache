@@ -147,9 +147,7 @@ class TestAsymK16V8SerdeFsRoundTrip:
             )
             sm = StorageManager(sm_cfg)
             try:
-                assert (
-                    sm.storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER
-                )
+                assert sm.storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER
             finally:
                 sm.close()
         finally:
@@ -180,9 +178,7 @@ class TestAsymK16V8SerdeFsRoundTrip:
             )
             sm = StorageManager(sm_cfg)
             try:
-                assert (
-                    sm.storage_layout_mode == StorageLayoutMode.KV_COMPONENT_GROUPS
-                )
+                assert sm.storage_layout_mode == StorageLayoutMode.KV_COMPONENT_GROUPS
             finally:
                 sm.close()
         finally:
@@ -336,8 +332,13 @@ class TestAsymK16V8SerdeFsRoundTrip:
                 assert torch.equal(k_got, k_orig), "K is NOT bit-exact"
                 # V went through FP8 quant; allow per-tensor relative error.
                 v_rel = (
-                    (v_got.float() - v_orig.float()).abs() / (v_orig.float().abs() + 1e-6)
-                ).mean().item()
+                    (
+                        (v_got.float() - v_orig.float()).abs()
+                        / (v_orig.float().abs() + 1e-6)
+                    )
+                    .mean()
+                    .item()
+                )
                 assert v_rel < 0.05, (
                     f"V FP8 round-trip relative error too high: {v_rel:.4f}"
                 )
@@ -549,18 +550,20 @@ class TestAsymK16V8VOnlySplitTierRoundTrip:
             with sm.read_prefetched_results(keys) as mem_objs:
                 assert mem_objs is not None
                 assert len(mem_objs) == len(keys)
-                for (k_orig, v_orig), mem_obj in zip(
-                    originals, mem_objs, strict=True
-                ):
+                for (k_orig, v_orig), mem_obj in zip(originals, mem_objs, strict=True):
                     k_got = mem_obj.get_tensor(0)
                     v_got = mem_obj.get_tensor(1)
                     assert torch.equal(k_got, k_orig), (
                         "K is NOT bit-exact through split-tier load"
                     )
                     v_rel = (
-                        (v_got.float() - v_orig.float()).abs()
-                        / (v_orig.float().abs() + 1e-6)
-                    ).mean().item()
+                        (
+                            (v_got.float() - v_orig.float()).abs()
+                            / (v_orig.float().abs() + 1e-6)
+                        )
+                        .mean()
+                        .item()
+                    )
                     assert v_rel < 0.05, (
                         f"V FP8 round-trip relative error too high: {v_rel:.4f}"
                     )
