@@ -539,7 +539,9 @@ def test_group_slot_view_exposes_parent_tensor_view() -> None:
 
     # Writes through the view alias the parent's buffer.
     view_k.tensor.fill_(7.0)
-    assert int(parent.get_tensor(0)[0].item()) == 7
+    parent_k = parent.get_tensor(0)
+    assert parent_k is not None
+    assert int(parent_k[0].item()) == 7
 
 
 def test_layout_desc_to_group_identity_mapping() -> None:

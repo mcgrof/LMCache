@@ -333,7 +333,7 @@ class AsymK16V8VOnlyMultiSerializer(MultiSerializer):
     def group_size(self) -> int:
         return _GROUP_SIZE_V_ONLY
 
-    def input_slot_mapping(self):
+    def input_slot_mapping(self) -> "tuple[int | None, ...]":
         # Split-tier: K stays in L1 / host -- never passed to this
         # serializer.  Slot 0 is always None; slot 1 reads parent
         # group 1 (V).
@@ -478,7 +478,7 @@ class AsymK16V8VOnlyMultiDeserializer(MultiDeserializer):
     def group_size(self) -> int:
         return _GROUP_SIZE_V_ONLY
 
-    def output_slot_mapping(self):
+    def output_slot_mapping(self) -> "tuple[int | None, ...]":
         # Split-tier: K is sourced from L1 / host, not from this blob.
         # Slot 0 is always None on the dst tuple; slot 1 writes parent
         # group 1 (V).
@@ -568,6 +568,9 @@ class AsymK16V8VOnlyMultiDeserializer(MultiDeserializer):
 # ``input_slot_mapping`` / ``output_slot_mapping``.
 
 # First Party
+# Late imports (factory registration): kept below module body to avoid a
+# circular import via serde/__init__, which imports this module for its
+# registration side effect.
 from lmcache.v1.distributed.serde.async_processor import AsyncSerdeProcessor  # noqa: E402
 from lmcache.v1.distributed.serde.base import SerdeProcessor  # noqa: E402
 from lmcache.v1.distributed.serde.factory import register_serde_factory  # noqa: E402

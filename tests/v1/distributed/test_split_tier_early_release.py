@@ -191,7 +191,6 @@ def _make_wrapper(placement_mode):
     from lmcache.v1.distributed.l2_adapters.serde_wrapper import (
         SerdeL2AdapterWrapper,
     )
-    from lmcache.v1.distributed.serde import AsyncSerdeProcessor
     from lmcache.v1.distributed.storage_placement import SplitTierManifest
 
     capture = _Capture(
@@ -328,7 +327,7 @@ def test_wrapper_implements_early_release_protocol() -> None:
     try:
         assert isinstance(wrapper, EarlyReleaseStoreAdapter)
     finally:
-        wrapper.close()
+        wrapper.close()  # type: ignore[attr-defined]
 
 
 def test_kv_together_claims_nothing() -> None:
@@ -382,9 +381,11 @@ def test_kchild_slab_free_pools_for_reuse() -> None:
         shape=torch.Size([4]), dtype=torch.float16, max_slots=2
     )
     o1 = slab.allocate(None, None)
+    assert o1 is not None
     orig_data = o1.raw_data.data_ptr()
     slab.free(o1)
     o2 = slab.allocate(None, None)
+    assert o2 is not None
     # The slab handed back the same MemoryObj (same backing buffer).
     assert o2.raw_data.data_ptr() == orig_data
     # And reset it for reuse — valid + ref_count restored.
@@ -538,9 +539,11 @@ def test_kchild_slab_in_flight_tracks_one_shots() -> None:
     assert slab.get_used_capacity_bytes() == (0, 16)
     o1 = slab.allocate(None, None)
     o2 = slab.allocate(None, None)  # fills the pool
+    assert o1 is not None and o2 is not None
     assert slab.get_used_capacity_bytes() == (16, 16)
     # Third acquire over-subscribes; used MUST cross capacity.
     o3 = slab.allocate(None, None)
+    assert o3 is not None
     used, cap = slab.get_used_capacity_bytes()
     assert used == 24, f"expected 24, got {used}"
     assert cap == 16
@@ -595,12 +598,14 @@ def test_slab_get_used_capacity_bytes_tracks_live_objects() -> None:
 
     # One live object: 8 bytes used, capacity unchanged.
     o1 = slab.allocate(None, None)
+    assert o1 is not None
     used, capacity = slab.get_used_capacity_bytes()
     assert used == 8
     assert capacity == 32
 
     # Two live: 16 bytes used.
     o2 = slab.allocate(None, None)
+    assert o2 is not None
     used, _ = slab.get_used_capacity_bytes()
     assert used == 16
 
@@ -639,6 +644,7 @@ def test_l1_memory_manager_aggregates_external_provider() -> None:
 
     # Allocate from slab: used grows, capacity unchanged.
     o = slab.allocate(None, None)
+    assert o is not None
     used_after_alloc, cap_after_alloc = mm.get_memory_usage()
     assert used_after_alloc == used_before + 8
     assert cap_after_alloc == cap_after_register
@@ -672,6 +678,7 @@ def test_register_external_memory_provider_idempotent() -> None:
     # Allocate one object; ensure exactly one provider contributed (not
     # double-counted).
     o = slab.allocate(None, None)
+    assert o is not None
     used, _ = mm.get_memory_usage()
     assert used == 8  # single contribution, not 16
     slab.free(o)
@@ -838,7 +845,7 @@ def test_register_rejects_non_protocol_object() -> None:
         pass
 
     with pytest.raises(TypeError):
-        mm.register_external_memory_provider(_NotAProvider())
+        mm.register_external_memory_provider(_NotAProvider())  # type: ignore[arg-type]
 
 
 def test_reserve_external_writes_validates_lengths() -> None:
@@ -862,9 +869,14 @@ def test_reserve_external_writes_validates_lengths() -> None:
     )
     objs = slab.batched_allocate(None, None, batch_size=2)
     with pytest.raises(ValueError):
-        l1.reserve_external_writes(["k0"], objs)  # 1 key, 2 objs
+        # 1 key, 2 objs
+        l1.reserve_external_writes(["k0"], objs)  # type: ignore[list-item]
     with pytest.raises(ValueError):
-        l1.reserve_external_writes(["k0", "k1"], objs, is_temporary=[False])
+        l1.reserve_external_writes(
+            ["k0", "k1"],  # type: ignore[list-item]
+            objs,
+            is_temporary=[False],
+        )
 
 
 def test_claim_is_single_shot() -> None:
@@ -884,12 +896,12 @@ def test_claim_is_single_shot() -> None:
         # pre-populated.  Exercises the latch in claim_early_release_keys.
         state = _StoreTaskState(
             wrapped_id=1,
-            keys=["k0", "k1"],
+            keys=["k0", "k1"],  # type: ignore[list-item]
             temp_keys=[],
             temp_objs=[],
-            phase=None,
+            phase=None,  # type: ignore[arg-type]
             is_split_tier=True,
-            early_release_keys=["k0", "k1"],
+            early_release_keys=["k0", "k1"],  # type: ignore[list-item]
         )
         with wrapper._lock:
             wrapper._store_tasks[1] = state
