@@ -108,7 +108,7 @@ class MultiSerializer(abc.ABC):
         """Mapping from this serializer's slots to the parent
         grouped-:class:`MemoryObj`'s group indexes.
 
-        The :class:`~lmcache.v1.distributed.l2_adapters.serde_wrapper.SerdeL2AdapterWrapper`
+        The :class:`SerdeL2AdapterWrapper`
         receives a list of single grouped ``MemoryObj`` per key (the
         canonical LMCache shape: one ``MemoryObj`` carries all groups
         for a logical KV chunk).  Multi-output serdes need a tuple of

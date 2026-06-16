@@ -28,7 +28,7 @@ from __future__ import annotations
 
 # Standard
 from dataclasses import dataclass
-from typing import Optional
+from typing import cast
 import select
 import struct
 import time
@@ -49,6 +49,7 @@ from lmcache.v1.distributed.serde.multi import (
     single_to_multi_serializer,
     validate_group_size,
 )
+from lmcache.v1.memory_management import MemoryObj
 
 try:
     from lmcache.v1.distributed.serde import AsyncSerdeProcessor
@@ -66,7 +67,12 @@ except Exception:  # pragma: no cover - import guard for the xfail lane
 
 @dataclass
 class _FakeMemoryObj:
-    tensor: Optional[torch.Tensor]
+    tensor: torch.Tensor
+
+
+def _grp(*objs: object) -> MemoryObjGroup:
+    """Cast a tuple of test fakes to the production MemoryObjGroup type."""
+    return cast(MemoryObjGroup, objs)
 
 
 def _byte_buffer(num_bytes: int) -> _FakeMemoryObj:
@@ -116,7 +122,7 @@ class _FakeMultiSerializer(MultiSerializer):
         validate_group_size(src, self._n, role="src")
         masks, lens, payload = bytearray(), bytearray(), bytearray()
         for slot in src:
-            if slot is None:
+            if slot is None or slot.tensor is None:
                 masks += _MASK.pack(0)
                 lens += _LEN.pack(0)
                 continue
@@ -170,7 +176,7 @@ class _FakeMultiDeserializer(MultiDeserializer):
         cursor = _header_size(n)
         for i, slot in enumerate(dst):
             this_len = lens[i]
-            if slot is None or not present[i]:
+            if slot is None or slot.tensor is None or not present[i]:
                 cursor += this_len
                 continue
             dstv = slot.tensor.view(torch.uint8).flatten()
@@ -208,28 +214,28 @@ class _IdentityDeserializer(Deserializer):
 
 
 def test_multi_output_local_roundtrip_preserves_named_outputs() -> None:
-    """K/V round-trip with distinct sizes+sentinels: no aliasing/ordering bug can hide."""
+    """K/V round-trip distinct sizes+sentinels: no aliasing/ordering bug hides."""
     s, d = _FakeMultiSerializer(), _FakeMultiDeserializer()
     src = tuple(_sentinel_obj(nbytes, fill) for _, nbytes, fill in (_K, _V))
     layout = tuple(
         MemoryLayoutDesc(shapes=[o.tensor.shape], dtypes=[o.tensor.dtype]) for o in src
     )
     buf = _byte_buffer(s.estimate_serialized_size(layout))
-    n = s.serialize(src, buf)
+    n = s.serialize(_grp(*src), buf)
     assert n > 0
 
     out = tuple(_byte_buffer(nbytes) for _, nbytes, _ in (_K, _V))
-    d.deserialize(buf, out)
-    for (name, nbytes, fill), o in zip((_K, _V), out):
+    d.deserialize(buf, _grp(*out))
+    for (name, nbytes, fill), o in zip((_K, _V), out, strict=True):
         assert o.tensor.numel() == nbytes, f"{name}: size changed"
         assert torch.all(o.tensor == fill), f"{name}: sentinel/content cross-wired"
 
 
 def test_multi_output_absent_k_slot_split_tier_semantics() -> None:
-    """Split-tier: K absent on serialize (None slot); V round-trips, K dst left untouched."""
+    """Split-tier: K absent on serialize (None slot); V round-trips, K untouched."""
     s, d = _FakeMultiSerializer(), _FakeMultiDeserializer()
     v = _sentinel_obj(_V[1], _V[2])
-    src: MemoryObjGroup = (None, v)
+    src: MemoryObjGroup = _grp(None, v)
     layout: LayoutDescGroup = (
         None,
         MemoryLayoutDesc(shapes=[v.tensor.shape], dtypes=[v.tensor.dtype]),
@@ -239,7 +245,7 @@ def test_multi_output_absent_k_slot_split_tier_semantics() -> None:
 
     k_out = _sentinel_obj(_K[1], 0xEE)  # pre-filled; must stay untouched (K absent)
     v_out = _byte_buffer(_V[1])
-    d.deserialize(buf, (k_out, v_out))
+    d.deserialize(buf, _grp(k_out, v_out))
     assert torch.all(k_out.tensor == 0xEE), "absent K must not be written"
     assert torch.all(v_out.tensor == _V[2])
 
@@ -254,9 +260,9 @@ def test_single_output_bridge_backcompat() -> None:
         MemoryLayoutDesc(shapes=[payload.tensor.shape], dtypes=[payload.tensor.dtype]),
     )
     buf = _byte_buffer(ms.estimate_serialized_size(layout))
-    ms.serialize((payload,), buf)
+    ms.serialize(_grp(payload), cast(MemoryObj, buf))
     out = (_byte_buffer(1024),)
-    md.deserialize(buf, out)
+    md.deserialize(cast(MemoryObj, buf), _grp(*out))
     assert torch.all(out[0].tensor == 0x5A), "single-output bridge broke byte fidelity"
 
 
@@ -319,19 +325,20 @@ def test_multi_output_through_async_processor_roundtrip() -> None:
             for o in src
         )
         buf = _byte_buffer(s.estimate_serialized_size(layout))
-        sid = proc.submit_serialize([src], [buf])  # group as a single work item
+        # group as a single work item
+        sid = proc.submit_serialize([cast(MemoryObj, src)], [cast(MemoryObj, buf)])
         assert _wait_for_fd(proc.get_serialize_event_fd()), (
             "serialize fd never signaled"
         )
         assert proc.query_serialize_result(sid) is True
 
         out = tuple(_byte_buffer(nbytes) for _, nbytes, _ in (_K, _V))
-        did = proc.submit_deserialize([buf], [out])
+        did = proc.submit_deserialize([cast(MemoryObj, buf)], [cast(MemoryObj, out)])
         assert _wait_for_fd(proc.get_deserialize_event_fd()), (
             "deserialize fd never signaled"
         )
         assert proc.query_deserialize_result(did) is True
-        for (_, _, fill), o in zip((_K, _V), out):
+        for (_, _, fill), o in zip((_K, _V), out, strict=True):
             assert torch.all(o.tensor == fill)
     finally:
         proc.close()
@@ -414,18 +421,22 @@ def test_split_policy_routes_k_to_cpu_v_to_nvme() -> None:
 
     # ---- Placement mode resolution: V-only serde -> KV_SPLIT_TIER ----
     # First Party
+    from lmcache.v1.distributed.l2_adapters.config import L2AdapterConfigBase
     from lmcache.v1.distributed.serde.base import SerdeConfig
 
     class _FakeCfg:
-        def __init__(self, serde_config):
+        def __init__(self, serde_config: SerdeConfig) -> None:
             self.serde_config = serde_config
 
+    def _cfgs(*cfgs: _FakeCfg) -> list[L2AdapterConfigBase]:
+        return cast("list[L2AdapterConfigBase]", list(cfgs))
+
     v_only_mode = derive_storage_placement_mode(
-        [_FakeCfg(SerdeConfig(type="asym_k16_v8_v_only"))]
+        _cfgs(_FakeCfg(SerdeConfig(type="asym_k16_v8_v_only")))
     )
     assert v_only_mode == StoragePlacementMode.KV_SPLIT_TIER
     asym_mode_1_mode = derive_storage_placement_mode(
-        [_FakeCfg(SerdeConfig(type="asym_k16_v8"))]
+        _cfgs(_FakeCfg(SerdeConfig(type="asym_k16_v8")))
     )
     assert asym_mode_1_mode == StoragePlacementMode.KV_TOGETHER
 
