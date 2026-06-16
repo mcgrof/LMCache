@@ -17,11 +17,15 @@ Covers:
 # Future
 from __future__ import annotations
 
+# Standard
+from typing import cast
+
 # Third Party
 import pytest
 
 # First Party
 from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.l2_adapters.config import L2AdapterConfigBase
 from lmcache.v1.distributed.serde import SerdeConfig
 from lmcache.v1.distributed.storage_placement import (
     SplitTierManifest,
@@ -44,6 +48,11 @@ class _FakeAdapterCfg:
 
     def __init__(self, serde_config) -> None:
         self.serde_config = serde_config
+
+
+def _cfgs(*cfgs: _FakeAdapterCfg) -> list[L2AdapterConfigBase]:
+    """Cast test stand-ins to the production adapter-config list type."""
+    return cast("list[L2AdapterConfigBase]", list(cfgs))
 
 
 def _make_key(chunk_hash: bytes = b"\x00" * 32, *, salt: str = "") -> ObjectKey:
@@ -192,27 +201,36 @@ def test_derive_placement_mode_empty_returns_kv_together() -> None:
 
 def test_derive_placement_mode_no_serde_returns_kv_together() -> None:
     cfgs = [_FakeAdapterCfg(serde_config=None)]
-    assert derive_storage_placement_mode(cfgs) == StoragePlacementMode.KV_TOGETHER
+    assert (
+        derive_storage_placement_mode(_cfgs(*cfgs)) == StoragePlacementMode.KV_TOGETHER
+    )
 
 
 def test_derive_placement_mode_fp8_returns_kv_together() -> None:
     """Single-tensor serdes (no slot mapping) place K+V together."""
     cfgs = [_FakeAdapterCfg(serde_config=SerdeConfig(type="fp8"))]
-    assert derive_storage_placement_mode(cfgs) == StoragePlacementMode.KV_TOGETHER
+    assert (
+        derive_storage_placement_mode(_cfgs(*cfgs)) == StoragePlacementMode.KV_TOGETHER
+    )
 
 
 def test_derive_placement_mode_asym_mode_1_returns_kv_together() -> None:
     """asym_k16_v8 storage-only: identity mapping (0, 1), no None
     slots -> both children in one blob (kv_together)."""
     cfgs = [_FakeAdapterCfg(serde_config=SerdeConfig(type="asym_k16_v8"))]
-    assert derive_storage_placement_mode(cfgs) == StoragePlacementMode.KV_TOGETHER
+    assert (
+        derive_storage_placement_mode(_cfgs(*cfgs)) == StoragePlacementMode.KV_TOGETHER
+    )
 
 
 def test_derive_placement_mode_asym_v_only_returns_kv_split_tier() -> None:
     """asym_k16_v8_v_only: mapping (None, 1), so slot 0 (K) is
     absent from the L2 path -> split-tier placement."""
     cfgs = [_FakeAdapterCfg(serde_config=SerdeConfig(type="asym_k16_v8_v_only"))]
-    assert derive_storage_placement_mode(cfgs) == StoragePlacementMode.KV_SPLIT_TIER
+    assert (
+        derive_storage_placement_mode(_cfgs(*cfgs))
+        == StoragePlacementMode.KV_SPLIT_TIER
+    )
 
 
 def test_derive_placement_mode_mixed_rejected() -> None:
@@ -223,7 +241,7 @@ def test_derive_placement_mode_mixed_rejected() -> None:
         _FakeAdapterCfg(serde_config=SerdeConfig(type="asym_k16_v8_v_only")),
     ]
     with pytest.raises(ValueError, match="Incompatible L2 adapter storage placement"):
-        derive_storage_placement_mode(cfgs)
+        derive_storage_placement_mode(_cfgs(*cfgs))
 
 
 def test_derive_placement_mode_mixed_no_serde_and_v_only_rejected() -> None:
@@ -234,7 +252,7 @@ def test_derive_placement_mode_mixed_no_serde_and_v_only_rejected() -> None:
         _FakeAdapterCfg(serde_config=SerdeConfig(type="asym_k16_v8_v_only")),
     ]
     with pytest.raises(ValueError, match="Incompatible L2 adapter storage placement"):
-        derive_storage_placement_mode(cfgs)
+        derive_storage_placement_mode(_cfgs(*cfgs))
 
 
 def test_derive_placement_mode_two_v_only_adapters_returns_split_tier() -> None:
@@ -243,7 +261,10 @@ def test_derive_placement_mode_two_v_only_adapters_returns_split_tier() -> None:
         _FakeAdapterCfg(serde_config=SerdeConfig(type="asym_k16_v8_v_only")),
         _FakeAdapterCfg(serde_config=SerdeConfig(type="asym_k16_v8_v_only")),
     ]
-    assert derive_storage_placement_mode(cfgs) == StoragePlacementMode.KV_SPLIT_TIER
+    assert (
+        derive_storage_placement_mode(_cfgs(*cfgs))
+        == StoragePlacementMode.KV_SPLIT_TIER
+    )
 
 
 # =============================================================================
