@@ -563,9 +563,12 @@ class AsymK16V8VOnlyMultiDeserializer(MultiDeserializer):
 # ``input_slot_mapping`` / ``output_slot_mapping``.
 
 # First Party
-from lmcache.v1.distributed.serde.async_processor import AsyncSerdeProcessor
-from lmcache.v1.distributed.serde.base import SerdeProcessor
-from lmcache.v1.distributed.serde.factory import register_serde_factory
+# Late imports (factory registration): kept below module body to avoid a
+# circular import via serde/__init__, which imports this module for its
+# registration side effect.
+from lmcache.v1.distributed.serde.async_processor import AsyncSerdeProcessor  # noqa: E402
+from lmcache.v1.distributed.serde.base import SerdeProcessor  # noqa: E402
+from lmcache.v1.distributed.serde.factory import register_serde_factory  # noqa: E402
 
 
 def _resolve_dtype(name: str) -> torch.dtype:

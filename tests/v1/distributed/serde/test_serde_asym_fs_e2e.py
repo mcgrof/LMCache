@@ -294,8 +294,11 @@ class TestAsymK16V8SerdeFsRoundTrip:
         for k, (k_orig, v_orig) in zip(keys, originals, strict=True):
             mem_obj = reserved[k]
             # Multi-group MemoryObj: get_tensor(0) = K, get_tensor(1) = V.
-            mem_obj.get_tensor(0).copy_(k_orig)
-            mem_obj.get_tensor(1).copy_(v_orig)
+            k_view = mem_obj.get_tensor(0)
+            v_view = mem_obj.get_tensor(1)
+            assert k_view is not None and v_view is not None
+            k_view.copy_(k_orig)
+            v_view.copy_(v_orig)
         sm.finish_write(keys)
 
         # ---- Step 2: wait for L2 store ----
@@ -331,6 +334,7 @@ class TestAsymK16V8SerdeFsRoundTrip:
             for (k_orig, v_orig), mem_obj in zip(originals, mem_objs, strict=True):
                 k_got = mem_obj.get_tensor(0)
                 v_got = mem_obj.get_tensor(1)
+                assert k_got is not None and v_got is not None
                 # K is preserved bit-exact (the codec stores it native).
                 assert torch.equal(k_got, k_orig), "K is NOT bit-exact"
                 # V went through FP8 quant; allow per-tensor relative error.
@@ -450,8 +454,11 @@ class TestAsymK16V8VOnlySplitTierRoundTrip:
         assert len(reserved) == len(keys)
         for k, (k_orig, v_orig) in zip(keys, originals, strict=True):
             mem_obj = reserved[k]
-            mem_obj.get_tensor(0).copy_(k_orig)
-            mem_obj.get_tensor(1).copy_(v_orig)
+            k_view = mem_obj.get_tensor(0)
+            v_view = mem_obj.get_tensor(1)
+            assert k_view is not None and v_view is not None
+            k_view.copy_(k_orig)
+            v_view.copy_(v_orig)
         sm.finish_write(keys)
         return layout
 
@@ -477,7 +484,6 @@ class TestAsymK16V8VOnlySplitTierRoundTrip:
     def _run_store_only(self, disk_path: str) -> None:
         # First Party
         from lmcache.v1.distributed.storage_placement import (
-            SplitTierState,
             derive_component_key,
         )
 
@@ -534,10 +540,6 @@ class TestAsymK16V8VOnlySplitTierRoundTrip:
                 )
                 for _ in keys
             ]
-            packed_layout = MemoryLayoutDesc(
-                shapes=[torch.Size([2, 4, 256, 128])],
-                dtypes=[kv_dtype],
-            )
             layout = self._store(sm, keys, originals)
             self._wait_for_l2_drain(sm, disk_path)
 
@@ -556,6 +558,7 @@ class TestAsymK16V8VOnlySplitTierRoundTrip:
                 for (k_orig, v_orig), mem_obj in zip(originals, mem_objs, strict=True):
                     k_got = mem_obj.get_tensor(0)
                     v_got = mem_obj.get_tensor(1)
+                    assert k_got is not None and v_got is not None
                     assert torch.equal(k_got, k_orig), (
                         "K is NOT bit-exact through split-tier load"
                     )
