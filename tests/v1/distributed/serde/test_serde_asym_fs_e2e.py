@@ -75,7 +75,10 @@ def wait_for_prefetch_status(sm, handle, timeout=15.0, poll_interval=0.1):
     while time.monotonic() < deadline:
         status = sm.query_prefetch_status(handle)
         if status is not None:
-            return status
+            # query_prefetch_status returns a found-key Bitmap (over
+            # original positions); the prefix hit count is its leading
+            # ones (see StorageManager.query_prefetch_status).
+            return status.count_leading_ones()
         time.sleep(poll_interval)
     return None
 
