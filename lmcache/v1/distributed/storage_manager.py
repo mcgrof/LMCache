@@ -151,9 +151,7 @@ class StorageManager:
             # ``is_key_evictable`` gates K-child eviction on manifest
             # state — STORE_IN_FLIGHT K-children stay pinned across
             # the V codec + L2 write window (PR-11').
-            self._l1_manager.set_split_tier_manifest(
-                self._split_tier_manifest
-            )
+            self._l1_manager.set_split_tier_manifest(self._split_tier_manifest)
 
         # Per-cache_salt quota registry. Shared across the L2 eviction
         # controller (reads quotas each cycle) and the HTTP quota

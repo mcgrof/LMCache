@@ -338,7 +338,7 @@ class _KChildSlab(MemoryAllocatorInterface):
         """Return a single MemoryObj for one K-child slot."""
         return self._allocate_one()
 
-    def batched_allocate(
+    def batched_allocate(  # type: ignore[override]
         self,
         shapes,
         dtypes,
@@ -588,9 +588,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         # silently mint a fresh local manifest instead of using the
         # caller-provided one.  The bug bit Phase 2 pod testing.
         self._split_tier_manifest = (
-            SplitTierManifest()
-            if split_tier_manifest is None
-            else split_tier_manifest
+            SplitTierManifest() if split_tier_manifest is None else split_tier_manifest
         )
 
         # Thread pool used to parallelize the per-key K-bytes copy in
@@ -696,22 +694,17 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
             wrapped_id = self._next_task_id
             self._next_task_id += 1
 
-        is_split_tier = (
-            self._placement_mode == StoragePlacementMode.KV_SPLIT_TIER
-        )
+        is_split_tier = self._placement_mode == StoragePlacementMode.KV_SPLIT_TIER
         k_child_keys: list[ObjectKey] = []
         v_child_keys: list[ObjectKey] = []
         v_scratch_tensors: list[torch.Tensor] = []
         early_release_keys: list[ObjectKey] = []
         if is_split_tier:
-            k_child_keys, v_child_keys = self._alloc_split_tier_children(
-                keys, objects
-            )
+            k_child_keys, v_child_keys = self._alloc_split_tier_children(keys, objects)
             if not k_child_keys:
                 # K-child alloc failed (out of L1 or non-grouped input).
                 logger.warning(
-                    "Serde wrapper: split-tier K-child alloc failed for "
-                    "store task %d",
+                    "Serde wrapper: split-tier K-child alloc failed for store task %d",
                     wrapped_id,
                 )
                 self._finalize_store(wrapped_id, success=False)
@@ -780,14 +773,16 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         try:
             with self._lock:
                 self._store_tasks[wrapped_id] = state
+                # Declared broad: the split-tier branch builds a V-only
+                # group over scratch tensors, the default branch builds
+                # the packed serde src inputs.
+                serde_src: list
                 if is_split_tier and v_scratch_tensors:
                     # V-only codec reads V from src[i][1].tensor; route it
                     # to the slab-borrowed scratch tensor instead of the
                     # logical L1 entry (which the StoreController is about
                     # to release).
-                    serde_src = [
-                        (None, _VScratchSlot(t)) for t in v_scratch_tensors
-                    ]
+                    serde_src = [(None, _VScratchSlot(t)) for t in v_scratch_tensors]
                 else:
                     serde_src = self._build_serde_src_inputs(objects)
                 serde_task_id = self._serde.submit_serialize(
@@ -913,9 +908,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
             wrapped_id = self._next_task_id
             self._next_task_id += 1
 
-        is_split_tier = (
-            self._placement_mode == StoragePlacementMode.KV_SPLIT_TIER
-        )
+        is_split_tier = self._placement_mode == StoragePlacementMode.KV_SPLIT_TIER
         k_child_keys: list[ObjectKey] = []
         v_child_keys: list[ObjectKey] = []
         if is_split_tier:
@@ -950,9 +943,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         try:
             with self._lock:
                 self._load_tasks[wrapped_id] = state
-                inner_task_id = self._inner.submit_load_task(
-                    inner_load_keys, temp_objs
-                )
+                inner_task_id = self._inner.submit_load_task(inner_load_keys, temp_objs)
                 self._inner_to_load[inner_task_id] = wrapped_id
         except Exception:
             logger.exception(
@@ -1152,9 +1143,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
             # logical keys, so V lives under a deterministic derived
             # name on L2 that the load path will re-derive.  For
             # KV_TOGETHER it's the logical keys as today.
-            inner_store_keys = (
-                state.v_child_keys if state.is_split_tier else state.keys
-            )
+            inner_store_keys = state.v_child_keys if state.is_split_tier else state.keys
             try:
                 inner_id = self._inner.submit_store_task(
                     inner_store_keys, state.temp_objs
@@ -1466,9 +1455,11 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         # manager).  Falls back to the default reserve_write path if
         # the slab is exhausted or shape-mismatched.
         slab = self._ensure_k_child_slab(shapes[0], dtypes[0])
-        slab_objs = slab.batched_allocate(
-            [shapes[0]], [dtypes[0]], len(k_child_keys)
-        ) if slab is not None else None
+        slab_objs = (
+            slab.batched_allocate([shapes[0]], [dtypes[0]], len(k_child_keys))
+            if slab is not None
+            else None
+        )
         if slab_objs is not None and len(slab_objs) == len(k_child_keys):
             results = self._l1_manager.reserve_external_writes(
                 keys=k_child_keys,
@@ -1479,9 +1470,9 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
             # (KEY_NOT_WRITABLE -- the K-child already exists from a
             # prior incomplete store), recycle the unused slab objects
             # so they don't leak.
-            for k_child_key, obj in zip(
-                k_child_keys, slab_objs, strict=True
-            ):
+            # slab_objs is non-None only when slab was non-None above.
+            assert slab is not None
+            for k_child_key, obj in zip(k_child_keys, slab_objs, strict=True):
                 r = results.get(k_child_key)
                 if r is None or r[0] != L1Error.SUCCESS:
                     slab.free(obj)
@@ -1522,9 +1513,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
             return True
 
         if self._split_tier_copy_pool is not None and len(keys) > 1:
-            ok_list = list(
-                self._split_tier_copy_pool.map(_copy_one, range(len(keys)))
-            )
+            ok_list = list(self._split_tier_copy_pool.map(_copy_one, range(len(keys))))
         else:
             # Single-key batch or no pool: avoid the dispatch overhead.
             ok_list = [_copy_one(i) for i in range(len(keys))]
@@ -1716,8 +1705,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
             self._l1_manager.delete(k_child_keys)
         except Exception:
             logger.exception(
-                "Serde wrapper split-tier release: delete raised for "
-                "%d K children",
+                "Serde wrapper split-tier release: delete raised for %d K children",
                 len(k_child_keys),
             )
 
@@ -1774,9 +1762,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         """
         # Surviving indices = those still set in the bitmap after the
         # manifest mask.
-        surviving = [
-            i for i in range(len(state.keys)) if bitmap.test(i)
-        ]
+        surviving = [i for i in range(len(state.keys)) if bitmap.test(i)]
         if not surviving:
             return
         k_keys_to_read = [state.k_child_keys[i] for i in surviving]
@@ -1801,8 +1787,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
                 dst_k.copy_(src_k)
             except Exception:
                 logger.exception(
-                    "Serde wrapper split-tier load: K copy failed for "
-                    "logical key %s",
+                    "Serde wrapper split-tier load: K copy failed for logical key %s",
                     state.keys[idx],
                 )
                 bitmap.clear(idx)
@@ -1831,10 +1816,9 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         mapping = self._serde.input_slot_mapping()
         if mapping is None:
             return objects
-        return [
+        return [  # type: ignore[return-value]
             tuple(
-                GroupSlotView(obj, idx) if idx is not None else None
-                for idx in mapping
+                GroupSlotView(obj, idx) if idx is not None else None for idx in mapping
             )
             for obj in objects
         ]
@@ -1849,10 +1833,9 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         mapping = self._serde.output_slot_mapping()
         if mapping is None:
             return dst_objs
-        return [
+        return [  # type: ignore[return-value]
             tuple(
-                GroupSlotView(obj, idx) if idx is not None else None
-                for idx in mapping
+                GroupSlotView(obj, idx) if idx is not None else None for idx in mapping
             )
             for obj in dst_objs
         ]

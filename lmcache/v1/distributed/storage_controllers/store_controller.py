@@ -716,9 +716,7 @@ class StoreController(StorageControllerInterface):
                 remaining_read_locked = [
                     k for k in successful_keys if k not in early_set
                 ]
-                released = [
-                    k for k in successful_keys if k in early_set
-                ]
+                released = [k for k in successful_keys if k in early_set]
                 if released:
                     self._l1_manager.finish_read(released)
                     # Split-tier additionally deletes the original
@@ -728,7 +726,8 @@ class StoreController(StorageControllerInterface):
                     # early-release).
                     if self._split_tier_manifest is not None:
                         split_tier_logicals = [
-                            k for k in released
+                            k
+                            for k in released
                             if self._split_tier_manifest.lookup(k) is not None
                         ]
                         if split_tier_logicals:
@@ -857,14 +856,13 @@ class StoreController(StorageControllerInterface):
             if self._split_tier_manifest is not None:
                 already_released = set(task.early_released_logicals)
                 split_tier_logicals = [
-                    k for k in task.keys
+                    k
+                    for k in task.keys
                     if k not in already_released
                     and self._split_tier_manifest.lookup(k) is not None
                 ]
                 if split_tier_logicals:
-                    delete_keys = list(
-                        set(delete_keys) | set(split_tier_logicals)
-                    )
+                    delete_keys = list(set(delete_keys) | set(split_tier_logicals))
             if delete_keys:
                 l1_mgr.delete(delete_keys)
         else:

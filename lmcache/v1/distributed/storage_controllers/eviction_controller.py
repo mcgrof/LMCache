@@ -213,9 +213,7 @@ class L1EvictionController(EvictionController):
             logger.error("Treating it as DISCARD.")
             self._evict_with_split_tier_pairing(action.keys)
 
-    def _evict_with_split_tier_pairing(
-        self, keys: "list[ObjectKey]"
-    ) -> None:
+    def _evict_with_split_tier_pairing(self, keys: "list[ObjectKey]") -> None:
         """Discard L1 keys; for split-tier K children, also invalidate
         the manifest and enqueue the paired V child for L2 deletion.
 
