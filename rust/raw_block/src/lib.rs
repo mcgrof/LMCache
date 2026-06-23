@@ -847,6 +847,11 @@ struct IoSubmission {
     payload_len: Option<usize>,         // For bounce buffer reads
     batch_id: u64,                      // Batch ID for per-batch tracking
     nvme_cmd_data: Option<NvmeCmdData>, // NVMe command data for io_uring_cmd
+    // KV-object trace id, encoded into the high 32 bits of the SQE user_data so
+    // an external observer (eBPF) can attribute each io_uring/NVMe op back to a
+    // specific KV cache object. 0 = untagged. The low 32 bits stay a unique
+    // completion counter, so internal CQE matching is unaffected.
+    trace_id: u64,
 }
 
 impl Default for IoSubmission {
@@ -864,6 +869,7 @@ impl Default for IoSubmission {
             payload_len: None,
             batch_id: 0,
             nvme_cmd_data: None,
+            trace_id: 0,
         }
     }
 }
@@ -1575,8 +1581,15 @@ impl RawBlockDevice {
                             // if submit() fails or returns partial count
                             let mut user_data_list: Vec<u64> = Vec::with_capacity(to_submit_count);
                             for sub in batch.iter().take(to_submit_count) {
-                                let user_data = next_user_data;
+                                // Encode user_data = <trace_id : high 32><counter : low 32>.
+                                // The low 32 bits are a unique counter so CQE->request
+                                // matching (in_flight keyed by user_data) is unaffected; the
+                                // high 32 carry the KV-object trace_id so an external eBPF
+                                // observer can attribute this op to a KV object. trace_id 0
+                                // leaves user_data as the plain counter (legacy behavior).
+                                let counter = next_user_data & 0xFFFF_FFFF;
                                 next_user_data = next_user_data.wrapping_add(1);
+                                let user_data = ((sub.trace_id & 0xFFFF_FFFF) << 32) | counter;
                                 user_data_list.push(user_data);
                                 in_flight.insert(user_data, sub.clone());
 
@@ -2136,6 +2149,7 @@ impl RawBlockDevice {
                     payload_len: None,
                     batch_id,
                     nvme_cmd_data,
+                    trace_id: 0, // TODO: thread per-object trace_id through batched_write
                 };
 
                 submissions.push((sub, comp));
@@ -2279,7 +2293,7 @@ impl RawBlockDevice {
     }
 
     /// Synchronous read using io_uring.
-    #[pyo3(signature = (offset, data, payload_len, total_len = None))]
+    #[pyo3(signature = (offset, data, payload_len, total_len = None, trace_id = 0))]
     fn read_uring(
         &self,
         py: Python<'_>,
@@ -2287,6 +2301,7 @@ impl RawBlockDevice {
         data: &Bound<'_, PyAny>,
         payload_len: usize,
         total_len: Option<usize>,
+        trace_id: u64,
     ) -> PyResult<()> {
         if !self.use_iouring {
             return Err(PyRuntimeError::new_err("io_uring not enabled"));
@@ -2371,6 +2386,7 @@ impl RawBlockDevice {
                 payload_len: None,
                 batch_id: 0,
                 nvme_cmd_data: self._build_nvme_cmd_data(0, 0)?,
+                trace_id,
             };
             {
                 let q = self.queue.as_ref().expect("queue must exist");
@@ -2400,6 +2416,7 @@ impl RawBlockDevice {
                 payload_len: Some(payload_len),
                 batch_id: 0,
                 nvme_cmd_data: self._build_nvme_cmd_data(0, 0)?,
+                trace_id,
             };
             {
                 let q = self.queue.as_ref().expect("queue must exist");
@@ -2418,7 +2435,7 @@ impl RawBlockDevice {
     }
 
     /// Synchronous write using io_uring.
-    #[pyo3(signature = (offset, data, payload_len, total_len = None))]
+    #[pyo3(signature = (offset, data, payload_len, total_len = None, trace_id = 0))]
     fn write_uring(
         &self,
         py: Python<'_>,
@@ -2426,6 +2443,7 @@ impl RawBlockDevice {
         data: &Bound<'_, PyAny>,
         payload_len: usize,
         total_len: Option<usize>,
+        trace_id: u64,
     ) -> PyResult<()> {
         if !self.use_iouring {
             return Err(PyRuntimeError::new_err("io_uring not enabled"));
@@ -2506,6 +2524,7 @@ impl RawBlockDevice {
                 payload_len: None,
                 batch_id: 0,
                 nvme_cmd_data: self._build_nvme_cmd_data(0, 0)?,
+                trace_id,
             };
             {
                 let q = self.queue.as_ref().expect("queue must exist");
@@ -2539,6 +2558,7 @@ impl RawBlockDevice {
                 payload_len: Some(payload_len),
                 batch_id: 0,
                 nvme_cmd_data: self._build_nvme_cmd_data(0, 0)?,
+                trace_id,
             };
             {
                 let q = self.queue.as_ref().expect("queue must exist");
@@ -2715,6 +2735,7 @@ impl RawBlockDevice {
                     payload_len: None,
                     batch_id,
                     nvme_cmd_data: nvme_cmd_data.clone(),
+                    trace_id: 0, // TODO: thread per-object trace_id through batched_read
                 };
 
                 submissions.push((sub, comp));
