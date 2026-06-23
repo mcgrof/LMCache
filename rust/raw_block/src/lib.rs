@@ -1984,14 +1984,18 @@ impl RawBlockDevice {
     ///
     /// Returns a batch_id that must be passed to wait_iouring() to wait
     /// for completions for that batch.
-    #[pyo3(signature = (offsets, buffers, total_lens))]
+    #[pyo3(signature = (offsets, buffers, total_lens, trace_ids = None))]
     fn batched_write(
         &self,
         py: Python<'_>,
         offsets: Vec<u64>,
         buffers: Vec<Bound<'_, PyAny>>,
         total_lens: Vec<usize>,
+        // Optional per-op KV-object trace_ids (one per offset); encoded into the
+        // SQE user_data so an eBPF observer can attribute each op to a KV object.
+        trace_ids: Option<Vec<u64>>,
     ) -> PyResult<u64> {
+        let trace_ids = trace_ids.unwrap_or_default();
         if !self.use_iouring {
             return Err(PyRuntimeError::new_err("io_uring not enabled"));
         }
@@ -2149,7 +2153,7 @@ impl RawBlockDevice {
                     payload_len: None,
                     batch_id,
                     nvme_cmd_data,
-                    trace_id: 0, // TODO: thread per-object trace_id through batched_write
+                    trace_id: trace_ids.get(i).copied().unwrap_or(0),
                 };
 
                 submissions.push((sub, comp));
@@ -2582,14 +2586,17 @@ impl RawBlockDevice {
     ///
     /// Returns a batch_id that must be passed to wait_iouring() to wait
     /// for completions for that batch
-    #[pyo3(signature = (offsets, buffers, total_lens))]
+    #[pyo3(signature = (offsets, buffers, total_lens, trace_ids = None))]
     fn batched_read(
         &self,
         py: Python<'_>,
         offsets: Vec<u64>,
         buffers: Vec<Bound<'_, PyAny>>,
         total_lens: Vec<usize>,
+        // Optional per-op KV-object trace_ids; encoded into the SQE user_data.
+        trace_ids: Option<Vec<u64>>,
     ) -> PyResult<u64> {
+        let trace_ids = trace_ids.unwrap_or_default();
         if !self.use_iouring {
             return Err(PyRuntimeError::new_err("io_uring not enabled"));
         }
@@ -2735,7 +2742,7 @@ impl RawBlockDevice {
                     payload_len: None,
                     batch_id,
                     nvme_cmd_data: nvme_cmd_data.clone(),
-                    trace_id: 0, // TODO: thread per-object trace_id through batched_read
+                    trace_id: trace_ids.get(i).copied().unwrap_or(0),
                 };
 
                 submissions.push((sub, comp));
