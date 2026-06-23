@@ -611,6 +611,48 @@ class RawBlockCore:
         """Return the byte offset where raw-block data slots begin."""
         return int(self._data_base_offset)
 
+    # --- kvio observability ------------------------------------------------
+    # Tag each KV object's device I/O with a trace_id (encoded into the io_uring
+    # user_data by the rust engine) so an external eBPF tracer can attribute every
+    # io_uring/NVMe op back to that object, and emit a side record giving the
+    # trace_id meaning. Entirely off unless env LMCACHE_KVIO_TRACE names an output
+    # file; zero overhead and trace_id=0 (untagged) otherwise.
+    def _kvio_enabled(self) -> bool:
+        path = getattr(self, "_kvio_trace_path", False)
+        if path is False:  # unresolved
+            path = os.environ.get("LMCACHE_KVIO_TRACE") or None
+            self._kvio_trace_path = path
+        return path is not None
+
+    def _kvio_next_tid(self) -> int:
+        tid = getattr(self, "_kvio_tid_counter", 0) + 1
+        self._kvio_tid_counter = tid
+        # 32 bits, packed into the high half of user_data; 0 means untagged
+        return (tid & 0xFFFFFFFF) or 1
+
+    def _kvio_emit(self, trace_id, op, key, size, offset, meta=None) -> None:
+        if not self._kvio_enabled():
+            return
+        rec = {
+            "trace_id": trace_id,
+            "op": op,
+            "key": key,
+            "bytes": int(size),
+            "slot_offset": int(offset),
+            "ts": time.monotonic(),
+        }
+        if meta is not None:
+            try:
+                rec["shape"] = list(meta.shape) if meta.shape is not None else None
+                rec["dtype"] = str(meta.dtype)
+            except Exception:
+                pass
+        try:
+            with open(self._kvio_trace_path, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+        except Exception:
+            pass
+
     def put_many(
         self,
         keys: Sequence[RawBlockKeySpec],
@@ -671,7 +713,8 @@ class RawBlockCore:
                 )
                 self._inflight[key.encoded] = _Inflight(offset=offset, meta=meta)
 
-            success = self._write_one(key, obj, offset)
+            trace_id = self._kvio_next_tid() if self._kvio_enabled() else 0
+            success = self._write_one(key, obj, offset, trace_id=trace_id)
 
             with self._lock:
                 inflight = self._inflight.pop(key.encoded, None)
@@ -694,6 +737,10 @@ class RawBlockCore:
                 self._meta_dirty_total += 1
                 results[i] = True
                 stored_keys.append(key.encoded)
+                self._kvio_emit(
+                    trace_id, "store", key.encoded,
+                    inflight.meta.size, inflight.offset, inflight.meta,
+                )
 
         return RawBlockPutManyResult(
             results=results,
@@ -769,6 +816,7 @@ class RawBlockCore:
                 if entry is None:
                     continue
                 try:
+                    trace_id = self._kvio_next_tid() if self._kvio_enabled() else 0
                     payload_len = int(entry.size)
                     total_len = (
                         round_up(payload_len, self.block_align)
@@ -798,6 +846,7 @@ class RawBlockCore:
                                 else payload_len
                             ],
                             [total_len],
+                            trace_ids=[trace_id],
                         )
                     else:
                         self._read_buffers(
@@ -805,9 +854,14 @@ class RawBlockCore:
                             [buf],
                             [payload_len],
                             [total_len],
+                            trace_ids=[trace_id],
                         )
                     objs[i].metadata.cached_positions = entry.meta.cached_positions
                     results[i] = True
+                    self._kvio_emit(
+                        trace_id, "load", encoded_key,
+                        entry.size, entry.offset, entry.meta,
+                    )
                 except Exception as e:
                     if raise_on_error:
                         raise
@@ -1130,6 +1184,7 @@ class RawBlockCore:
         buffers: Sequence[Any],
         payload_lens: Sequence[int],
         total_lens: Sequence[int],
+        trace_ids: Optional[Sequence[int]] = None,
     ) -> None:
         """Write buffers as bounded NVMe raw-command chunks.
 
@@ -1144,13 +1199,15 @@ class RawBlockCore:
             Exception: Propagates Rust raw-device write errors.
         """
         raw_dev = self._rawdev()
+        tids = list(trace_ids) if trace_ids is not None else [0] * len(offsets)
         chunk_offsets: list[int] = []
         chunk_buffers: list[memoryview] = []
         chunk_lens: list[int] = []
+        chunk_trace_ids: list[int] = []
         keepalive: list[memoryview] = []
 
-        for offset, buf, payload_len, total_len in zip(
-            offsets, buffers, payload_lens, total_lens, strict=True
+        for offset, buf, payload_len, total_len, tid in zip(
+            offsets, buffers, payload_lens, total_lens, tids, strict=True
         ):
             offset = int(offset)
             payload_len = int(payload_len)
@@ -1175,6 +1232,7 @@ class RawBlockCore:
                 chunk_offsets.append(offset + cursor)
                 chunk_buffers.append(view[cursor : cursor + chunk_len])
                 chunk_lens.append(chunk_len)
+                chunk_trace_ids.append(tid)
                 cursor += chunk_len
 
         if not chunk_offsets:
@@ -1183,6 +1241,7 @@ class RawBlockCore:
             chunk_offsets,
             chunk_buffers,
             chunk_lens,
+            chunk_trace_ids,
         )
         raw_dev.wait_iouring(batch_id)
         keepalive.clear()
@@ -1193,6 +1252,7 @@ class RawBlockCore:
         buffers: Sequence[Any],
         payload_lens: Sequence[int],
         total_lens: Sequence[int],
+        trace_ids: Optional[Sequence[int]] = None,
     ) -> None:
         """Read buffers as bounded NVMe raw-command chunks.
 
@@ -1208,9 +1268,10 @@ class RawBlockCore:
         """
         raw_dev = self._rawdev()
         read_uring = raw_dev.read_uring
+        tids = list(trace_ids) if trace_ids is not None else [0] * len(offsets)
 
-        for offset, buf, payload_len, total_len in zip(
-            offsets, buffers, payload_lens, total_lens, strict=True
+        for offset, buf, payload_len, total_len, tid in zip(
+            offsets, buffers, payload_lens, total_lens, tids, strict=True
         ):
             offset = int(offset)
             payload_len = int(payload_len)
@@ -1236,6 +1297,7 @@ class RawBlockCore:
                     target[cursor : cursor + chunk_len],
                     chunk_len,
                     chunk_len,
+                    tid,
                 )
                 cursor += chunk_len
 
@@ -1248,6 +1310,7 @@ class RawBlockCore:
         buffers: Sequence[Any],
         payload_lens: Sequence[int],
         total_lens: Sequence[int],
+        trace_ids: Optional[Sequence[int]] = None,
     ) -> None:
         """Write one or more buffers through the configured Rust I/O path.
 
@@ -1262,7 +1325,9 @@ class RawBlockCore:
             Exception: Propagates Rust raw-device write errors.
         """
         raw_dev = self._rawdev()
+        tids = list(trace_ids) if trace_ids is not None else [0] * len(offsets)
         if self.io_engine != "io_uring":
+            # POSIX path has no io_uring user_data; trace_ids are not applicable.
             for offset, buf, payload_len, total_len in zip(
                 offsets, buffers, payload_lens, total_lens, strict=True
             ):
@@ -1275,6 +1340,7 @@ class RawBlockCore:
                 buffers,
                 payload_lens,
                 total_lens,
+                trace_ids=tids,
             )
             return
 
@@ -1287,14 +1353,17 @@ class RawBlockCore:
                 [int(offset) for offset in offsets],
                 list(buffers),
                 [int(total_len) for total_len in total_lens],
+                [int(t) for t in tids],
             )
             raw_dev.wait_iouring(batch_id)
             return
 
-        for offset, buf, payload_len, total_len in zip(
-            offsets, buffers, payload_lens, total_lens, strict=True
+        for offset, buf, payload_len, total_len, tid in zip(
+            offsets, buffers, payload_lens, total_lens, tids, strict=True
         ):
-            raw_dev.write_uring(int(offset), buf, int(payload_len), int(total_len))
+            raw_dev.write_uring(
+                int(offset), buf, int(payload_len), int(total_len), int(tid)
+            )
 
     def _read_buffers(
         self,
@@ -1302,6 +1371,7 @@ class RawBlockCore:
         buffers: Sequence[Any],
         payload_lens: Sequence[int],
         total_lens: Sequence[int],
+        trace_ids: Optional[Sequence[int]] = None,
     ) -> None:
         """Read one or more buffers through the configured Rust I/O path.
 
@@ -1316,7 +1386,9 @@ class RawBlockCore:
             Exception: Propagates Rust raw-device read errors.
         """
         raw_dev = self._rawdev()
+        tids = list(trace_ids) if trace_ids is not None else [0] * len(offsets)
         if self.io_engine != "io_uring":
+            # POSIX path has no io_uring user_data; trace_ids are not applicable.
             for offset, buf, payload_len, total_len in zip(
                 offsets, buffers, payload_lens, total_lens, strict=True
             ):
@@ -1324,7 +1396,9 @@ class RawBlockCore:
             return
 
         if self.use_uring_cmd:
-            self._read_uring_cmd_buffers(offsets, buffers, payload_lens, total_lens)
+            self._read_uring_cmd_buffers(
+                offsets, buffers, payload_lens, total_lens, trace_ids=tids
+            )
             return
 
         can_batch = all(
@@ -1338,17 +1412,21 @@ class RawBlockCore:
                 [int(offset) for offset in offsets],
                 list(buffers),
                 [int(total_len) for total_len in total_lens],
+                [int(t) for t in tids],
             )
             raw_dev.wait_iouring(batch_id)
             return
 
-        for offset, buf, payload_len, total_len in zip(
-            offsets, buffers, payload_lens, total_lens, strict=True
+        for offset, buf, payload_len, total_len, tid in zip(
+            offsets, buffers, payload_lens, total_lens, tids, strict=True
         ):
-            raw_dev.read_uring(int(offset), buf, int(payload_len), int(total_len))
+            raw_dev.read_uring(
+                int(offset), buf, int(payload_len), int(total_len), int(tid)
+            )
 
     def _write_one(
-        self, key: RawBlockKeySpec, memory_obj: MemoryObj, offset: int
+        self, key: RawBlockKeySpec, memory_obj: MemoryObj, offset: int,
+        trace_id: int = 0,
     ) -> bool:
         """Write one object header and payload into a raw-block slot.
 
@@ -1385,6 +1463,7 @@ class RawBlockCore:
                         payload_len,
                     ],
                     [hdr_total, total_len],
+                    trace_ids=[trace_id, trace_id],
                 )
             finally:
                 with self._lock:
