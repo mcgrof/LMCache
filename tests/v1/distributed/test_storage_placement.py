@@ -371,13 +371,67 @@ def test_manifest_register_then_complete() -> None:
 
 
 def test_manifest_register_rejects_duplicate() -> None:
-    """A second register_pending under the same logical key is a
+    """A second register_pending while a store is IN FLIGHT is a
     wrapper bug -- surface it loudly rather than silently overwriting."""
     m = SplitTierManifest()
     k = _make_key()
     m.register_pending(k)
     with pytest.raises(ValueError, match="already tracked"):
         m.register_pending(k)
+
+
+def test_manifest_register_rejects_delete_in_flight() -> None:
+    """Paired cleanup is actively deleting the previous generation's
+    children -- a new store would race the deletes, so it is refused
+    (the caller fails the task; a retry succeeds after drop())."""
+    m = SplitTierManifest()
+    k = _make_key()
+    m.register_pending(k)
+    m.mark_invalidated(k)
+    m.mark_delete_in_flight(k)
+    with pytest.raises(ValueError, match="DELETE_IN_FLIGHT"):
+        m.register_pending(k)
+
+
+def test_manifest_register_reclaims_stale_complete() -> None:
+    """A COMPLETE entry whose K child was cleared out from under the
+    manifest (POST /cache/clear tier=l1) must not block a re-store of
+    the key forever -- register_pending starts a new generation."""
+    m = SplitTierManifest()
+    k = _make_key()
+    m.register_pending(k)
+    m.mark_complete(k)
+    m.register_pending(k)  # new generation, no raise
+    assert m.lookup(k) == SplitTierState.STORE_IN_FLIGHT
+    m.mark_complete(k)
+    assert m.is_complete(k)
+
+
+def test_manifest_register_reclaims_invalidated() -> None:
+    """A failed store's cleanup leaves INVALIDATED; the key must be
+    storable again (one failure must never become a permanent per-key
+    denial of caching)."""
+    m = SplitTierManifest()
+    k = _make_key()
+    m.register_pending(k)
+    m.mark_invalidated(k)
+    m.register_pending(k)  # new generation, no raise
+    assert m.lookup(k) == SplitTierState.STORE_IN_FLIGHT
+
+
+def test_manifest_tracked_keys_snapshot() -> None:
+    """tracked_keys returns every tracked logical key regardless of
+    state (StorageManager.clear sweeps this snapshot)."""
+    m = SplitTierManifest()
+    k1 = _make_key(chunk_hash=b"\x11" * 32)
+    k2 = _make_key(chunk_hash=b"\x22" * 32)
+    assert m.tracked_keys() == []
+    m.register_pending(k1)
+    m.register_pending(k2)
+    m.mark_complete(k1)
+    assert sorted(m.tracked_keys(), key=lambda k: k.chunk_hash) == [k1, k2]
+    m.drop(k1)
+    assert m.tracked_keys() == [k2]
 
 
 def test_manifest_mark_complete_rejects_wrong_state() -> None:
@@ -509,6 +563,95 @@ def test_storage_manager_exposes_split_tier_manifest() -> None:
             manifest = sm.split_tier_manifest
             assert isinstance(manifest, SplitTierManifest)
             assert len(manifest) == 0
+        finally:
+            sm.close()
+    finally:
+        shutil.rmtree(disk_path, ignore_errors=True)
+
+
+def test_storage_manager_clear_sweeps_stale_manifest_entries() -> None:
+    """POST /cache/clear (tier=l1) removes K children from L1; the
+    manifest sweep must drop the now-uncomposable entries (phantom
+    COMPLETE hits + permanently blocked re-stores otherwise) while
+    keeping entries whose K child survived the clear."""
+    # Standard
+    import shutil
+    import tempfile
+
+    # Third Party
+    import torch
+
+    # First Party
+    from lmcache.v1.distributed.api import MemoryLayoutDesc
+    from lmcache.v1.distributed.config import (
+        EvictionConfig,
+        L1ManagerConfig,
+        L1MemoryManagerConfig,
+        StorageManagerConfig,
+    )
+    from lmcache.v1.distributed.l2_adapters.config import L2AdaptersConfig
+    from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import FSL2AdapterConfig
+    from lmcache.v1.distributed.serde import SerdeConfig
+    from lmcache.v1.distributed.storage_manager import StorageManager
+
+    disk_path = tempfile.mkdtemp(prefix="lmcache_clear_sweep_test_")
+    try:
+        fs_cfg = FSL2AdapterConfig(
+            base_path=disk_path,
+            relative_tmp_dir=None,
+            read_ahead_size=None,
+            use_odirect=False,
+        )
+        fs_cfg.serde_config = SerdeConfig(type="asym_k16_v8_v_only")
+        sm_cfg = StorageManagerConfig(
+            l1_manager_config=L1ManagerConfig(
+                memory_config=L1MemoryManagerConfig(
+                    size_in_bytes=1 << 30,
+                    use_lazy=True,
+                    init_size_in_bytes=64 << 20,
+                ),
+            ),
+            eviction_config=EvictionConfig(eviction_policy="LRU"),
+            l2_adapter_config=L2AdaptersConfig(adapters=[fs_cfg]),  # type: ignore[list-item]
+        )
+        sm = StorageManager(sm_cfg)
+        try:
+            manifest = sm.split_tier_manifest
+
+            # Entry A: COMPLETE but its K child is NOT in L1 (the
+            # stale-after-clear shape).  It must be swept.
+            stale = _make_key(chunk_hash=b"\x51" * 32)
+            manifest.register_pending(stale)
+            manifest.mark_complete(stale)
+
+            # Entry B: its K child holds an L1 WRITE lock across the
+            # clear (an in-flight store), so force=False keeps the L1
+            # entry and the sweep must keep the manifest entry.
+            live = _make_key(chunk_hash=b"\x52" * 32)
+            manifest.register_pending(live)
+            live_k_child = derive_component_key(live, "k")
+            reserved = sm.reserve_write(
+                keys=[live_k_child],
+                layout_desc=MemoryLayoutDesc(
+                    shapes=[torch.Size([16])], dtypes=[torch.bfloat16]
+                ),
+                mode="new",
+            )
+            assert live_k_child in reserved
+
+            sm.clear(force=False)
+
+            assert manifest.lookup(stale) is None, (
+                "stale COMPLETE entry survived the clear sweep"
+            )
+            assert manifest.lookup(live) is not None, (
+                "entry with a surviving K child was wrongly swept"
+            )
+            # The swept key is storable again.
+            manifest.register_pending(stale)
+
+            # Release the write lock before close.
+            sm.finish_write([live_k_child])
         finally:
             sm.close()
     finally:
