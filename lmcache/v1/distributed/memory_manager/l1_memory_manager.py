@@ -134,11 +134,23 @@ class L1MemoryManager:
         self._allocator = create_memory_allocator(config)
         self._size_in_bytes = config.size_in_bytes
         self._align_bytes = config.align_bytes
-        # External usage providers (e.g. SerdeL2AdapterWrapper's K-child
-        # slab) registered via :meth:`register_external_memory_provider`.
-        # Their bytes get summed into the reading returned by
-        # :meth:`get_memory_usage` so the eviction policy sees true L1
-        # pressure rather than the address-manager subset.
+        self._init_external_provider_state()
+
+    def _init_external_provider_state(self) -> None:
+        """Initialize the external usage-provider registry.
+
+        External providers (e.g. SerdeL2AdapterWrapper's K-child slab)
+        are registered via :meth:`register_external_memory_provider`;
+        their bytes get summed into the reading returned by
+        :meth:`get_memory_usage` so the eviction policy sees true L1
+        pressure rather than the address-manager subset.
+
+        Split out of ``__init__`` so subclasses that build their own
+        allocator instead of chaining to ``super().__init__`` (e.g.
+        :class:`DevDaxL1MemoryManager`, which must not construct the
+        default CPU allocator) still initialize the state the provider
+        hooks rely on.
+        """
         self._external_providers: list[L1MemoryUsageProvider] = []
         self._external_lock = threading.Lock()
 
@@ -199,7 +211,8 @@ class L1MemoryManager:
         """
 
         if hasattr(self._allocator, "get_memory_usage"):
-            return self._allocator.get_memory_usage()
+            used_size, total_size = self._allocator.get_memory_usage()
+            return self._aggregate_external_usage(used_size, total_size)
 
         def get_address_manager(allocator: MemoryAllocatorInterface):
             if isinstance(allocator, MixedMemoryAllocator) and hasattr(
@@ -216,11 +229,28 @@ class L1MemoryManager:
         free_size = address_manager.get_free_size()
         total_size = address_manager.get_heap_size()
         used_size = total_size - free_size
+        return self._aggregate_external_usage(used_size, total_size)
 
-        # Aggregate external providers (slabs etc.).  Held briefly so a
-        # late register/unregister can't race a concurrent read; each
-        # provider's own accounting is responsible for thread safety on
-        # the actual counters.
+    def _aggregate_external_usage(
+        self, used_size: int, total_size: int
+    ) -> tuple[int, int]:
+        """Add every registered external provider's bytes to a reading.
+
+        Applies to BOTH allocator flavors -- the ones exposing their
+        own ``get_memory_usage`` (e.g. the Device-DAX allocator) and
+        the address-manager path -- so slab bytes stay visible to the
+        eviction policy regardless of the configured L1 tier.
+
+        Args:
+            used_size: Base used bytes from the allocator.
+            total_size: Base capacity bytes from the allocator.
+
+        Returns:
+            ``(used, total)`` including external provider bytes.
+        """
+        # The lock is held briefly so a late register/unregister can't
+        # race a concurrent read; each provider's own accounting is
+        # responsible for thread safety on the actual counters.
         with self._external_lock:
             providers = list(self._external_providers)
         for provider in providers:

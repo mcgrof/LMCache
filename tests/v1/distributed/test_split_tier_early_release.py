@@ -1095,3 +1095,131 @@ def test_split_tier_registration_collision_rolls_back_batch() -> None:
         assert all(k in deleted for k in k_children)
     finally:
         wrapper.close()
+
+
+# =============================================================================
+# Parent-aware L1 frees -- slab-backed K children return to their pool
+# =============================================================================
+
+
+def _build_l1_and_slab():
+    """Fresh real L1Manager + K-child slab + one registered external
+    K-child entry (write-committed).
+
+    Returns:
+        ``(l1, slab, k_child_key)``.
+    """
+    # First Party
+    from lmcache.v1.distributed.api import ObjectKey
+    from lmcache.v1.distributed.config import (
+        L1ManagerConfig,
+        L1MemoryManagerConfig,
+    )
+    from lmcache.v1.distributed.l1_manager import L1Manager
+    from lmcache.v1.distributed.l2_adapters.serde_wrapper import _KChildSlab
+    from lmcache.v1.distributed.storage_placement import derive_component_key
+
+    cfg = L1ManagerConfig(
+        memory_config=L1MemoryManagerConfig(
+            size_in_bytes=1 << 20,
+            use_lazy=False,
+            init_size_in_bytes=1 << 20,
+        )
+    )
+    l1 = L1Manager(cfg)
+    logical = ObjectKey(
+        chunk_hash=b"\x66" * 32,
+        model_name="m",
+        kv_rank=0,
+        cache_salt="",
+    )
+    k_child = derive_component_key(logical, "k")
+    slab = _KChildSlab(shape=torch.Size([4]), dtype=torch.float16, max_slots=2)
+    objs = slab.batched_allocate(None, None, batch_size=1)
+    l1.reserve_external_writes([k_child], objs)
+    l1.finish_write([k_child])
+    return l1, slab, k_child
+
+
+def test_external_kchild_delete_returns_buffer_to_slab() -> None:
+    """Deleting a slab-backed K child must return the buffer to the
+    SLAB, not hand its raw pointer to the L1 memory manager (which
+    poisons the pinned pool's free list on the CPU tier and raises on
+    Device-DAX, killing the eviction loop)."""
+    # First Party
+    from lmcache.v1.distributed.error import L1Error
+
+    l1, slab, k_child = _build_l1_and_slab()
+    before = slab.stats()
+    assert before["in_flight"] == 1
+    assert before["free"] == 0
+
+    res = l1.delete([k_child])
+    assert res[k_child] == L1Error.SUCCESS
+
+    after = slab.stats()
+    assert after["in_flight"] == 0, "slab accounting never refilled"
+    assert after["free"] == 1, "buffer not returned to the slab pool"
+
+    # And the pooled buffer is reusable: the next allocate is served
+    # from the free deque instead of permanently falling back to the
+    # slow path (the post-first-eviction-wave failure shape).
+    again = slab.batched_allocate(None, None, batch_size=1)
+    assert again is not None and len(again) == 1
+
+
+def test_external_kchild_clear_routes_to_slab() -> None:
+    """clear(force=True) frees every entry -- external ones must
+    still route to their parent pool."""
+    l1, slab, _k_child = _build_l1_and_slab()
+    l1.clear(force=True)
+    stats = slab.stats()
+    assert stats["in_flight"] == 0
+    assert stats["free"] == 1
+
+
+def test_external_kchild_close_routes_to_slab() -> None:
+    """close() frees every entry -- same routing requirement."""
+    l1, slab, _k_child = _build_l1_and_slab()
+    l1.close()
+    stats = slab.stats()
+    assert stats["in_flight"] == 0
+    assert stats["free"] == 1
+
+
+def test_own_objects_still_freed_via_memory_manager() -> None:
+    """Catalog-owned objects (plain reserve_write) keep flowing
+    through the memory manager's free -- the partitioned path must
+    not change their lifecycle."""
+    # First Party
+    from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+    from lmcache.v1.distributed.config import (
+        L1ManagerConfig,
+        L1MemoryManagerConfig,
+    )
+    from lmcache.v1.distributed.error import L1Error
+    from lmcache.v1.distributed.l1_manager import L1Manager
+
+    cfg = L1ManagerConfig(
+        memory_config=L1MemoryManagerConfig(
+            size_in_bytes=1 << 20,
+            use_lazy=False,
+            init_size_in_bytes=1 << 20,
+        )
+    )
+    l1 = L1Manager(cfg)
+    key = ObjectKey(chunk_hash=b"\x67" * 32, model_name="m", kv_rank=0)
+    res = l1.reserve_write(
+        keys=[key],
+        is_temporary=[False],
+        layout_desc=MemoryLayoutDesc(shapes=[torch.Size([16])], dtypes=[torch.float16]),
+        mode="new",
+    )
+    assert res[key][0] == L1Error.SUCCESS
+    l1.finish_write([key])
+    used_before, _ = l1.get_memory_usage()
+    assert used_before > 0
+    assert l1.delete([key])[key] == L1Error.SUCCESS
+    used_after, _ = l1.get_memory_usage()
+    assert used_after < used_before
+    l1.close()
