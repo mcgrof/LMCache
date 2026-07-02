@@ -295,6 +295,16 @@ class _KChildSlab(MemoryAllocatorInterface):
         self._in_flight = 0
         self._alloc_lock = threading.Lock()
 
+    @property
+    def shape(self) -> torch.Size:
+        """Per-slot tensor shape, pinned at construction."""
+        return self._shape
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """Per-slot dtype, pinned at construction."""
+        return self._dtype
+
     def _build_memory_obj(self) -> TensorMemoryObj:
         """Allocate a fresh CPU tensor + wrap as a TensorMemoryObj."""
         tensor = torch.empty(self._shape, dtype=self._dtype, device="cpu")
@@ -321,7 +331,7 @@ class _KChildSlab(MemoryAllocatorInterface):
         obj.valid = True
         obj.meta.ref_count = 1
         obj.meta.pin_count = 0
-        obj._used_size_override = None
+        obj.reset_used_size()
         # group_prefix_sum + shape are pinned at construction (single-
         # shape slab); nothing else to reset.
         return obj
@@ -330,21 +340,28 @@ class _KChildSlab(MemoryAllocatorInterface):
 
     def allocate(
         self,
-        shapes,
-        dtypes,
+        shapes: "torch.Size | list[torch.Size] | None",
+        dtypes: "torch.dtype | list[torch.dtype] | None",
         fmt: MemoryFormat = MemoryFormat.UNDEFINED,
-        allocator_type=None,
+        allocator_type: "str | None" = None,
     ) -> TensorMemoryObj | None:
-        """Return a single MemoryObj for one K-child slot."""
+        """Return a single MemoryObj for one K-child slot.
+
+        The slab is shape-pinned at construction; ``shapes`` /
+        ``dtypes`` are accepted (and may be ``None``) only to satisfy
+        the :class:`MemoryAllocatorInterface` call shape -- callers
+        verify the pinned shape via :attr:`shape` / :attr:`dtype`
+        before allocating.
+        """
         return self._allocate_one()
 
     def batched_allocate(  # type: ignore[override]
         self,
-        shapes,
-        dtypes,
+        shapes: "torch.Size | list[torch.Size] | None",
+        dtypes: "torch.dtype | list[torch.dtype] | None",
         batch_size: int,
         fmt: MemoryFormat = MemoryFormat.UNDEFINED,
-        allocator_type=None,
+        allocator_type: "str | None" = None,
     ) -> list[TensorMemoryObj]:
         """Return a list of MemoryObjs for ``batch_size`` K-child slots.
 
@@ -373,7 +390,7 @@ class _KChildSlab(MemoryAllocatorInterface):
         self._in_flight += 1
         return self._build_memory_obj()
 
-    def free(self, memory_obj: MemoryObj, allocator_type=None) -> None:
+    def free(self, memory_obj: MemoryObj, allocator_type: "str | None" = None) -> None:
         """Return a slab-borrowed MemoryObj to the deque.
 
         No-op if the deque is already at ``max_slots`` (one-shot
@@ -784,10 +801,14 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         try:
             with self._lock:
                 self._store_tasks[wrapped_id] = state
-                # Declared broad: the split-tier branch builds a V-only
-                # group over scratch tensors, the default branch builds
-                # the packed serde src inputs.
-                serde_src: list
+                # The split-tier branch builds a V-only group over
+                # scratch tensors, the default branch builds the packed
+                # serde src inputs.
+                serde_src: (
+                    list[MemoryObj]
+                    | list[MemoryObjGroup]
+                    | list[tuple[None, _VScratchSlot]]
+                )
                 if is_split_tier and v_scratch_tensors:
                     # V-only codec reads V from src[i][1].tensor; route it
                     # to the slab-borrowed scratch tensor instead of the
@@ -875,9 +896,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         """
         if self._placement_mode == StoragePlacementMode.KV_SPLIT_TIER:
             v_child_keys = [derive_component_key(k, "v") for k in keys]
-            task_id = self._inner.submit_lookup_and_lock_task(
-                v_child_keys, layout_desc
-            )
+            task_id = self._inner.submit_lookup_and_lock_task(v_child_keys, layout_desc)
             with self._lock:
                 self._lookup_logical_keys[task_id] = list(keys)
             return task_id
@@ -1672,7 +1691,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         """
         slab = self._k_child_slab
         if slab is not None:
-            if slab._shape == shape and slab._dtype == dtype:
+            if slab.shape == shape and slab.dtype == dtype:
                 return slab
             # Shape mismatch (a fresh wrapper would see one shape for
             # its lifetime; this branch is defensive).

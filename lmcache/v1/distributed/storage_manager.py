@@ -872,6 +872,21 @@ class StorageManager:
         skipped = sum(1 for err in results.values() if err == L1Error.KEY_IS_LOCKED)
         return deleted, skipped
 
+    def contains_l1_key(self, key: ObjectKey) -> bool:
+        """Whether ``key`` currently has an L1 catalog entry.
+
+        Pure introspection for diagnostics and tests: reports presence
+        regardless of lock state and does not lock, touch, or
+        otherwise perturb the entry.
+
+        Args:
+            key (ObjectKey): The key to probe.
+
+        Returns:
+            bool: True if the key has an L1 entry (any lock state).
+        """
+        return self._l1_manager.get_object_state(key) is not None
+
     def unsafe_read(
         self, keys: list[ObjectKey]
     ) -> tuple[list[ObjectKey], list[MemoryObj]]:
