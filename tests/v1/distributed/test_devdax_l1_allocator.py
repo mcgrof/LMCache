@@ -1042,3 +1042,39 @@ def test_hybrid_manager_get_backend_type_reports_per_object_medium(tmp_path):
         gc.collect()
     finally:
         manager.close()
+def test_devdax_manager_supports_external_memory_providers(tmp_path):
+    """DevDaxL1MemoryManager builds its own allocator instead of
+    chaining to super().__init__, but it must still initialize the
+    inherited external-provider registry -- register/unregister and
+    the usage aggregation raised AttributeError without it."""
+    # First Party
+    from lmcache.v1.distributed.memory_manager.devdax_l1_memory_manager import (
+        DevDaxL1MemoryManager,
+    )
+
+    path = _make_mmap_file(tmp_path, name="l1-devdax-provider-test.bin")
+    mgr = DevDaxL1MemoryManager(
+        L1MemoryManagerConfig(
+            size_in_bytes=1024 * 1024,
+            use_lazy=False,
+            shm_name="",
+            devdax_path=path,
+            devdax_size_in_bytes=1024 * 1024,
+        )
+    )
+    try:
+
+        class _Provider:
+            def get_used_capacity_bytes(self) -> tuple[int, int]:
+                return (4096, 8192)
+
+        provider = _Provider()
+        used_before, total_before = mgr.get_memory_usage()
+        mgr.register_external_memory_provider(provider)
+        used_after, total_after = mgr.get_memory_usage()
+        assert used_after == used_before + 4096
+        assert total_after == total_before + 8192
+        mgr.unregister_external_memory_provider(provider)
+        assert mgr.get_memory_usage() == (used_before, total_before)
+    finally:
+        mgr.close()
