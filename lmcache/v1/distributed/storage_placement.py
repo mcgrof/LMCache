@@ -120,10 +120,12 @@ _V_CHILD_MARKER = b"\x02"
 def derive_component_key(logical_key: ObjectKey, role: str) -> ObjectKey:
     """Derive a child :class:`ObjectKey` from a logical key + role.
 
-    Preserves ``model_name``, ``kv_rank``, and ``cache_salt`` (per
-    codex: per-tenant adapter accounting and quotas depend on
-    ``cache_salt`` -- do NOT mutate it).  Domain-separates via the
-    ``chunk_hash`` field by appending a 1-byte role marker.
+    Preserves every identity field of the logical key --
+    ``model_name``, ``kv_rank``, ``object_group_id``, and
+    ``cache_salt`` (per-tenant adapter accounting and quotas depend
+    on ``cache_salt``; multi-object-group models depend on
+    ``object_group_id`` -- do NOT drop either).  Domain-separates via
+    the ``chunk_hash`` field by appending a 1-byte role marker.
 
     Args:
         logical_key: The original logical chunk key.
@@ -152,6 +154,7 @@ def derive_component_key(logical_key: ObjectKey, role: str) -> ObjectKey:
         chunk_hash=logical_key.chunk_hash + marker,
         model_name=logical_key.model_name,
         kv_rank=logical_key.kv_rank,
+        object_group_id=logical_key.object_group_id,
         cache_salt=logical_key.cache_salt,
     )
 
@@ -194,6 +197,7 @@ def reverse_component_key(
         chunk_hash=h[:-1],
         model_name=child_key.model_name,
         kv_rank=child_key.kv_rank,
+        object_group_id=child_key.object_group_id,
         cache_salt=child_key.cache_salt,
     )
     return logical, role
