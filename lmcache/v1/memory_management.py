@@ -711,26 +711,42 @@ class TensorMemoryObj(MemoryObj):
         unchanged.  Allocator reuse resets this override to ``None`` so
         a recycled block returns to its layout-derived size.
 
-        Supported only on flat single-byte (uint8) buffers -- the serde
+        Narrowing (``n`` smaller than the current logical size) is
+        supported only on flat single-byte (uint8) buffers -- the serde
         temp buffers the async processor narrows.  Multi-byte dtypes or
         multi-group layouts would need a non-trivial reinterpretation
         and are rejected explicitly; the caller can fall back to
-        ``byte_array`` for raw byte access.
+        ``byte_array`` for raw byte access.  When ``n`` equals the
+        current logical size the call is a no-op for every layout: the
+        buffer already exposes exactly ``n`` bytes, so a full-size read
+        into a fixed-layout KV object (the plain, no-serde L2 load
+        path) passes through without triggering the narrowing checks.
 
         Args:
             n: bytes actually written.  Must satisfy
                 ``0 <= n <= get_physical_size()``.
 
         Raises:
-            ValueError: if ``n`` is outside the allowed range, the
-                buffer is multi-group, or the buffer's dtype is not
-                ``torch.uint8``.
+            ValueError: if ``n`` is outside the allowed range, or the
+                call would narrow (``n != get_size()``) and the buffer
+                is multi-group or its dtype is not ``torch.uint8``.
         """
-        if n < 0 or n > self.meta.phy_size:
-            raise ValueError(
-                f"set_used_size: n={n} out of range [0, {self.meta.phy_size}]"
-            )
         with self.lock:
+            if n == self.get_size():
+                # Nothing to narrow: the logical view already exposes
+                # exactly n bytes.  This is the common case for plain
+                # (no-serde) L2 loads, where the on-disk object is
+                # exactly the size of the fixed-layout destination
+                # buffer -- which must NOT be rejected by the
+                # narrowing-only validation below.  Checked before the
+                # range check because ad-hoc allocations carry
+                # phy_size=0, which would spuriously reject a
+                # full-size report.
+                return
+            if n < 0 or n > self.meta.phy_size:
+                raise ValueError(
+                    f"set_used_size: n={n} out of range [0, {self.meta.phy_size}]"
+                )
             if self.meta.shapes is not None and len(self.meta.shapes) > 1:
                 raise ValueError(
                     "set_used_size is only valid on single-group buffers; "
