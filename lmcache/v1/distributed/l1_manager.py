@@ -55,6 +55,13 @@ class L1ObjectState:
     is_temporary: bool
     """ Whether the object is temporary (need to be deleted after read). """
 
+    is_external: bool = False
+    """ Whether the backing buffer came from an external pool
+    (registered via ``reserve_external_writes``).  External objects
+    are freed through their own ``parent_allocator`` -- handing their
+    raw address to the L1 memory manager's allocator would corrupt
+    its free list. """
+
     def available_for_read(self) -> bool:
         """Check if the object is available for read.
 
@@ -418,7 +425,7 @@ class L1Manager:
         """
         extra_count = _validate_extra_count(extra_count)
         total = 1 + extra_count
-        need_to_free: list[MemoryObj] = []
+        need_to_free: list[L1ObjectState] = []
         need_to_free_keys: list[ObjectKey] = []
         ret: dict[ObjectKey, L1Error] = {}
         successful_keys: list[ObjectKey] = []
@@ -459,14 +466,14 @@ class L1Manager:
                 entry.read_lock.unlock()
             if entry.is_temporary and not entry.read_lock.is_locked():
                 # NOTE: temporary objects shouldn't have write-locks
-                need_to_free.append(entry.memory_obj)
+                need_to_free.append(entry)
                 need_to_free_keys.append(key)
                 del self._objects[key]
 
             ret[key] = L1Error.SUCCESS
             successful_keys.append(key)
 
-        self._memory_manager.free(need_to_free)
+        self._free_entries(need_to_free)
 
         for listener in self._registered_listeners:
             listener.on_l1_keys_read_finished(successful_keys)
@@ -659,6 +666,7 @@ class L1Manager:
                 write_lock=TTLLock(self._write_ttl_seconds),
                 read_lock=TTLLock(self._read_ttl_seconds),
                 is_temporary=is_temp,
+                is_external=True,
             )
             self._objects[key].write_lock.lock()
             ret[key] = (L1Error.SUCCESS, mem_obj)
@@ -806,6 +814,47 @@ class L1Manager:
         )
         return ret
 
+    def _free_entries(self, entries: list[L1ObjectState]) -> None:
+        """Free the entries' memory objects, routing each to its owner.
+
+        Catalog-owned objects go to the memory manager's batched free.
+        Externally-registered objects (``reserve_external_writes`` --
+        e.g. the serde wrapper's K-child slab) are returned to their
+        own ``parent_allocator``: handing a foreign raw address to the
+        memory manager's allocator poisons its free list on the CPU
+        tier and raises outright on Device-DAX, which would kill the
+        eviction loop.
+
+        Args:
+            entries: The catalog entries whose backing buffers are
+                being released.  Callers must have already removed
+                them from ``self._objects``.
+        """
+        own: list[MemoryObj] = []
+        for entry in entries:
+            if not entry.is_external:
+                own.append(entry.memory_obj)
+                continue
+            obj = entry.memory_obj
+            parent = getattr(obj, "parent_allocator", None)
+            if parent is None:
+                logger.warning(
+                    "L1Manager: externally-registered memory object has "
+                    "no parent allocator; falling back to the L1 memory "
+                    "manager free (possible pool accounting leak)"
+                )
+                own.append(obj)
+                continue
+            try:
+                parent.free(obj)
+            except Exception:
+                logger.exception(
+                    "L1Manager: external pool free raised; the buffer "
+                    "is leaked back to its pool's accounting"
+                )
+        if own:
+            self._memory_manager.free(own)
+
     @l1_mgr_synchronized
     def delete(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1Error]:
         """Delete the given keys from L1 cache.
@@ -821,7 +870,7 @@ class L1Manager:
             KEY_IS_LOCKED: The key is locked (either write-locked or read-locked
                 and cannot be deleted).
         """
-        need_to_free: list[MemoryObj] = []
+        need_to_free: list[L1ObjectState] = []
         ret: dict[ObjectKey, L1Error] = {}
         successful_keys: list[ObjectKey] = []
 
@@ -835,12 +884,12 @@ class L1Manager:
                 ret[key] = L1Error.KEY_IS_LOCKED
                 continue
 
-            need_to_free.append(entry.memory_obj)
+            need_to_free.append(entry)
             del self._objects[key]
             ret[key] = L1Error.SUCCESS
             successful_keys.append(key)
 
-        self._memory_manager.free(need_to_free)
+        self._free_entries(need_to_free)
 
         for listener in self._registered_listeners:
             listener.on_l1_keys_deleted_by_manager(successful_keys)
@@ -879,8 +928,8 @@ class L1Manager:
                 len(self._objects),
             )
             all_keys = list(self._objects.keys())
-            all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
-            self._memory_manager.free(all_memory_objs)
+            all_entries = list(self._objects.values())
+            self._free_entries(all_entries)
             self._objects.clear()
             for listener in self._registered_listeners:
                 listener.on_l1_keys_deleted_by_manager(all_keys)
@@ -897,7 +946,7 @@ class L1Manager:
             return
 
         keys_to_clear: list[ObjectKey] = []
-        objs_to_free: list[MemoryObj] = []
+        entries_to_free: list[L1ObjectState] = []
         locked_count = 0
 
         for key, entry in list(self._objects.items()):
@@ -905,12 +954,12 @@ class L1Manager:
                 locked_count += 1
                 continue
             keys_to_clear.append(key)
-            objs_to_free.append(entry.memory_obj)
+            entries_to_free.append(entry)
 
         for key in keys_to_clear:
             del self._objects[key]
 
-        self._memory_manager.free(objs_to_free)
+        self._free_entries(entries_to_free)
 
         if keys_to_clear:
             for listener in self._registered_listeners:
@@ -994,8 +1043,7 @@ class L1Manager:
     def close(self) -> None:
         """Close the L1Manager and free all resources."""
         with self._lock:
-            all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
-            self._memory_manager.free(all_memory_objs)
+            self._free_entries(list(self._objects.values()))
             self._objects.clear()
 
         self._memory_manager.close()

@@ -56,6 +56,10 @@ class DevDaxL1MemoryManager(L1MemoryManager):
         )
         self._size_in_bytes = config.size_in_bytes
         self._align_bytes = config.align_bytes
+        # Deliberately not chaining to super().__init__ (it would build
+        # the default CPU allocator); initialize the inherited
+        # external-provider hooks' state explicitly instead.
+        self._init_external_provider_state()
 
     def get_l1_memory_desc(self) -> L1MemoryDesc:
         """Return a descriptor for the primary L1 buffer.
