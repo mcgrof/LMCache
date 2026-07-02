@@ -637,6 +637,12 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         self._inner_to_store: dict[L2TaskId, L2TaskId] = {}
         self._inner_to_load: dict[L2TaskId, L2TaskId] = {}
         self._serde_to_load: dict[SerdeTaskId, L2TaskId] = {}
+        # Split-tier lookup tasks: inner task id -> the caller's
+        # LOGICAL keys, retained so query_lookup_and_lock_result can
+        # apply the manifest COMPLETE gate (and unlock masked-off V
+        # children on the inner adapter).  Entries are popped when the
+        # (once-only) inner result is surfaced.
+        self._lookup_logical_keys: dict[L2TaskId, list[ObjectKey]] = {}
 
         # User-visible completion queues (drained by controller polls).
         self._completed_store: dict[L2TaskId, L2StoreResult] = {}
@@ -863,28 +869,60 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         For :attr:`StoragePlacementMode.KV_SPLIT_TIER`, translate
         logical keys → V child keys before delegating to the inner
         adapter (V lives on L2 under derived names).  The caller's
-        view stays logical; the wrapper's
-        :meth:`query_lookup_and_lock_result` combines inner's V-hit
-        bitmap with the manifest's ``COMPLETE`` state so a logical
-        key resolves as a composite hit only when both children are
-        addressable.
+        view stays logical; the wrapper retains the logical keys per
+        task so :meth:`query_lookup_and_lock_result` can combine
+        inner's V-hit bitmap with the manifest's ``COMPLETE`` state --
+        a logical key resolves as a composite hit only when both
+        children are addressable.
         """
         if self._placement_mode == StoragePlacementMode.KV_SPLIT_TIER:
             v_child_keys = [derive_component_key(k, "v") for k in keys]
-            return self._inner.submit_lookup_and_lock_task(
+            task_id = self._inner.submit_lookup_and_lock_task(
                 v_child_keys, group_layout_descs
             )
+            with self._lock:
+                self._lookup_logical_keys[task_id] = list(keys)
+            return task_id
         return self._inner.submit_lookup_and_lock_task(keys, group_layout_descs)
 
     def query_lookup_and_lock_result(self, task_id: L2TaskId) -> Bitmap | None:
-        # For KV_TOGETHER the inner result is the final answer.  For
-        # KV_SPLIT_TIER the caller-visible bitmap is the intersection
-        # of inner's V-on-L2 hit AND the manifest's COMPLETE state;
-        # we cannot mask here without the original logical keys, so
-        # the load path takes care of the manifest gate on read.  The
-        # inner result is forwarded as-is (callers that need strict
-        # manifest semantics should rely on submit_load_task's bitmap).
-        return self._inner.query_lookup_and_lock_result(task_id)
+        """Query a lookup-and-lock result; applies the manifest gate.
+
+        For ``KV_TOGETHER`` the inner result is the final answer.  For
+        :attr:`StoragePlacementMode.KV_SPLIT_TIER` the caller-visible
+        bitmap is the intersection of inner's V-on-L2 hit AND the
+        manifest's ``COMPLETE`` state.  V hits masked off by the gate
+        are immediately unlocked on the inner adapter: the caller
+        derives its unlocks from the bitmap it receives, so a hidden
+        hit would otherwise hold its L2 lock forever.  The load path
+        re-applies the gate on read as defense in depth (the manifest
+        can transition between this query and the load).
+        """
+        result = self._inner.query_lookup_and_lock_result(task_id)
+        if result is None:
+            return None
+        with self._lock:
+            logical_keys = self._lookup_logical_keys.pop(task_id, None)
+        if logical_keys is None:
+            # KV_TOGETHER (nothing recorded) -- inner result is final.
+            return result
+        masked_v_children: list[ObjectKey] = []
+        for i, logical_key in enumerate(logical_keys):
+            if not result.test(i):
+                continue
+            if self._split_tier_manifest.is_complete(logical_key):
+                continue
+            result.clear(i)
+            masked_v_children.append(derive_component_key(logical_key, "v"))
+        if masked_v_children:
+            logger.info(
+                "Serde wrapper split-tier lookup: masked %d V hit(s) "
+                "whose manifest state is not COMPLETE; unlocking them "
+                "on the inner adapter",
+                len(masked_v_children),
+            )
+            self._inner.submit_unlock(masked_v_children)
+        return result
 
     def submit_unlock(self, keys: list[ObjectKey]) -> None:
         if self._placement_mode == StoragePlacementMode.KV_SPLIT_TIER:
@@ -1070,6 +1108,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
             self._inner_to_store.clear()
             self._inner_to_load.clear()
             self._serde_to_load.clear()
+            self._lookup_logical_keys.clear()
 
         if write_locked:
             try:
