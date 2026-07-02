@@ -413,11 +413,27 @@ def test_split_policy_routes_k_to_cpu_v_to_nvme() -> None:
     assert k_child != v_child
     assert k_child != logical
     assert v_child != logical
-    # Cache salt + model + rank preserved (per-tenant quota accounting).
+    # Cache salt + model + rank + object group preserved (per-tenant
+    # quota accounting; hybrid-model group separation).
     assert k_child.cache_salt == logical.cache_salt
     assert k_child.model_name == logical.model_name
     assert k_child.kv_rank == logical.kv_rank
+    assert k_child.object_group_id == logical.object_group_id
     assert v_child.cache_salt == logical.cache_salt
+    assert v_child.object_group_id == logical.object_group_id
+
+    # Two logical keys that differ ONLY by object_group_id (hybrid /
+    # sliding-window models emit one key per KV cache group with the
+    # same chunk_hash) must not collide after derivation.
+    logical_g1 = ObjectKey(
+        chunk_hash=logical.chunk_hash,
+        model_name=logical.model_name,
+        kv_rank=logical.kv_rank,
+        object_group_id=logical.object_group_id + 1,
+        cache_salt=logical.cache_salt,
+    )
+    assert derive_component_key(logical_g1, "k") != k_child
+    assert derive_component_key(logical_g1, "v") != v_child
 
     # ---- Placement mode resolution: V-only serde -> KV_SPLIT_TIER ----
     # First Party
