@@ -732,6 +732,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
                     wrapped_id,
                 )
                 self._release_split_tier_k_children(k_child_keys)
+                self._drop_split_tier_pending(keys)
                 self._finalize_store(wrapped_id, success=False)
                 return wrapped_id
             # Logical keys can be released immediately by the
@@ -746,8 +747,12 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
             )
             if k_child_keys:
                 # Release the K-children we just allocated; they would
-                # otherwise leak L1 with no V partner to back them.
+                # otherwise leak L1 with no V partner to back them --
+                # and drop the pending manifest entries so the keys
+                # remain storable (this exit fires precisely under L1
+                # memory pressure, when retries are most likely).
                 self._release_split_tier_k_children(k_child_keys)
+                self._drop_split_tier_pending(keys)
             if v_scratch_tensors:
                 self._return_v_scratch(v_scratch_tensors)
             self._finalize_store(wrapped_id, success=False)
@@ -804,6 +809,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
                 self._return_v_scratch(v_scratch_tensors)
             if k_child_keys:
                 self._release_split_tier_k_children(k_child_keys)
+                self._drop_split_tier_pending(keys)
             self._finalize_store(wrapped_id, success=False)
             return wrapped_id
         return wrapped_id
@@ -1545,8 +1551,30 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         # fires.  Otherwise the K-child key races into the pending
         # queue and gets routed back into submit_store_task as a
         # bare 1-shape MemoryObj, failing the multi-group check.
-        for logical_key in keys:
-            self._split_tier_manifest.register_pending(logical_key)
+        #
+        # All-or-nothing: register_pending raises on a key with an
+        # ACTIVE generation (concurrent duplicate store, or paired
+        # cleanup mid-delete).  Roll back the keys registered so far
+        # and fail the whole task -- a half-registered batch would
+        # leave the unregistered keys' K-child writes visible to the
+        # StoreController without the listener filter.
+        registered: list[ObjectKey] = []
+        try:
+            for logical_key in keys:
+                self._split_tier_manifest.register_pending(logical_key)
+                registered.append(logical_key)
+        except ValueError:
+            logger.warning(
+                "Serde wrapper: split-tier registration collided on an "
+                "in-flight generation (%d/%d keys registered); failing "
+                "the store task",
+                len(registered),
+                len(keys),
+            )
+            for logical_key in registered:
+                self._split_tier_manifest.drop(logical_key)
+            self._release_split_tier_k_children(successful)
+            return [], []
 
         # Commit the K-child writes.  After this they are read-only
         # cache residents under their child keys.
@@ -1752,14 +1780,50 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
 
     def _invalidate_split_tier_pending(self, state: _StoreTaskState) -> None:
         """Inner L2 V-store failed (or serialize failed) for a
-        split-tier task: invalidate the manifest and release the K
-        children we reserved.
+        split-tier task: invalidate the manifest, release the K
+        children we reserved, best-effort delete any V child the
+        failed inner store may have partially written, and DROP the
+        manifest entries.
 
-        Idempotent on the manifest side via :meth:`SplitTierManifest.mark_invalidated`.
+        The drop is what keeps a failed store from permanently
+        blocking the key: after cleanup no physical split-tier state
+        remains, so leaving an ``INVALIDATED`` tombstone would only
+        make the next ``register_pending`` collide (nothing would
+        ever transition it further -- the paired-eviction path never
+        sees these keys because their K children are gone).
+
+        Idempotent on the manifest side via
+        :meth:`SplitTierManifest.mark_invalidated` / ``drop``.
         """
         for logical_key in state.keys:
             self._split_tier_manifest.mark_invalidated(logical_key)
         self._release_split_tier_k_children(state.k_child_keys)
+        if state.v_child_keys:
+            # The inner store failed as a task, but a failure result
+            # doesn't guarantee no bytes landed -- delete the V child
+            # names so a partial blob can't be mistaken for a valid V
+            # by a future generation's load.  Best-effort: adapters
+            # without delete support leave tolerable cold-tier waste.
+            try:
+                self._inner.delete(state.v_child_keys)
+            except Exception:
+                logger.exception(
+                    "Serde wrapper split-tier cleanup: inner delete "
+                    "raised for %d V children",
+                    len(state.v_child_keys),
+                )
+        for logical_key in state.keys:
+            self._split_tier_manifest.drop(logical_key)
+
+    def _drop_split_tier_pending(self, keys: list[ObjectKey]) -> None:
+        """Submit-side failure AFTER ``register_pending`` but BEFORE
+        any inner L2 submission: the K children are released by the
+        caller and no V bytes were ever sent, so no physical state
+        remains -- drop the entries outright so the logical keys can
+        be stored again.
+        """
+        for logical_key in keys:
+            self._split_tier_manifest.drop(logical_key)
 
     def _compose_split_tier_k_from_l1(
         self,

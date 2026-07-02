@@ -207,17 +207,22 @@ class SplitTierManifest:
     """Thread-safe manifest of split-tier state per logical
     :class:`ObjectKey`.
 
-    Owned by :class:`StorageManager` (codex: lives there, not in the
+    Owned by :class:`StorageManager` (it lives there, not in the
     wrapper, so it composes with eviction and quota accounting).
     The wrapper queries / mutates it through the StorageManager's
     interface during store and load.
 
-    Operations are linear-forward (mirrors :class:`SplitTierState`):
-    ``STORE_IN_FLIGHT`` → ``COMPLETE`` → ``INVALIDATED`` →
-    ``DELETE_IN_FLIGHT``.  A key never moves to an earlier state;
+    Operations are linear-forward WITHIN one store generation
+    (mirrors :class:`SplitTierState`): ``STORE_IN_FLIGHT`` →
+    ``COMPLETE`` → ``INVALIDATED`` → ``DELETE_IN_FLIGHT``.  A key
+    never moves to an earlier state while its generation is active;
     invalid transitions raise :class:`ValueError` so a race in the
     wrapper surfaces immediately rather than silently corrupting
-    the lifecycle.
+    the lifecycle.  A NEW generation begins when
+    :meth:`register_pending` reclaims a key whose previous
+    generation ended (``COMPLETE`` gone stale or ``INVALIDATED``
+    after failed-store cleanup) -- a store failure must never
+    permanently block a key from being stored again.
 
     Lookup against an unregistered logical key returns ``None``;
     callers MUST treat that as "miss" (the composite cache entry
@@ -244,16 +249,34 @@ class SplitTierManifest:
         can suppress L2 routing for that K child (the K stays in L1
         as the canonical tier).
 
+        Keys whose previous store generation has ENDED are reclaimed
+        rather than rejected: a stale ``COMPLETE`` (the K child was
+        cleared or evicted out from under the manifest -- lookups
+        already miss because the composite requires the K child) or
+        ``INVALIDATED`` (a failed store whose cleanup finished)
+        entry is overwritten by the new generation.  A permanent
+        refusal here is worse than the race it guards against: it
+        turns one failed store into a per-key denial of caching for
+        the lifetime of the process.
+
         Raises:
-            ValueError: if the key is already tracked (a duplicate
-                store under the same logical key would be a wrapper
-                bug; surface it loudly).
+            ValueError: if the key has an ACTIVE operation in flight
+                (``STORE_IN_FLIGHT``: a concurrent duplicate store is
+                a wrapper bug -- surface it loudly;
+                ``DELETE_IN_FLIGHT``: paired cleanup is actively
+                deleting the previous generation's children and a new
+                write would race it -- the caller fails this store
+                and a later retry succeeds after :meth:`drop`).
         """
         with self._lock:
-            if logical_key in self._entries:
+            cur = self._entries.get(logical_key)
+            if cur in (
+                SplitTierState.STORE_IN_FLIGHT,
+                SplitTierState.DELETE_IN_FLIGHT,
+            ):
                 raise ValueError(
                     f"SplitTierManifest.register_pending: key already "
-                    f"tracked in state {self._entries[logical_key].name}"
+                    f"tracked in state {cur.name}"
                 )
             self._entries[logical_key] = SplitTierState.STORE_IN_FLIGHT
             self._k_child_keys.add(
@@ -358,6 +381,18 @@ class SplitTierManifest:
     def is_complete(self, logical_key: ObjectKey) -> bool:
         """Convenience: ``True`` iff lookup resolves to a composite hit."""
         return self.lookup(logical_key) == SplitTierState.COMPLETE
+
+    def tracked_keys(self) -> list[ObjectKey]:
+        """Return a snapshot of every tracked logical key.
+
+        Used by :meth:`StorageManager.clear` to sweep entries whose
+        K children were just removed from L1.  The snapshot is
+        consistent at the time of the call; callers must tolerate
+        entries transitioning (or being dropped) between the
+        snapshot and any follow-up per-key operation.
+        """
+        with self._lock:
+            return list(self._entries)
 
     def __len__(self) -> int:
         with self._lock:
