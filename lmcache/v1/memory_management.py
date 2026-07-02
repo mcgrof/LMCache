@@ -767,6 +767,20 @@ class TensorMemoryObj(MemoryObj):
                 self.meta.shapes = [new_shape]
             self.group_prefix_sum = [0, n]
 
+    def reset_used_size(self) -> None:
+        """Clear any :meth:`set_used_size` narrowing override, restoring
+        the layout-derived logical size.
+
+        For allocator / pool reuse paths that recycle a buffer for a
+        new allocation (e.g. the serde wrapper's K-child slab).  Only
+        the override itself is cleared: a pool whose buffers can
+        actually narrow (flat uint8) must rebuild the object's
+        metadata on reuse, since narrowing also rewrote ``meta.shape``
+        / ``meta.shapes`` / the group prefix sums.
+        """
+        with self.lock:
+            self._used_size_override = None
+
     # TODO(chunxiaozheng): use get_shapes and get_dtypes to replace
     #  get_shape and get_dtype
     def get_shape(self) -> torch.Size:

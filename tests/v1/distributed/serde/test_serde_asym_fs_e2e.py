@@ -517,11 +517,10 @@ class TestAsymK16V8VOnlySplitTierRoundTrip:
                 # The K child must be in L1; the original logical key
                 # must NOT (the wrapper deletes it after V-store ack).
                 k_child = derive_component_key(k, "k")
-                l1_objects = sm._l1_manager._objects  # type: ignore[attr-defined]
-                assert k_child in l1_objects, (
+                assert sm.contains_l1_key(k_child), (
                     "K child missing from L1 after V-only store"
                 )
-                assert k not in l1_objects, (
+                assert not sm.contains_l1_key(k), (
                     "original logical entry still in L1 after split-tier store; "
                     "the L1 footprint win did not materialize"
                 )

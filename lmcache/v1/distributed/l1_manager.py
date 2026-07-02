@@ -19,6 +19,7 @@ from lmcache.v1.distributed.memory_manager import (
     GDSL1MemoryManager,
     L1ManagerProtocol,
     L1MemoryManager,
+    L1MemoryUsageProvider,
 )
 from lmcache.v1.distributed.memory_manager.devdax_l1_memory_manager import (
     DevDaxL1MemoryManager,
@@ -280,7 +281,9 @@ class L1Manager:
         """
         self._split_tier_manifest = manifest
 
-    def register_external_memory_provider(self, provider) -> None:
+    def register_external_memory_provider(
+        self, provider: L1MemoryUsageProvider
+    ) -> None:
         """Register an auxiliary memory provider with the underlying
         :class:`L1MemoryManager`.
 
@@ -296,7 +299,9 @@ class L1Manager:
         """
         self._memory_manager.register_external_memory_provider(provider)
 
-    def unregister_external_memory_provider(self, provider) -> None:
+    def unregister_external_memory_provider(
+        self, provider: L1MemoryUsageProvider
+    ) -> None:
         """Mirror of :meth:`register_external_memory_provider`."""
         self._memory_manager.unregister_external_memory_provider(provider)
 
