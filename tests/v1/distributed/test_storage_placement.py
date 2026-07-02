@@ -133,6 +133,44 @@ def test_derive_component_key_deterministic() -> None:
     assert derive_component_key(logical, "v") == derive_component_key(logical, "v")
 
 
+def test_derive_component_key_preserves_object_group_id() -> None:
+    """object_group_id is part of ObjectKey identity (hybrid /
+    sliding-window models store one chunk per KV cache group under
+    the same chunk_hash) -- the child keys must inherit it verbatim
+    or same-hash chunks from different groups collide."""
+    logical = ObjectKey(
+        chunk_hash=b"\x42" * 32,
+        model_name="hybrid-model",
+        kv_rank=0,
+        object_group_id=3,
+        cache_salt="",
+    )
+    assert derive_component_key(logical, "k").object_group_id == 3
+    assert derive_component_key(logical, "v").object_group_id == 3
+
+
+def test_derive_component_key_no_collision_across_object_groups() -> None:
+    """Two logical keys differing ONLY by object_group_id (the exact
+    shape hybrid models produce: same content hash, one key per KV
+    cache group) must derive non-colliding children for both roles."""
+    group0 = ObjectKey(
+        chunk_hash=b"\x42" * 32,
+        model_name="hybrid-model",
+        kv_rank=0,
+        object_group_id=0,
+        cache_salt="",
+    )
+    group1 = ObjectKey(
+        chunk_hash=b"\x42" * 32,
+        model_name="hybrid-model",
+        kv_rank=0,
+        object_group_id=1,
+        cache_salt="",
+    )
+    assert derive_component_key(group0, "k") != derive_component_key(group1, "k")
+    assert derive_component_key(group0, "v") != derive_component_key(group1, "v")
+
+
 # =============================================================================
 # reverse_component_key
 # =============================================================================
@@ -158,6 +196,27 @@ def test_reverse_component_key_round_trip_v() -> None:
     rev_logical, role = result
     assert role == "v"
     assert rev_logical == logical
+
+
+def test_reverse_component_key_round_trips_all_identity_fields() -> None:
+    """Every ObjectKey identity field survives derive -> reverse,
+    including object_group_id (paired eviction reverses a K-child to
+    find its logical key; a dropped field would delete the wrong
+    group's V child)."""
+    logical = ObjectKey(
+        chunk_hash=b"\x99" * 32,
+        model_name="hybrid-model",
+        kv_rank=5,
+        object_group_id=2,
+        cache_salt="tenant-7",
+    )
+    for role in ("k", "v"):
+        child = derive_component_key(logical, role)
+        result = reverse_component_key(child)
+        assert result is not None
+        rev_logical, rev_role = result
+        assert rev_role == role
+        assert rev_logical == logical
 
 
 def test_reverse_component_key_returns_none_for_logical_key() -> None:
