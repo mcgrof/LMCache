@@ -58,6 +58,7 @@ from lmcache.v1.distributed.storage_layout import (
 from lmcache.v1.distributed.storage_placement import (
     SplitTierManifest,
     StoragePlacementMode,
+    derive_component_key,
     derive_storage_placement_mode,
 )
 from lmcache.v1.memory_management import MemoryObj
@@ -1168,6 +1169,16 @@ class StorageManager:
         """
         Clear data in the storage manager.
 
+        Under :attr:`StoragePlacementMode.KV_SPLIT_TIER`, additionally
+        sweep the split-tier manifest: any tracked logical key whose
+        K child was just removed from L1 can never compose again (the
+        composite requires the L1-resident K child), so its entry is
+        invalidated and dropped and its V child is best-effort deleted
+        from every L2 adapter. Without the sweep, cleared keys stay
+        ``COMPLETE`` in the manifest -- phantom lookup hits that fail
+        at load, orphaned V children on L2, and (before manifest
+        generations) a permanent refusal to re-store those keys.
+
         Args:
             force: If True, clear ALL objects including locked ones.
                 This may corrupt in-flight store/prefetch operations.
@@ -1175,6 +1186,33 @@ class StorageManager:
                 write-locked and read-locked objects intact.
         """
         self._l1_manager.clear(force=force)
+        if self._storage_placement_mode != StoragePlacementMode.KV_SPLIT_TIER:
+            return
+        orphaned_v_children: list[ObjectKey] = []
+        for logical_key in self._split_tier_manifest.tracked_keys():
+            k_child = derive_component_key(logical_key, "k")
+            if self._l1_manager.get_object_state(k_child) is not None:
+                # K child survived (locked entry under force=False, or
+                # an in-flight store's write-locked child): the
+                # composite is still intact -- leave the entry alone.
+                continue
+            self._split_tier_manifest.mark_invalidated(logical_key)
+            orphaned_v_children.append(derive_component_key(logical_key, "v"))
+            self._split_tier_manifest.drop(logical_key)
+        if not orphaned_v_children:
+            return
+        with self._adapters_lock:
+            adapters = list(self._l2_adapters.values())
+        for adapter in adapters:
+            try:
+                adapter.delete(orphaned_v_children)
+            except Exception:
+                logger.exception(
+                    "clear: L2 adapter %s delete raised for %d orphaned "
+                    "split-tier V children",
+                    type(adapter).__name__,
+                    len(orphaned_v_children),
+                )
 
     def close(self):
         """
