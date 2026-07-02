@@ -115,6 +115,8 @@ class _Capture:
     delete_calls: list[list]
     inner_submit_calls: list[tuple]
     inner_delete_calls: list[list]
+    inner_lookup_calls: list[list]
+    inner_unlock_calls: list[list]
 
 
 class _FakeL1Manager:
@@ -211,6 +213,8 @@ def _make_wrapper(
         delete_calls=[],
         inner_submit_calls=[],
         inner_delete_calls=[],
+        inner_lookup_calls=[],
+        inner_unlock_calls=[],
     )
     inner = _FakeInnerAdapter(capture)
     serde = _FakeSerdeProcessor(serialize_result=serialize_result)
@@ -263,6 +267,33 @@ class _FakeInnerAdapter:
 
     def delete(self, keys):
         self._capture.inner_delete_calls.append(list(keys))
+
+    def submit_lookup_and_lock_task(self, keys, layout_desc):
+        self._capture.inner_lookup_calls.append(list(keys))
+        if not hasattr(self, "_lookup_tasks"):
+            self._lookup_tasks = {}
+            self._next_lookup_id = 100
+        tid = self._next_lookup_id
+        self._next_lookup_id += 1
+        self._lookup_tasks[tid] = len(keys)
+        return tid
+
+    def query_lookup_and_lock_result(self, task_id):
+        # First Party
+        from lmcache.native_storage_ops import Bitmap
+
+        n = getattr(self, "_lookup_tasks", {}).pop(task_id, None)
+        if n is None:
+            return None
+        # Report every submitted key as a hit; the wrapper's manifest
+        # gate decides what the caller actually sees.
+        bitmap = Bitmap(n)
+        for i in range(n):
+            bitmap.set(i)
+        return bitmap
+
+    def submit_unlock(self, keys):
+        self._capture.inner_unlock_calls.append(list(keys))
 
     def pop_completed_store_tasks(self):
         return {}
@@ -1223,3 +1254,86 @@ def test_own_objects_still_freed_via_memory_manager() -> None:
     used_after, _ = l1.get_memory_usage()
     assert used_after < used_before
     l1.close()
+
+
+# =============================================================================
+# Manifest-gated lookup -- lock symmetry for masked V hits
+# =============================================================================
+
+
+def test_split_tier_lookup_masks_incomplete_and_unlocks() -> None:
+    """query_lookup_and_lock_result must AND the inner V-hit bitmap
+    with the manifest COMPLETE mask (its documented contract) and
+    immediately unlock the masked-off V children: callers derive
+    their unlocks from the bitmap they receive, so a hidden hit would
+    hold its L2 lock forever."""
+    # First Party
+    from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+    from lmcache.v1.distributed.storage_placement import (
+        StoragePlacementMode,
+        derive_component_key,
+    )
+
+    wrapper, capture, _l1, manifest = _make_wrapper(StoragePlacementMode.KV_SPLIT_TIER)
+    try:
+        complete = ObjectKey(chunk_hash=b"\x71" * 32, model_name="m", kv_rank=0)
+        in_flight = ObjectKey(chunk_hash=b"\x72" * 32, model_name="m", kv_rank=0)
+        untracked = ObjectKey(chunk_hash=b"\x73" * 32, model_name="m", kv_rank=0)
+        manifest.register_pending(complete)
+        manifest.mark_complete(complete)
+        manifest.register_pending(in_flight)
+
+        layout = MemoryLayoutDesc(shapes=[], dtypes=[])
+        task_id = wrapper.submit_lookup_and_lock_task(
+            [complete, in_flight, untracked], layout
+        )
+
+        # The inner adapter saw V-CHILD keys, not logical keys.
+        assert capture.inner_lookup_calls == [
+            [
+                derive_component_key(complete, "v"),
+                derive_component_key(in_flight, "v"),
+                derive_component_key(untracked, "v"),
+            ]
+        ]
+
+        bitmap = wrapper.query_lookup_and_lock_result(task_id)
+        assert bitmap is not None
+        # Only the COMPLETE key survives the gate (the inner reported
+        # all three V children as hits).
+        assert bitmap.test(0)
+        assert not bitmap.test(1)
+        assert not bitmap.test(2)
+
+        # The two masked V hits were unlocked on the inner adapter.
+        unlocked = [k for call in capture.inner_unlock_calls for k in call]
+        assert derive_component_key(in_flight, "v") in unlocked
+        assert derive_component_key(untracked, "v") in unlocked
+        assert derive_component_key(complete, "v") not in unlocked
+    finally:
+        wrapper.close()
+
+
+def test_kv_together_lookup_passes_through_unmodified() -> None:
+    """KV_TOGETHER keeps the legacy behavior: keys untranslated, the
+    inner bitmap final, no unlocks issued by the wrapper."""
+    # First Party
+    from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+    from lmcache.v1.distributed.storage_placement import StoragePlacementMode
+
+    wrapper, capture, _l1, _manifest = _make_wrapper(StoragePlacementMode.KV_TOGETHER)
+    try:
+        keys = [
+            ObjectKey(chunk_hash=b"\x74" * 32, model_name="m", kv_rank=0),
+            ObjectKey(chunk_hash=b"\x75" * 32, model_name="m", kv_rank=0),
+        ]
+        layout = MemoryLayoutDesc(shapes=[], dtypes=[])
+        task_id = wrapper.submit_lookup_and_lock_task(keys, layout)
+        assert capture.inner_lookup_calls == [keys]
+
+        bitmap = wrapper.query_lookup_and_lock_result(task_id)
+        assert bitmap is not None
+        assert bitmap.test(0) and bitmap.test(1)
+        assert capture.inner_unlock_calls == []
+    finally:
+        wrapper.close()
