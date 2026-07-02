@@ -114,6 +114,7 @@ class _Capture:
     finish_read_calls: list[list]
     delete_calls: list[list]
     inner_submit_calls: list[tuple]
+    inner_delete_calls: list[list]
 
 
 class _FakeL1Manager:
@@ -124,9 +125,13 @@ class _FakeL1Manager:
     behaviors that the wrapper invokes during a split-tier store.
     """
 
-    def __init__(self, capture: _Capture) -> None:
+    def __init__(self, capture: _Capture, fail_reserve_write: bool = False) -> None:
         self._capture = capture
         self._objects: dict = {}
+        # When True, every reserve_write fails (simulates L1 memory
+        # pressure at temp-buffer allocation time -- K-children go
+        # through reserve_external_writes and are unaffected).
+        self.fail_reserve_write = fail_reserve_write
 
     def register_listener(self, listener) -> None:
         pass
@@ -134,11 +139,22 @@ class _FakeL1Manager:
     def reserve_write(self, keys, is_temporary, layout_desc, mode):
         from lmcache.v1.distributed.error import L1Error
 
+        if self.fail_reserve_write:
+            return {k: (L1Error.OUT_OF_MEMORY, None) for k in keys}
         # Allocate a tiny placeholder MemoryObj-like per key.
         out = {}
         for k in keys:
             tensor = torch.zeros(layout_desc.shapes[0], dtype=layout_desc.dtypes[0])
             obj = _GroupedMemoryObj(tensors=[tensor])
+            self._objects[k] = obj
+            out[k] = (L1Error.SUCCESS, obj)
+        return out
+
+    def reserve_external_writes(self, keys, memory_objs, is_temporary):
+        from lmcache.v1.distributed.error import L1Error
+
+        out = {}
+        for k, obj in zip(keys, memory_objs, strict=True):
             self._objects[k] = obj
             out[k] = (L1Error.SUCCESS, obj)
         return out
@@ -180,7 +196,11 @@ class _GroupedMemoryObj:
         return [t.dtype for t in self._tensors]
 
 
-def _make_wrapper(placement_mode):
+def _make_wrapper(
+    placement_mode,
+    serialize_result: bool | None = None,
+    fail_reserve_write: bool = False,
+):
     from lmcache.v1.distributed.l2_adapters.serde_wrapper import (
         SerdeL2AdapterWrapper,
     )
@@ -190,10 +210,11 @@ def _make_wrapper(placement_mode):
         finish_read_calls=[],
         delete_calls=[],
         inner_submit_calls=[],
+        inner_delete_calls=[],
     )
     inner = _FakeInnerAdapter(capture)
-    serde = _FakeSerdeProcessor()
-    l1 = _FakeL1Manager(capture)
+    serde = _FakeSerdeProcessor(serialize_result=serialize_result)
+    l1 = _FakeL1Manager(capture, fail_reserve_write=fail_reserve_write)
     manifest = SplitTierManifest()
     wrapper = SerdeL2AdapterWrapper(
         inner=inner,
@@ -240,6 +261,9 @@ class _FakeInnerAdapter:
         self._capture.inner_submit_calls.append((list(keys), list(objects)))
         return 0
 
+    def delete(self, keys):
+        self._capture.inner_delete_calls.append(list(keys))
+
     def pop_completed_store_tasks(self):
         return {}
 
@@ -264,14 +288,23 @@ class _FakeInnerAdapter:
 
 class _FakeSerdeProcessor:
     """Minimal SerdeProcessor stand-in.  The wrapper's submit_serialize
-    is exercised but we don't need it to produce a completion here.
+    is exercised but by default we don't produce a completion.
+
+    Pass ``serialize_result=False`` to make every submitted serialize
+    task complete as a FAILURE: the fake signals the serialize eventfd
+    shortly after submit (from a timer thread, so the wrapper has
+    registered its reverse-map entry by the time the drain runs) and
+    ``query_serialize_result`` reports the failure.  This drives the
+    wrapper's real drain-loop store-failure path end to end.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, serialize_result: bool | None = None) -> None:
         from lmcache.v1.platform import create_event_notifier
 
         self._efd = create_event_notifier()
         self._next_id = 0
+        self._serialize_result = serialize_result
+        self._submitted: set[int] = set()
 
     def get_serialize_event_fd(self) -> int:
         return self._efd.fileno()
@@ -286,6 +319,16 @@ class _FakeSerdeProcessor:
     def submit_serialize(self, src, dst) -> int:
         sid = self._next_id
         self._next_id += 1
+        if self._serialize_result is not None:
+            # Standard
+            import threading
+
+            self._submitted.add(sid)
+            # Delay the completion signal so the wrapper's
+            # submit_store_task has released its lock and registered
+            # the serde-to-store reverse mapping before the drain
+            # loop polls for results.
+            threading.Timer(0.05, self._efd.notify).start()
         return sid
 
     def submit_deserialize(self, src, dst) -> int:
@@ -293,7 +336,12 @@ class _FakeSerdeProcessor:
         self._next_id += 1
         return sid
 
+    def estimate_serialized_size(self, layout_desc) -> int:
+        return 4096
+
     def query_serialize_result(self, sid):
+        if self._serialize_result is not None and sid in self._submitted:
+            return self._serialize_result
         return None
 
     def query_deserialize_result(self, sid):
@@ -880,5 +928,170 @@ def test_claim_is_single_shot() -> None:
         assert first == ["k0", "k1"]
         assert second == []
         assert state.early_release_claimed
+    finally:
+        wrapper.close()
+
+
+# =============================================================================
+# Split-tier store-failure lifecycle -- the manifest must never leak
+# =============================================================================
+
+
+def _submit_split_tier_store(wrapper, n_keys: int = 2):
+    """Submit a split-tier store of ``n_keys`` grouped (K, V) objects
+    through the wrapper's public surface.
+
+    Returns:
+        ``(logical_keys, task_id)``.
+    """
+    # First Party
+    from lmcache.v1.distributed.api import ObjectKey
+
+    keys = [
+        ObjectKey(chunk_hash=bytes([0x30 + i]) * 32, model_name="m", kv_rank=0)
+        for i in range(n_keys)
+    ]
+    objects = [
+        _GroupedMemoryObj(
+            tensors=[
+                torch.zeros(torch.Size([4]), dtype=torch.bfloat16),
+                torch.zeros(torch.Size([8]), dtype=torch.bfloat16),
+            ]
+        )
+        for _ in range(n_keys)
+    ]
+    task_id = wrapper.submit_store_task(keys, objects)
+    return keys, task_id
+
+
+def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.02) -> bool:
+    # Standard
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return False
+
+
+def test_split_tier_serialize_failure_drops_manifest_and_cleans_children() -> None:
+    """A serialize failure surfaces through the wrapper's drain loop:
+    the manifest entries must be DROPPED (not left INVALIDATED -- one
+    failed store must never permanently block a key), the K children
+    deleted from L1, and the V child names best-effort deleted on the
+    inner adapter."""
+    # First Party
+    from lmcache.v1.distributed.storage_placement import (
+        StoragePlacementMode,
+        derive_component_key,
+    )
+
+    wrapper, capture, _l1, manifest = _make_wrapper(
+        StoragePlacementMode.KV_SPLIT_TIER, serialize_result=False
+    )
+    try:
+        keys, task_id = _submit_split_tier_store(wrapper)
+        # Registration happened synchronously on submit.
+        assert len(manifest) == len(keys)
+
+        popped: dict = {}
+
+        def _task_failed() -> bool:
+            popped.update(wrapper.pop_completed_store_tasks())
+            return task_id in popped
+
+        assert _wait_until(_task_failed), "store task never completed"
+        assert not popped[task_id].is_successful()
+        assert _wait_until(lambda: len(manifest) == 0), (
+            "manifest entries leaked after a serialize failure"
+        )
+
+        # K children removed from L1.
+        k_children = [derive_component_key(k, "k") for k in keys]
+        deleted = [k for call in capture.delete_calls for k in call]
+        assert all(k in deleted for k in k_children)
+
+        # V child names best-effort deleted on the inner adapter.
+        v_children = [derive_component_key(k, "v") for k in keys]
+        inner_deleted = [k for call in capture.inner_delete_calls for k in call]
+        assert all(v in inner_deleted for v in v_children)
+
+        # The keys are storable again: a new generation registers
+        # without raising.
+        for k in keys:
+            manifest.register_pending(k)
+    finally:
+        wrapper.close()
+
+
+def test_split_tier_temp_alloc_failure_drops_manifest() -> None:
+    """Temp-buffer allocation fails under L1 memory pressure -- exactly
+    when retries are most likely.  The pending manifest entries must be
+    dropped on the synchronous submit path so the keys stay storable."""
+    # First Party
+    from lmcache.v1.distributed.storage_placement import (
+        StoragePlacementMode,
+        derive_component_key,
+    )
+
+    wrapper, capture, _l1, manifest = _make_wrapper(
+        StoragePlacementMode.KV_SPLIT_TIER, fail_reserve_write=True
+    )
+    try:
+        keys, task_id = _submit_split_tier_store(wrapper)
+        # The failure is synchronous: no drain loop involved.
+        assert len(manifest) == 0, "manifest entries leaked after a temp-alloc failure"
+        popped = wrapper.pop_completed_store_tasks()
+        assert task_id in popped
+        assert not popped[task_id].is_successful()
+
+        k_children = [derive_component_key(k, "k") for k in keys]
+        deleted = [k for call in capture.delete_calls for k in call]
+        assert all(k in deleted for k in k_children)
+
+        for k in keys:
+            manifest.register_pending(k)
+    finally:
+        wrapper.close()
+
+
+def test_split_tier_registration_collision_rolls_back_batch() -> None:
+    """If register_pending collides mid-batch (a concurrent store of
+    one key is in flight), the keys registered so far are rolled back,
+    the K children released, and the COLLIDING key's pre-existing
+    generation is left untouched."""
+    # First Party
+    from lmcache.v1.distributed.storage_placement import (
+        SplitTierState,
+        StoragePlacementMode,
+        derive_component_key,
+    )
+
+    wrapper, capture, _l1, manifest = _make_wrapper(StoragePlacementMode.KV_SPLIT_TIER)
+    try:
+        # Pre-register the SECOND key (index 1) as an in-flight
+        # generation owned by "another" store task.
+        # First Party
+        from lmcache.v1.distributed.api import ObjectKey
+
+        colliding = ObjectKey(chunk_hash=bytes([0x31]) * 32, model_name="m", kv_rank=0)
+        manifest.register_pending(colliding)
+
+        keys, task_id = _submit_split_tier_store(wrapper)
+        assert keys[1] == colliding
+
+        # The batch failed; only the pre-existing entry remains.
+        assert manifest.lookup(keys[0]) is None
+        assert manifest.lookup(colliding) == SplitTierState.STORE_IN_FLIGHT
+        popped = wrapper.pop_completed_store_tasks()
+        assert task_id in popped
+        assert not popped[task_id].is_successful()
+
+        # Both freshly-allocated K children were released.
+        k_children = [derive_component_key(k, "k") for k in keys]
+        deleted = [k for call in capture.delete_calls for k in call]
+        assert all(k in deleted for k in k_children)
     finally:
         wrapper.close()
