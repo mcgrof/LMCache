@@ -929,36 +929,22 @@ def test_reserve_external_writes_validates_lengths() -> None:
 
 
 def test_claim_is_single_shot() -> None:
-    """Future-proofing: even if a controller polls more than once for the
-    same task id, the wrapper hands the key list back exactly once.
+    """Even if a controller polls more than once for the same task id,
+    the wrapper hands the key list back exactly once.
 
-    This is a unit test against the underlying state, not a full submit
-    flow (that would require a working inner adapter + serde to drive
-    submit_store_task end-to-end).  We probe the state directly.
+    Driven through the public submit path: the fake serde never
+    completes, so the task stays in flight with its early-release keys
+    populated -- exactly the state a polling controller observes.
     """
-    from lmcache.v1.distributed.l2_adapters.serde_wrapper import _StoreTaskState
     from lmcache.v1.distributed.storage_placement import StoragePlacementMode
 
     wrapper, *_ = _make_wrapper(StoragePlacementMode.KV_SPLIT_TIER)
     try:
-        # Synthesize a finished _StoreTaskState with early-release keys
-        # pre-populated.  Exercises the latch in claim_early_release_keys.
-        state = _StoreTaskState(
-            wrapped_id=1,
-            keys=["k0", "k1"],  # type: ignore[list-item]
-            temp_keys=[],
-            temp_objs=[],
-            phase=None,  # type: ignore[arg-type]
-            is_split_tier=True,
-            early_release_keys=["k0", "k1"],  # type: ignore[list-item]
-        )
-        with wrapper._lock:
-            wrapper._store_tasks[1] = state
-        first = wrapper.claim_early_release_keys(1)
-        second = wrapper.claim_early_release_keys(1)
-        assert first == ["k0", "k1"]
+        keys, task_id = _submit_split_tier_store(wrapper)
+        first = wrapper.claim_early_release_keys(task_id)
+        second = wrapper.claim_early_release_keys(task_id)
+        assert first == keys
         assert second == []
-        assert state.early_release_claimed
     finally:
         wrapper.close()
 
