@@ -25,6 +25,7 @@ from unittest.mock import MagicMock
 # First Party
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.config import EvictionConfig
+from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import (
     EvictionAction,
     EvictionDestination,
@@ -164,15 +165,16 @@ def test_paired_eviction_idempotent_on_already_invalidated() -> None:
 
 def test_paired_eviction_skips_store_in_flight_avoids_corruption() -> None:
     """If a K child is somehow selected for eviction while the
-    store is still STORE_IN_FLIGHT, the wrapper's drain path will
-    fail to mark_complete (race) and clean up via the failed-store
-    path.  The eviction's job here is the same: invalidate the
-    manifest, enqueue V cleanup (best-effort), delete K from L1.
+    store is still STORE_IN_FLIGHT (a stale eviction-policy
+    snapshot -- ``is_key_evictable`` pins these by design), the
+    controller must leave it COMPLETELY alone: deleting the K child
+    would tear the K out from under the active V codec / L2 write,
+    and invalidating the manifest would make the store's later
+    mark_complete blow up on an untracked key.
     """
     manifest = SplitTierManifest()
     logical = _make_key(b"\x66" * 32)
     k_child = derive_component_key(logical, "k")
-    v_child = derive_component_key(logical, "v")
     manifest.register_pending(logical)
     # STORE_IN_FLIGHT, not COMPLETE.
     assert manifest.lookup(logical) == SplitTierState.STORE_IN_FLIGHT
@@ -181,11 +183,45 @@ def test_paired_eviction_skips_store_in_flight_avoids_corruption() -> None:
     ctrl.execute_eviction_action(
         EvictionAction(keys=[k_child], destination=EvictionDestination.DISCARD)
     )
-    # Manifest still gets invalidated + dropped.
+    # Manifest untouched: the in-flight store proceeds normally.
+    assert manifest.lookup(logical) == SplitTierState.STORE_IN_FLIGHT
+    # No V delete enqueued and the K child excluded from the L1
+    # delete batch.
+    adapter.delete.assert_not_called()
+    ctrl._l1_manager.delete.assert_called_once_with([])
+
+
+def test_paired_eviction_locked_k_child_preserves_composite() -> None:
+    """Between the eviction policy's is_key_evictable snapshot and
+    the physical delete, a reader can read-lock the K child.  The
+    delete then returns KEY_IS_LOCKED -- the composite (manifest
+    entry + V child) must survive intact for a later retry instead
+    of being torn down under the reader."""
+    manifest = SplitTierManifest()
+    logical = _make_key(b"\x88" * 32)
+    k_child = derive_component_key(logical, "k")
+    v_child = derive_component_key(logical, "v")
+    manifest.register_pending(logical)
+    manifest.mark_complete(logical)
+
+    adapter = MagicMock()
+    ctrl = _build_controller(manifest=manifest, l2_adapters=[adapter])
+    ctrl._l1_manager.delete.return_value = {k_child: L1Error.KEY_IS_LOCKED}
+    ctrl.execute_eviction_action(
+        EvictionAction(keys=[k_child], destination=EvictionDestination.DISCARD)
+    )
+    # Composite intact: manifest still COMPLETE, no V delete issued.
+    assert manifest.lookup(logical) == SplitTierState.COMPLETE
+    adapter.delete.assert_not_called()
+
+    # The reader finishes; a later eviction cycle succeeds and the
+    # paired teardown completes.
+    ctrl._l1_manager.delete.return_value = {k_child: L1Error.SUCCESS}
+    ctrl.execute_eviction_action(
+        EvictionAction(keys=[k_child], destination=EvictionDestination.DISCARD)
+    )
     assert manifest.lookup(logical) is None
-    # V child delete enqueued (the V store might be racing; best-effort).
     adapter.delete.assert_called_once_with([v_child])
-    ctrl._l1_manager.delete.assert_called_once_with([k_child])
 
 
 def test_paired_eviction_tolerates_adapter_delete_raise() -> None:

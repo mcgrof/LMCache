@@ -197,6 +197,14 @@ class InFlightStoreTask:
     redundant split-tier logical-delete on ``_finalize_store``
     (those entries are gone already)."""
 
+    adapter_is_split_tier: bool = False
+    """Whether this task's adapter is the split-tier wrapper (an
+    :class:`EarlyReleaseStoreAdapter`).  Only ITS completion may
+    trigger the split-tier logical-L1 deletion in
+    ``_finalize_store`` -- another adapter's success (e.g. a peer
+    adapter acknowledging instantly) says nothing about whether K
+    and V have actually been mirrored out of the staging entry."""
+
     l2_store_result: bool | None = None
     """L2 outcome (True=success, False=failure, None=still in flight)."""
 
@@ -749,6 +757,7 @@ class StoreController(StorageControllerInterface):
                 keys=successful_keys,
                 read_locked_keys=remaining_read_locked,
                 early_released_logicals=list(early_release),
+                adapter_is_split_tier=isinstance(adapter, EarlyReleaseStoreAdapter),
             )
             self._status_in_flight_count += 1
 
@@ -856,7 +865,12 @@ class StoreController(StorageControllerInterface):
             # under the V-child key; the original staging is now
             # redundant and deleting it is what drops the L1 footprint
             # per cached chunk to K-only (the core L1 win for V-only).
-            if self._split_tier_manifest is not None:
+            # Gated on THIS task's adapter being the split-tier wrapper:
+            # only its completion proves K and V were mirrored out of
+            # the staging entry -- another adapter's success (e.g. a
+            # peer adapter's instant 0-byte acknowledgment) must not
+            # trigger the deletion.
+            if self._split_tier_manifest is not None and task.adapter_is_split_tier:
                 already_released = set(task.early_released_logicals)
                 split_tier_logicals = [
                     k for k in task.keys
