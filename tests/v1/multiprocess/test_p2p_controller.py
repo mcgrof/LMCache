@@ -537,3 +537,32 @@ def test_poll_cycle_skips_peer_without_p2p_url():
 
     ctx.storage_manager.add_l2_adapter.assert_not_called()
     assert controller.report_status()["p2p_peers"] == []
+
+
+def test_p2p_incompatible_peer_not_retried():
+    """A peer whose adapter violates the storage placement matrix
+    (add_l2_adapter raises SplitTierConfigError) is recorded and never
+    re-attempted on subsequent reconcile cycles."""
+    from lmcache.v1.distributed.storage_placement import SplitTierConfigError
+    from lmcache.v1.multiprocess.modules.p2p_controller import _PeerInstance
+
+    controller, ctx = _make_controller()
+    ctx.storage_manager.add_l2_adapter.side_effect = SplitTierConfigError(
+        "KV_TOGETHER peer against a KV_SPLIT_TIER manager"
+    )
+    inst = _PeerInstance(
+        instance_id="peerX",
+        ip="1.2.3.4",
+        p2p_advertised_url="tcp://1.2.3.4:9",
+        mq_port=5555,
+    )
+    upstream = {"peerX": inst}
+
+    added, _removed = controller._reconcile(upstream)
+    assert added == 0
+    assert "peerX" in controller._incompatible_peers
+    assert ctx.storage_manager.add_l2_adapter.call_count == 1
+
+    # Second cycle: the peer is skipped, no re-attempt.
+    controller._reconcile(upstream)
+    assert ctx.storage_manager.add_l2_adapter.call_count == 1
