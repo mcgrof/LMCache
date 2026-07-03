@@ -1217,11 +1217,30 @@ class StorageManager:
         at load, orphaned V children on L2, and (before manifest
         generations) a permanent refusal to re-store those keys.
 
+        With ``force=False`` the underlying L1 clear now preserves
+        STORE_IN_FLIGHT K children (see :meth:`L1Manager.clear`), so an
+        in-flight split-tier store survives a non-forced clear intact:
+        its K child stays resident, the sweep skips its still-present
+        entry, and the store completes normally.
+
+        Restart / persistence (Option C): the split-tier manifest is
+        purely in-memory and is NOT persisted across process restarts.
+        A restart yields an empty manifest; any V children left on L2 by
+        a prior process are stale and age out via that adapter's own
+        lifecycle (they can never be composed without their L1 K child,
+        which did not survive the restart). This is the documented,
+        single-process, non-restart-persistent contract.
+
         Args:
-            force: If True, clear ALL objects including locked ones.
-                This may corrupt in-flight store/prefetch operations.
-                If False (default), only clear unlocked objects, keeping
-                write-locked and read-locked objects intact.
+            force: If True, clear ALL objects including locked and
+                in-flight ones. This is a hard reset that can abort an
+                in-flight store/prefetch (the operator explicitly wiped
+                the cache); the manifest sweep still invalidates the
+                affected entries so no phantom ``COMPLETE`` remains.
+                If False (default), only clear objects eviction itself
+                would remove -- unlocked objects that are not pinned by
+                an in-flight operation -- so a live composite is never
+                torn out from under a store that is still writing it.
         """
         self._l1_manager.clear(force=force)
         if self._storage_placement_mode != StoragePlacementMode.KV_SPLIT_TIER:

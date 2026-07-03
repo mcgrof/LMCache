@@ -32,7 +32,7 @@ from __future__ import annotations
 # Standard
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import enum
 import math
 import select
@@ -44,7 +44,12 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.native_storage_ops import Bitmap
-from lmcache.v1.distributed.api import KeyListPage, MemoryLayoutDesc, ObjectKey
+from lmcache.v1.distributed.api import (
+    KeyEntry,
+    KeyListPage,
+    MemoryLayoutDesc,
+    ObjectKey,
+)
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L2AdapterListener, L2StoreResult
 from lmcache.v1.distributed.l1_manager import L1Manager
@@ -65,6 +70,7 @@ from lmcache.v1.distributed.storage_placement import (
     SplitTierManifest,
     StoragePlacementMode,
     derive_component_key,
+    reverse_component_key,
 )
 from lmcache.v1.memory_management import (
     MemoryAllocatorInterface,
@@ -1080,11 +1086,40 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         page_size: int = 500,
         cursor: str | None = None,
     ) -> KeyListPage:
-        return self._inner.list_l2_keys(
+        """List L2 keys, re-presenting split-tier V children under their
+        logical key.
+
+        For ``KV_TOGETHER`` the inner page is returned verbatim.  For
+        :attr:`StoragePlacementMode.KV_SPLIT_TIER` the inner adapter
+        stores V children under derived keys carrying a 1-byte role
+        marker; surfacing those raw would leak internal child keys onto
+        operator listing surfaces (GET /cache/objects), so each ``v``
+        child is mapped back to its logical key.  Any ``k``-role entry
+        (K children are L1-only; one on L2 is anomalous) is dropped.
+        Pagination and ``model_name`` filtering are unaffected -- the
+        cursor is the inner adapter's, and ``derive_component_key``
+        preserves ``model_name`` so the inner filter still matches.
+        """
+        page = self._inner.list_l2_keys(
             model_name=model_name,
             page_size=page_size,
             cursor=cursor,
         )
+        if self._placement_mode != StoragePlacementMode.KV_SPLIT_TIER:
+            return page
+        mapped: list[KeyEntry] = []
+        for entry in page.entries:
+            decomposed = reverse_component_key(entry.key.to_object_key())
+            if decomposed is None:
+                # Not a derived child key; present as-is (defensive).
+                mapped.append(entry)
+                continue
+            logical_key, role = decomposed
+            if role != "v":
+                # K children never live on L2; drop any that surface.
+                continue
+            mapped.append(replace(entry, key=logical_key.to_encoded_object_key()))
+        return replace(page, entries=tuple(mapped))
 
     def register_listener(self, listener: L2AdapterListener) -> None:
         # Listeners track what's actually stored — which is inner's job.
