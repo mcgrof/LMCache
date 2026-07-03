@@ -952,7 +952,22 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
                 "on the inner adapter",
                 len(masked_v_children),
             )
-            self._inner.submit_unlock(masked_v_children)
+            # Guard the unlock: the inner lookup result is once-only and
+            # already consumed above, so a raising submit_unlock would
+            # lose the gated bitmap entirely and hang the caller's
+            # prefetch.  Return the bitmap regardless; the masked V
+            # children keep their inner lock until TTL / close (a bounded
+            # leak, and a no-op on adapters whose submit_unlock is a
+            # no-op, e.g. the FS adapter).
+            try:
+                self._inner.submit_unlock(masked_v_children)
+            except Exception:
+                logger.exception(
+                    "Serde wrapper split-tier lookup: inner submit_unlock "
+                    "raised for %d masked V child(ren); returning the "
+                    "gated bitmap anyway",
+                    len(masked_v_children),
+                )
         return result
 
     def submit_unlock(self, keys: list[ObjectKey]) -> None:
@@ -1885,11 +1900,10 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
                 )
 
     def _invalidate_split_tier_pending(self, state: _StoreTaskState) -> None:
-        """Inner L2 V-store failed (or serialize failed) for a
-        split-tier task: invalidate the manifest, release the K
-        children we reserved, best-effort delete any V child the
-        failed inner store may have partially written, and DROP the
-        manifest entries.
+        """Split-tier store failed: invalidate the manifest, release
+        the K children we reserved, best-effort delete any V child the
+        inner store may have partially written, and DROP the manifest
+        entries.
 
         The drop is what keeps a failed store from permanently
         blocking the key: after cleanup no physical split-tier state
@@ -1908,7 +1922,17 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         do we release the K children, opening the key for re-store,
         and finally ``drop`` our generation (a no-op if a newer store
         has already reclaimed it).
+
+        The inner V-child delete is issued ONLY when the inner store
+        was actually submitted (``phase == INNER_STORE``).  On the
+        pre-submit failure exits (serialize failed, or
+        ``inner.submit_store_task`` raised) no V bytes can have
+        landed, so the delete is skipped -- it would be a no-op that
+        still blocks this poll thread on the inner adapter's
+        synchronous delete (S3 round-trip, raw_block sync I/O),
+        stalling every other store/load the wrapper services.
         """
+        inner_store_submitted = state.phase == _StorePhase.INNER_STORE
         owned_keys: list[ObjectKey] = []
         for logical_key in state.keys:
             generation = state.split_tier_generations.get(logical_key)
@@ -1916,15 +1940,15 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
                 continue
             if self._split_tier_manifest.mark_invalidated(logical_key, generation):
                 owned_keys.append(logical_key)
-        if owned_keys:
-            # The inner store failed as a task, but a failure result
-            # doesn't guarantee no bytes landed -- delete the V child
-            # names so a partial blob can't be mistaken for a valid V
-            # by a future generation's load.  Restrict to keys we still
-            # own (mark_invalidated returned True): a key reclaimed by a
-            # newer generation is skipped so its live V child survives.
-            # Best-effort: adapters without delete support leave
-            # tolerable cold-tier waste.
+        if owned_keys and inner_store_submitted:
+            # The inner store was submitted and failed, but a failure
+            # result doesn't guarantee no bytes landed -- delete the V
+            # child names so a partial blob can't be mistaken for a
+            # valid V by a future generation's load.  Restrict to keys
+            # we still own (mark_invalidated returned True): a key
+            # reclaimed by a newer generation is skipped so its live V
+            # child survives.  Best-effort: adapters without delete
+            # support leave tolerable cold-tier waste.
             v_child_keys = [derive_component_key(k, "v") for k in owned_keys]
             try:
                 self._inner.delete(v_child_keys)
