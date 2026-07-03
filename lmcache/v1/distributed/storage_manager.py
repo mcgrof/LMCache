@@ -58,6 +58,7 @@ from lmcache.v1.distributed.storage_layout import (
     derive_storage_layout_mode,
 )
 from lmcache.v1.distributed.storage_placement import (
+    SplitTierConfigError,
     SplitTierManifest,
     StoragePlacementMode,
     derive_component_key,
@@ -98,8 +99,8 @@ def _reject_unsupported_split_tier_config(config: StorageManagerConfig) -> None:
         config: The fully-normalized storage manager configuration.
 
     Raises:
-        ValueError: naming every unsupported combination present, so an
-            operator sees all matrix violations at once.
+        SplitTierConfigError: naming every unsupported combination
+            present, so an operator sees all matrix violations at once.
     """
     reasons: list[str] = []
 
@@ -150,7 +151,7 @@ def _reject_unsupported_split_tier_config(config: StorageManagerConfig) -> None:
         )
 
     if reasons:
-        raise ValueError(
+        raise SplitTierConfigError(
             "Unsupported configuration for KV_SPLIT_TIER (V-only) storage "
             "placement:\n  - " + "\n  - ".join(reasons)
         )
@@ -1145,8 +1146,47 @@ class StorageManager:
 
         Returns:
             The stable id assigned to the new adapter.
+
+        Raises:
+            SplitTierConfigError: if adding this adapter would change the
+                frozen placement mode (a mode cannot flip at runtime --
+                the manifest / paired-eviction wiring is set up once at
+                construction), mix incompatible placement/layout modes
+                (this closes the P2P auto-add bypass), or exceed the
+                KV_SPLIT_TIER single-adapter limit.
         """
         with self._lifecycle_lock:
+            # Runtime support-matrix guard: re-derive the
+            # placement + layout modes over the existing adapters plus
+            # the candidate and reject any config that would change the
+            # frozen mode or break the split-tier single-adapter rule.
+            # A KV_TOGETHER peer adapter attaching to a KV_SPLIT_TIER
+            # manager produces a mixed set that the derive rejects.
+            with self._adapters_lock:
+                candidate_configs = [
+                    d.config for d in self._adapter_descriptors.values()
+                ] + [config]
+            try:
+                candidate_placement = derive_storage_placement_mode(candidate_configs)
+                derive_storage_layout_mode(candidate_configs)
+            except ValueError as e:
+                raise SplitTierConfigError(
+                    f"runtime add_l2_adapter rejected: incompatible "
+                    f"placement/layout with the existing adapters: {e}"
+                ) from e
+            if candidate_placement != self._storage_placement_mode:
+                raise SplitTierConfigError(
+                    "runtime add_l2_adapter would change the storage "
+                    f"placement mode from {self._storage_placement_mode.value} "
+                    f"to {candidate_placement.value}; the mode is frozen at "
+                    "construction and cannot flip at runtime"
+                )
+            if self._storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER:
+                raise SplitTierConfigError(
+                    "KV_SPLIT_TIER (V-only) placement supports exactly one "
+                    "L2 adapter; cannot add another at runtime"
+                )
+
             adapter_id, adapter, descriptor = self._build_l2_adapter(config)
             for listener in self._registered_l2_listeners:
                 adapter.register_listener(listener)
@@ -1205,8 +1245,41 @@ class StorageManager:
             with self._adapters_lock:
                 adapter = self._l2_adapters.pop(adapter_id)
                 self._adapter_descriptors.pop(adapter_id, None)
+                remaining = list(self._l2_adapters.values())
             adapter.close()
+            if self._storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER:
+                # Refresh the paired-eviction adapter snapshot so the
+                # just-closed adapter is never handed a V-child delete.
+                # When the last split-tier adapter is gone,
+                # sweep the manifest: its V children are unreachable, so
+                # leaving COMPLETE entries would return phantom lookup
+                # hits that can never load.
+                self._eviction_controller.set_split_tier_paired_eviction(
+                    self._split_tier_manifest, remaining
+                )
+                if not remaining:
+                    self._sweep_manifest_no_adapters()
             logger.info("Deleted L2 adapter %d", adapter_id)
+
+    def _sweep_manifest_no_adapters(self) -> None:
+        """Invalidate + drop every split-tier manifest entry after the
+        last split-tier L2 adapter has been removed.
+
+        The V children are unreachable (their adapter is closed), so no
+        L2 delete is issued -- unlike :meth:`clear`'s sweep, the point
+        here is purely to stop lookups from returning phantom COMPLETE
+        composite hits that can never load.  The K children in L1 become
+        ordinary orphans (evictable).  Each transition is generation-
+        guarded so a concurrent re-store under a fresh generation is left
+        untouched.  Caller holds ``_lifecycle_lock``.
+        """
+        for logical_key in self._split_tier_manifest.tracked_keys():
+            entry = self._split_tier_manifest.lookup_entry(logical_key)
+            if entry is None:
+                continue
+            _state, generation = entry
+            if self._split_tier_manifest.mark_invalidated(logical_key, generation):
+                self._split_tier_manifest.drop(logical_key, generation)
 
     def l2_adapters(self) -> list[tuple[AdapterDescriptor, L2AdapterInterface]]:
         """Return all active L2 adapters paired with descriptors, in

@@ -18,6 +18,7 @@ from lmcache.v1.distributed.api import (
     PrefetchHandle,
 )
 from lmcache.v1.distributed.l2_adapters.p2p_l2_adapter import P2PL2AdapterConfig
+from lmcache.v1.distributed.storage_placement import SplitTierConfigError
 from lmcache.v1.distributed.transfer_channel import (
     delete_transfer_channel_context,
     initialize_transfer_channel_context,
@@ -119,6 +120,13 @@ class P2PController:
         self._orch_lock = threading.Lock()
         self._state = _P2PState.UNREGISTERED
         self._adapters: dict[str, _PeerAdapter] = {}
+        # Peers whose adapter can NEVER be added because it violates the
+        # storage manager's split-tier support matrix (a deterministic
+        # SplitTierConfigError -- e.g. a KV_TOGETHER peer adapter against
+        # a KV_SPLIT_TIER manager).  Skipped by _reconcile so we do
+        # not re-attempt the identical add every heartbeat.  Poll-thread
+        # local (written and read only by the reconcile path).
+        self._incompatible_peers: set[str] = set()
 
         self._instances_url = ""
         self._http_client: httpx.Client | None = None
@@ -467,6 +475,10 @@ class P2PController:
         added = 0
         removed = 0
         for peer_id, inst in upstream.items():
+            if peer_id in self._incompatible_peers:
+                # A prior add was rejected by the support matrix; the same
+                # config will always be rejected, so never re-attempt it.
+                continue
             current = self._adapters.get(peer_id)
             if current is None:
                 if self._add_adapter(inst):
@@ -523,6 +535,19 @@ class P2PController:
         )
         try:
             adapter_id = self._ctx.storage_manager.add_l2_adapter(config)
+        except SplitTierConfigError as e:
+            # Deterministic: this peer's adapter is incompatible with the
+            # manager's storage placement (e.g. a KV_TOGETHER peer against
+            # a KV_SPLIT_TIER manager).  Record it so reconcile stops
+            # re-attempting the identical add on every heartbeat.
+            self._incompatible_peers.add(inst.instance_id)
+            logger.warning(
+                "P2P adapter for peer %s is incompatible with the storage "
+                "placement and will not be retried: %s",
+                inst.instance_id,
+                e,
+            )
+            return False
         except Exception:
             logger.exception("Failed to add P2P adapter for peer %s", inst.instance_id)
             return False

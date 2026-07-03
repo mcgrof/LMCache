@@ -91,6 +91,19 @@ if TYPE_CHECKING:
     from lmcache.v1.distributed.l2_adapters.config import L2AdapterConfigBase
 
 
+class SplitTierConfigError(ValueError):
+    """A configuration is outside the KV_SPLIT_TIER (V-only) support
+    matrix.
+
+    Subclasses :class:`ValueError` so existing ``except ValueError``
+    handlers still catch it, but gives callers a precise type to
+    distinguish a *deterministic* split-tier config/placement conflict
+    (retrying the identical config cannot help) from a transient
+    failure.  The runtime P2P adapter-discovery loop uses this to stop
+    re-attempting a peer whose adapter would violate the matrix.
+    """
+
+
 class StoragePlacementMode(Enum):
     """Per-StorageManager placement policy for serde-encoded output."""
 
