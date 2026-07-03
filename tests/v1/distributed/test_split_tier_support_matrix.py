@@ -284,3 +284,61 @@ def test_delete_last_split_tier_adapter_sweeps_manifest() -> None:
             sm.close()
     finally:
         shutil.rmtree(disk, ignore_errors=True)
+
+
+def test_clear_sweep_holds_delete_in_flight_fence_across_v_delete() -> None:
+    """Adversarial-review finding: StorageManager.clear()'s manifest sweep
+    must hold each swept entry in DELETE_IN_FLIGHT across the batched V
+    delete and drop it only AFTER, so the fence blocks a concurrent
+    re-store from reclaiming the (generation-agnostic) V key while the
+    physical delete is in flight.  The broken code dropped the entry
+    BEFORE the batched delete, reopening the key: a re-store's fresh V
+    child could then be clobbered, leaving a phantom COMPLETE with no V on
+    L2.  We pin the ordering invariant directly: at the instant the V
+    child is physically deleted, its logical entry must still be present
+    and in DELETE_IN_FLIGHT (not already dropped)."""
+    # Standard
+    import shutil
+
+    # First Party
+    from lmcache.v1.distributed.api import ObjectKey
+    from lmcache.v1.distributed.storage_placement import (
+        SplitTierState,
+        derive_component_key,
+    )
+
+    disk = tempfile.mkdtemp(prefix="lmcache_clearfence_")
+    try:
+        sm = StorageManager(_cfg(adapters=[_v_only_fs_adapter(disk)]))
+        try:
+            manifest = sm.split_tier_manifest
+            logical = ObjectKey(chunk_hash=b"\x72" * 32, model_name="m", kv_rank=0)
+            v_child = derive_component_key(logical, "v")
+            gen = manifest.register_pending(logical)
+            manifest.mark_complete(logical, gen)
+            # K child was never stored in L1, so the sweep sees it absent
+            # (get_object_state is None) and reaps the phantom composite.
+
+            # Spy the adapter delete to capture the manifest state of the
+            # logical key at the moment its V child is physically deleted.
+            adapter = next(iter(sm._l2_adapters.values()))
+            states_at_delete: list = []
+
+            def _spy_delete(keys: list) -> None:
+                if v_child in keys:
+                    states_at_delete.append(manifest.lookup(logical))
+
+            adapter.delete = _spy_delete  # type: ignore[method-assign]
+
+            sm.clear(force=False)
+
+            # The V child was deleted exactly once while the reclaim fence
+            # (DELETE_IN_FLIGHT) was held -- not after the entry was
+            # dropped/reopened.
+            assert states_at_delete == [SplitTierState.DELETE_IN_FLIGHT]
+            # Fence released after the physical purge: the entry is gone.
+            assert manifest.lookup(logical) is None
+        finally:
+            sm.close()
+    finally:
+        shutil.rmtree(disk, ignore_errors=True)
