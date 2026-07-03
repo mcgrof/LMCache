@@ -47,6 +47,16 @@ def _v_only_fs_adapter(base_path: str) -> FSL2AdapterConfig:
     return cfg
 
 
+def _plain_fs_adapter(base_path: str) -> FSL2AdapterConfig:
+    """An FS L2 adapter with no serde (derives KV_TOGETHER)."""
+    return FSL2AdapterConfig(
+        base_path=base_path,
+        relative_tmp_dir=None,
+        read_ahead_size=None,
+        use_odirect=False,
+    )
+
+
 def _pinned_l1() -> L1ManagerConfig:
     return L1ManagerConfig(
         memory_config=L1MemoryManagerConfig(
@@ -188,6 +198,88 @@ def test_reserve_write_rejects_multi_object_group_under_split_tier() -> None:
             )
             with pytest.raises(ValueError, match="single object group"):
                 sm.reserve_write([k0, k1], layout, mode="new")
+        finally:
+            sm.close()
+    finally:
+        shutil.rmtree(disk, ignore_errors=True)
+
+
+def test_add_l2_adapter_rejects_second_adapter_under_split_tier() -> None:
+    """Phase 1b: a KV_SPLIT_TIER manager already holds its one allowed
+    adapter; adding a second (even another V-only one) is rejected with
+    a SplitTierConfigError."""
+    # Standard
+    import shutil
+
+    # First Party
+    from lmcache.v1.distributed.storage_placement import SplitTierConfigError
+
+    disk1 = tempfile.mkdtemp(prefix="lmcache_add1_")
+    disk2 = tempfile.mkdtemp(prefix="lmcache_add2_")
+    try:
+        sm = StorageManager(_cfg(adapters=[_v_only_fs_adapter(disk1)]))
+        try:
+            with pytest.raises(SplitTierConfigError, match="exactly one L2 adapter"):
+                sm.add_l2_adapter(_v_only_fs_adapter(disk2))
+        finally:
+            sm.close()
+    finally:
+        shutil.rmtree(disk1, ignore_errors=True)
+        shutil.rmtree(disk2, ignore_errors=True)
+
+
+def test_add_l2_adapter_rejects_incompatible_mode_bypass() -> None:
+    """Phase 1b (B1): a KV_TOGETHER adapter (no serde -- the shape a P2P
+    peer adapter takes) cannot silently attach to a KV_SPLIT_TIER manager;
+    the re-derivation sees a mixed set and rejects it."""
+    # Standard
+    import shutil
+
+    # First Party
+    from lmcache.v1.distributed.storage_placement import SplitTierConfigError
+
+    disk1 = tempfile.mkdtemp(prefix="lmcache_mix1_")
+    disk2 = tempfile.mkdtemp(prefix="lmcache_mix2_")
+    try:
+        sm = StorageManager(_cfg(adapters=[_v_only_fs_adapter(disk1)]))
+        try:
+            with pytest.raises(SplitTierConfigError):
+                sm.add_l2_adapter(_plain_fs_adapter(disk2))
+        finally:
+            sm.close()
+    finally:
+        shutil.rmtree(disk1, ignore_errors=True)
+        shutil.rmtree(disk2, ignore_errors=True)
+
+
+def test_delete_last_split_tier_adapter_sweeps_manifest() -> None:
+    """Phase 1b: removing the last split-tier adapter sweeps the manifest
+    (its V children are now unreachable) so lookups miss instead of
+    returning phantom COMPLETE hits, and clears the paired-eviction
+    adapter snapshot so the closed adapter is never handed a delete."""
+    # Standard
+    import shutil
+
+    # First Party
+    from lmcache.v1.distributed.api import ObjectKey
+
+    disk = tempfile.mkdtemp(prefix="lmcache_del_")
+    try:
+        sm = StorageManager(_cfg(adapters=[_v_only_fs_adapter(disk)]))
+        try:
+            manifest = sm.split_tier_manifest
+            logical = ObjectKey(chunk_hash=b"\x71" * 32, model_name="m", kv_rank=0)
+            gen = manifest.register_pending(logical)
+            manifest.mark_complete(logical, gen)
+            assert len(manifest) == 1
+
+            adapter_id = next(iter(sm._l2_adapters))
+            sm.delete_l2_adapter(adapter_id)
+
+            # Manifest swept; no split-tier adapters remain in the paired-
+            # eviction wiring.
+            assert len(manifest) == 0
+            assert sm._eviction_controller._l2_adapters == []
         finally:
             sm.close()
     finally:
