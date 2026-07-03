@@ -279,6 +279,67 @@ def test_paired_eviction_stale_generation_preserves_new_complete() -> None:
     adapter.delete.assert_not_called()
 
 
+class _ReclaimAfterInvalidateManifest(SplitTierManifest):
+    """A manifest that simulates a concurrent re-store reclaiming the
+    logical key in the window right AFTER ``mark_invalidated`` succeeds
+    and BEFORE the paired physical V-child delete -- the exact
+    interleaving the adversarial review flagged.  The V child's L2 key is
+    generation-agnostic, so an un-fenced delete issued in this window
+    destroys the NEW generation's live V child."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._reclaim_target: ObjectKey | None = None
+        self.reclaimed_generation = 0
+
+    def arm_reclaim(self, logical_key: ObjectKey) -> None:
+        self._reclaim_target = logical_key
+
+    def mark_invalidated(self, logical_key: ObjectKey, generation: int) -> bool:
+        result = super().mark_invalidated(logical_key, generation)
+        if result and logical_key == self._reclaim_target:
+            self._reclaim_target = None
+            # Concurrent re-store: reclaim under a fresh generation and
+            # write + complete a new composite (a new V child lands on L2
+            # under the same generation-agnostic key).
+            g2 = super().register_pending(logical_key)
+            super().mark_complete(logical_key, g2)
+            self.reclaimed_generation = g2
+        return result
+
+
+def test_paired_eviction_reclaim_in_invalidate_window_preserves_new_v_child() -> None:
+    """Adversarial-review finding (error): the paired V-child delete must
+    be fenced by INVALIDATED -> DELETE_IN_FLIGHT BEFORE it touches L2.  If
+    a re-store reclaims the logical key in the window right after
+    ``mark_invalidated`` (register_pending is permitted from INVALIDATED),
+    the generation-agnostic V-child delete would otherwise clobber the new
+    generation's live V child, leaving a phantom COMPLETE with no V on L2.
+    With the fence, the DELETE_IN_FLIGHT compare-and-set fails on the
+    reclaimed generation and the delete is skipped."""
+    manifest = _ReclaimAfterInvalidateManifest()
+    logical = _make_key(b"\xbc" * 32)
+    k_child = derive_component_key(logical, "k")
+    g1 = manifest.register_pending(logical)
+    manifest.mark_complete(logical, g1)  # old generation COMPLETE
+    manifest.arm_reclaim(logical)
+
+    adapter = MagicMock()
+    ctrl = _build_controller(manifest=manifest, l2_adapters=[adapter])
+    ctrl._l1_manager.delete.return_value = {k_child: L1Error.SUCCESS}
+    ctrl.execute_eviction_action(
+        EvictionAction(keys=[k_child], destination=EvictionDestination.DISCARD)
+    )
+
+    # The reclaim landed inside the invalidate->delete window; the new
+    # composite (generation g2) must survive intact and its V child must
+    # NOT have been deleted.
+    assert manifest.is_complete(logical)
+    entry = manifest.lookup_entry(logical)
+    assert entry is not None and entry[1] == manifest.reclaimed_generation
+    adapter.delete.assert_not_called()
+
+
 def test_paired_eviction_stale_generation_preserves_new_store_in_flight() -> None:
     """Finding E (the reviewer's exact scenario): a new STORE_IN_FLIGHT
     generation registers between the old K child's L1 delete and the

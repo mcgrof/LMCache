@@ -156,7 +156,13 @@ class _VScratchSlab:
         """
         try:
             t = self._free.popleft()
-            # GIL-atomic increment; no lock needed for a single += 1.
+            # Best-effort accounting only.  ``+= 1`` is a non-atomic
+            # LOAD/ADD/STORE, and acquire (caller's submit thread) races
+            # release (the wrapper's internal drain thread) with no shared
+            # lock, so this counter can lose updates and drift.  That is
+            # tolerated: ``_in_flight`` feeds only the advisory L1/LRU
+            # memory-pressure gauge (clamped at zero, documented advisory),
+            # never data correctness or the manifest state machine.
             self._in_flight += 1
             return t
         except IndexError:
@@ -380,7 +386,13 @@ class _KChildSlab(MemoryAllocatorInterface):
     def _allocate_one(self) -> TensorMemoryObj:
         try:
             obj = self._free.popleft()
-            # GIL-atomic single-bytecode increment; no lock needed.
+            # Best-effort accounting only: ``+= 1`` is a non-atomic
+            # LOAD/ADD/STORE and this popleft fast path races the lazy-
+            # alloc path and free() (which run under _alloc_lock / on other
+            # threads) with no shared lock, so the counter can drift.
+            # Tolerated -- ``_in_flight`` feeds only the advisory LRU
+            # memory-pressure gauge (the read clamps at zero), never data
+            # correctness.
             self._in_flight += 1
             return self._rebind_for_reuse(obj)
         except IndexError:
