@@ -458,9 +458,9 @@ def test_split_policy_routes_k_to_cpu_v_to_nvme() -> None:
 
     # ---- Manifest tracks the 4-state lifecycle ----
     m = SplitTierManifest()
-    m.register_pending(logical)
+    gen = m.register_pending(logical)
     assert m.lookup(logical) == SplitTierState.STORE_IN_FLIGHT
-    m.mark_complete(logical)
+    m.mark_complete(logical, gen)
     assert m.is_complete(logical)
-    m.mark_invalidated(logical)
+    m.mark_invalidated(logical, gen)
     assert m.lookup(logical) == SplitTierState.INVALIDATED

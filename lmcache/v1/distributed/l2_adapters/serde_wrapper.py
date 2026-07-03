@@ -512,6 +512,14 @@ class _StoreTaskState:
     logical keys.  Derived deterministically from the logical keys
     via ``derive_component_key(logical, 'v')``."""
 
+    split_tier_generations: dict[ObjectKey, int] = field(default_factory=dict)
+    """Manifest generation id per logical key, returned by
+    ``register_pending`` in ``_alloc_split_tier_children``.  Threaded
+    into every cleanup call (``mark_complete`` / ``mark_invalidated`` /
+    ``drop``) so this task only ever transitions the generation it
+    registered -- a later re-store of the same key gets a fresh
+    generation and this task's cleanup no longer touches it."""
+
     early_release_keys: list[ObjectKey] = field(default_factory=list)
     """Logical keys whose StoreController read locks can be released
     immediately after ``submit_store_task`` returns.  Set only in
@@ -720,10 +728,15 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         is_split_tier = self._placement_mode == StoragePlacementMode.KV_SPLIT_TIER
         k_child_keys: list[ObjectKey] = []
         v_child_keys: list[ObjectKey] = []
+        split_tier_generations: dict[ObjectKey, int] = {}
         v_scratch_tensors: list[torch.Tensor] = []
         early_release_keys: list[ObjectKey] = []
         if is_split_tier:
-            k_child_keys, v_child_keys = self._alloc_split_tier_children(keys, objects)
+            (
+                k_child_keys,
+                v_child_keys,
+                split_tier_generations,
+            ) = self._alloc_split_tier_children(keys, objects)
             if not k_child_keys:
                 # K-child alloc failed (out of L1 or non-grouped input).
                 logger.warning(
@@ -752,7 +765,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
                     wrapped_id,
                 )
                 self._release_split_tier_k_children(k_child_keys)
-                self._drop_split_tier_pending(keys)
+                self._drop_split_tier_pending(keys, split_tier_generations)
                 self._finalize_store(wrapped_id, success=False)
                 return wrapped_id
             # Logical keys can be released immediately by the
@@ -772,7 +785,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
                 # remain storable (this exit fires precisely under L1
                 # memory pressure, when retries are most likely).
                 self._release_split_tier_k_children(k_child_keys)
-                self._drop_split_tier_pending(keys)
+                self._drop_split_tier_pending(keys, split_tier_generations)
             if v_scratch_tensors:
                 self._return_v_scratch(v_scratch_tensors)
             self._finalize_store(wrapped_id, success=False)
@@ -795,6 +808,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
             is_split_tier=is_split_tier,
             k_child_keys=k_child_keys,
             v_child_keys=v_child_keys,
+            split_tier_generations=split_tier_generations,
             early_release_keys=early_release_keys,
             v_scratch_tensors=v_scratch_tensors,
         )
@@ -834,7 +848,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
                 self._return_v_scratch(v_scratch_tensors)
             if k_child_keys:
                 self._release_split_tier_k_children(k_child_keys)
-                self._drop_split_tier_pending(keys)
+                self._drop_split_tier_pending(keys, split_tier_generations)
             self._finalize_store(wrapped_id, success=False)
             return wrapped_id
         return wrapped_id
@@ -1459,7 +1473,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         self,
         keys: list[ObjectKey],
         objects: list[MemoryObj],
-    ) -> tuple[list[ObjectKey], list[ObjectKey]]:
+    ) -> tuple[list[ObjectKey], list[ObjectKey], dict[ObjectKey, int]]:
         """Allocate K-only L1 child entries + derive V child keys.
 
         For each logical key:
@@ -1474,14 +1488,17 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         * Commit the K child write so it persists as the canonical
           L1 resident.
 
-        Returns ``(k_child_keys, v_child_keys)`` on success.  Returns
-        ``([], [])`` if any L1 allocation fails or the input
+        Returns ``(k_child_keys, v_child_keys, generations)`` on
+        success, where ``generations`` maps each logical key to the
+        manifest generation :meth:`register_pending` assigned it (the
+        caller threads it into every later cleanup call).  Returns
+        ``([], [], {})`` if any L1 allocation fails or the input
         ``objects`` aren't grouped (sanity check -- shouldn't happen
         if placement is correctly KV_SPLIT_TIER, but raises a clear
         error instead of corrupting L1).
         """
         if not objects:
-            return [], []
+            return [], [], {}
         # Sanity: V-only placement requires grouped K/V layout in L1.
         # Use the public get_shapes/get_dtypes API (not meta.shapes
         # directly) so this works across all MemoryObj subclasses /
@@ -1502,7 +1519,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
                 shapes,
                 dtypes,
             )
-            return [], []
+            return [], [], {}
 
         k_child_keys = [derive_component_key(k, "k") for k in keys]
         v_child_keys = [derive_component_key(k, "v") for k in keys]
@@ -1560,7 +1577,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
             # whole task (the caller has not yet registered the
             # manifest entries).
             self._release_split_tier_k_children(successful)
-            return [], []
+            return [], [], {}
 
         # Copy K bytes from each staging object's group-0 tensor into
         # the K child.  torch's .copy_() between CPU tensors releases
@@ -1585,7 +1602,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
             ok_list = [_copy_one(i) for i in range(len(keys))]
         if not all(ok_list):
             self._release_split_tier_k_children(successful)
-            return [], []
+            return [], [], {}
 
         # Register the manifest BEFORE finish_write so the
         # StoreController's listener filter (is_k_child_key) sees
@@ -1598,31 +1615,34 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         # All-or-nothing: register_pending raises on a key with an
         # ACTIVE generation (concurrent duplicate store, or paired
         # cleanup mid-delete).  Roll back the keys registered so far
-        # and fail the whole task -- a half-registered batch would
-        # leave the unregistered keys' K-child writes visible to the
-        # StoreController without the listener filter.
-        registered: list[ObjectKey] = []
+        # and fail the whole task.  Order matters: release the K
+        # children FIRST (a no-drain release that does not depend on
+        # the side-set) and only THEN drop the manifest entries for
+        # the generations we own, so a concurrent generation's entry
+        # is never dropped by this rollback.
+        generations: dict[ObjectKey, int] = {}
         try:
             for logical_key in keys:
-                self._split_tier_manifest.register_pending(logical_key)
-                registered.append(logical_key)
+                generations[logical_key] = self._split_tier_manifest.register_pending(
+                    logical_key
+                )
         except ValueError:
             logger.warning(
                 "Serde wrapper: split-tier registration collided on an "
                 "in-flight generation (%d/%d keys registered); failing "
                 "the store task",
-                len(registered),
+                len(generations),
                 len(keys),
             )
-            for logical_key in registered:
-                self._split_tier_manifest.drop(logical_key)
             self._release_split_tier_k_children(successful)
-            return [], []
+            for logical_key, generation in generations.items():
+                self._split_tier_manifest.drop(logical_key, generation)
+            return [], [], {}
 
         # Commit the K-child writes.  After this they are read-only
         # cache residents under their child keys.
         self._l1_manager.finish_write(k_child_keys)
-        return k_child_keys, v_child_keys
+        return k_child_keys, v_child_keys, generations
 
     def _alloc_v_scratch_and_copy(
         self,
@@ -1775,20 +1795,55 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
             slab.release(t)
 
     def _release_split_tier_k_children(self, k_child_keys: list[ObjectKey]) -> None:
-        """Release K-child L1 entries.  Used on a partial / failed
-        store path so K children don't orphan in L1 with no V partner."""
+        """Release K-child L1 entries on a partial / failed store path
+        so K children don't orphan in L1 with no V partner.
+
+        Critically this must NOT fire the StoreController's L1→L2
+        drain listener (``on_l1_keys_write_finished``).  A plain
+        ``finish_write`` would fire it, and on the failure paths that
+        call this the ``is_k_child_key`` side-set may not yet be
+        populated (this runs before :meth:`register_pending` in the
+        K-child alloc/copy-failure branches) or already dropped (the
+        registration-collision rollback), so the drain would route
+        these write-locked K children to L2 unfiltered -- the exact
+        multi-group re-entry the side-set exists to prevent, plus a
+        read-locked K-child leak if the store loop wins the race.
+
+        Instead release the write lock via
+        ``finish_write_and_reserve_read`` (whose listener is a no-op
+        in the StoreController) then drop the read lock and delete.
+        K children already committed (``finish_write`` ran on the
+        success path before a later failure) are not write-locked, so
+        that call reports ``KEY_IN_WRONG_STATE`` for them and the
+        plain ``delete`` reclaims them.
+        """
         if not k_child_keys:
             return
+        read_locked: list[ObjectKey] = []
         try:
-            self._l1_manager.finish_write(k_child_keys)
+            results = self._l1_manager.finish_write_and_reserve_read(k_child_keys)
+            for key, (err, _obj) in results.items():
+                if err == L1Error.SUCCESS:
+                    read_locked.append(key)
         except Exception:
-            # If finish_write fails some children may not have been in
-            # write phase -- the delete below is still authoritative.
+            # Older / mocked L1Manager without the atomic transition --
+            # the delete below is still authoritative for unlocked
+            # children.
             logger.debug(
-                "Serde wrapper split-tier release: finish_write raised; "
-                "continuing to delete %d K children",
+                "Serde wrapper split-tier release: "
+                "finish_write_and_reserve_read raised; continuing to "
+                "delete %d K children",
                 len(k_child_keys),
             )
+        if read_locked:
+            try:
+                self._l1_manager.finish_read(read_locked)
+            except Exception:
+                logger.debug(
+                    "Serde wrapper split-tier release: finish_read raised "
+                    "for %d K children; continuing to delete",
+                    len(read_locked),
+                )
         try:
             self._l1_manager.delete(k_child_keys)
         except Exception:
@@ -1806,18 +1861,27 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         ``_finalize_store`` after it releases the read lock the
         controller acquired on those keys -- attempting to delete
         them here would race the lock and fail with KEY_IS_LOCKED.
+
+        Each ``mark_complete`` is guarded by the generation this task
+        registered, so a completion racing a re-store never marks the
+        newer generation's entry COMPLETE off this task's stale ack.
         """
         for logical_key in state.keys:
+            generation = state.split_tier_generations.get(logical_key)
+            if generation is None:
+                continue
             try:
-                self._split_tier_manifest.mark_complete(logical_key)
+                self._split_tier_manifest.mark_complete(logical_key, generation)
             except ValueError:
                 # Pre-empted by an invalidate from the eviction
-                # controller (PR-3').  The K child + manifest entry
-                # cleanup happens through the invalidation path; here
-                # we just refuse to mark COMPLETE on an INVALIDATED key.
+                # controller (PR-3'), or the entry was reclaimed by a
+                # newer generation.  The K child + manifest entry
+                # cleanup happens through the invalidation path (for
+                # the entry we owned) or belongs to the newer
+                # generation; here we just refuse to mark COMPLETE.
                 logger.debug(
                     "Serde wrapper split-tier: logical key already "
-                    "invalidated before COMPLETE; skipping"
+                    "invalidated / superseded before COMPLETE; skipping"
                 )
 
     def _invalidate_split_tier_pending(self, state: _StoreTaskState) -> None:
@@ -1834,38 +1898,70 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         ever transition it further -- the paired-eviction path never
         sees these keys because their K children are gone).
 
-        Idempotent on the manifest side via
-        :meth:`SplitTierManifest.mark_invalidated` / ``drop``.
+        Every manifest mutation is guarded by the generation this
+        task registered.  Ordering matters for the V-child delete: it
+        runs while this task's K children are still resident in L1, so
+        no concurrent store can have reclaimed the logical key yet (a
+        reclaim would collide on the K-child allocation and fail before
+        registering).  Deleting V first therefore cannot clobber a
+        newer generation's freshly written V child.  Only after that
+        do we release the K children, opening the key for re-store,
+        and finally ``drop`` our generation (a no-op if a newer store
+        has already reclaimed it).
         """
+        owned_keys: list[ObjectKey] = []
         for logical_key in state.keys:
-            self._split_tier_manifest.mark_invalidated(logical_key)
-        self._release_split_tier_k_children(state.k_child_keys)
-        if state.v_child_keys:
+            generation = state.split_tier_generations.get(logical_key)
+            if generation is None:
+                continue
+            if self._split_tier_manifest.mark_invalidated(logical_key, generation):
+                owned_keys.append(logical_key)
+        if owned_keys:
             # The inner store failed as a task, but a failure result
             # doesn't guarantee no bytes landed -- delete the V child
             # names so a partial blob can't be mistaken for a valid V
-            # by a future generation's load.  Best-effort: adapters
-            # without delete support leave tolerable cold-tier waste.
+            # by a future generation's load.  Restrict to keys we still
+            # own (mark_invalidated returned True): a key reclaimed by a
+            # newer generation is skipped so its live V child survives.
+            # Best-effort: adapters without delete support leave
+            # tolerable cold-tier waste.
+            v_child_keys = [derive_component_key(k, "v") for k in owned_keys]
             try:
-                self._inner.delete(state.v_child_keys)
+                self._inner.delete(v_child_keys)
             except Exception:
                 logger.exception(
                     "Serde wrapper split-tier cleanup: inner delete "
                     "raised for %d V children",
-                    len(state.v_child_keys),
+                    len(v_child_keys),
                 )
+        self._release_split_tier_k_children(state.k_child_keys)
         for logical_key in state.keys:
-            self._split_tier_manifest.drop(logical_key)
+            generation = state.split_tier_generations.get(logical_key)
+            if generation is not None:
+                self._split_tier_manifest.drop(logical_key, generation)
 
-    def _drop_split_tier_pending(self, keys: list[ObjectKey]) -> None:
+    def _drop_split_tier_pending(
+        self, keys: list[ObjectKey], generations: dict[ObjectKey, int]
+    ) -> None:
         """Submit-side failure AFTER ``register_pending`` but BEFORE
         any inner L2 submission: the K children are released by the
         caller and no V bytes were ever sent, so no physical state
         remains -- drop the entries outright so the logical keys can
         be stored again.
+
+        Each drop is guarded by the generation this task registered
+        (from :meth:`_alloc_split_tier_children`), so it never removes
+        an entry a concurrent re-store has already reclaimed.
+
+        Args:
+            keys: Logical keys whose pending manifest entries to drop.
+            generations: Per-key generation ids from
+                ``register_pending``.
         """
         for logical_key in keys:
-            self._split_tier_manifest.drop(logical_key)
+            generation = generations.get(logical_key)
+            if generation is not None:
+                self._split_tier_manifest.drop(logical_key, generation)
 
     def _compose_split_tier_k_from_l1(
         self,
