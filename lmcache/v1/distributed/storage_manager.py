@@ -1116,15 +1116,26 @@ class StorageManager:
             return
         orphaned_v_children: list[ObjectKey] = []
         for logical_key in self._split_tier_manifest.tracked_keys():
+            entry = self._split_tier_manifest.lookup_entry(logical_key)
+            if entry is None:
+                # Dropped between the snapshot and here; nothing to do.
+                continue
+            _state, generation = entry
             k_child = derive_component_key(logical_key, "k")
             if self._l1_manager.get_object_state(k_child) is not None:
                 # K child survived (locked entry under force=False, or
                 # an in-flight store's write-locked child): the
                 # composite is still intact -- leave the entry alone.
                 continue
-            self._split_tier_manifest.mark_invalidated(logical_key)
+            # Generation-guarded compare-and-set: if a fresh store
+            # reclaimed this logical key (writing a new K child) after
+            # the tracked_keys snapshot, the captured generation no
+            # longer matches, mark_invalidated returns False, and we
+            # leave the new composite -- and its live V child -- alone.
+            if not self._split_tier_manifest.mark_invalidated(logical_key, generation):
+                continue
             orphaned_v_children.append(derive_component_key(logical_key, "v"))
-            self._split_tier_manifest.drop(logical_key)
+            self._split_tier_manifest.drop(logical_key, generation)
         if not orphaned_v_children:
             return
         with self._adapters_lock:

@@ -362,12 +362,31 @@ def test_manifest_lookup_unregistered_returns_none() -> None:
 def test_manifest_register_then_complete() -> None:
     m = SplitTierManifest()
     k = _make_key()
-    m.register_pending(k)
+    g = m.register_pending(k)
     assert m.lookup(k) == SplitTierState.STORE_IN_FLIGHT
+    assert m.lookup_entry(k) == (SplitTierState.STORE_IN_FLIGHT, g)
     assert not m.is_complete(k)
-    m.mark_complete(k)
+    m.mark_complete(k, g)
     assert m.lookup(k) == SplitTierState.COMPLETE
     assert m.is_complete(k)
+
+
+def test_manifest_register_returns_monotonic_generations() -> None:
+    """Each register_pending hands out a strictly increasing,
+    process-unique generation id -- even across drop (so a stale
+    cleanup for an old generation can never collide with a fresh
+    entry)."""
+    m = SplitTierManifest()
+    k1 = _make_key(chunk_hash=b"\x11" * 32)
+    k2 = _make_key(chunk_hash=b"\x22" * 32)
+    g1 = m.register_pending(k1)
+    g2 = m.register_pending(k2)
+    assert g2 > g1
+    m.mark_complete(k1, g1)
+    m.mark_invalidated(k1, g1)
+    m.drop(k1, g1)
+    g3 = m.register_pending(k1)  # same key, brand-new generation
+    assert g3 > g2
 
 
 def test_manifest_register_rejects_duplicate() -> None:
@@ -386,9 +405,9 @@ def test_manifest_register_rejects_delete_in_flight() -> None:
     (the caller fails the task; a retry succeeds after drop())."""
     m = SplitTierManifest()
     k = _make_key()
-    m.register_pending(k)
-    m.mark_invalidated(k)
-    m.mark_delete_in_flight(k)
+    g = m.register_pending(k)
+    m.mark_invalidated(k, g)
+    m.mark_delete_in_flight(k, g)
     with pytest.raises(ValueError, match="DELETE_IN_FLIGHT"):
         m.register_pending(k)
 
@@ -399,11 +418,12 @@ def test_manifest_register_reclaims_stale_complete() -> None:
     the key forever -- register_pending starts a new generation."""
     m = SplitTierManifest()
     k = _make_key()
-    m.register_pending(k)
-    m.mark_complete(k)
-    m.register_pending(k)  # new generation, no raise
+    g1 = m.register_pending(k)
+    m.mark_complete(k, g1)
+    g2 = m.register_pending(k)  # new generation, no raise
+    assert g2 != g1
     assert m.lookup(k) == SplitTierState.STORE_IN_FLIGHT
-    m.mark_complete(k)
+    m.mark_complete(k, g2)
     assert m.is_complete(k)
 
 
@@ -413,10 +433,53 @@ def test_manifest_register_reclaims_invalidated() -> None:
     denial of caching)."""
     m = SplitTierManifest()
     k = _make_key()
-    m.register_pending(k)
-    m.mark_invalidated(k)
-    m.register_pending(k)  # new generation, no raise
+    g1 = m.register_pending(k)
+    m.mark_invalidated(k, g1)
+    g2 = m.register_pending(k)  # new generation, no raise
+    assert g2 != g1
     assert m.lookup(k) == SplitTierState.STORE_IN_FLIGHT
+
+
+def test_manifest_stale_cleanup_never_touches_new_generation() -> None:
+    """The core generation guard: a cleanup started for generation G
+    (invalidate / delete-in-flight / drop) must be a no-op once the key
+    has been reclaimed under G+1.  This is the invariant that keeps an
+    eviction teardown or failed-store cleanup from destroying the
+    composite a concurrent re-store just built."""
+    m = SplitTierManifest()
+    k = _make_key()
+    g1 = m.register_pending(k)
+    m.mark_complete(k, g1)
+    # A re-store reclaims the key under a fresh generation.
+    m.drop(k, g1)  # (in practice the K child was evicted first)
+    g2 = m.register_pending(k)
+    m.mark_complete(k, g2)
+    assert m.is_complete(k)
+    # The OLD generation's late cleanup must not touch g2.
+    assert m.mark_invalidated(k, g1) is False
+    assert m.is_complete(k)  # still COMPLETE under g2
+    m.drop(k, g1)  # stale drop: no-op
+    assert m.lookup_entry(k) == (SplitTierState.COMPLETE, g2)
+    with pytest.raises(ValueError, match="expected generation"):
+        m.mark_delete_in_flight(k, g1)
+    # The current generation's own cleanup still works.
+    assert m.mark_invalidated(k, g2) is True
+    assert m.lookup(k) == SplitTierState.INVALIDATED
+
+
+def test_manifest_mark_complete_wrong_generation_raises() -> None:
+    """A stale completion (this task's ack arriving after the key was
+    reclaimed) must not resurrect a superseded composite."""
+    m = SplitTierManifest()
+    k = _make_key()
+    g1 = m.register_pending(k)
+    m.mark_invalidated(k, g1)
+    g2 = m.register_pending(k)
+    with pytest.raises(ValueError, match="expected generation"):
+        m.mark_complete(k, g1)
+    # g2 can still complete.
+    m.mark_complete(k, g2)
+    assert m.is_complete(k)
 
 
 def test_manifest_tracked_keys_snapshot() -> None:
@@ -426,11 +489,11 @@ def test_manifest_tracked_keys_snapshot() -> None:
     k1 = _make_key(chunk_hash=b"\x11" * 32)
     k2 = _make_key(chunk_hash=b"\x22" * 32)
     assert m.tracked_keys() == []
-    m.register_pending(k1)
+    g1 = m.register_pending(k1)
     m.register_pending(k2)
-    m.mark_complete(k1)
+    m.mark_complete(k1, g1)
     assert sorted(m.tracked_keys(), key=lambda k: k.chunk_hash) == [k1, k2]
-    m.drop(k1)
+    m.drop(k1, g1)
     assert m.tracked_keys() == [k2]
 
 
@@ -438,13 +501,13 @@ def test_manifest_mark_complete_rejects_wrong_state() -> None:
     m = SplitTierManifest()
     k = _make_key()
     # Untracked
-    with pytest.raises(ValueError, match="UNTRACKED"):
-        m.mark_complete(k)
+    with pytest.raises(ValueError, match="untracked or owned"):
+        m.mark_complete(k, 1)
     # In INVALIDATED
-    m.register_pending(k)
-    m.mark_invalidated(k)
+    g = m.register_pending(k)
+    m.mark_invalidated(k, g)
     with pytest.raises(ValueError, match="INVALIDATED"):
-        m.mark_complete(k)
+        m.mark_complete(k, g)
 
 
 def test_manifest_mark_invalidated_from_any_state_is_idempotent() -> None:
@@ -452,42 +515,42 @@ def test_manifest_mark_invalidated_from_any_state_is_idempotent() -> None:
     starting state (including STORE_IN_FLIGHT for a failed store)."""
     m = SplitTierManifest()
     k = _make_key()
-    # Untracked: no-op.
-    m.mark_invalidated(k)
+    # Untracked: no-op, returns False (nothing owned).
+    assert m.mark_invalidated(k, 1) is False
     assert m.lookup(k) is None
     # From STORE_IN_FLIGHT: valid (failed-store cleanup path).
-    m.register_pending(k)
-    m.mark_invalidated(k)
+    g = m.register_pending(k)
+    assert m.mark_invalidated(k, g) is True
     assert m.lookup(k) == SplitTierState.INVALIDATED
-    # Idempotent repeat.
-    m.mark_invalidated(k)
+    # Idempotent repeat at the same generation.
+    assert m.mark_invalidated(k, g) is True
     assert m.lookup(k) == SplitTierState.INVALIDATED
 
 
 def test_manifest_delete_in_flight_requires_invalidated() -> None:
     m = SplitTierManifest()
     k = _make_key()
-    m.register_pending(k)
-    m.mark_complete(k)
+    g = m.register_pending(k)
+    m.mark_complete(k, g)
     # Not yet invalidated.
     with pytest.raises(ValueError, match="INVALIDATED"):
-        m.mark_delete_in_flight(k)
-    m.mark_invalidated(k)
-    m.mark_delete_in_flight(k)
+        m.mark_delete_in_flight(k, g)
+    m.mark_invalidated(k, g)
+    m.mark_delete_in_flight(k, g)
     assert m.lookup(k) == SplitTierState.DELETE_IN_FLIGHT
 
 
 def test_manifest_drop_removes_entry() -> None:
     m = SplitTierManifest()
     k = _make_key()
-    m.register_pending(k)
-    m.mark_complete(k)
-    m.mark_invalidated(k)
-    m.mark_delete_in_flight(k)
-    m.drop(k)
+    g = m.register_pending(k)
+    m.mark_complete(k, g)
+    m.mark_invalidated(k, g)
+    m.mark_delete_in_flight(k, g)
+    m.drop(k, g)
     assert m.lookup(k) is None
     # Idempotent.
-    m.drop(k)
+    m.drop(k, g)
 
 
 def test_manifest_distinct_keys_dont_interfere() -> None:
@@ -496,12 +559,12 @@ def test_manifest_distinct_keys_dont_interfere() -> None:
     m = SplitTierManifest()
     k1 = _make_key(chunk_hash=b"\x11" * 32)
     k2 = _make_key(chunk_hash=b"\x22" * 32)
-    m.register_pending(k1)
+    g1 = m.register_pending(k1)
     m.register_pending(k2)
-    m.mark_complete(k1)
+    m.mark_complete(k1, g1)
     assert m.lookup(k1) == SplitTierState.COMPLETE
     assert m.lookup(k2) == SplitTierState.STORE_IN_FLIGHT
-    m.mark_invalidated(k1)
+    m.mark_invalidated(k1, g1)
     assert m.lookup(k1) == SplitTierState.INVALIDATED
     assert m.lookup(k2) == SplitTierState.STORE_IN_FLIGHT
 
@@ -511,11 +574,11 @@ def test_manifest_len_tracks_outstanding_keys() -> None:
     assert len(m) == 0
     k1 = _make_key(chunk_hash=b"\x11" * 32)
     k2 = _make_key(chunk_hash=b"\x22" * 32)
-    m.register_pending(k1)
+    g1 = m.register_pending(k1)
     assert len(m) == 1
     m.register_pending(k2)
     assert len(m) == 2
-    m.drop(k1)
+    m.drop(k1, g1)
     assert len(m) == 1
 
 
@@ -621,8 +684,8 @@ def test_storage_manager_clear_sweeps_stale_manifest_entries() -> None:
             # Entry A: COMPLETE but its K child is NOT in L1 (the
             # stale-after-clear shape).  It must be swept.
             stale = _make_key(chunk_hash=b"\x51" * 32)
-            manifest.register_pending(stale)
-            manifest.mark_complete(stale)
+            stale_gen = manifest.register_pending(stale)
+            manifest.mark_complete(stale, stale_gen)
 
             # Entry B: its K child holds an L1 WRITE lock across the
             # clear (an in-flight store), so force=False keeps the L1

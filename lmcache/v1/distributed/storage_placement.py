@@ -78,6 +78,7 @@ reclaimed in the background (best-effort for V on adapters without
 from __future__ import annotations
 
 # Standard
+from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 import threading
@@ -201,6 +202,25 @@ def reverse_component_key(
     return logical, role
 
 
+@dataclass
+class _ManifestEntry:
+    """One logical key's manifest state plus the generation that owns
+    it.
+
+    ``generation`` is a process-unique, monotonically increasing id
+    assigned by :meth:`SplitTierManifest.register_pending`.  It lets
+    every cleanup path act on *only* the generation it started for:
+    a stale delete/invalidate for generation ``G`` becomes a no-op
+    the instant a fresh :meth:`register_pending` has reclaimed the
+    key under generation ``G+1``.  Without it, a cleanup racing a
+    re-store of the same logical key could tear down the brand-new
+    composite it never owned.
+    """
+
+    state: "SplitTierState"
+    generation: int
+
+
 class SplitTierManifest:
     """Thread-safe manifest of split-tier state per logical
     :class:`ObjectKey`.
@@ -222,6 +242,20 @@ class SplitTierManifest:
     after failed-store cleanup) -- a store failure must never
     permanently block a key from being stored again.
 
+    **Generation guard.**  :meth:`register_pending` returns a
+    process-unique, monotonically increasing generation id, and
+    every mutator that a *cleanup* path uses
+    (:meth:`mark_complete`, :meth:`mark_invalidated`,
+    :meth:`mark_delete_in_flight`, :meth:`drop`) takes that
+    generation and only acts when it still matches the entry's
+    current generation.  This closes the class of races where a
+    delete/invalidate started for one store transition lands *after*
+    the same logical key has been re-registered by a newer store
+    (the eviction controller deleting the old K child, then a fresh
+    store re-registering under the same key before the eviction's
+    teardown runs).  A generation-mismatched cleanup is a silent
+    no-op: it never touches the newer generation's state.
+
     Lookup against an unregistered logical key returns ``None``;
     callers MUST treat that as "miss" (the composite cache entry
     does not exist).
@@ -229,7 +263,12 @@ class SplitTierManifest:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._entries: dict[ObjectKey, SplitTierState] = {}
+        self._entries: dict[ObjectKey, _ManifestEntry] = {}
+        # Monotonic, process-unique generation counter.  Never reset
+        # (not even when an entry is dropped) so a generation number
+        # is never reused -- a stale cleanup for an old generation can
+        # therefore never collide with a fresh entry.
+        self._next_generation = 1
         # Side set of currently-tracked K child keys, populated when
         # the wrapper registers a logical key as STORE_IN_FLIGHT.  The
         # StoreController consults this set to skip K_child write
@@ -239,8 +278,9 @@ class SplitTierManifest:
         # single-shape MemoryObj).
         self._k_child_keys: set[ObjectKey] = set()
 
-    def register_pending(self, logical_key: ObjectKey) -> None:
-        """Mark a logical key as ``STORE_IN_FLIGHT``.
+    def register_pending(self, logical_key: ObjectKey) -> int:
+        """Mark a logical key as ``STORE_IN_FLIGHT`` under a fresh
+        generation and return that generation id.
 
         Also records the derived K-child key in
         :meth:`is_k_child_key`'s lookup set so the StoreController
@@ -257,6 +297,13 @@ class SplitTierManifest:
         turns one failed store into a per-key denial of caching for
         the lifetime of the process.
 
+        Returns:
+            The generation id assigned to this store transition.  The
+            caller MUST pass it back to :meth:`mark_complete`,
+            :meth:`mark_invalidated`, :meth:`mark_delete_in_flight`,
+            and :meth:`drop` so those cleanup paths act only on this
+            generation.
+
         Raises:
             ValueError: if the key has an ACTIVE operation in flight
                 (``STORE_IN_FLIGHT``: a concurrent duplicate store is
@@ -268,56 +315,102 @@ class SplitTierManifest:
         """
         with self._lock:
             cur = self._entries.get(logical_key)
-            if cur in (
+            if cur is not None and cur.state in (
                 SplitTierState.STORE_IN_FLIGHT,
                 SplitTierState.DELETE_IN_FLIGHT,
             ):
                 raise ValueError(
                     f"SplitTierManifest.register_pending: key already "
-                    f"tracked in state {cur.name}"
+                    f"tracked in state {cur.state.name}"
                 )
-            self._entries[logical_key] = SplitTierState.STORE_IN_FLIGHT
+            generation = self._next_generation
+            self._next_generation += 1
+            self._entries[logical_key] = _ManifestEntry(
+                state=SplitTierState.STORE_IN_FLIGHT,
+                generation=generation,
+            )
             self._k_child_keys.add(derive_component_key(logical_key, "k"))
+            return generation
 
-    def mark_complete(self, logical_key: ObjectKey) -> None:
-        """Transition ``STORE_IN_FLIGHT`` → ``COMPLETE``.
+    def mark_complete(self, logical_key: ObjectKey, generation: int) -> None:
+        """Transition ``STORE_IN_FLIGHT`` → ``COMPLETE`` for a
+        specific generation.
 
         The inner L2 store has acknowledged; lookup may now resolve
         as a composite hit.
 
+        Args:
+            logical_key: The logical key to complete.
+            generation: The generation returned by the matching
+                :meth:`register_pending`.
+
         Raises:
-            ValueError: if the key is not in ``STORE_IN_FLIGHT``.
+            ValueError: if the key is untracked, is owned by a
+                different (newer) generation, or is not in
+                ``STORE_IN_FLIGHT``.  A generation mismatch means
+                this store was superseded by a newer one and must
+                not resurrect a stale composite.
         """
         with self._lock:
             cur = self._entries.get(logical_key)
-            if cur != SplitTierState.STORE_IN_FLIGHT:
+            if cur is None or cur.generation != generation:
+                raise ValueError(
+                    f"SplitTierManifest.mark_complete: key untracked or "
+                    f"owned by generation "
+                    f"{cur.generation if cur else 'NONE'}; expected "
+                    f"generation {generation}"
+                )
+            if cur.state != SplitTierState.STORE_IN_FLIGHT:
                 raise ValueError(
                     f"SplitTierManifest.mark_complete: key in state "
-                    f"{cur.name if cur else 'UNTRACKED'}; expected "
-                    f"STORE_IN_FLIGHT"
+                    f"{cur.state.name}; expected STORE_IN_FLIGHT"
                 )
-            self._entries[logical_key] = SplitTierState.COMPLETE
+            cur.state = SplitTierState.COMPLETE
 
-    def mark_invalidated(self, logical_key: ObjectKey) -> None:
-        """Mark a logical key as ``INVALIDATED``.
+    def mark_invalidated(self, logical_key: ObjectKey, generation: int) -> bool:
+        """Invalidate a logical key iff ``generation`` still owns it.
 
-        Lookup returns "miss" from this point on; physical cleanup
-        (K child in L1 + V child on L2) proceeds in the background
-        per the eviction controller's policy.  Acceptable to
-        invalidate from any state (including ``STORE_IN_FLIGHT``
-        if a failed store needs to clean up).
+        Compare-and-set on the generation: transitions the entry to
+        ``INVALIDATED`` only when the tracked generation matches the
+        caller's.  Lookup returns "miss" from that point on; physical
+        cleanup (K child in L1 + V child on L2) proceeds in the
+        background per the caller's policy.  Acceptable to invalidate
+        from any state at the matching generation (including
+        ``STORE_IN_FLIGHT`` if a failed store needs to clean up);
+        already-``INVALIDATED`` / ``DELETE_IN_FLIGHT`` at the same
+        generation is idempotent.
+
+        Args:
+            logical_key: The logical key to invalidate.
+            generation: The generation the caller believes it is
+                cleaning up (from :meth:`register_pending`, or
+                captured via :meth:`lookup_entry`).
+
+        Returns:
+            ``True`` if this call left the caller's generation
+            invalidated (either it transitioned it now, or it was
+            already invalidated / delete-in-flight at the SAME
+            generation).  ``False`` if the key is untracked or has
+            been reclaimed by a newer generation -- in which case the
+            caller MUST NOT run any paired physical cleanup, since the
+            resources now belong to that newer generation.
         """
         with self._lock:
-            if logical_key not in self._entries:
-                return
-            cur = self._entries[logical_key]
-            if cur in (SplitTierState.INVALIDATED, SplitTierState.DELETE_IN_FLIGHT):
+            cur = self._entries.get(logical_key)
+            if cur is None or cur.generation != generation:
+                return False
+            if cur.state in (
+                SplitTierState.INVALIDATED,
+                SplitTierState.DELETE_IN_FLIGHT,
+            ):
                 # Already invalidated / being deleted; idempotent.
-                return
-            self._entries[logical_key] = SplitTierState.INVALIDATED
+                return True
+            cur.state = SplitTierState.INVALIDATED
+            return True
 
-    def mark_delete_in_flight(self, logical_key: ObjectKey) -> None:
-        """Transition ``INVALIDATED`` → ``DELETE_IN_FLIGHT``.
+    def mark_delete_in_flight(self, logical_key: ObjectKey, generation: int) -> None:
+        """Transition ``INVALIDATED`` → ``DELETE_IN_FLIGHT`` for a
+        specific generation.
 
         K child deletion in L1 has completed; the V child delete is
         enqueued against the L2 adapter.  The manifest entry is
@@ -325,27 +418,50 @@ class SplitTierManifest:
         (or after a cleanup timeout for adapters without ``delete()``;
         the V orphan is tolerable cold-tier waste).
 
+        Args:
+            logical_key: The logical key being deleted.
+            generation: The generation the caller is cleaning up.
+
         Raises:
-            ValueError: if the key is not in ``INVALIDATED``.
+            ValueError: if the key is untracked, owned by a different
+                generation, or not in ``INVALIDATED``.
         """
         with self._lock:
             cur = self._entries.get(logical_key)
-            if cur != SplitTierState.INVALIDATED:
+            if cur is None or cur.generation != generation:
+                raise ValueError(
+                    f"SplitTierManifest.mark_delete_in_flight: key "
+                    f"untracked or owned by generation "
+                    f"{cur.generation if cur else 'NONE'}; expected "
+                    f"generation {generation}"
+                )
+            if cur.state != SplitTierState.INVALIDATED:
                 raise ValueError(
                     f"SplitTierManifest.mark_delete_in_flight: key in "
-                    f"state {cur.name if cur else 'UNTRACKED'}; expected "
-                    f"INVALIDATED"
+                    f"state {cur.state.name}; expected INVALIDATED"
                 )
-            self._entries[logical_key] = SplitTierState.DELETE_IN_FLIGHT
+            cur.state = SplitTierState.DELETE_IN_FLIGHT
 
-    def drop(self, logical_key: ObjectKey) -> None:
-        """Remove the manifest entry for ``logical_key``.
+    def drop(self, logical_key: ObjectKey, generation: int) -> None:
+        """Remove the manifest entry for ``logical_key`` iff
+        ``generation`` still owns it.
 
         Called after physical cleanup completes; no further state
         transitions are possible.  Idempotent.  Also drops the
         side-set entry for the K-child key.
+
+        A generation mismatch is a silent no-op: the key has been
+        reclaimed by a newer store, whose entry and K-child side-set
+        membership MUST be preserved.
+
+        Args:
+            logical_key: The logical key whose entry to remove.
+            generation: The generation the caller is cleaning up.
         """
         with self._lock:
+            cur = self._entries.get(logical_key)
+            if cur is None or cur.generation != generation:
+                return
             self._entries.pop(logical_key, None)
             self._k_child_keys.discard(derive_component_key(logical_key, "k"))
 
@@ -366,11 +482,30 @@ class SplitTierManifest:
         """Return the manifest state for ``logical_key``, or ``None``.
 
         Threadsafe snapshot; callers that need to act on the result
-        atomically should call :meth:`mark_*` immediately (the
-        transitions are themselves atomic and locked).
+        atomically should call the generation-guarded ``mark_*`` /
+        :meth:`drop` immediately (the transitions are themselves
+        atomic and locked, and no-op on a generation mismatch).
         """
         with self._lock:
-            return self._entries.get(logical_key)
+            cur = self._entries.get(logical_key)
+            return cur.state if cur is not None else None
+
+    def lookup_entry(
+        self, logical_key: ObjectKey
+    ) -> Optional[tuple["SplitTierState", int]]:
+        """Return ``(state, generation)`` for ``logical_key``, or
+        ``None`` if untracked.
+
+        Cleanup paths that do not own a generation (the eviction
+        controller, :meth:`StorageManager.clear`) capture the
+        generation here and pass it to the generation-guarded
+        mutators so they only tear down the generation they observed.
+        """
+        with self._lock:
+            cur = self._entries.get(logical_key)
+            if cur is None:
+                return None
+            return cur.state, cur.generation
 
     def is_complete(self, logical_key: ObjectKey) -> bool:
         """Convenience: ``True`` iff lookup resolves to a composite hit."""
