@@ -247,6 +247,68 @@ sum(rate(lmcache_mp_lookup_hit_tokens_total[5m])) by (model_name)
 
 ---
 
+## Split-Tier (KV_SPLIT_TIER / V-only) Metrics
+
+Active only when a serde routes stores through the V-only split-tier state
+machine (`serde_config: {type: asym_k16_v8_v_only}` → placement
+`KV_SPLIT_TIER`).  Exact K stays in L1 host DRAM; compressed V is written to
+L2/NVMe under a derived child key.  One logical key therefore maps to a K
+child (L1) + a V child (L2), coordinated by the per-key `SplitTierManifest`.
+These metrics expose that store lifecycle and the manifest state machine.
+
+The event counters are maintained by `SplitTierMetricsSubscriber`
+(`subscribers/metrics/split_tier.py`).  The manifest gauge is registered by
+`StorageManager` only under `KV_SPLIT_TIER` (the manifest is inert / empty
+otherwise), so the gauge series are absent under plain `KV_TOGETHER`.
+
+| OTel metric name | Prometheus name | Type | Source event | Calculation | Tags |
+|---|---|---|---|---|---|
+| `lmcache_mp.split_tier_store_completed` | `lmcache_mp_split_tier_store_completed_chunks_total` | Counter | `SPLIT_TIER_STORE_COMPLETED` | `+count` per `model_name` bucket | `model_name` |
+| `lmcache_mp.split_tier_store_invalidated` | `lmcache_mp_split_tier_store_invalidated_chunks_total` | Counter | `SPLIT_TIER_STORE_INVALIDATED` | `+count` per `(reason, model_name)` bucket | `reason` ∈ {`pre_submit`, `inner_store`}, `model_name` |
+| `lmcache_mp.split_tier_v_child_deleted` | `lmcache_mp_split_tier_v_child_deleted_chunks_total` | Counter | `SPLIT_TIER_V_CHILD_DELETED` | `+count` per `trigger` bucket | `trigger` ∈ {`eviction`, `clear`, `store_failure`} |
+| `lmcache_mp.split_tier_manifest_entries` | `lmcache_mp_split_tier_manifest_entries` | ObservableGauge (attr: `state`) | `StorageManager.get_split_tier_state_counts()` (calls `SplitTierManifest.state_counts()`) | Number of tracked logical keys in each state at scrape time; one observation per state | `state` ∈ {`store_in_flight`, `complete`, `invalidated`, `delete_in_flight`} |
+
+**What they answer:**
+
+- `split_tier_store_completed` — rate of split-tier composites that became
+  valid lookup hits (V reached L2, K resident in L1).
+- `split_tier_store_invalidated` — rate of failed / rolled-back stores.
+  `reason=pre_submit` means the codec / temp-alloc failed before any V bytes
+  were submitted; `reason=inner_store` means the submitted V store failed.
+- `split_tier_v_child_deleted` — rate of V children whose L2 delete was
+  issued during paired cleanup: `eviction` (a K child was evicted, so its V
+  partner is deleted), `clear` (a cache-clear sweep), or `store_failure`
+  (rollback of a store that had already submitted its V child).  Best-effort
+  — an adapter `delete()` that raises is logged but still counted (same
+  convention as `l2_evicted_objects`), so this is deletes *issued*, not a
+  media-durable purge.  Removing the last split-tier L2 adapter sweeps the
+  manifest but issues no L2 delete (the adapter is gone), so it is not
+  counted here.
+- `split_tier_manifest_entries` — the live state-machine distribution.  A
+  rising `store_in_flight` / `delete_in_flight` count, or a monotonically
+  growing total, is the operator's signal for a stuck transition or an
+  entry leak.
+
+```promql
+# Split-tier store failure fraction (all models):
+sum(rate(lmcache_mp_split_tier_store_invalidated_chunks_total[5m]))
+/ (
+  sum(rate(lmcache_mp_split_tier_store_completed_chunks_total[5m]))
+  + sum(rate(lmcache_mp_split_tier_store_invalidated_chunks_total[5m]))
+)
+
+# Manifest entries stuck mid-transition (leak / stall signal):
+lmcache_mp_split_tier_manifest_entries{state=~"store_in_flight|delete_in_flight"}
+```
+
+> **Counting note:** the three counters use `chunks` units — each increment
+> is one logical key (one K/V composite), not one byte.  `store_completed`
+> and `store_invalidated` are tagged by `model_name` for per-model slicing;
+> `v_child_deleted` is tagged only by cleanup `trigger` because a paired
+> delete already knows the physical child, not the producing model.
+
+---
+
 ## L0 (GPU) Block Lifecycle Histograms
 
 Sampled (default 1%) GPU KV cache block lifecycle tracking via shadow monitoring

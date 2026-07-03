@@ -64,6 +64,14 @@ class EventType(Enum):
     # L2 failure events (LM-291 health monitoring)
     L2_PREFETCH_FAILED = "l2.prefetch.failed"
 
+    # Split-tier (KV_SPLIT_TIER / V-only) lifecycle events.  Metadata:
+    #   SPLIT_TIER_STORE_COMPLETED:  count (int), model_names (Counter)
+    #   SPLIT_TIER_STORE_INVALIDATED: count (int), reason (str), model_names
+    #   SPLIT_TIER_V_CHILD_DELETED:  count (int), trigger (str)
+    SPLIT_TIER_STORE_COMPLETED = "split_tier.store.completed"
+    SPLIT_TIER_STORE_INVALIDATED = "split_tier.store.invalidated"
+    SPLIT_TIER_V_CHILD_DELETED = "split_tier.v_child.deleted"
+
     # MP Server request-level events (start/end pairs)
     MP_STORE_START = "mp.store.start"
     MP_STORE_END = "mp.store.end"
