@@ -269,9 +269,13 @@ class TestAsymK16V8SerdeFsRoundTrip:
         kv_shape = torch.Size([2, 4, 256, 128])
         kv_dtype = torch.bfloat16
         packed_layout = MemoryLayoutDesc(shapes=[kv_shape], dtypes=[kv_dtype])
-        # Canonical L1 layout: K and V as separate component groups.
-        layout = sm.apply_layout_policy(packed_layout)
-        assert len(layout.shapes) == 2, "policy did not split into K/V groups"
+        # reserve_write / submit_prefetch_task apply the layout policy
+        # internally (the PR-0 choke point), so we pass the PACKED layout
+        # and let them split it into K/V component groups.  Sanity-check
+        # the policy does split (it must not be pre-applied by the caller).
+        assert len(sm.apply_layout_policy(packed_layout).shapes) == 2, (
+            "policy did not split into K/V groups"
+        )
 
         keys = [
             _make_key(b"\x00" * 31 + b"\x01"),
@@ -289,7 +293,7 @@ class TestAsymK16V8SerdeFsRoundTrip:
         ]
 
         # ---- Step 1: reserve, fill K/V via typed group views ----
-        reserved = sm.reserve_write(keys, layout, mode="new")
+        reserved = sm.reserve_write(keys, packed_layout, mode="new")
         assert len(reserved) == len(keys)
         for k, (k_orig, v_orig) in zip(keys, originals, strict=True):
             mem_obj = reserved[k]
@@ -320,7 +324,7 @@ class TestAsymK16V8SerdeFsRoundTrip:
         assert sm.report_status()["l1_manager"]["total_object_count"] == 0
 
         # ---- Step 4: prefetch (disk load + asym deserialize) ----
-        handle = sm.submit_prefetch_task(keys, layout)
+        handle = sm.submit_prefetch_task(keys, packed_layout)
         prefix_hits = wait_for_prefetch_status(sm, handle)
         assert prefix_hits is not None, "Prefetch never completed"
         assert prefix_hits == len(keys), (
@@ -448,9 +452,10 @@ class TestAsymK16V8VOnlySplitTierRoundTrip:
         kv_shape = torch.Size([2, 4, 256, 128])
         kv_dtype = torch.bfloat16
         packed_layout = MemoryLayoutDesc(shapes=[kv_shape], dtypes=[kv_dtype])
-        layout = sm.apply_layout_policy(packed_layout)
-        assert len(layout.shapes) == 2
-        reserved = sm.reserve_write(keys, layout, mode="new")
+        # reserve_write applies the layout policy internally (PR-0 choke
+        # point); pass the PACKED layout and let it split into K/V groups.
+        assert len(sm.apply_layout_policy(packed_layout).shapes) == 2
+        reserved = sm.reserve_write(keys, packed_layout, mode="new")
         assert len(reserved) == len(keys)
         for k, (k_orig, v_orig) in zip(keys, originals, strict=True):
             mem_obj = reserved[k]
@@ -460,7 +465,8 @@ class TestAsymK16V8VOnlySplitTierRoundTrip:
             k_view.copy_(k_orig)
             v_view.copy_(v_orig)
         sm.finish_write(keys)
-        return layout
+        # Return the PACKED layout; submit_prefetch_task applies the policy.
+        return packed_layout
 
     def _wait_for_l2_drain(self, sm: StorageManager, disk_path: str):
         # Files must appear on disk under the *V child* keys.  Since
