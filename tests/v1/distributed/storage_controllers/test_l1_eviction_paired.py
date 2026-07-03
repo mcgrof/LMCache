@@ -87,8 +87,8 @@ def test_paired_eviction_k_child_invalidates_manifest_and_enqueues_v_delete() ->
     v_child = derive_component_key(logical, "v")
     # Drive the manifest through the happy path so it's COMPLETE
     # when eviction picks the K child.
-    manifest.register_pending(logical)
-    manifest.mark_complete(logical)
+    gen = manifest.register_pending(logical)
+    manifest.mark_complete(logical, gen)
 
     adapter_a = MagicMock()
     adapter_b = MagicMock()
@@ -129,8 +129,8 @@ def test_paired_eviction_skips_v_child_keys() -> None:
     manifest = SplitTierManifest()
     logical = _make_key(b"\x44" * 32)
     v_child = derive_component_key(logical, "v")
-    manifest.register_pending(logical)
-    manifest.mark_complete(logical)
+    gen = manifest.register_pending(logical)
+    manifest.mark_complete(logical, gen)
     adapter = MagicMock()
     ctrl = _build_controller(manifest=manifest, l2_adapters=[adapter])
     ctrl.execute_eviction_action(
@@ -149,10 +149,10 @@ def test_paired_eviction_idempotent_on_already_invalidated() -> None:
     manifest = SplitTierManifest()
     logical = _make_key(b"\x55" * 32)
     k_child = derive_component_key(logical, "k")
-    manifest.register_pending(logical)
-    manifest.mark_invalidated(logical)
-    manifest.mark_delete_in_flight(logical)
-    manifest.drop(logical)
+    gen = manifest.register_pending(logical)
+    manifest.mark_invalidated(logical, gen)
+    manifest.mark_delete_in_flight(logical, gen)
+    manifest.drop(logical, gen)
     adapter = MagicMock()
     ctrl = _build_controller(manifest=manifest, l2_adapters=[adapter])
     # Manifest already fully cleaned up -> paired branch is a no-op.
@@ -201,8 +201,8 @@ def test_paired_eviction_locked_k_child_preserves_composite() -> None:
     logical = _make_key(b"\x88" * 32)
     k_child = derive_component_key(logical, "k")
     v_child = derive_component_key(logical, "v")
-    manifest.register_pending(logical)
-    manifest.mark_complete(logical)
+    gen = manifest.register_pending(logical)
+    manifest.mark_complete(logical, gen)
 
     adapter = MagicMock()
     ctrl = _build_controller(manifest=manifest, l2_adapters=[adapter])
@@ -232,8 +232,8 @@ def test_paired_eviction_tolerates_adapter_delete_raise() -> None:
     manifest = SplitTierManifest()
     logical = _make_key(b"\x77" * 32)
     k_child = derive_component_key(logical, "k")
-    manifest.register_pending(logical)
-    manifest.mark_complete(logical)
+    gen = manifest.register_pending(logical)
+    manifest.mark_complete(logical, gen)
     flaky_adapter = MagicMock()
     flaky_adapter.delete.side_effect = RuntimeError("L2 down")
     ctrl = _build_controller(manifest=manifest, l2_adapters=[flaky_adapter])
@@ -244,3 +244,64 @@ def test_paired_eviction_tolerates_adapter_delete_raise() -> None:
     # Manifest still progressed; L1 still deleted the K child.
     assert manifest.lookup(logical) is None
     ctrl._l1_manager.delete.assert_called_once_with([k_child])
+
+
+def test_paired_eviction_stale_generation_preserves_new_complete() -> None:
+    """After the eviction deletes the old K child, a fresh
+    store reclaims the logical key under a NEW generation and completes
+    before the teardown loop runs.  The teardown captured the OLD
+    generation, so its invalidate / V-delete / drop must be no-ops --
+    the new composite and its live V child must survive."""
+    manifest = SplitTierManifest()
+    logical = _make_key(b"\x99" * 32)
+    k_child = derive_component_key(logical, "k")
+    g1 = manifest.register_pending(logical)
+    manifest.mark_complete(logical, g1)  # old generation COMPLETE
+
+    adapter = MagicMock()
+    ctrl = _build_controller(manifest=manifest, l2_adapters=[adapter])
+
+    # The delete of the old K child opens the key; a concurrent re-store
+    # reclaims it under a new generation and reaches COMPLETE before the
+    # teardown loop runs.
+    def _delete_then_restore(keys):
+        g2 = manifest.register_pending(logical)
+        manifest.mark_complete(logical, g2)
+        return {k: L1Error.SUCCESS for k in keys}
+
+    ctrl._l1_manager.delete.side_effect = _delete_then_restore
+    ctrl.execute_eviction_action(
+        EvictionAction(keys=[k_child], destination=EvictionDestination.DISCARD)
+    )
+
+    # The new composite survived untouched.
+    assert manifest.is_complete(logical)
+    adapter.delete.assert_not_called()
+
+
+def test_paired_eviction_stale_generation_preserves_new_store_in_flight() -> None:
+    """Scenario: a new STORE_IN_FLIGHT
+    generation registers between the old K child's L1 delete and the
+    teardown.  The teardown must NOT mark_invalidated it -- that would
+    destroy the composite the new store is mid-way through writing."""
+    manifest = SplitTierManifest()
+    logical = _make_key(b"\x9a" * 32)
+    k_child = derive_component_key(logical, "k")
+    g1 = manifest.register_pending(logical)
+    manifest.mark_complete(logical, g1)
+
+    adapter = MagicMock()
+    ctrl = _build_controller(manifest=manifest, l2_adapters=[adapter])
+
+    def _delete_then_restore(keys):
+        manifest.register_pending(logical)  # new gen, STORE_IN_FLIGHT
+        return {k: L1Error.SUCCESS for k in keys}
+
+    ctrl._l1_manager.delete.side_effect = _delete_then_restore
+    ctrl.execute_eviction_action(
+        EvictionAction(keys=[k_child], destination=EvictionDestination.DISCARD)
+    )
+
+    # The in-flight new generation was left alone.
+    assert manifest.lookup(logical) == SplitTierState.STORE_IN_FLIGHT
+    adapter.delete.assert_not_called()
