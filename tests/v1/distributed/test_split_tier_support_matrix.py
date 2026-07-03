@@ -150,3 +150,45 @@ def test_storage_manager_init_rejects_before_building_resources() -> None:
     ]
     with pytest.raises(ValueError, match="multiple L2 adapters"):
         StorageManager(_cfg(adapters=adapters))
+
+
+def test_reserve_write_rejects_multi_object_group_under_split_tier() -> None:
+    """A fact invisible at config time -- multiple object groups
+    (hybrid / sliding-window / MLA models emit one key per KV group) --
+    is caught on the producer's reserve_write path with a clear ValueError
+    that reaches the producer (not swallowed by the async store loop)."""
+    # Standard
+    import shutil
+
+    # Third Party
+    import torch
+
+    # First Party
+    from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+
+    disk = tempfile.mkdtemp(prefix="lmcache_og_")
+    try:
+        sm = StorageManager(_cfg(adapters=[_v_only_fs_adapter(disk)]))
+        try:
+            k0 = ObjectKey(
+                chunk_hash=b"\x01" * 32,
+                model_name="m",
+                kv_rank=0,
+                object_group_id=0,
+            )
+            k1 = ObjectKey(
+                chunk_hash=b"\x02" * 32,
+                model_name="m",
+                kv_rank=0,
+                object_group_id=1,
+            )
+            layout = MemoryLayoutDesc(
+                shapes=[torch.Size([4]), torch.Size([8])],
+                dtypes=[torch.bfloat16, torch.bfloat16],
+            )
+            with pytest.raises(ValueError, match="single object group"):
+                sm.reserve_write([k0, k1], layout, mode="new")
+        finally:
+            sm.close()
+    finally:
+        shutil.rmtree(disk, ignore_errors=True)
