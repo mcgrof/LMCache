@@ -28,7 +28,10 @@ from lmcache.v1.distributed.internal_api import L1MemoryDesc, L2AdapterListener
 from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.l2_adapters import create_l2_adapter
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface
-from lmcache.v1.distributed.l2_adapters.config import L2AdapterConfigBase
+from lmcache.v1.distributed.l2_adapters.config import (
+    L2AdapterConfigBase,
+    get_type_name_for_config,
+)
 from lmcache.v1.distributed.l2_adapters.reconfiguration import (
     L2ReconfigurableAdapter,
     L2ReconfigureError,
@@ -76,8 +79,107 @@ from lmcache.v1.platform import HAS_EVENTFD
 logger = init_logger(__name__)
 
 
+def _reject_unsupported_split_tier_config(config: StorageManagerConfig) -> None:
+    """Enforce the KV_SPLIT_TIER (V-only) support matrix at config time.
+
+    The split-tier path composes an L1-resident exact-K child with an
+    L2-resident compressed-V child under one logical key.  It is only
+    correct for the narrow initial matrix documented in
+    ``docs/design/v1/distributed/`` -- CPU pinned-DRAM L1, exactly one
+    split-tier L2 adapter, no L2 eviction/quota driving the V child out
+    from under a live composite.  Configurations outside that matrix are
+    rejected here, before any resource is built, so they fail closed at
+    startup rather than silently mis-serving.
+
+    Only call this when the derived placement mode is
+    :attr:`StoragePlacementMode.KV_SPLIT_TIER`; KV_TOGETHER configs are
+    unrestricted.
+
+    Args:
+        config: The fully-normalized storage manager configuration.
+
+    Raises:
+        ValueError: naming every unsupported combination present, so an
+            operator sees all matrix violations at once.
+    """
+    reasons: list[str] = []
+
+    l1 = config.l1_manager_config
+    if l1.gds_l1_config is not None:
+        reasons.append(
+            "GDS L1 (gds-l1-path): split-tier requires a CPU pinned-DRAM "
+            "L1 tier to retain the exact-K child"
+        )
+    if l1.memory_config.devdax_path:
+        reasons.append(
+            "Device-DAX L1 (l1-devdax-path): split-tier requires a CPU "
+            "pinned-DRAM L1 tier to retain the exact-K child"
+        )
+
+    adapters = config.l2_adapter_config.adapters
+    if len(adapters) > 1:
+        names = ", ".join(get_type_name_for_config(ac) for ac in adapters)
+        reasons.append(
+            f"multiple L2 adapters ({names}): split-tier supports exactly "
+            "one L2 adapter for the V child"
+        )
+
+    evicting = [
+        get_type_name_for_config(ac)
+        for ac in adapters
+        if ac.eviction_config is not None
+    ]
+    if evicting:
+        reasons.append(
+            f"per-adapter L2 eviction ({', '.join(evicting)}): L2 eviction "
+            "can delete a V child out from under a live composite"
+        )
+
+    quota_sources: list[str] = []
+    if config.eviction_config.eviction_policy == "IsolatedLRU":
+        quota_sources.append("L1 eviction policy")
+    quota_sources.extend(
+        get_type_name_for_config(ac)
+        for ac in adapters
+        if ac.eviction_config is not None
+        and ac.eviction_config.eviction_policy == "IsolatedLRU"
+    )
+    if quota_sources:
+        reasons.append(
+            f"IsolatedLRU per-cache_salt quota ({', '.join(quota_sources)}): "
+            "quota accounting does not yet model the split K/V children"
+        )
+
+    if reasons:
+        raise ValueError(
+            "Unsupported configuration for KV_SPLIT_TIER (V-only) storage "
+            "placement:\n  - " + "\n  - ".join(reasons)
+        )
+
+
 class StorageManager:
     def __init__(self, config: StorageManagerConfig):
+        # Canonical L1 placement / lifecycle mode, derived from the
+        # configured L2 adapters' serdes.  Determines whether the wrapper
+        # packs K + V into one stored blob (KV_TOGETHER) or splits them
+        # into separately keyed children with K retained in L1 and V
+        # routed to L2 (KV_SPLIT_TIER, the Mode 2 V-only path).  Mixed
+        # configurations are rejected.  Derived FIRST -- it is pure config
+        # inspection -- so the split-tier support matrix can fail closed
+        # before any hardware-backed resource (the L1 memory manager, the
+        # adapters) is constructed.
+        self._storage_placement_mode = derive_storage_placement_mode(
+            config.l2_adapter_config.adapters
+        )
+
+        # Support matrix: the V-only split-tier path is only
+        # correct for a narrow, documented configuration.  Reject the
+        # unsupported combinations before any resource is built so a bad
+        # config fails closed at startup instead of silently mis-serving.
+        # KV_TOGETHER is unaffected (the check is gated on the mode).
+        if self._storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER:
+            _reject_unsupported_split_tier_config(config)
+
         self._l1_manager = L1Manager(config.l1_manager_config)
         self._event_bus = get_event_bus()
 
@@ -94,16 +196,6 @@ class StorageManager:
         # (e.g. ``asym_k16_v8``) on the same StorageManager is rejected
         # at config time.  See lmcache/v1/distributed/storage_layout.py.
         self._storage_layout_mode = derive_storage_layout_mode(
-            config.l2_adapter_config.adapters
-        )
-
-        # Canonical L1 placement / lifecycle mode, derived alongside the
-        # layout mode.  Determines whether the wrapper packs K + V into
-        # one stored blob (KV_TOGETHER) or splits them into separately
-        # keyed children with K retained in L1 and V routed to L2
-        # (KV_SPLIT_TIER, the Mode 2 V-only path).  Mixed configurations
-        # are rejected.
-        self._storage_placement_mode = derive_storage_placement_mode(
             config.l2_adapter_config.adapters
         )
 
