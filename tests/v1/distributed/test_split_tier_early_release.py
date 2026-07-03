@@ -112,6 +112,9 @@ class _Capture:
     """Records calls to L1Manager + inner adapter for assertions."""
 
     finish_read_calls: list[list]
+    finish_write_calls: list[list]
+    fwrr_calls: list[list]
+    drained_keys: list[list]
     delete_calls: list[list]
     inner_submit_calls: list[tuple]
     inner_delete_calls: list[list]
@@ -134,9 +137,13 @@ class _FakeL1Manager:
         # pressure at temp-buffer allocation time -- K-children go
         # through reserve_external_writes and are unaffected).
         self.fail_reserve_write = fail_reserve_write
+        # Drain-listener subscribers (the real StoreController listener).
+        # Populated via register_listener so a test can observe which
+        # keys reach the L1->L2 drain when finish_write fires.
+        self._listeners: list = []
 
     def register_listener(self, listener) -> None:
-        pass
+        self._listeners.append(listener)
 
     def reserve_write(self, keys, is_temporary, layout_desc, mode):
         from lmcache.v1.distributed.error import L1Error
@@ -161,8 +168,18 @@ class _FakeL1Manager:
             out[k] = (L1Error.SUCCESS, obj)
         return out
 
-    def finish_write(self, keys) -> None:
-        pass
+    def finish_write(self, keys):
+        from lmcache.v1.distributed.error import L1Error
+
+        self._capture.finish_write_calls.append(list(keys))
+        # Mirror the real L1Manager: finish_write releases the write
+        # lock AND fires the L1->L2 drain listener.  A K child that
+        # reaches this listener without the is_k_child_key filter is
+        # exactly the Finding-A leak we are guarding against.
+        for listener in self._listeners:
+            listener.on_l1_keys_write_finished(list(keys))
+            self._capture.drained_keys.append(list(keys))
+        return {k: L1Error.SUCCESS for k in keys}
 
     def reserve_read(self, keys):
         from lmcache.v1.distributed.error import L1Error
@@ -176,10 +193,20 @@ class _FakeL1Manager:
 
     def delete(self, keys):
         self._capture.delete_calls.append(list(keys))
+        for k in keys:
+            self._objects.pop(k, None)
         return {}
 
-    def finish_write_and_reserve_read(self, keys) -> None:
-        pass
+    def finish_write_and_reserve_read(self, keys):
+        from lmcache.v1.distributed.error import L1Error
+
+        # Mirror the real L1Manager: releases the write lock, takes a
+        # read lock, and fires ONLY the (no-op in StoreController)
+        # reserve-read listener -- never the L1->L2 drain listener.
+        self._capture.fwrr_calls.append(list(keys))
+        return {
+            k: (L1Error.SUCCESS, self._objects[k]) for k in keys if k in self._objects
+        }
 
 
 class _GroupedMemoryObj:
@@ -210,6 +237,9 @@ def _make_wrapper(
 
     capture = _Capture(
         finish_read_calls=[],
+        finish_write_calls=[],
+        fwrr_calls=[],
+        drained_keys=[],
         delete_calls=[],
         inner_submit_calls=[],
         inner_delete_calls=[],
@@ -802,8 +832,8 @@ def test_kchild_evictable_when_complete() -> None:
     """K-child in COMPLETE state is fair game for LRU eviction --
     paired eviction kicks in afterwards."""
     l1, manifest, k_child, logical = _build_l1_with_manifest()
-    manifest.register_pending(logical)
-    manifest.mark_complete(logical)
+    gen = manifest.register_pending(logical)
+    manifest.mark_complete(logical, gen)
     assert l1.is_key_evictable(k_child) is True
 
 
@@ -1114,6 +1144,66 @@ def test_split_tier_registration_collision_rolls_back_batch() -> None:
         wrapper.close()
 
 
+def test_split_tier_rollback_release_never_drains_k_children() -> None:
+    """The failure-path K-child release must NOT fire the
+    L1->L2 drain listener (``on_l1_keys_write_finished``).
+
+    On the registration-collision rollback the manifest entries (and
+    their is_k_child_key side-set membership) are gone, so a plain
+    ``finish_write`` release would drain the write-locked K children to
+    the StoreController unfiltered -- routing a single-shape K-only
+    buffer into ``submit_store_task`` and leaking a read-locked K child
+    if the store loop wins the race.  The release must instead go
+    through ``finish_write_and_reserve_read`` (drain-silent) + delete.
+    """
+    # First Party
+    from lmcache.v1.distributed.api import ObjectKey
+    from lmcache.v1.distributed.storage_placement import (
+        StoragePlacementMode,
+        derive_component_key,
+    )
+
+    wrapper, capture, l1, manifest = _make_wrapper(StoragePlacementMode.KV_SPLIT_TIER)
+
+    # A recording drain subscriber standing in for the StoreController
+    # listener.  ANY K child reaching it on the rollback path is the bug.
+    drained: list[ObjectKey] = []
+
+    class _Recorder:
+        def on_l1_keys_write_finished(self, keys) -> None:
+            drained.extend(keys)
+
+    l1.register_listener(_Recorder())
+
+    try:
+        # Force the mid-batch collision so the store rolls back after
+        # allocating + copying both K children.
+        colliding = ObjectKey(chunk_hash=bytes([0x31]) * 32, model_name="m", kv_rank=0)
+        manifest.register_pending(colliding)
+
+        keys, task_id = _submit_split_tier_store(wrapper)
+        assert keys[1] == colliding
+        popped = wrapper.pop_completed_store_tasks()
+        assert not popped[task_id].is_successful()
+
+        k_children = [derive_component_key(k, "k") for k in keys]
+
+        # The drain listener never saw ANY key (rollback never commits
+        # a finish_write), and specifically no K child leaked to it.
+        assert drained == []
+        assert capture.finish_write_calls == []
+        assert not any(k in call for call in capture.drained_keys for k in k_children)
+
+        # The K children were released via the drain-silent path...
+        released_via_fwrr = [k for call in capture.fwrr_calls for k in call]
+        assert all(k in released_via_fwrr for k in k_children)
+        # ...and then deleted from L1.
+        deleted = [k for call in capture.delete_calls for k in call]
+        assert all(k in deleted for k in k_children)
+    finally:
+        wrapper.close()
+
+
 # =============================================================================
 # Parent-aware L1 frees -- slab-backed K children return to their pool
 # =============================================================================
@@ -1265,8 +1355,8 @@ def test_split_tier_lookup_masks_incomplete_and_unlocks() -> None:
         complete = ObjectKey(chunk_hash=b"\x71" * 32, model_name="m", kv_rank=0)
         in_flight = ObjectKey(chunk_hash=b"\x72" * 32, model_name="m", kv_rank=0)
         untracked = ObjectKey(chunk_hash=b"\x73" * 32, model_name="m", kv_rank=0)
-        manifest.register_pending(complete)
-        manifest.mark_complete(complete)
+        complete_gen = manifest.register_pending(complete)
+        manifest.mark_complete(complete, complete_gen)
         manifest.register_pending(in_flight)
 
         layout = MemoryLayoutDesc(shapes=[], dtypes=[])
