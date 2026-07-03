@@ -279,19 +279,32 @@ class L1EvictionController(EvictionController):
             self._l1_manager.delete(keys)
             return
 
+        # Capture the manifest generation of each K child at the moment
+        # we decide to delete it.  Only one generation's K child can be
+        # resident in L1 under a given key at a time (a re-store collides
+        # on the K-child allocation while the old child is present), so
+        # the generation observed here is the one whose K child the
+        # delete below removes.  The teardown then acts only on THAT
+        # generation: if a fresh store reclaims the logical key after the
+        # delete opens it, the captured generation no longer matches and
+        # the teardown leaves the new composite untouched.
         delete_batch: list[ObjectKey] = []
+        evict_generations: dict[ObjectKey, int] = {}
         for k in keys:
             decomposed = reverse_component_key(k)
             if decomposed is not None and decomposed[1] == "k":
-                state = self._split_tier_manifest.lookup(decomposed[0])
-                if state == SplitTierState.STORE_IN_FLIGHT:
-                    logger.warning(
-                        "L1EvictionController paired-evict: skipping "
-                        "K child of logical %s -- store still in "
-                        "flight (stale eviction snapshot)",
-                        decomposed[0],
-                    )
-                    continue
+                entry = self._split_tier_manifest.lookup_entry(decomposed[0])
+                if entry is not None:
+                    entry_state, entry_generation = entry
+                    if entry_state == SplitTierState.STORE_IN_FLIGHT:
+                        logger.warning(
+                            "L1EvictionController paired-evict: skipping "
+                            "K child of logical %s -- store still in "
+                            "flight (stale eviction snapshot)",
+                            decomposed[0],
+                        )
+                        continue
+                    evict_generations[k] = entry_generation
             delete_batch.append(k)
 
         results = self._l1_manager.delete(delete_batch)
@@ -318,9 +331,21 @@ class L1EvictionController(EvictionController):
                     logical_key,
                 )
                 continue
-            state = self._split_tier_manifest.lookup(logical_key)
-            if state is None:
+            generation = evict_generations.get(k)
+            if generation is None:
+                # No manifest entry when we built the delete batch
+                # (untracked K child, or the STORE_IN_FLIGHT exclusion
+                # above); nothing to pair.
+                continue
+            entry = self._split_tier_manifest.lookup_entry(logical_key)
+            if entry is None:
                 # Manifest already cleaned up; nothing to do.
+                continue
+            state, cur_generation = entry
+            if cur_generation != generation:
+                # A newer store reclaimed the logical key after we
+                # deleted the old K child; that composite belongs to the
+                # new generation and must not be torn down here.
                 continue
             if state in (
                 SplitTierState.INVALIDATED,
@@ -328,8 +353,18 @@ class L1EvictionController(EvictionController):
             ):
                 # Idempotent on repeat eviction of the same K child.
                 continue
-            # Logical invalidation: lookup returns miss from here on.
-            self._split_tier_manifest.mark_invalidated(logical_key)
+            if state == SplitTierState.STORE_IN_FLIGHT:
+                # Same generation still writing (would only happen if the
+                # captured generation itself was STORE_IN_FLIGHT, which
+                # the exclusion above prevents); never tear down an
+                # in-flight store.
+                continue
+            # COMPLETE at the generation we evicted: invalidate it via a
+            # generation-guarded compare-and-set.  If it lost to a
+            # concurrent reclaim between the lookup and here, skip the
+            # paired physical cleanup so the newer composite survives.
+            if not self._split_tier_manifest.mark_invalidated(logical_key, generation):
+                continue
             # Enqueue the V child delete against every L2 adapter.
             v_child_key = derive_component_key(logical_key, "v")
             for adapter in self._l2_adapters:
@@ -344,13 +379,13 @@ class L1EvictionController(EvictionController):
                         logical_key,
                     )
             try:
-                self._split_tier_manifest.mark_delete_in_flight(logical_key)
+                self._split_tier_manifest.mark_delete_in_flight(logical_key, generation)
             except ValueError:
                 # Lost a race against a concurrent invalidation /
                 # delete; the manifest is already INVALIDATED or
                 # DELETE_IN_FLIGHT.  Idempotent.
                 pass
-            self._split_tier_manifest.drop(logical_key)
+            self._split_tier_manifest.drop(logical_key, generation)
 
 
 class L2AdapterEvictionState:
