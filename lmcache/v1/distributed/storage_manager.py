@@ -404,7 +404,27 @@ class StorageManager:
             dict[ObjectKey, MemoryObj]: A dictionary mapping object keys to their
                 reserved memory objects. Note that not all requested keys could be
                 reserved (e.g., out of memory or write conflict)
+
+        Raises:
+            ValueError: under KV_SPLIT_TIER, if any key carries a non-zero
+                ``object_group_id`` -- a fact invisible at config time.
+                Multiple object groups (hybrid / sliding-window / MLA
+                models emit one key per KV cache group) are outside the
+                split-tier support matrix; failing closed here surfaces
+                the mismatch to the producer instead of silently building
+                independent, untested per-group composites.
         """
+        if self._storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER:
+            multi_group = [k for k in keys if k.object_group_id != 0]
+            if multi_group:
+                raise ValueError(
+                    "KV_SPLIT_TIER (V-only) placement supports a single "
+                    f"object group, but {len(multi_group)} of {len(keys)} "
+                    "key(s) carry object_group_id != 0 (hybrid / "
+                    "sliding-window / MLA models emit multiple object "
+                    "groups). This model topology is outside the "
+                    "split-tier support matrix."
+                )
         reserve_result = self._l1_manager.reserve_write(
             keys=keys,
             is_temporary=[False] * len(keys),
