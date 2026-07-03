@@ -315,6 +315,25 @@ class StorageManager:
             self.get_l2_usages,
         )
 
+        # Split-tier manifest state gauge — one observation per
+        # SplitTierState, tagged by ``state``.  Registered only under
+        # KV_SPLIT_TIER (the manifest is inert / empty otherwise).  The
+        # event-driven ``lmcache_mp.split_tier_store_*`` counters report
+        # the store lifecycle rate; this gauge reports the live
+        # state-machine distribution (a stuck-transition / leak signal).
+        if self._storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER:
+            register_gauge(
+                "lmcache.split_tier",
+                "lmcache_mp.split_tier_manifest_entries",
+                (
+                    "Number of split-tier logical keys tracked in the "
+                    "manifest, tagged by ``state`` (store_in_flight | "
+                    "complete | invalidated | delete_in_flight). One "
+                    "observation per state."
+                ),
+                self.get_split_tier_state_counts,
+            )
+
     # External APIs for serving engine integration code to call
 
     @property
@@ -1082,6 +1101,27 @@ class StorageManager:
             out.append((int(usage.total_bytes_used), {"l2_name": desc.type_name}))
         return out
 
+    def get_split_tier_state_counts(
+        self,
+    ) -> list[tuple[int | float, dict[str, object]]]:
+        """Split-tier manifest state distribution in OTel-observation shape.
+
+        Backing data for the ``lmcache_mp.split_tier_manifest_entries``
+        observable gauge.  One entry per :class:`SplitTierState`, so the
+        gauge always emits the full set of series (zero for empty states).
+        A rising ``store_in_flight`` / ``delete_in_flight`` count or a
+        monotonically growing total is the operator's signal for a stuck
+        transition or an entry leak.
+
+        Returns:
+            A list of ``(count, {"state": <state_value>})`` tuples, one per
+            split-tier state.
+        """
+        return [
+            (count, {"state": state.value})
+            for state, count in self._split_tier_manifest.state_counts().items()
+        ]
+
     def get_usage_bytes_by_cache_salt(self) -> dict[str, int]:
         """Aggregate ``cache_salt`` byte usage across every L2 adapter.
 
@@ -1397,9 +1437,7 @@ class StorageManager:
             # blocks any reclaim; the CAS also catches a reclaim that beat
             # us to this line (raises -> skip this key).
             try:
-                self._split_tier_manifest.mark_delete_in_flight(
-                    logical_key, generation
-                )
+                self._split_tier_manifest.mark_delete_in_flight(logical_key, generation)
             except ValueError:
                 continue
             orphaned_v_children.append(derive_component_key(logical_key, "v"))
@@ -1421,6 +1459,15 @@ class StorageManager:
         # Physical purge done; release the reclaim fence.
         for logical_key, generation in pending_drops:
             self._split_tier_manifest.drop(logical_key, generation)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.SPLIT_TIER_V_CHILD_DELETED,
+                metadata={
+                    "count": len(orphaned_v_children),
+                    "trigger": "clear",
+                },
+            )
+        )
 
     def close(self):
         """

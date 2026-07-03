@@ -30,7 +30,7 @@ invariants don't need to change.
 from __future__ import annotations
 
 # Standard
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 import enum
@@ -79,6 +79,8 @@ from lmcache.v1.memory_management import (
     MemoryObjMetadata,
     TensorMemoryObj,
 )
+from lmcache.v1.mp_observability.event import Event, EventType
+from lmcache.v1.mp_observability.event_bus import get_event_bus
 from lmcache.v1.platform import consume_fd, create_event_notifier
 
 logger = init_logger(__name__)
@@ -1939,6 +1941,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         registered, so a completion racing a re-store never marks the
         newer generation's entry COMPLETE off this task's stale ack.
         """
+        completed_models: Counter[str] = Counter()
         for logical_key in state.keys:
             generation = state.split_tier_generations.get(logical_key)
             if generation is None:
@@ -1956,6 +1959,18 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
                     "Serde wrapper split-tier: logical key already "
                     "invalidated / superseded before COMPLETE; skipping"
                 )
+                continue
+            completed_models[logical_key.model_name] += 1
+        if completed_models:
+            get_event_bus().publish(
+                Event(
+                    event_type=EventType.SPLIT_TIER_STORE_COMPLETED,
+                    metadata={
+                        "count": sum(completed_models.values()),
+                        "model_names": completed_models,
+                    },
+                )
+            )
 
     def _invalidate_split_tier_pending(self, state: _StoreTaskState) -> None:
         """Split-tier store failed: invalidate the manifest, release
@@ -1998,6 +2013,20 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
                 continue
             if self._split_tier_manifest.mark_invalidated(logical_key, generation):
                 owned_keys.append(logical_key)
+        if owned_keys:
+            invalidated_models: Counter[str] = Counter(k.model_name for k in owned_keys)
+            get_event_bus().publish(
+                Event(
+                    event_type=EventType.SPLIT_TIER_STORE_INVALIDATED,
+                    metadata={
+                        "count": len(owned_keys),
+                        "reason": (
+                            "inner_store" if inner_store_submitted else "pre_submit"
+                        ),
+                        "model_names": invalidated_models,
+                    },
+                )
+            )
         if owned_keys and inner_store_submitted:
             # The inner store was submitted and failed, but a failure
             # result doesn't guarantee no bytes landed -- delete the V
@@ -2016,6 +2045,15 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
                     "raised for %d V children",
                     len(v_child_keys),
                 )
+            get_event_bus().publish(
+                Event(
+                    event_type=EventType.SPLIT_TIER_V_CHILD_DELETED,
+                    metadata={
+                        "count": len(v_child_keys),
+                        "trigger": "store_failure",
+                    },
+                )
+            )
         self._release_split_tier_k_children(state.k_child_keys)
         for logical_key in state.keys:
             generation = state.split_tier_generations.get(logical_key)

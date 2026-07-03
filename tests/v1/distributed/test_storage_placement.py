@@ -582,6 +582,59 @@ def test_manifest_len_tracks_outstanding_keys() -> None:
     assert len(m) == 1
 
 
+def test_manifest_state_counts_empty_has_all_states_zero() -> None:
+    """The gauge backing ``state_counts`` always reports every state so
+    the observability series set is stable even when the manifest is
+    empty."""
+    m = SplitTierManifest()
+    counts = m.state_counts()
+    assert set(counts) == set(SplitTierState)
+    assert all(v == 0 for v in counts.values())
+
+
+def test_manifest_state_counts_reflects_mixed_states() -> None:
+    """One entry parked in each of the four states is counted in its own
+    bucket, and the buckets sum to the tracked total."""
+    m = SplitTierManifest()
+    k_store = _make_key(chunk_hash=b"\x11" * 32)
+    k_complete = _make_key(chunk_hash=b"\x22" * 32)
+    k_invalidated = _make_key(chunk_hash=b"\x33" * 32)
+    k_delete = _make_key(chunk_hash=b"\x44" * 32)
+
+    m.register_pending(k_store)  # STORE_IN_FLIGHT
+
+    g_complete = m.register_pending(k_complete)
+    m.mark_complete(k_complete, g_complete)  # COMPLETE
+
+    g_inv = m.register_pending(k_invalidated)
+    m.mark_invalidated(k_invalidated, g_inv)  # INVALIDATED
+
+    g_del = m.register_pending(k_delete)
+    m.mark_invalidated(k_delete, g_del)
+    m.mark_delete_in_flight(k_delete, g_del)  # DELETE_IN_FLIGHT
+
+    counts = m.state_counts()
+    assert counts[SplitTierState.STORE_IN_FLIGHT] == 1
+    assert counts[SplitTierState.COMPLETE] == 1
+    assert counts[SplitTierState.INVALIDATED] == 1
+    assert counts[SplitTierState.DELETE_IN_FLIGHT] == 1
+    assert sum(counts.values()) == len(m)
+
+
+def test_manifest_state_counts_drop_decrements() -> None:
+    """Dropping an entry removes it from the state distribution."""
+    m = SplitTierManifest()
+    k = _make_key(chunk_hash=b"\x55" * 32)
+    g = m.register_pending(k)
+    assert m.state_counts()[SplitTierState.STORE_IN_FLIGHT] == 1
+    m.mark_complete(k, g)
+    assert m.state_counts()[SplitTierState.COMPLETE] == 1
+    m.mark_invalidated(k, g)
+    m.drop(k, g)
+    counts = m.state_counts()
+    assert all(v == 0 for v in counts.values())
+
+
 def test_storage_manager_exposes_split_tier_manifest() -> None:
     """Sanity: every StorageManager has a manifest (empty by default).
     This is the integration point the wrapper depends on."""
