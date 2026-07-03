@@ -1035,21 +1035,24 @@ class L1Manager:
 
         Split-tier extension: when a manifest is wired via
         :meth:`set_split_tier_manifest`, K-child keys are additionally
-        gated by manifest state.  Only :class:`SplitTierState.COMPLETE`
-        K-children are evictable.  A K-child in
-        :class:`SplitTierState.STORE_IN_FLIGHT` is held by an active
-        store path (the V codec / inner L2 store hasn't finished yet);
-        evicting it silently corrupts the in-flight write and stalls
-        the producer.  V-children live on L2 and are not subject to
-        L1 eviction; they bypass this gate.
+        gated by manifest state.  A K-child is non-evictable ONLY while
+        its logical entry is :class:`SplitTierState.STORE_IN_FLIGHT` --
+        an active store path holds it as its L1-resident half (the V
+        codec / inner L2 store hasn't finished yet), so evicting it
+        silently corrupts the in-flight write and stalls the producer.
+        A K-child that is ``COMPLETE``, ``INVALIDATED``,
+        ``DELETE_IN_FLIGHT``, or untracked (an orphan whose manifest
+        entry was already dropped by paired-eviction / post-INVALIDATED
+        cleanup) is evictable.  V-children live on L2 and are not
+        subject to L1 eviction; they bypass this gate.
 
         Args:
             key: The object key to check.
 
         Returns:
             True if the key exists, is not locked, and -- for
-            split-tier K-children -- has a manifest state of
-            ``COMPLETE``.  False otherwise.
+            split-tier K-children -- is not ``STORE_IN_FLIGHT``.  False
+            otherwise.
         """
         entry = self._objects.get(key, None)
         if entry is None:
