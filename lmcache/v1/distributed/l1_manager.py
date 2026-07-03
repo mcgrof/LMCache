@@ -921,9 +921,16 @@ class L1Manager:
 
         Args:
             force: If True, clear ALL objects including locked ones.
-                This may corrupt in-flight store/prefetch operations.
-                If False (default), only clear unlocked objects, keeping
-                write-locked and read-locked objects intact.
+                This may corrupt in-flight store/prefetch operations
+                (a hard reset -- see the restart-semantics note in
+                ``StorageManager.clear``).  If False (default), only
+                clear objects eviction itself would remove: unlocked
+                objects that are not pinned by an in-flight operation.
+                Write-locked, read-locked, and -- under a wired
+                split-tier manifest -- STORE_IN_FLIGHT K children are
+                kept intact, so a non-forced clear never destroys the
+                L1-canonical half of a composite a store is still
+                writing.
         """
         if force:
             logger.warning(
@@ -952,11 +959,21 @@ class L1Manager:
 
         keys_to_clear: list[ObjectKey] = []
         entries_to_free: list[L1ObjectState] = []
-        locked_count = 0
+        pinned_count = 0
 
         for key, entry in list(self._objects.items()):
-            if entry.write_lock.is_locked() or entry.read_lock.is_locked():
-                locked_count += 1
+            # Skip anything eviction itself would refuse to remove:
+            # locked objects AND split-tier K children pinned by an
+            # in-flight store (is_key_evictable consults the manifest).
+            # Clearing an unlocked STORE_IN_FLIGHT K child would destroy
+            # the composite's L1-canonical half while the store still
+            # reports success -- the exact corruption the eviction gate
+            # exists to prevent.  is_key_evictable does not take the lock
+            # (we already hold it) and returns True for every unlocked
+            # key when no manifest is wired, so non-split-tier clear is
+            # unchanged.
+            if not self.is_key_evictable(key):
+                pinned_count += 1
                 continue
             keys_to_clear.append(key)
             entries_to_free.append(entry)
@@ -977,9 +994,9 @@ class L1Manager:
             )
 
         logger.info(
-            "L1Manager: cleared %d objects, %d locked objects remaining.",
+            "L1Manager: cleared %d objects, %d pinned objects remaining.",
             len(keys_to_clear),
-            locked_count,
+            pinned_count,
         )
 
     def is_key_evictable(self, key: ObjectKey) -> bool:

@@ -269,9 +269,13 @@ class _FakeInnerAdapter:
 
     def __init__(self, capture: _Capture) -> None:
         self._capture = capture
+        from lmcache.v1.distributed.api import KeyListPage
         from lmcache.v1.platform import create_event_notifier
 
         self._efd = create_event_notifier()
+        # Page returned by list_l2_keys; a test overrides it to exercise
+        # the wrapper's split-tier child-key re-presentation (B40).
+        self._list_page = KeyListPage(entries=(), next_page_token=None)
 
     def get_store_event_fd(self) -> int:
         return self._efd.fileno()
@@ -297,6 +301,9 @@ class _FakeInnerAdapter:
 
     def delete(self, keys):
         self._capture.inner_delete_calls.append(list(keys))
+
+    def list_l2_keys(self, model_name=None, page_size=500, cursor=None):
+        return self._list_page
 
     def submit_lookup_and_lock_task(self, keys, layout_desc):
         self._capture.inner_lookup_calls.append(list(keys))
@@ -843,6 +850,105 @@ def test_kchild_evictable_when_manifest_absent_orphan() -> None:
     l1, _manifest, k_child, _logical = _build_l1_with_manifest()
     # No register_pending: manifest has no entry for this logical.
     assert l1.is_key_evictable(k_child) is True
+
+
+def test_clear_force_false_preserves_in_flight_kchild() -> None:
+    """Finding D: clear(force=False) must NOT delete an UNLOCKED
+    STORE_IN_FLIGHT K child.  finish_write released its write lock, so
+    the legacy lock-only clear predicate would remove it -- destroying
+    the composite's L1-canonical half while the store still reports
+    success.  The manifest-aware predicate pins it exactly as
+    is_key_evictable pins it against LRU eviction."""
+    l1, manifest, k_child, logical = _build_l1_with_manifest()
+    manifest.register_pending(logical)  # STORE_IN_FLIGHT
+    assert l1.is_key_evictable(k_child) is False
+    l1.clear(force=False)
+    assert l1.get_object_state(k_child) is not None, (
+        "in-flight STORE_IN_FLIGHT K child was wrongly cleared"
+    )
+
+
+def test_clear_force_false_removes_complete_kchild() -> None:
+    """A COMPLETE K child is evictable, so clear(force=False) removes it
+    like any other unlocked object -- the pin is specific to the
+    in-flight window."""
+    l1, manifest, k_child, logical = _build_l1_with_manifest()
+    gen = manifest.register_pending(logical)
+    manifest.mark_complete(logical, gen)
+    assert l1.is_key_evictable(k_child) is True
+    l1.clear(force=False)
+    assert l1.get_object_state(k_child) is None
+
+
+def test_clear_force_true_removes_in_flight_kchild() -> None:
+    """force=True is a documented hard reset: it removes everything,
+    including a manifest-pinned in-flight K child (restart Option-C
+    semantics -- the operator explicitly wiped the cache)."""
+    l1, manifest, k_child, logical = _build_l1_with_manifest()
+    manifest.register_pending(logical)
+    l1.clear(force=True)
+    assert l1.get_object_state(k_child) is None
+
+
+def test_split_tier_list_l2_keys_maps_v_children_to_logical() -> None:
+    """B40: operator listings must not leak internal child keys.  The
+    wrapper re-presents each V child under its logical key, drops any
+    anomalous K child, and passes non-child keys through -- pagination
+    and sizes preserved."""
+    # First Party
+    from lmcache.v1.distributed.api import KeyEntry, KeyListPage, ObjectKey
+    from lmcache.v1.distributed.storage_placement import (
+        StoragePlacementMode,
+        derive_component_key,
+    )
+
+    wrapper, _capture, _l1, _manifest = _make_wrapper(
+        StoragePlacementMode.KV_SPLIT_TIER
+    )
+    try:
+        logical = ObjectKey(chunk_hash=b"\x61" * 32, model_name="m", kv_rank=0)
+        v_child = derive_component_key(logical, "v")
+        k_child = derive_component_key(logical, "k")
+        other = ObjectKey(chunk_hash=b"\x62" * 32, model_name="m", kv_rank=0)
+        wrapper._inner._list_page = KeyListPage(
+            entries=(
+                KeyEntry(key=v_child.to_encoded_object_key(), size_bytes=128),
+                KeyEntry(key=k_child.to_encoded_object_key(), size_bytes=64),
+                KeyEntry(key=other.to_encoded_object_key(), size_bytes=99),
+            ),
+            next_page_token="tok",
+        )
+        page = wrapper.list_l2_keys(model_name="m")
+        keys = [e.key.to_object_key() for e in page.entries]
+        assert logical in keys  # V child re-presented under logical
+        assert v_child not in keys
+        assert k_child not in keys  # anomalous K on L2 dropped
+        assert other in keys  # non-child passed through
+        assert page.next_page_token == "tok"  # pagination preserved
+        v_entry = next(e for e in page.entries if e.key.to_object_key() == logical)
+        assert v_entry.size_bytes == 128  # size preserved through the remap
+    finally:
+        wrapper.close()
+
+
+def test_kv_together_list_l2_keys_passthrough() -> None:
+    """KV_TOGETHER returns the inner page verbatim (no child keys exist
+    to re-present)."""
+    # First Party
+    from lmcache.v1.distributed.api import KeyEntry, KeyListPage, ObjectKey
+    from lmcache.v1.distributed.storage_placement import StoragePlacementMode
+
+    wrapper, _capture, _l1, _manifest = _make_wrapper(StoragePlacementMode.KV_TOGETHER)
+    try:
+        logical = ObjectKey(chunk_hash=b"\x63" * 32, model_name="m", kv_rank=0)
+        page_in = KeyListPage(
+            entries=(KeyEntry(key=logical.to_encoded_object_key(), size_bytes=42),),
+            next_page_token=None,
+        )
+        wrapper._inner._list_page = page_in
+        assert wrapper.list_l2_keys() is page_in
+    finally:
+        wrapper.close()
 
 
 def test_non_kchild_keys_unaffected_by_manifest() -> None:
