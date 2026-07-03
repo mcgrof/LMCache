@@ -307,6 +307,7 @@ class L1EvictionController(EvictionController):
 
         results = self._l1_manager.delete(delete_batch)
 
+        v_children_deleted = 0
         for k in delete_batch:
             decomposed = reverse_component_key(k)
             if decomposed is None:
@@ -396,7 +397,19 @@ class L1EvictionController(EvictionController):
                         type(adapter).__name__,
                         logical_key,
                     )
+            v_children_deleted += 1
             self._split_tier_manifest.drop(logical_key, generation)
+
+        if v_children_deleted:
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.SPLIT_TIER_V_CHILD_DELETED,
+                    metadata={
+                        "count": v_children_deleted,
+                        "trigger": "eviction",
+                    },
+                )
+            )
 
 
 class L2AdapterEvictionState:

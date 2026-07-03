@@ -540,6 +540,25 @@ class SplitTierManifest:
         with self._lock:
             return len(self._entries)
 
+    def state_counts(self) -> dict["SplitTierState", int]:
+        """Snapshot the number of tracked entries in each state.
+
+        Every :class:`SplitTierState` is present in the result (zero when
+        no entry is in that state), so the observability gauge emits a
+        stable set of series.  A rising ``STORE_IN_FLIGHT`` /
+        ``DELETE_IN_FLIGHT`` count or a monotonically growing total is the
+        operator's signal for a stuck transition or an entry leak.
+
+        Returns:
+            A mapping from each :class:`SplitTierState` to the count of
+            tracked logical keys currently in that state.
+        """
+        with self._lock:
+            counts: dict[SplitTierState, int] = {state: 0 for state in SplitTierState}
+            for entry in self._entries.values():
+                counts[entry.state] += 1
+            return counts
+
 
 class SplitTierState(Enum):
     """Manifest-entry state machine for a logical key under
