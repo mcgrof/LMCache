@@ -1026,9 +1026,10 @@ def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.02) -> bool
 def test_split_tier_serialize_failure_drops_manifest_and_cleans_children() -> None:
     """A serialize failure surfaces through the wrapper's drain loop:
     the manifest entries must be DROPPED (not left INVALIDATED -- one
-    failed store must never permanently block a key), the K children
-    deleted from L1, and the V child names best-effort deleted on the
-    inner adapter."""
+    failed store must never permanently block a key) and the K children
+    deleted from L1.  The inner store was never submitted, so NO V-child
+    delete is issued on the inner adapter (no bytes can have landed, and
+    the delete would needlessly block the poll thread)."""
     # First Party
     from lmcache.v1.distributed.storage_placement import (
         StoragePlacementMode,
@@ -1060,15 +1061,62 @@ def test_split_tier_serialize_failure_drops_manifest_and_cleans_children() -> No
         deleted = [k for call in capture.delete_calls for k in call]
         assert all(k in deleted for k in k_children)
 
-        # V child names best-effort deleted on the inner adapter.
-        v_children = [derive_component_key(k, "v") for k in keys]
-        inner_deleted = [k for call in capture.inner_delete_calls for k in call]
-        assert all(v in inner_deleted for v in v_children)
+        # No inner V-child delete: the inner store was never submitted
+        # (serialize failed first), so no V bytes could have landed.
+        assert capture.inner_delete_calls == []
 
         # The keys are storable again: a new generation registers
         # without raising.
         for k in keys:
             manifest.register_pending(k)
+    finally:
+        wrapper.close()
+
+
+def test_split_tier_inner_store_failure_deletes_v_children() -> None:
+    """When the inner L2 store was actually SUBMITTED and then failed,
+    a partial V blob may have landed, so the failed-store teardown must
+    best-effort delete the V child names on the inner adapter.  This is
+    the counterpart to the serialize-failure path, which skips the
+    delete because nothing was submitted."""
+    # First Party
+    from lmcache.v1.distributed.l2_adapters.serde_wrapper import (
+        _StorePhase,
+        _StoreTaskState,
+    )
+    from lmcache.v1.distributed.storage_placement import (
+        StoragePlacementMode,
+        derive_component_key,
+    )
+
+    wrapper, capture, _l1, manifest = _make_wrapper(StoragePlacementMode.KV_SPLIT_TIER)
+    try:
+        keys, _task_id = _submit_split_tier_store(wrapper)
+        gens = {k: manifest.lookup_entry(k)[1] for k in keys}
+        k_children = [derive_component_key(k, "k") for k in keys]
+        v_children = [derive_component_key(k, "v") for k in keys]
+
+        # Reconstruct the drain-loop state as it looks AFTER a successful
+        # inner submit (phase INNER_STORE), then fail it.
+        state = _StoreTaskState(
+            wrapped_id=999,
+            keys=list(keys),
+            temp_keys=[],
+            temp_objs=[],
+            phase=_StorePhase.INNER_STORE,
+            is_split_tier=True,
+            k_child_keys=k_children,
+            v_child_keys=v_children,
+            split_tier_generations=gens,
+        )
+        capture.inner_delete_calls.clear()
+        wrapper._invalidate_split_tier_pending(state)
+
+        # V children WERE best-effort deleted on the inner adapter...
+        inner_deleted = [k for call in capture.inner_delete_calls for k in call]
+        assert all(v in inner_deleted for v in v_children)
+        # ...and the manifest entries were dropped (keys storable again).
+        assert all(manifest.lookup(k) is None for k in keys)
     finally:
         wrapper.close()
 
