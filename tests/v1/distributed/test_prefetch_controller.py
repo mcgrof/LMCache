@@ -27,6 +27,7 @@ from lmcache.v1.distributed.api import (
 )
 from lmcache.v1.distributed.config import L1ManagerConfig, L1MemoryManagerConfig
 from lmcache.v1.distributed.error import L1Error
+from lmcache.v1.distributed.internal_api import L1ManagerListener
 from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.l2_adapters.fault_inject_l2_adapter import (
     FaultInjectL2Adapter,
@@ -1494,6 +1495,118 @@ class TestPrefetchMode:
         l1_manager.finish_read(keys)
         read_results = l1_manager.reserve_read(keys)
         for key in keys:
+            assert read_results[key][0] == L1Error.KEY_NOT_EXIST
+
+        ctrl.stop()
+        adapter.close()
+
+
+class _DrainSpyListener(L1ManagerListener):
+    """Records which L1 write-finish transition fired per key so a test
+    can assert the store drain (``on_l1_keys_write_finished``) was NOT
+    fired for prefetch-loaded / failed-reservation keys."""
+
+    def __init__(self) -> None:
+        self.write_finished: set = set()
+        self.reserve_read_finished: set = set()
+
+    def on_l1_keys_write_finished(self, keys: list[ObjectKey]) -> None:
+        self.write_finished.update(keys)
+
+    def on_l1_keys_finish_write_and_reserve_read(self, keys: list[ObjectKey]) -> None:
+        self.reserve_read_finished.update(keys)
+
+    # Remaining L1ManagerListener hooks are not exercised by these tests;
+    # implement them as no-ops so the ABC can be instantiated.
+    def on_l1_keys_reserved_read(self, keys: list[ObjectKey]) -> None:
+        pass
+
+    def on_l1_keys_read_finished(self, keys: list[ObjectKey]) -> None:
+        pass
+
+    def on_l1_keys_reserved_write(self, keys: list[ObjectKey]) -> None:
+        pass
+
+    def on_l1_keys_deleted_by_manager(self, keys: list[ObjectKey]) -> None:
+        pass
+
+    def on_l1_keys_accessed(self, keys: list[ObjectKey]) -> None:
+        pass
+
+
+class TestPrefetchDrainSilentEgress:
+    """Prefetch must NOT fire the StoreController L1->L2 drain
+    (``finish_write`` -> ``on_l1_keys_write_finished``) for keys it loaded
+    from L2 (warm) or for reservations that never loaded (failed / trimmed).
+    Firing it re-stores just-loaded keys (re-splitting them under a
+    component / split-tier serde) or stores uninitialized buffers as
+    garbage."""
+
+    def test_warm_load_does_not_fire_store_drain(self, l1_manager):
+        """A WARM prefetch makes loaded keys resident via the
+        drain-silent transition, never the store drain."""
+        adapter = make_adapter()
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(4)]
+        store_keys_in_l2(adapter, keys, layout)
+
+        spy = _DrainSpyListener()
+        l1_manager.register_listener(spy)
+
+        ctrl = PrefetchController(
+            l1_manager=l1_manager,
+            l2_adapters=[adapter],
+            adapter_descriptors=[make_descriptor(0)],
+            policy=DefaultPrefetchPolicy(),
+        )
+        ctrl.start()
+        req_id = ctrl.submit_prefetch_request(keys, layout, mode=PrefetchMode.WARM)
+        assert wait_for_prefetch_result(ctrl, req_id) is not None
+
+        # The store drain was never fired for the warm-loaded keys; they
+        # went through the drain-silent transition instead.
+        assert spy.write_finished.isdisjoint(keys), (
+            "warm-loaded keys fired the store drain (would be re-stored / "
+            f"re-split): {spy.write_finished & set(keys)}"
+        )
+        assert set(keys).issubset(spy.reserve_read_finished)
+
+        ctrl.stop()
+        adapter.close()
+
+    def test_trimmed_reservations_do_not_fire_store_drain(self, l1_manager):
+        """Keys reserved during lookup but trimmed away (nothing
+        loadable) are discarded drain-silently -- their uninitialized
+        buffers are never enqueued for an L2 store."""
+        adapter = make_adapter()
+        layout = make_layout()
+        all_keys = [make_object_key(i) for i in range(4)]
+        # Key 0 absent at lookup -> keys 1,2,3 are reserved, then PREFIX
+        # trims everything (gap at position 0) -> reserved keys discarded.
+        reserved_then_trimmed = all_keys[1:]
+        store_keys_in_l2(adapter, reserved_then_trimmed, layout)
+
+        spy = _DrainSpyListener()
+        l1_manager.register_listener(spy)
+
+        ctrl = PrefetchController(
+            l1_manager=l1_manager,
+            l2_adapters=[adapter],
+            adapter_descriptors=[make_descriptor(0)],
+            policy=DefaultPrefetchPolicy(),
+        )
+        ctrl.start()
+        req_id = ctrl.submit_prefetch_request(all_keys, layout)
+        assert wait_for_prefetch_result(ctrl, req_id) == 0
+
+        # The reserved-but-discarded keys never fired the store drain.
+        assert spy.write_finished.isdisjoint(reserved_then_trimmed), (
+            "trimmed reservations fired the store drain (would store "
+            f"garbage): {spy.write_finished & set(reserved_then_trimmed)}"
+        )
+        # And they are gone from L1.
+        read_results = l1_manager.reserve_read(all_keys)
+        for key in all_keys:
             assert read_results[key][0] == L1Error.KEY_NOT_EXIST
 
         ctrl.stop()

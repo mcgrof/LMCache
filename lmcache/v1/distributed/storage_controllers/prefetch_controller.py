@@ -955,10 +955,10 @@ class PrefetchController(StorageControllerInterface):
         self._unlock_unneeded_keys(request)
 
         if not trimmed_plan:
-            # Nothing loadable after filtering
-            if request.write_reserved_keys:
-                l1_mgr.finish_write(request.write_reserved_keys)
-                l1_mgr.delete(request.write_reserved_keys)
+            # Nothing loadable after filtering: discard the reservations
+            # drain-silently (finish_write would enqueue the never-loaded
+            # buffers for an L2 store).
+            self._discard_reserved(request.write_reserved_keys)
             self._update_lookup_results(request.request_id, 0)
             self._event_bus.publish(
                 Event(
@@ -1112,6 +1112,56 @@ class PrefetchController(StorageControllerInterface):
                 )
             )
 
+    def _finish_write_quiet(self, keys: list[ObjectKey]) -> None:
+        """Transition write-reserved keys to resident WITHOUT firing the
+        StoreController's L1->L2 drain listener.
+
+        ``L1Manager.finish_write`` fires ``on_l1_keys_write_finished``,
+        which the StoreController enqueues for an L2 store.  For prefetch
+        keys that is wrong: a warm-LOADED key came FROM L2, so re-storing
+        it is redundant and, under a component-split / split-tier serde,
+        re-enters the store pipeline (re-splitting an already-stored key)
+        -- and a reserved-but-unloaded key holds an uninitialized buffer
+        that would be stored as garbage.  ``finish_write_and_reserve_read``
+        is the drain-silent transition (its StoreController listener is a
+        no-op); take the read lock, then release it so no lock is left
+        held.  Keys not in a write-locked state are reported as an error
+        by the transition and simply left for the caller (they hold no
+        read lock, so nothing to release).
+
+        Note: releasing the transient read lock emits ``L1_READ_FINISHED``,
+        so a prefetch fill counts toward the ``lmcache_mp.l1_read`` metric
+        even though it is not a consumer read.  This matches the other
+        drain-silent teardown paths (the split-tier K-child release and the
+        non-retained ``released`` keys in :meth:`_finalize_load`); avoiding
+        it would need a dedicated no-event L1Manager entry point, not worth
+        that surface for a metric-accuracy nit.
+        """
+        if not keys:
+            return
+        read_locked: list[ObjectKey] = []
+        results = self._l1_manager.finish_write_and_reserve_read(keys)
+        for key, (err, _obj) in results.items():
+            if err == L1Error.SUCCESS:
+                read_locked.append(key)
+        if read_locked:
+            self._l1_manager.finish_read(read_locked)
+
+    def _discard_reserved(self, keys: list[ObjectKey]) -> None:
+        """Drop write-reserved keys that will never be populated (nothing
+        loadable after trim, a load failure, or shutdown mid-load),
+        WITHOUT firing the store drain.
+
+        Going through ``finish_write`` here would enqueue the
+        uninitialized buffers for an L2 store racing the delete;
+        :meth:`_finish_write_quiet` releases the write lock drain-silently
+        first, then the entries are deleted.
+        """
+        if not keys:
+            return
+        self._finish_write_quiet(keys)
+        self._l1_manager.delete(keys)
+
     def _finalize_load(self, request: InFlightPrefetchRequest) -> None:
         """
         Finalize a completed load: build result bitmap, transition L1
@@ -1149,8 +1199,12 @@ class PrefetchController(StorageControllerInterface):
         # Transition loaded keys out of write-locked state.
         if loaded_keys:
             if request.mode is PrefetchMode.WARM:
-                # Warm: make ready, pin nothing.
-                l1_mgr.finish_write(loaded_keys)
+                # Warm: make ready, pin nothing.  Drain-silent -- these
+                # keys were just LOADED from L2, so firing the store drain
+                # (plain finish_write) would re-store them and, under a
+                # component-split / split-tier serde, re-enter the store
+                # pipeline for already-stored keys.
+                self._finish_write_quiet(loaded_keys)
             else:
                 # write-locked -> read-locked; extra_count so each TP worker
                 # gets its own read lock.
@@ -1158,10 +1212,12 @@ class PrefetchController(StorageControllerInterface):
                     loaded_keys, extra_count=request.extra_count
                 )
 
-        # Clean up failed keys
+        # Clean up failed keys.  These buffers were reserved but never
+        # populated (the L2 load missed / failed); discard them
+        # drain-silently so finish_write does not enqueue the
+        # uninitialized buffer for an L2 store.
         if failed_keys:
-            l1_mgr.finish_write(failed_keys)
-            l1_mgr.delete(failed_keys)
+            self._discard_reserved(failed_keys)
 
         self._event_bus.publish(
             Event(
@@ -1249,12 +1305,12 @@ class PrefetchController(StorageControllerInterface):
 
     def _cleanup_in_flight_requests(self) -> None:
         """Release resources for any in-flight requests during shutdown."""
-        l1_mgr = self._l1_manager
         for request in self._in_flight_requests.values():
             if request.phase == PrefetchPhase.PLAN_AND_LOAD:
-                if request.write_reserved_keys:
-                    l1_mgr.finish_write(request.write_reserved_keys)
-                    l1_mgr.delete(request.write_reserved_keys)
+                # Discard the never-loaded reservations drain-silently so
+                # shutdown does not enqueue uninitialized buffers for an L2
+                # store.
+                self._discard_reserved(request.write_reserved_keys)
                 self._unlock_all_plan_keys(request)
             elif request.phase == PrefetchPhase.LOOKUP:
                 self._unlock_all_lookups(request)
