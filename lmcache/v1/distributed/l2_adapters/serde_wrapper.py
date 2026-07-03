@@ -1560,12 +1560,23 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         except Exception:
             shapes = None
             dtypes = None
-        if shapes is None or dtypes is None or len(shapes) < 2:
+        # Split-tier requires EXACTLY one post-policy (K, V) component
+        # pair: shapes == [K_shape, V_shape].  len < 2 is a non-grouped
+        # (packed) object -- a placement/layout mismatch.  len > 2 is a
+        # multi-kernel-group object (e.g. [g0K, g0V, g1K, g1V] from a
+        # model with more than one KV cache group); the store path only
+        # mirrors group 0 -> K child and reads group 1 -> V, so admitting
+        # it would SILENTLY DROP every kernel group beyond the first
+        # pair.  Fail closed on both (B24): the single-KV-pair topology
+        # is static per StorageManager, so a mismatch is a hard config
+        # error, not a transient failure.
+        if shapes is None or dtypes is None or len(shapes) != 2:
             logger.error(
-                "Serde wrapper: split-tier requires grouped (K, V) "
-                "input; got non-grouped MemoryObj (shapes=%r, "
-                "dtypes=%r).  This is a placement / layout config "
-                "mismatch.",
+                "Serde wrapper: split-tier requires exactly one post-policy "
+                "(K, V) component pair; got shapes=%r, dtypes=%r.  A "
+                "non-grouped object is a placement/layout mismatch; more "
+                "than one pair is a multi-KV-group model topology outside "
+                "the split-tier support matrix.",
                 shapes,
                 dtypes,
             )

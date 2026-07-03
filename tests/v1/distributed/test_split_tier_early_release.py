@@ -1258,6 +1258,62 @@ def test_split_tier_temp_alloc_failure_drops_manifest() -> None:
         wrapper.close()
 
 
+def test_split_tier_rejects_multi_kv_pair_object() -> None:
+    """B24 (Phase 1c): a multi-kernel-group object (two+ K/V pairs) must
+    be rejected, not silently truncated to the first pair.  Admitting a
+    4-group [g0K, g0V, g1K, g1V] object would mirror only g0->K and read
+    g1->V, dropping the second KV group's bytes entirely."""
+    # First Party
+    from lmcache.v1.distributed.api import ObjectKey
+    from lmcache.v1.distributed.storage_placement import StoragePlacementMode
+
+    wrapper, capture, _l1, manifest = _make_wrapper(StoragePlacementMode.KV_SPLIT_TIER)
+    try:
+        keys = [ObjectKey(chunk_hash=bytes([0x40]) * 32, model_name="m", kv_rank=0)]
+        objects = [
+            _GroupedMemoryObj(
+                tensors=[
+                    torch.zeros(torch.Size([4]), dtype=torch.bfloat16),
+                    torch.zeros(torch.Size([8]), dtype=torch.bfloat16),
+                    torch.zeros(torch.Size([4]), dtype=torch.bfloat16),
+                    torch.zeros(torch.Size([8]), dtype=torch.bfloat16),
+                ]
+            )
+        ]
+        task_id = wrapper.submit_store_task(keys, objects)
+        popped = wrapper.pop_completed_store_tasks()
+        assert task_id in popped
+        assert not popped[task_id].is_successful()
+        # Fail closed: nothing registered, nothing submitted to the inner.
+        assert len(manifest) == 0
+        assert capture.inner_submit_calls == []
+    finally:
+        wrapper.close()
+
+
+def test_split_tier_rejects_non_grouped_object() -> None:
+    """A single-group (packed) object under split-tier is a placement /
+    layout mismatch and must fail closed, not be treated as K-only."""
+    # First Party
+    from lmcache.v1.distributed.api import ObjectKey
+    from lmcache.v1.distributed.storage_placement import StoragePlacementMode
+
+    wrapper, _capture, _l1, manifest = _make_wrapper(StoragePlacementMode.KV_SPLIT_TIER)
+    try:
+        keys = [ObjectKey(chunk_hash=bytes([0x41]) * 32, model_name="m", kv_rank=0)]
+        objects = [
+            _GroupedMemoryObj(
+                tensors=[torch.zeros(torch.Size([4]), dtype=torch.bfloat16)]
+            )
+        ]
+        task_id = wrapper.submit_store_task(keys, objects)
+        popped = wrapper.pop_completed_store_tasks()
+        assert not popped[task_id].is_successful()
+        assert len(manifest) == 0
+    finally:
+        wrapper.close()
+
+
 def test_split_tier_registration_collision_rolls_back_batch() -> None:
     """If register_pending collides mid-batch (a concurrent store of
     one key is in flight), the keys registered so far are rolled back,
