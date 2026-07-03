@@ -693,8 +693,14 @@ def test_storage_manager_clear_sweeps_stale_manifest_entries() -> None:
             live = _make_key(chunk_hash=b"\x52" * 32)
             manifest.register_pending(live)
             live_k_child = derive_component_key(live, "k")
-            reserved = sm.reserve_write(
+            # Seed the K-child L1 entry via the LOW-LEVEL l1_manager, the
+            # way the real split-tier store path reserves single-component
+            # K children.  The high-level StorageManager.reserve_write is
+            # the layout-policy choke point (it would try to split this
+            # single-component [16] buffer as a packed [2, ...] group).
+            reserved = sm._l1_manager.reserve_write(
                 keys=[live_k_child],
+                is_temporary=[False],
                 layout_desc=MemoryLayoutDesc(
                     shapes=[torch.Size([16])], dtypes=[torch.bfloat16]
                 ),

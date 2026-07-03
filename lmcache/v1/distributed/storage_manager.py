@@ -394,8 +394,12 @@ class StorageManager:
 
         Args:
             keys (list[ObjectKey]): List of object keys to reserve for writing.
-            layout_desc (MemoryLayoutDesc): Description of the memory layout
-                for the objects to be reserved.
+            layout_desc (MemoryLayoutDesc): Transfer-side (packed) memory
+                layout for the objects to be reserved.  The L1 storage-layout
+                policy is applied to it internally (see
+                :meth:`apply_layout_policy`); callers pass the packed layout
+                and MUST NOT pre-apply the policy (the transform is not
+                idempotent).
             mode (Literal["new", "update", "all"]): Reservation mode.
             - "new": Reserve only new objects that do not exist.
             - "update": Reserve only existing objects for update.
@@ -426,6 +430,16 @@ class StorageManager:
                     "groups). This model topology is outside the "
                     "split-tier support matrix."
                 )
+        # Apply the L1 storage-layout policy exactly once, at this choke
+        # point, so every store path reserves the canonical L1 shape
+        # without each caller re-deriving it.  For the default PACKED
+        # layout this is a pure identity pass-through (KV_TOGETHER traffic
+        # is byte-unchanged); for a multi-output serde
+        # (KV_COMPONENT_GROUPS) it splits each [2, ...] group into K and V
+        # component groups.  Must run BEFORE the L1 reservation so the
+        # reserved object's shape matches what will be stored.  The
+        # transform is not idempotent -- callers must NOT pre-apply it.
+        layout_desc = self.apply_layout_policy(layout_desc)
         reserve_result = self._l1_manager.reserve_write(
             keys=keys,
             is_temporary=[False] * len(keys),
@@ -646,7 +660,10 @@ class StorageManager:
 
         Args:
             keys: Object keys to prefetch.
-            layout_desc: Memory layout description.
+            layout_desc: Transfer-side (packed) memory layout.  The L1
+                storage-layout policy is applied internally (see
+                :meth:`apply_layout_policy`); callers pass the packed layout
+                and MUST NOT pre-apply it (not idempotent).
             extra_count: Extra workers (on top of the default
                 1) that will independently retrieve the same
                 key.  Total locks = 1 + extra_count.
@@ -667,6 +684,14 @@ class StorageManager:
         Returns:
             PrefetchHandle to track the task.
         """
+        # Apply the L1 storage-layout policy once here (the prefetch choke
+        # point), before the WARM / SPARSE / PREFIX branches, so every
+        # caller (lookup, CacheBlend, p2p, warm-prefetch) prefetches into
+        # the canonical L1 shape.  PACKED is an identity no-op; a
+        # multi-output serde (KV_COMPONENT_GROUPS) splits each [2, ...]
+        # group into K/V components.  Not idempotent -- callers must not
+        # pre-apply.
+        layout_desc = self.apply_layout_policy(layout_desc)
         if mode is PrefetchMode.WARM:
             # Warm path: load all keys, pin none. skip_l2 makes it a no-op.
             prefetch_request_id = -1
