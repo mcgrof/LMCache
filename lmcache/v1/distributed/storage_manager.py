@@ -1319,6 +1319,10 @@ class StorageManager:
         if self._storage_placement_mode != StoragePlacementMode.KV_SPLIT_TIER:
             return
         orphaned_v_children: list[ObjectKey] = []
+        # (logical_key, generation) pairs held in DELETE_IN_FLIGHT across
+        # the batched physical delete below; dropped only after it
+        # completes so the reclaim fence covers the whole purge.
+        pending_drops: list[tuple[ObjectKey, int]] = []
         for logical_key in self._split_tier_manifest.tracked_keys():
             entry = self._split_tier_manifest.lookup_entry(logical_key)
             if entry is None:
@@ -1338,8 +1342,23 @@ class StorageManager:
             # leave the new composite -- and its live V child -- alone.
             if not self._split_tier_manifest.mark_invalidated(logical_key, generation):
                 continue
+            # Fence the reclaim window BEFORE queuing the V child for the
+            # physical delete.  The V key is generation-agnostic, so if we
+            # dropped the entry here (reopening the key) a concurrent
+            # re-store could write a fresh V child under the same key and
+            # the deferred batch delete would clobber it -- a phantom
+            # COMPLETE with no V on L2.  INVALIDATED -> DELETE_IN_FLIGHT is
+            # refused by register_pending, so holding it across the batch
+            # blocks any reclaim; the CAS also catches a reclaim that beat
+            # us to this line (raises -> skip this key).
+            try:
+                self._split_tier_manifest.mark_delete_in_flight(
+                    logical_key, generation
+                )
+            except ValueError:
+                continue
             orphaned_v_children.append(derive_component_key(logical_key, "v"))
-            self._split_tier_manifest.drop(logical_key, generation)
+            pending_drops.append((logical_key, generation))
         if not orphaned_v_children:
             return
         with self._adapters_lock:
@@ -1354,6 +1373,9 @@ class StorageManager:
                     type(adapter).__name__,
                     len(orphaned_v_children),
                 )
+        # Physical purge done; release the reclaim fence.
+        for logical_key, generation in pending_drops:
+            self._split_tier_manifest.drop(logical_key, generation)
 
     def close(self):
         """

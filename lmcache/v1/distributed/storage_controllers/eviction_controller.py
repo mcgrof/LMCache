@@ -346,7 +346,27 @@ class L1EvictionController(EvictionController):
             # paired physical cleanup so the newer composite survives.
             if not self._split_tier_manifest.mark_invalidated(logical_key, generation):
                 continue
-            # Enqueue the V child delete against every L2 adapter.
+            # Fence the reclaim window BEFORE physically deleting the V
+            # child.  The V child's L2 key (derive_component_key(logical,
+            # "v")) carries no generation tag, so a physical delete is
+            # generation-blind: if a concurrent re-store reclaimed this
+            # logical key (register_pending is permitted from INVALIDATED)
+            # and wrote a fresh V child under the same key, an un-fenced
+            # delete would destroy the NEW generation's live V child,
+            # leaving a phantom COMPLETE entry with no V on L2.  The
+            # INVALIDATED -> DELETE_IN_FLIGHT transition is refused by
+            # register_pending, so once this generation-guarded CAS
+            # succeeds no reclaim can occur while the delete is in flight.
+            # If a reclaim already slipped in between mark_invalidated and
+            # here, the CAS raises and we skip the delete so the newer
+            # generation's V child survives.
+            try:
+                self._split_tier_manifest.mark_delete_in_flight(logical_key, generation)
+            except ValueError:
+                continue
+            # DELETE_IN_FLIGHT is held across the delete, so the
+            # generation-agnostic V key still names THIS generation's V
+            # child.  Delete it against every L2 adapter, then drop.
             v_child_key = derive_component_key(logical_key, "v")
             for adapter in self._l2_adapters:
                 try:
@@ -359,13 +379,6 @@ class L1EvictionController(EvictionController):
                         type(adapter).__name__,
                         logical_key,
                     )
-            try:
-                self._split_tier_manifest.mark_delete_in_flight(logical_key, generation)
-            except ValueError:
-                # Lost a race against a concurrent invalidation /
-                # delete; the manifest is already INVALIDATED or
-                # DELETE_IN_FLIGHT.  Idempotent.
-                pass
             self._split_tier_manifest.drop(logical_key, generation)
 
 
