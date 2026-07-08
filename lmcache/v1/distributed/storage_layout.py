@@ -41,6 +41,7 @@ from lmcache.v1.distributed.api import MemoryLayoutDesc
 if TYPE_CHECKING:
     # First Party
     from lmcache.v1.distributed.l2_adapters.config import L2AdapterConfigBase
+    from lmcache.v1.distributed.storage_placement import ComponentKeyScheme
 
 
 class StorageLayoutMode(Enum):
@@ -59,6 +60,32 @@ class StorageLayoutMode(Enum):
     ``TensorMemoryObj.get_tensor(0)`` returns the K view;
     ``get_tensor(1)`` returns the V view.  Both groups carry the
     same dtype today; heterogeneous K / V dtypes are future work."""
+
+
+class StorageInputForm(Enum):
+    """How the transfer side presents K and V to the layout policy.
+
+    Selects which transform the ``KV_COMPONENT_GROUPS`` layout mode
+    applies.  It is a *structural* classification only; the chosen
+    transform then independently validates dtype, canonical order and
+    the per-engine ``component_key_scheme`` (see
+    :func:`apply_layout_policy`).  Shape never decides K vs V role."""
+
+    PACKED_KV_UNIFORM = "packed_kv_uniform"
+    """One group per KV pair, leading dim ``2`` = (K, V), with K and V
+    sharing one dtype / element size.  LMCache splits it into K and V
+    component groups (and, for the byte-through V-only path, overrides
+    the V child dtype).  Mechanism B (LMCache self-quantizes V) and the
+    packed synthetic serde tests produce this form."""
+
+    PRESPLIT_COMPONENTS = "presplit_components"
+    """K and V arrive as already-separate component groups (leading dim
+    ``1``, ``kv_size == 1`` each), in canonical ``[K, V, ...]`` order,
+    carrying their own heterogeneous dtypes (bf16 K, fp8 V).  vLLM
+    mechanism-A stores V as its own fp8 plane, so the live MP
+    byte-through connector presents this form.  LMCache passes it
+    through unchanged after validation -- no split, no dtype override,
+    no dequant."""
 
 
 def derive_storage_layout_mode(
@@ -175,38 +202,173 @@ def apply_kv_component_split(
     return MemoryLayoutDesc(shapes=new_shapes, dtypes=new_dtypes)
 
 
+def classify_input_form(layout_desc: MemoryLayoutDesc) -> StorageInputForm:
+    """Classify the transfer-side input as packed or pre-split, by structure.
+
+    Every input group must share one form.  A layout that mixes a
+    leading-dim-2 packed group with a leading-dim-1 pre-split component,
+    or carries any other leading dim, is rejected: a real registration
+    never produces a mix, and guessing per-group would risk a silent
+    K/V mis-pairing.
+
+    This only SELECTS which transform runs; the chosen transform then
+    independently validates dtype, canonical order and scheme.  Shape is
+    never used to decide K vs V role.
+
+    Args:
+        layout_desc: The transfer-side layout (one entry per kernel
+            group, in the kernel groups' declared order).
+
+    Returns:
+        :attr:`StorageInputForm.PACKED_KV_UNIFORM` if every group has
+        leading dim ``2``; :attr:`StorageInputForm.PRESPLIT_COMPONENTS`
+        if every group has leading dim ``1``.
+
+    Raises:
+        ValueError: On an empty layout, a 0-d group, a mixed layout, or
+            any leading dim other than 1 or 2.
+    """
+    if not layout_desc.shapes:
+        raise ValueError("classify_input_form: empty layout_desc")
+    leading: list[int] = []
+    for shape in layout_desc.shapes:
+        if len(shape) < 1:
+            raise ValueError(
+                f"classify_input_form: 0-d group shape {tuple(shape)} has no "
+                "leading K|V / component dim"
+            )
+        leading.append(shape[0])
+    if all(d == 2 for d in leading):
+        return StorageInputForm.PACKED_KV_UNIFORM
+    if all(d == 1 for d in leading):
+        return StorageInputForm.PRESPLIT_COMPONENTS
+    raise ValueError(
+        f"classify_input_form: layout mixes or has unexpected leading dims "
+        f"{leading}; expected all 2 (packed K|V) or all 1 (pre-split "
+        "components)"
+    )
+
+
+def pass_through_presplit_component_groups(
+    layout_desc: MemoryLayoutDesc,
+    *,
+    v_dtype: torch.dtype,
+) -> MemoryLayoutDesc:
+    """Validate and pass through already-split K/V component groups.
+
+    The live MP byte-through path (vLLM mechanism-A) hands K and V as
+    separate component groups -- K bf16, V fp8 -- in canonical
+    ``[K, V, K, V, ...]`` order (one (K, V) pair per attention layer
+    group).  LMCache stores them as they are: the split already happened
+    in vLLM and V is already fp8, so there is nothing to split,
+    re-quantize or upcast.
+
+    Role is NOT inferred from dtype.  The order is the authoritative
+    contract (K at even index, V at odd index, fixed by the connector's
+    plane registration).  This function VALIDATES that the tensor at each
+    position carries the dtype that position requires, which also makes a
+    K/V order inversion fail closed -- K and V have different dtypes in
+    the asymmetric case, so a swap trips the dtype check.  No dtype is
+    overridden and total bytes are unchanged.
+
+    Args:
+        layout_desc: Pre-split component groups (each leading dim ``1``),
+            an even number of them, in ``[K, V]`` pair order.
+        v_dtype: The required V-component dtype (``float8_e4m3fn`` for the
+            byte-through path).  Every V position must equal it; no K
+            position may.
+
+    Returns:
+        ``layout_desc`` unchanged (validated).
+
+    Raises:
+        ValueError: On an odd / zero group count, a group whose leading
+            dim is not 1, a V position whose dtype != ``v_dtype``, or a K
+            position whose dtype == ``v_dtype`` (either means K and V were
+            swapped or a component was wrongly typed).
+    """
+    n = len(layout_desc.shapes)
+    if n == 0 or n % 2 != 0:
+        raise ValueError(
+            "pass_through_presplit_component_groups: expected an even, "
+            f"non-zero number of [K, V] component groups; got {n}"
+        )
+    for idx, (shape, dtype) in enumerate(
+        zip(layout_desc.shapes, layout_desc.dtypes, strict=True)
+    ):
+        if len(shape) < 1 or shape[0] != 1:
+            raise ValueError(
+                f"pass_through_presplit_component_groups: component group "
+                f"{idx} shape {tuple(shape)} must have leading dim 1 "
+                "(kv_size == 1, already split)"
+            )
+        is_v_position = idx % 2 == 1
+        if is_v_position and dtype != v_dtype:
+            raise ValueError(
+                f"pass_through_presplit_component_groups: V component at index "
+                f"{idx} has dtype {dtype}, expected {v_dtype} (byte-through V "
+                "must already be fp8; a mismatch means a K/V order inversion "
+                "or an un-quantized V)"
+            )
+        if not is_v_position and dtype == v_dtype:
+            raise ValueError(
+                f"pass_through_presplit_component_groups: K component at index "
+                f"{idx} has the V dtype {v_dtype}; K must not be fp8 (a K/V "
+                "order inversion would corrupt decode silently)"
+            )
+    return layout_desc
+
+
 def apply_layout_policy(
     layout_desc: MemoryLayoutDesc,
     mode: StorageLayoutMode,
     *,
     k_dtype: torch.dtype | None = None,
     v_dtype: torch.dtype | None = None,
+    scheme: "ComponentKeyScheme | None" = None,
 ) -> MemoryLayoutDesc:
-    """Convert a packed layout to the canonical shape for ``mode``.
+    """Convert the transfer-side layout to the canonical shape for ``mode``.
 
     For :attr:`StorageLayoutMode.PACKED`, returns ``layout_desc``
-    unchanged.  For :attr:`StorageLayoutMode.KV_COMPONENT_GROUPS`,
-    splits each input group via :func:`apply_kv_component_split`,
-    forwarding any ``k_dtype`` / ``v_dtype`` override for asymmetric
-    K/V (e.g. bf16 K + fp8 V).
+    unchanged.  For :attr:`StorageLayoutMode.KV_COMPONENT_GROUPS`, the
+    input is first classified (:func:`classify_input_form`):
+
+    * :attr:`StorageInputForm.PACKED_KV_UNIFORM` -- one packed
+      leading-dim-2 group -- is split via :func:`apply_kv_component_split`,
+      forwarding any ``k_dtype`` / ``v_dtype`` override (mechanism B and
+      the packed byte-through tests).
+    * :attr:`StorageInputForm.PRESPLIT_COMPONENTS` -- already-separate K
+      (bf16) and V (fp8) groups -- is validated and passed through via
+      :func:`pass_through_presplit_component_groups` with NO split and NO
+      dtype override (the live MP byte-through path).  This form is only
+      valid under the ``RAW_UNIT`` scheme; ``COMPUTED_LEGACY`` must
+      receive packed input because it splits and quantizes V itself.
+
+    The pass-through decision is gated on the explicit per-engine
+    ``scheme`` and validated by dtype + canonical order; shape only
+    classifies, it never assigns K vs V role.
 
     Args:
-        layout_desc: The packed layout the upstream (transfer-kernel
-            side) produced.
+        layout_desc: The layout the upstream (transfer-kernel side)
+            produced -- one entry per kernel group.
         mode: The canonical storage layout mode for this
             ``StorageManager``.
-        k_dtype: Optional K-child dtype override (KV_COMPONENT_GROUPS
-            only). ``None`` keeps the packed dtype.
-        v_dtype: Optional V-child dtype override (KV_COMPONENT_GROUPS
-            only). ``None`` keeps the packed dtype.
+        k_dtype: Optional K-child dtype override (packed split only).
+        v_dtype: Optional V-child dtype override (packed split) AND the
+            required V dtype for pre-split validation (``float8_e4m3fn``
+            on the byte-through path).
+        scheme: The per-engine ``component_key_scheme``.  Required to be
+            ``RAW_UNIT`` for a pre-split input; ignored for a packed input.
 
     Returns:
-        The layout to pass to ``StorageManager.reserve_write``.
+        The layout to pass to ``StorageManager.reserve_write`` /
+        ``submit_prefetch_task``.
 
     Raises:
-        ValueError: For an unknown ``mode``, or if a dtype override is
-            supplied for :attr:`StorageLayoutMode.PACKED` (which cannot
-            express heterogeneous K/V dtypes).
+        ValueError: For an unknown ``mode``; a dtype override on
+            :attr:`StorageLayoutMode.PACKED`; a pre-split input under a
+            non-``RAW_UNIT`` scheme or without ``v_dtype``; or any layout /
+            dtype / order validation failure from the delegates.
     """
     if mode == StorageLayoutMode.PACKED:
         if k_dtype is not None or v_dtype is not None:
@@ -217,5 +379,29 @@ def apply_layout_policy(
             )
         return layout_desc
     if mode == StorageLayoutMode.KV_COMPONENT_GROUPS:
-        return apply_kv_component_split(layout_desc, k_dtype=k_dtype, v_dtype=v_dtype)
+        input_form = classify_input_form(layout_desc)
+        if input_form == StorageInputForm.PACKED_KV_UNIFORM:
+            return apply_kv_component_split(
+                layout_desc, k_dtype=k_dtype, v_dtype=v_dtype
+            )
+        # PRESPLIT_COMPONENTS: only the byte-through (RAW_UNIT) scheme
+        # presents pre-split heterogeneous K/V.  COMPUTED_LEGACY must
+        # receive packed input (it splits and quantizes V itself), so a
+        # pre-split input under it is a contract violation -> fail closed.
+        # First Party
+        from lmcache.v1.distributed.storage_placement import ComponentKeyScheme
+
+        if scheme is not ComponentKeyScheme.RAW_UNIT:
+            raise ValueError(
+                "apply_layout_policy: pre-split component input requires the "
+                "RAW_UNIT (byte-through) component_key_scheme; got "
+                f"{scheme!r}. COMPUTED_LEGACY expects packed leading-dim-2 "
+                "input to split and quantize V itself."
+            )
+        if v_dtype is None:
+            raise ValueError(
+                "apply_layout_policy: RAW_UNIT pre-split pass-through requires "
+                "v_dtype (the fp8 V-component dtype) to validate the V groups."
+            )
+        return pass_through_presplit_component_groups(layout_desc, v_dtype=v_dtype)
     raise ValueError(f"Unknown StorageLayoutMode: {mode!r}")
