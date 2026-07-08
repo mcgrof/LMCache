@@ -229,11 +229,18 @@ def _make_wrapper(
     placement_mode,
     serialize_result: bool | None = None,
     fail_reserve_write: bool = False,
+    component_key_scheme=None,
 ):
     from lmcache.v1.distributed.l2_adapters.serde_wrapper import (
         SerdeL2AdapterWrapper,
     )
-    from lmcache.v1.distributed.storage_placement import SplitTierManifest
+    from lmcache.v1.distributed.storage_placement import (
+        ComponentKeyScheme,
+        SplitTierManifest,
+    )
+
+    if component_key_scheme is None:
+        component_key_scheme = ComponentKeyScheme.COMPUTED_LEGACY
 
     capture = _Capture(
         finish_read_calls=[],
@@ -249,12 +256,13 @@ def _make_wrapper(
     inner = _FakeInnerAdapter(capture)
     serde = _FakeSerdeProcessor(serialize_result=serialize_result)
     l1 = _FakeL1Manager(capture, fail_reserve_write=fail_reserve_write)
-    manifest = SplitTierManifest()
+    manifest = SplitTierManifest(component_key_scheme=component_key_scheme)
     wrapper = SerdeL2AdapterWrapper(
         inner=inner,
         serde=serde,
         l1_manager=l1,
         placement_mode=placement_mode,
+        component_key_scheme=component_key_scheme,
         split_tier_manifest=manifest,
     )
     return wrapper, capture, l1, manifest
@@ -1595,6 +1603,164 @@ def test_split_tier_lookup_masks_incomplete_and_unlocks() -> None:
         assert derive_component_key(in_flight, "v") in unlocked
         assert derive_component_key(untracked, "v") in unlocked
         assert derive_component_key(complete, "v") not in unlocked
+    finally:
+        wrapper.close()
+
+
+def test_raw_unit_wrapper_propagates_scheme_to_minted_manifest() -> None:
+    """A RAW_UNIT wrapper constructed WITHOUT a manifest mints one that
+    carries the same scheme -- else the minted manifest's K-child side-set
+    records a different key than the wrapper allocates."""
+    # First Party
+    from lmcache.v1.distributed.l2_adapters.serde_wrapper import (
+        SerdeL2AdapterWrapper,
+    )
+    from lmcache.v1.distributed.storage_placement import (
+        ComponentKeyScheme,
+        StoragePlacementMode,
+    )
+
+    capture = _Capture(
+        finish_read_calls=[],
+        finish_write_calls=[],
+        fwrr_calls=[],
+        drained_keys=[],
+        delete_calls=[],
+        inner_submit_calls=[],
+        inner_delete_calls=[],
+        inner_lookup_calls=[],
+        inner_unlock_calls=[],
+    )
+    wrapper = SerdeL2AdapterWrapper(
+        inner=_FakeInnerAdapter(capture),
+        serde=_FakeSerdeProcessor(),
+        l1_manager=_FakeL1Manager(capture),
+        placement_mode=StoragePlacementMode.KV_SPLIT_TIER,
+        component_key_scheme=ComponentKeyScheme.RAW_UNIT,
+        split_tier_manifest=None,  # force the fallback mint
+    )
+    try:
+        assert wrapper._component_key_scheme is ComponentKeyScheme.RAW_UNIT
+        # The minted manifest carries the same scheme (public accessor).
+        assert (
+            wrapper._split_tier_manifest.component_key_scheme
+            is ComponentKeyScheme.RAW_UNIT
+        )
+    finally:
+        wrapper.close()
+
+
+def test_wrapper_rejects_mismatched_manifest_scheme() -> None:
+    """A supplied manifest whose scheme disagrees with the wrapper's
+    scheme arg must be rejected -- else the manifest's K-child side-set
+    and the wrapper's K key diverge and the K child leaks to L2."""
+    # First Party
+    from lmcache.v1.distributed.l2_adapters.serde_wrapper import (
+        SerdeL2AdapterWrapper,
+    )
+    from lmcache.v1.distributed.storage_placement import (
+        ComponentKeyScheme,
+        SplitTierManifest,
+        StoragePlacementMode,
+    )
+
+    capture = _Capture(
+        finish_read_calls=[],
+        finish_write_calls=[],
+        fwrr_calls=[],
+        drained_keys=[],
+        delete_calls=[],
+        inner_submit_calls=[],
+        inner_delete_calls=[],
+        inner_lookup_calls=[],
+        inner_unlock_calls=[],
+    )
+    legacy_manifest = SplitTierManifest(
+        component_key_scheme=ComponentKeyScheme.COMPUTED_LEGACY
+    )
+    with pytest.raises(ValueError, match="disagrees with the supplied"):
+        SerdeL2AdapterWrapper(
+            inner=_FakeInnerAdapter(capture),
+            serde=_FakeSerdeProcessor(),
+            l1_manager=_FakeL1Manager(capture),
+            placement_mode=StoragePlacementMode.KV_SPLIT_TIER,
+            component_key_scheme=ComponentKeyScheme.RAW_UNIT,
+            split_tier_manifest=legacy_manifest,
+        )
+
+
+def test_raw_unit_store_registers_raw_unit_k_child() -> None:
+    """The C (byte-through) store path tags the K child RAW_UNIT: the
+    manifest side-set AND the L1-resident K child must both be under the
+    RAW_UNIT key, never the legacy one -- else is_k_child_key misses the
+    real K child and the StoreController mis-routes it to L2."""
+    # First Party
+    from lmcache.v1.distributed.storage_placement import (
+        ComponentKeyScheme,
+        StoragePlacementMode,
+        derive_component_key,
+    )
+
+    wrapper, capture, l1, manifest = _make_wrapper(
+        StoragePlacementMode.KV_SPLIT_TIER,
+        component_key_scheme=ComponentKeyScheme.RAW_UNIT,
+    )
+    try:
+        keys, _task_id = _submit_split_tier_store(wrapper)
+        for k in keys:
+            raw_k = derive_component_key(
+                k, "k", scheme=ComponentKeyScheme.RAW_UNIT
+            )
+            legacy_k = derive_component_key(k, "k")
+            assert manifest.is_k_child_key(raw_k) is True
+            assert manifest.is_k_child_key(legacy_k) is False
+            assert raw_k in l1._objects
+            assert legacy_k not in l1._objects
+    finally:
+        wrapper.close()
+
+
+def test_raw_unit_lookup_uses_raw_unit_v_children_and_masks() -> None:
+    """The lookup path derives V children under RAW_UNIT (not legacy) and
+    the manifest COMPLETE gate still masks incomplete entries.  Proves the
+    lookup derive site is scheme-wired and the gate composes with C."""
+    # First Party
+    from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+    from lmcache.v1.distributed.storage_placement import (
+        ComponentKeyScheme,
+        StoragePlacementMode,
+        derive_component_key,
+    )
+
+    wrapper, capture, _l1, manifest = _make_wrapper(
+        StoragePlacementMode.KV_SPLIT_TIER,
+        component_key_scheme=ComponentKeyScheme.RAW_UNIT,
+    )
+    try:
+        complete = ObjectKey(chunk_hash=b"\x81" * 32, model_name="m", kv_rank=0)
+        in_flight = ObjectKey(chunk_hash=b"\x82" * 32, model_name="m", kv_rank=0)
+        complete_gen = manifest.register_pending(complete)
+        manifest.mark_complete(complete, complete_gen)
+        manifest.register_pending(in_flight)
+
+        layout = MemoryLayoutDesc(shapes=[], dtypes=[])
+        task_id = wrapper.submit_lookup_and_lock_task([complete, in_flight], layout)
+
+        # Inner saw RAW_UNIT V children, NOT legacy ones.
+        raw = ComponentKeyScheme.RAW_UNIT
+        assert capture.inner_lookup_calls == [
+            [
+                derive_component_key(complete, "v", scheme=raw),
+                derive_component_key(in_flight, "v", scheme=raw),
+            ]
+        ]
+        # A legacy V key was never used.
+        assert derive_component_key(complete, "v") not in capture.inner_lookup_calls[0]
+
+        bitmap = wrapper.query_lookup_and_lock_result(task_id)
+        assert bitmap is not None
+        assert bitmap.test(0)  # COMPLETE survives
+        assert not bitmap.test(1)  # in-flight masked off
     finally:
         wrapper.close()
 

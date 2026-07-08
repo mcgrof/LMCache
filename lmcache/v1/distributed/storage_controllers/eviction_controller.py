@@ -25,6 +25,7 @@ from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface
 from lmcache.v1.distributed.storage_controller import StorageControllerInterface
 from lmcache.v1.distributed.storage_placement import (
+    ComponentKeyScheme,
     SplitTierManifest,
     SplitTierState,
     derive_component_key,
@@ -123,11 +124,16 @@ class L1EvictionController(EvictionController):
         # deletes against the L2 adapters.
         self._split_tier_manifest = split_tier_manifest
         self._l2_adapters = list(l2_adapters or [])
+        # Per-engine child-key scheme; paired eviction derives the V-child
+        # delete key under it so a RAW_UNIT K victim reclaims the RAW_UNIT
+        # V child (not a legacy one).  Set via set_split_tier_paired_eviction.
+        self._component_key_scheme = ComponentKeyScheme.COMPUTED_LEGACY
 
     def set_split_tier_paired_eviction(
         self,
         manifest: "SplitTierManifest",
         l2_adapters: "list[L2AdapterInterface]",
+        component_key_scheme: ComponentKeyScheme = ComponentKeyScheme.COMPUTED_LEGACY,
     ) -> None:
         """Wire paired-eviction state post-construction.
 
@@ -138,9 +144,15 @@ class L1EvictionController(EvictionController):
         adapters once they exist.  Calling more than once replaces the
         previous wiring; passing empty adapters reverts to legacy
         DISCARD-only behavior.
+
+        ``component_key_scheme`` is the per-engine child-key scheme; the
+        paired V-child delete is derived under it so a RAW_UNIT (byte-
+        through) K victim reclaims the RAW_UNIT V child rather than a
+        legacy one.
         """
         self._split_tier_manifest = manifest
         self._l2_adapters = list(l2_adapters)
+        self._component_key_scheme = component_key_scheme
 
     def report_status(self) -> dict:
         return {
@@ -385,7 +397,9 @@ class L1EvictionController(EvictionController):
             # DELETE_IN_FLIGHT is held across the delete, so the
             # generation-agnostic V key still names THIS generation's V
             # child.  Delete it against every L2 adapter, then drop.
-            v_child_key = derive_component_key(logical_key, "v")
+            v_child_key = derive_component_key(
+                logical_key, "v", scheme=self._component_key_scheme
+            )
             for adapter in self._l2_adapters:
                 try:
                     adapter.delete([v_child_key])

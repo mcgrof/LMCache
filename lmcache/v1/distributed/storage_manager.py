@@ -10,6 +10,9 @@ from typing import Iterator, Literal, Optional
 import threading
 import time
 
+# Third Party
+import torch
+
 # First Party
 from lmcache.logging import init_logger
 from lmcache.native_storage_ops import Bitmap, PeriodicEventNotifier
@@ -59,10 +62,12 @@ from lmcache.v1.distributed.storage_layout import (
     derive_storage_layout_mode,
 )
 from lmcache.v1.distributed.storage_placement import (
+    ComponentKeyScheme,
     SplitTierConfigError,
     SplitTierManifest,
     StoragePlacementMode,
     derive_component_key,
+    derive_component_key_scheme,
     derive_storage_placement_mode,
 )
 from lmcache.v1.memory_management import MemoryObj
@@ -172,6 +177,13 @@ class StorageManager:
         self._storage_placement_mode = derive_storage_placement_mode(
             config.l2_adapter_config.adapters
         )
+        # Per-engine child-key scheme (byte-through RAW_UNIT vs scale-aware
+        # COMPUTED_LEGACY), derived once from the same adapter configs and
+        # frozen for this StorageManager.  Config-only inspection; a mixed
+        # adapter set is rejected fail-closed before any resource is built.
+        self._component_key_scheme = derive_component_key_scheme(
+            config.l2_adapter_config.adapters
+        )
 
         # Support matrix: the V-only split-tier path is only
         # correct for a narrow, documented configuration.  Reject the
@@ -200,11 +212,26 @@ class StorageManager:
             config.l2_adapter_config.adapters
         )
 
+        # V-child L1 dtype for the byte-through (RAW_UNIT) path (LO6).  The
+        # live-asymmetric V is already fp8 e4m3 in HBM and is stored byte-
+        # through, so its L1 component group MUST be allocated as
+        # float8_e4m3fn (1 byte/elem, no upcast) -- otherwise reserve_write
+        # would give a bf16 V group and the byte-through serializer rejects a
+        # non-fp8 V.  The scale-aware (COMPUTED_LEGACY) path keeps the packed
+        # native dtype and quantizes V internally, so it gets no override.
+        self._v_component_dtype: Optional[torch.dtype] = (
+            torch.float8_e4m3fn
+            if self._component_key_scheme == ComponentKeyScheme.RAW_UNIT
+            else None
+        )
+
         # Per-logical-key state machine for KV_SPLIT_TIER.  Always
         # constructed (cheap; empty when placement is KV_TOGETHER).
         # The wrapper queries and mutates this manifest as part of
         # the V-only store / load composition.
-        self._split_tier_manifest = SplitTierManifest()
+        self._split_tier_manifest = SplitTierManifest(
+            component_key_scheme=self._component_key_scheme
+        )
 
         # L2 adapters and store controller. When an adapter config carries
         # a ``serde_config``, the adapter is wrapped with
@@ -241,6 +268,7 @@ class StorageManager:
             self._eviction_controller.set_split_tier_paired_eviction(
                 self._split_tier_manifest,
                 list(self._l2_adapters.values()),
+                self._component_key_scheme,
             )
             # Also wire the manifest into L1Manager so its
             # ``is_key_evictable`` gates K-child eviction on manifest
@@ -390,6 +418,12 @@ class StorageManager:
         serdes see K and V as distinct typed sub-objects via
         ``TensorMemoryObj.get_tensor(0)`` / ``get_tensor(1)``.
 
+        For the byte-through (RAW_UNIT) path the V component group is
+        overridden to ``float8_e4m3fn`` (``self._v_component_dtype``, LO6):
+        the live-asymmetric V is already fp8 in HBM and is stored byte-
+        through with no upcast, so its L1 group must be fp8, not the
+        packed native dtype.  Scale-aware serdes get no override.
+
         Total bytes are unchanged.  The transfer kernel writes K bytes
         followed by V bytes either way; only the typed view changes.
 
@@ -400,7 +434,11 @@ class StorageManager:
         Returns:
             Layout to pass to :meth:`reserve_write`.
         """
-        return _apply_layout_policy(layout_desc, self._storage_layout_mode)
+        return _apply_layout_policy(
+            layout_desc,
+            self._storage_layout_mode,
+            v_dtype=self._v_component_dtype,
+        )
 
     @enable_tracing()
     def reserve_write(
@@ -1248,16 +1286,24 @@ class StorageManager:
             try:
                 candidate_placement = derive_storage_placement_mode(candidate_configs)
                 derive_storage_layout_mode(candidate_configs)
+                candidate_scheme = derive_component_key_scheme(candidate_configs)
             except ValueError as e:
                 raise SplitTierConfigError(
                     f"runtime add_l2_adapter rejected: incompatible "
-                    f"placement/layout with the existing adapters: {e}"
+                    f"placement/layout/scheme with the existing adapters: {e}"
                 ) from e
             if candidate_placement != self._storage_placement_mode:
                 raise SplitTierConfigError(
                     "runtime add_l2_adapter would change the storage "
                     f"placement mode from {self._storage_placement_mode.value} "
                     f"to {candidate_placement.value}; the mode is frozen at "
+                    "construction and cannot flip at runtime"
+                )
+            if candidate_scheme != self._component_key_scheme:
+                raise SplitTierConfigError(
+                    "runtime add_l2_adapter would change the component-key "
+                    f"scheme from {self._component_key_scheme.name} to "
+                    f"{candidate_scheme.name}; the scheme is frozen at "
                     "construction and cannot flip at runtime"
                 )
             if self._storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER:
@@ -1334,7 +1380,7 @@ class StorageManager:
                 # leaving COMPLETE entries would return phantom lookup
                 # hits that can never load.
                 self._eviction_controller.set_split_tier_paired_eviction(
-                    self._split_tier_manifest, remaining
+                    self._split_tier_manifest, remaining, self._component_key_scheme
                 )
                 if not remaining:
                     self._sweep_manifest_no_adapters()
@@ -1428,7 +1474,9 @@ class StorageManager:
                 # Dropped between the snapshot and here; nothing to do.
                 continue
             _state, generation = entry
-            k_child = derive_component_key(logical_key, "k")
+            k_child = derive_component_key(
+                logical_key, "k", scheme=self._component_key_scheme
+            )
             if self._l1_manager.get_object_state(k_child) is not None:
                 # K child survived (locked entry under force=False, or
                 # an in-flight store's write-locked child): the
@@ -1454,7 +1502,11 @@ class StorageManager:
                 self._split_tier_manifest.mark_delete_in_flight(logical_key, generation)
             except ValueError:
                 continue
-            orphaned_v_children.append(derive_component_key(logical_key, "v"))
+            orphaned_v_children.append(
+                derive_component_key(
+                    logical_key, "v", scheme=self._component_key_scheme
+                )
+            )
             pending_drops.append((logical_key, generation))
         if not orphaned_v_children:
             return
@@ -1587,6 +1639,7 @@ class StorageManager:
                 serde=create_serde_processor(config.serde_config),
                 l1_manager=self._l1_manager,
                 placement_mode=self._storage_placement_mode,
+                component_key_scheme=self._component_key_scheme,
                 split_tier_manifest=self._split_tier_manifest,
             )
         descriptor = AdapterDescriptor(index=adapter_id, config=config)
