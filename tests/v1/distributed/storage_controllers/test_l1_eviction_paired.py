@@ -34,6 +34,7 @@ from lmcache.v1.distributed.storage_controllers.eviction_controller import (
     L1EvictionController,
 )
 from lmcache.v1.distributed.storage_placement import (
+    ComponentKeyScheme,
     SplitTierManifest,
     SplitTierState,
     derive_component_key,
@@ -103,6 +104,36 @@ def test_paired_eviction_k_child_invalidates_manifest_and_enqueues_v_delete() ->
     adapter_b.delete.assert_called_once_with([v_child])
     # K child physically deleted from L1.
     ctrl._l1_manager.delete.assert_called_once_with([k_child])
+
+
+def test_paired_eviction_raw_unit_deletes_raw_unit_v_child() -> None:
+    """A byte-through (RAW_UNIT) K victim must reclaim the RAW_UNIT V
+    child, never a legacy V child.  The scheme travels via
+    set_split_tier_paired_eviction (the seam StorageManager uses); the
+    paired V-delete key must be derived under it."""
+    raw = ComponentKeyScheme.RAW_UNIT
+    manifest = SplitTierManifest(component_key_scheme=raw)
+    logical = _make_key(b"\xcd" * 32)
+    raw_k = derive_component_key(logical, "k", scheme=raw)
+    raw_v = derive_component_key(logical, "v", scheme=raw)
+    legacy_v = derive_component_key(logical, "v")  # must NOT be deleted
+    gen = manifest.register_pending(logical)
+    manifest.mark_complete(logical, gen)
+
+    adapter = MagicMock()
+    ctrl = _build_controller()
+    ctrl.set_split_tier_paired_eviction(manifest, [adapter], raw)
+    ctrl.execute_eviction_action(
+        EvictionAction(keys=[raw_k], destination=EvictionDestination.DISCARD)
+    )
+
+    assert manifest.lookup(logical) is None
+    # The RAW_UNIT V child is deleted; the legacy V key is never touched.
+    adapter.delete.assert_called_once_with([raw_v])
+    assert raw_v != legacy_v
+    for call in adapter.delete.call_args_list:
+        assert legacy_v not in call.args[0]
+    ctrl._l1_manager.delete.assert_called_once_with([raw_k])
 
 
 def test_paired_eviction_skips_logical_keys() -> None:

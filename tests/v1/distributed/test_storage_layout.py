@@ -240,3 +240,87 @@ def test_apply_layout_policy_kv_components_splits() -> None:
     assert len(out.shapes) == 2
     assert out.shapes[0] == torch.Size([4, 128])
     assert out.shapes[1] == torch.Size([4, 128])
+
+
+# --- CO4: heterogeneous K/V dtype children (asymmetric K16/V8) ----------------
+
+
+def test_component_split_default_is_byte_identical_regression() -> None:
+    """No dtype override reproduces the pre-change same-dtype behaviour."""
+    packed = MemoryLayoutDesc(
+        shapes=[torch.Size([2, 4, 8, 128])],
+        dtypes=[torch.bfloat16],
+    )
+    out = apply_kv_component_split(packed)
+    assert out.shapes == [torch.Size([4, 8, 128]), torch.Size([4, 8, 128])]
+    assert out.dtypes == [torch.bfloat16, torch.bfloat16]
+
+
+def test_component_split_v_dtype_override_is_heterogeneous() -> None:
+    """v_dtype makes the V child fp8 while K stays bf16 (K16/V8)."""
+    packed = MemoryLayoutDesc(
+        shapes=[torch.Size([2, 32, 64, 8, 128])],
+        dtypes=[torch.bfloat16],
+    )
+    out = apply_kv_component_split(packed, v_dtype=torch.float8_e4m3fn)
+    assert len(out.shapes) == 2
+    assert out.shapes[0] == torch.Size([32, 64, 8, 128])
+    assert out.shapes[1] == torch.Size([32, 64, 8, 128])
+    assert out.dtypes[0] is torch.bfloat16  # K child unchanged
+    assert out.dtypes[1] is torch.float8_e4m3fn  # V child overridden
+
+
+def test_component_split_k_dtype_override() -> None:
+    """k_dtype overrides the K child independently of V."""
+    packed = MemoryLayoutDesc(
+        shapes=[torch.Size([2, 4, 128])],
+        dtypes=[torch.float16],
+    )
+    out = apply_kv_component_split(
+        packed, k_dtype=torch.bfloat16, v_dtype=torch.float8_e4m3fn
+    )
+    assert out.dtypes == [torch.bfloat16, torch.float8_e4m3fn]
+
+
+def test_component_split_multi_group_applies_override_per_group() -> None:
+    """Every input group's V child takes the override, in order."""
+    packed = MemoryLayoutDesc(
+        shapes=[torch.Size([2, 4, 128]), torch.Size([2, 4, 128])],
+        dtypes=[torch.bfloat16, torch.bfloat16],
+    )
+    out = apply_kv_component_split(packed, v_dtype=torch.float8_e4m3fn)
+    assert out.dtypes == [
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+    ]
+
+
+def test_component_split_bad_leading_dim_still_raises() -> None:
+    """Leading dim != 2 still raises regardless of dtype overrides."""
+    bad = MemoryLayoutDesc(shapes=[torch.Size([3, 4, 128])], dtypes=[torch.bfloat16])
+    with pytest.raises(ValueError, match="leading dim 2"):
+        apply_kv_component_split(bad, v_dtype=torch.float8_e4m3fn)
+
+
+def test_apply_layout_policy_forwards_v_dtype() -> None:
+    """apply_layout_policy threads v_dtype into the component split."""
+    packed = MemoryLayoutDesc(
+        shapes=[torch.Size([2, 4, 128])],
+        dtypes=[torch.bfloat16],
+    )
+    out = apply_layout_policy(
+        packed, StorageLayoutMode.KV_COMPONENT_GROUPS, v_dtype=torch.float8_e4m3fn
+    )
+    assert out.dtypes == [torch.bfloat16, torch.float8_e4m3fn]
+
+
+def test_apply_layout_policy_packed_rejects_dtype_override() -> None:
+    """PACKED cannot express heterogeneous K/V dtypes -> loud error."""
+    packed = MemoryLayoutDesc(
+        shapes=[torch.Size([2, 4, 128])],
+        dtypes=[torch.bfloat16],
+    )
+    with pytest.raises(ValueError, match="PACKED"):
+        apply_layout_policy(packed, StorageLayoutMode.PACKED, v_dtype=torch.float8_e4m3fn)

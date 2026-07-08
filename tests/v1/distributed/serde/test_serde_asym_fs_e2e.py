@@ -49,7 +49,11 @@ from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import FSL2AdapterConfig
 from lmcache.v1.distributed.serde import SerdeConfig
 from lmcache.v1.distributed.storage_layout import StorageLayoutMode
 from lmcache.v1.distributed.storage_manager import StorageManager
-from lmcache.v1.distributed.storage_placement import StoragePlacementMode
+from lmcache.v1.distributed.storage_placement import (
+    ComponentKeyScheme,
+    StoragePlacementMode,
+    derive_component_key,
+)
 
 
 # =============================================================================
@@ -586,6 +590,226 @@ class TestAsymK16V8VOnlySplitTierRoundTrip:
                     assert v_rel < 0.05, (
                         f"V FP8 round-trip relative error too high: {v_rel:.4f}"
                     )
+            sm.finish_read_prefetched(keys)
+        finally:
+            sm.close()
+
+
+# =============================================================================
+# Byte-through V-only split-tier (Mode "C" / RAW_UNIT) round-trip
+# =============================================================================
+
+
+class TestAsymBytethroughK16V8VOnlySplitTierRoundTrip:
+    """Byte-through (Mode "C" / RAW_UNIT) split-tier round-trip.
+
+    The live-asymmetric V is **already** fp8 e4m3 in HBM, so this path copies
+    the raw e4m3 codes byte-through with no re-quantization.  That makes the
+    V round-trip **bit-exact** (contrast the scale-aware V-only path, which
+    quantizes bf16 -> fp8 and only round-trips within FP8 noise).
+
+    The CPU tests prove the config -> StorageManager resolution chain without a
+    CUDA allocator:
+
+      * placement resolves to KV_SPLIT_TIER, layout to KV_COMPONENT_GROUPS;
+      * the ``component_key_scheme`` derived at construction reaches the
+        manifest as RAW_UNIT (the live #34 wiring through a real StorageManager);
+      * the V component group is overridden to ``float8_e4m3fn`` (LO6): the
+        byte-through V must land in L1 as fp8 with no upcast, while K stays
+        bf16.
+
+    The full byte-identity round-trip through the real CUDA-backed L1 allocator
+    is the GPU capstone (``skipif`` not cuda) -- it is the M2 leg that proves
+    the raw e4m3 codes survive store -> L2 -> reload unchanged.
+    """
+
+    def _build_sm(self, disk_path: str) -> StorageManager:
+        fs_cfg = FSL2AdapterConfig(
+            base_path=disk_path,
+            relative_tmp_dir=None,
+            read_ahead_size=None,
+            use_odirect=False,
+        )
+        fs_cfg.serde_config = SerdeConfig(type="asym_bytethrough_k16_v8_v_only")
+        sm_cfg = StorageManagerConfig(
+            l1_manager_config=L1ManagerConfig(
+                memory_config=L1MemoryManagerConfig(
+                    size_in_bytes=4 << 30,
+                    use_lazy=True,
+                    init_size_in_bytes=1 << 30,
+                ),
+            ),
+            eviction_config=EvictionConfig(eviction_policy="LRU"),
+            l2_adapter_config=L2AdaptersConfig(adapters=[fs_cfg]),  # type: ignore[list-item]
+        )
+        return StorageManager(sm_cfg)
+
+    # ---- CPU: config -> StorageManager resolution (no allocator needed) ----
+
+    def test_bytethrough_resolves_split_tier_component_groups_raw_unit(self) -> None:
+        """The byte-through serde resolves through a real StorageManager to
+        KV_SPLIT_TIER + KV_COMPONENT_GROUPS, and the derived key scheme reaches
+        the manifest as RAW_UNIT (the #34 wiring, exercised end-to-end)."""
+        disk_path = tempfile.mkdtemp(prefix="lmcache_bytethrough_resolve_")
+        try:
+            sm = self._build_sm(disk_path)
+            try:
+                assert sm.storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER
+                assert (
+                    sm.storage_layout_mode == StorageLayoutMode.KV_COMPONENT_GROUPS
+                )
+                assert (
+                    sm.split_tier_manifest.component_key_scheme
+                    == ComponentKeyScheme.RAW_UNIT
+                )
+            finally:
+                sm.close()
+        finally:
+            shutil.rmtree(disk_path, ignore_errors=True)
+
+    def test_bytethrough_v_child_is_fp8_k_child_is_bf16(self) -> None:
+        """LO6: the byte-through V component group is overridden to fp8_e4m3fn
+        (no upcast) while K stays bf16; element counts are unchanged."""
+        disk_path = tempfile.mkdtemp(prefix="lmcache_bytethrough_dtype_")
+        try:
+            sm = self._build_sm(disk_path)
+            try:
+                packed = MemoryLayoutDesc(
+                    shapes=[torch.Size([2, 4, 256, 128])],
+                    dtypes=[torch.bfloat16],
+                )
+                adapted = sm.apply_layout_policy(packed)
+                assert len(adapted.shapes) == 2
+                # K child keeps native bf16; V child narrows to fp8 (byte-through).
+                assert adapted.dtypes[0] == torch.bfloat16
+                assert adapted.dtypes[1] == torch.float8_e4m3fn
+                # Only the V dtype changes; the element counts are preserved.
+                assert adapted.shapes[0] == torch.Size([4, 256, 128])
+                assert adapted.shapes[1] == torch.Size([4, 256, 128])
+            finally:
+                sm.close()
+        finally:
+            shutil.rmtree(disk_path, ignore_errors=True)
+
+    # ---- GPU: byte-identity round-trip through the real allocator ----
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason="StorageManager full E2E requires CUDA-backed L1 allocator",
+    )
+    def test_bytethrough_full_round_trip_is_byte_exact(self) -> None:
+        """Store an already-fp8 V byte-through -> L2 -> reload; V must come back
+        bit-for-bit identical (raw e4m3 codes), K bit-exact, manifest COMPLETE,
+        and the K child present in L1 under the RAW_UNIT scheme."""
+        disk_path = tempfile.mkdtemp(prefix="lmcache_bytethrough_round_trip_")
+        try:
+            self._run_byte_exact_round_trip(disk_path)
+        finally:
+            shutil.rmtree(disk_path, ignore_errors=True)
+
+    def _run_byte_exact_round_trip(self, disk_path: str) -> None:
+        sm = self._build_sm(disk_path)
+        try:
+            assert sm.storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER
+            component_shape = torch.Size([4, 256, 128])
+            kv_dtype = torch.bfloat16
+            keys = [_make_key(b"\x30" * 31 + b"\x01")]
+
+            torch.manual_seed(2)
+            # K is native bf16; V is ALREADY fp8 e4m3 (the live-asym layout).
+            originals = [
+                (
+                    torch.randn(component_shape, dtype=kv_dtype),
+                    torch.randn(component_shape, dtype=kv_dtype).to(
+                        torch.float8_e4m3fn
+                    ),
+                )
+                for _ in keys
+            ]
+
+            # Transfer-side packed layout; apply_layout_policy splits it into a
+            # bf16 K group + an fp8 V group (LO6).
+            packed_layout = MemoryLayoutDesc(
+                shapes=[torch.Size([2, 4, 256, 128])], dtypes=[kv_dtype]
+            )
+            adapted = sm.apply_layout_policy(packed_layout)
+            assert adapted.dtypes[1] == torch.float8_e4m3fn, (
+                "byte-through V group must be fp8 (LO6) before the round-trip"
+            )
+
+            reserved = sm.reserve_write(keys, packed_layout, mode="new")
+            assert len(reserved) == len(keys)
+            for k, (k_orig, v_orig) in zip(keys, originals, strict=True):
+                mem_obj = reserved[k]
+                k_view = mem_obj.get_tensor(0)
+                v_view = mem_obj.get_tensor(1)
+                assert k_view is not None and v_view is not None
+                assert v_view.dtype == torch.float8_e4m3fn, (
+                    "reserved V group is not fp8; the byte-through serde would "
+                    "reject a non-fp8 V"
+                )
+                k_view.copy_(k_orig)
+                v_view.copy_(v_orig)
+            sm.finish_write(keys)
+
+            # Wait for the V child to drain to L2.
+            import os
+
+            ok = wait_for_condition(
+                lambda: any(e.is_file() for e in os.scandir(disk_path)),
+                timeout=10.0,
+            )
+            assert ok, f"No V child files appeared under {disk_path}"
+            ok = wait_for_condition(
+                lambda: sm.report_status()["store_controller"][
+                    "in_flight_task_count"
+                ]
+                == 0,
+                timeout=10.0,
+            )
+            assert ok, "Store controller did not finish in time"
+
+            # Manifest COMPLETE + K child in L1 under the RAW_UNIT scheme.
+            for k in keys:
+                assert sm.split_tier_manifest.is_complete(k), (
+                    f"manifest for {k!r} is not COMPLETE"
+                )
+                k_child = derive_component_key(
+                    k, "k", scheme=ComponentKeyScheme.RAW_UNIT
+                )
+                assert sm.contains_l1_key(k_child), (
+                    "RAW_UNIT K child missing from L1 after byte-through store"
+                )
+
+            # Reload under the logical key and verify byte-identity.
+            handle = sm.submit_prefetch_task(
+                PrefetchRequestSpec(keys=keys, group_layout_descs={0: packed_layout})
+            )
+            prefix_hits = wait_for_prefetch_status(sm, handle)
+            assert prefix_hits == len(keys), (
+                f"byte-through prefetch failed: expected {len(keys)} hits, "
+                f"got {prefix_hits}"
+            )
+
+            with sm.read_prefetched_results(keys) as mem_objs:
+                assert mem_objs is not None
+                assert len(mem_objs) == len(keys)
+                for (k_orig, v_orig), mem_obj in zip(
+                    originals, mem_objs, strict=True
+                ):
+                    k_got = mem_obj.get_tensor(0)
+                    v_got = mem_obj.get_tensor(1)
+                    assert k_got is not None and v_got is not None
+                    assert torch.equal(k_got, k_orig), (
+                        "K is NOT bit-exact through byte-through split-tier load"
+                    )
+                    # Byte-through: compare the raw e4m3 code bytes, not the
+                    # decoded float values (fp8 equality via uint8 view is the
+                    # unambiguous byte-identity check).
+                    assert v_got.dtype == torch.float8_e4m3fn
+                    assert torch.equal(
+                        v_got.view(torch.uint8), v_orig.view(torch.uint8)
+                    ), "V is NOT byte-identical through byte-through load"
             sm.finish_read_prefetched(keys)
         finally:
             sm.close()

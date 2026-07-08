@@ -120,14 +120,24 @@ def derive_storage_layout_mode(
     return modes.pop()
 
 
-def apply_kv_component_split(layout_desc: MemoryLayoutDesc) -> MemoryLayoutDesc:
+def apply_kv_component_split(
+    layout_desc: MemoryLayoutDesc,
+    *,
+    k_dtype: torch.dtype | None = None,
+    v_dtype: torch.dtype | None = None,
+) -> MemoryLayoutDesc:
     """Split a packed ``[2, ...]`` KV layout into K and V component groups.
 
     The packed convention is that each input group has leading dim 2 =
     (K, V), with K at index 0 and V at index 1 of that dim.  This
     transform drops the leading 2 and emits two component groups of
-    shape ``[...]`` each, both at the input group's dtype.  Total bytes
-    are unchanged; only the typed view changes.
+    shape ``[...]`` each.  By default both children inherit the input
+    group's dtype (the symmetric, byte-identical case).  For asymmetric
+    K/V (e.g. bf16 K + fp8 V) pass ``k_dtype`` / ``v_dtype`` to override
+    the K child and V child dtype respectively; passing neither reproduces
+    the pre-existing same-dtype behaviour exactly.  The element *count*
+    per child is unchanged; the V child's byte size follows its (possibly
+    smaller) dtype.
 
     For a multi-input layout (e.g. MLA or other configurations where
     ``shapes`` already has more than one entry), every input group is
@@ -135,6 +145,11 @@ def apply_kv_component_split(layout_desc: MemoryLayoutDesc) -> MemoryLayoutDesc:
 
     Args:
         layout_desc: Input layout where each group has leading dim 2.
+        k_dtype: Optional dtype override for every K child. ``None``
+            keeps the input group's dtype (symmetric default).
+        v_dtype: Optional dtype override for every V child. ``None``
+            keeps the input group's dtype (symmetric default). For
+            asymmetric K16/V8 this is the fp8 value dtype.
 
     Returns:
         New ``MemoryLayoutDesc`` with 2× the groups, each carrying
@@ -154,33 +169,53 @@ def apply_kv_component_split(layout_desc: MemoryLayoutDesc) -> MemoryLayoutDesc:
             )
         component_shape = torch.Size(shape[1:])
         new_shapes.append(component_shape)
-        new_dtypes.append(dtype)
+        new_dtypes.append(k_dtype if k_dtype is not None else dtype)
         new_shapes.append(component_shape)
-        new_dtypes.append(dtype)
+        new_dtypes.append(v_dtype if v_dtype is not None else dtype)
     return MemoryLayoutDesc(shapes=new_shapes, dtypes=new_dtypes)
 
 
 def apply_layout_policy(
     layout_desc: MemoryLayoutDesc,
     mode: StorageLayoutMode,
+    *,
+    k_dtype: torch.dtype | None = None,
+    v_dtype: torch.dtype | None = None,
 ) -> MemoryLayoutDesc:
     """Convert a packed layout to the canonical shape for ``mode``.
 
     For :attr:`StorageLayoutMode.PACKED`, returns ``layout_desc``
     unchanged.  For :attr:`StorageLayoutMode.KV_COMPONENT_GROUPS`,
-    splits each input group via :func:`apply_kv_component_split`.
+    splits each input group via :func:`apply_kv_component_split`,
+    forwarding any ``k_dtype`` / ``v_dtype`` override for asymmetric
+    K/V (e.g. bf16 K + fp8 V).
 
     Args:
         layout_desc: The packed layout the upstream (transfer-kernel
             side) produced.
         mode: The canonical storage layout mode for this
             ``StorageManager``.
+        k_dtype: Optional K-child dtype override (KV_COMPONENT_GROUPS
+            only). ``None`` keeps the packed dtype.
+        v_dtype: Optional V-child dtype override (KV_COMPONENT_GROUPS
+            only). ``None`` keeps the packed dtype.
 
     Returns:
         The layout to pass to ``StorageManager.reserve_write``.
+
+    Raises:
+        ValueError: For an unknown ``mode``, or if a dtype override is
+            supplied for :attr:`StorageLayoutMode.PACKED` (which cannot
+            express heterogeneous K/V dtypes).
     """
     if mode == StorageLayoutMode.PACKED:
+        if k_dtype is not None or v_dtype is not None:
+            raise ValueError(
+                "apply_layout_policy: k_dtype/v_dtype overrides are not valid "
+                "for StorageLayoutMode.PACKED (a single packed group cannot "
+                "carry heterogeneous K/V dtypes); use KV_COMPONENT_GROUPS."
+            )
         return layout_desc
     if mode == StorageLayoutMode.KV_COMPONENT_GROUPS:
-        return apply_kv_component_split(layout_desc)
+        return apply_kv_component_split(layout_desc, k_dtype=k_dtype, v_dtype=v_dtype)
     raise ValueError(f"Unknown StorageLayoutMode: {mode!r}")
