@@ -29,6 +29,7 @@ from lmcache.v1.kv_codec.encoded_kv import (
     CodecHashes,
     CodecVersion,
     EncodedKV,
+    ScaleScheme,
     ScaleScope,
     deserialize_header,
     serialize_header,
@@ -46,6 +47,7 @@ __all__ = [
     "EncodedKV",
     "CodecHashes",
     "ScaleScope",
+    "ScaleScheme",
     "CodecVersion",
     "CODEC_MAGIC",
     # Errors
