@@ -418,18 +418,33 @@ class StorageManager:
         serdes see K and V as distinct typed sub-objects via
         ``TensorMemoryObj.get_tensor(0)`` / ``get_tensor(1)``.
 
-        For the byte-through (RAW_UNIT) path the V component group is
-        overridden to ``float8_e4m3fn`` (``self._v_component_dtype``, LO6):
-        the live-asymmetric V is already fp8 in HBM and is stored byte-
-        through with no upcast, so its L1 group must be fp8, not the
-        packed native dtype.  Scale-aware serdes get no override.
+        For the byte-through (RAW_UNIT) path the transfer side may present
+        either form:
+
+        * A **packed** leading-``2`` group (e.g. the packed byte-through
+          serde tests): it is split and the V component group is
+          overridden to ``float8_e4m3fn`` (``self._v_component_dtype``,
+          LO6) -- the already-fp8 V is stored byte-through with no upcast,
+          so its L1 group must be fp8, not the packed native dtype.
+        * **Pre-split** leading-``1`` K (bf16) and V (fp8) component
+          groups (the live MP asymmetric path -- vLLM mechanism-A stores
+          V as its own fp8 plane): the split already happened upstream, so
+          the layout is validated and passed through unchanged, with no
+          re-split and no dtype override.
+
+        Which form applies is classified structurally and gated on this
+        StorageManager's ``component_key_scheme`` (pre-split requires
+        ``RAW_UNIT``); the pass-through validates K/V dtype and canonical
+        order so a K/V order inversion fails closed.  Scale-aware
+        (``COMPUTED_LEGACY``) serdes get no override and must receive
+        packed input.
 
         Total bytes are unchanged.  The transfer kernel writes K bytes
         followed by V bytes either way; only the typed view changes.
 
         Args:
-            layout_desc: Packed layout as produced by the transfer side
-                (each input group has leading dim 2 for the K|V pair).
+            layout_desc: Transfer-side layout -- a packed leading-``2``
+                group, or pre-split leading-``1`` K/V component groups.
 
         Returns:
             Layout to pass to :meth:`reserve_write`.
@@ -438,6 +453,7 @@ class StorageManager:
             layout_desc,
             self._storage_layout_mode,
             v_dtype=self._v_component_dtype,
+            scheme=self._component_key_scheme,
         )
 
     @enable_tracing()

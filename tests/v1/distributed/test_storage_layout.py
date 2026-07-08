@@ -25,11 +25,15 @@ from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.distributed.l2_adapters.config import L2AdapterConfigBase
 from lmcache.v1.distributed.serde import SerdeConfig
 from lmcache.v1.distributed.storage_layout import (
+    StorageInputForm,
     StorageLayoutMode,
     apply_kv_component_split,
     apply_layout_policy,
+    classify_input_form,
     derive_storage_layout_mode,
+    pass_through_presplit_component_groups,
 )
+from lmcache.v1.distributed.storage_placement import ComponentKeyScheme
 
 
 # =============================================================================
@@ -323,4 +327,181 @@ def test_apply_layout_policy_packed_rejects_dtype_override() -> None:
         dtypes=[torch.bfloat16],
     )
     with pytest.raises(ValueError, match="PACKED"):
-        apply_layout_policy(packed, StorageLayoutMode.PACKED, v_dtype=torch.float8_e4m3fn)
+        apply_layout_policy(
+            packed, StorageLayoutMode.PACKED, v_dtype=torch.float8_e4m3fn
+        )
+
+
+# =============================================================================
+# Gate 0 -- classify_input_form (structural: packed vs pre-split)
+# =============================================================================
+
+
+def test_classify_input_form_packed_leading_dim_2() -> None:
+    """One leading-dim-2 group -> PACKED_KV_UNIFORM."""
+    ld = MemoryLayoutDesc(shapes=[torch.Size([2, 4, 128])], dtypes=[torch.bfloat16])
+    assert classify_input_form(ld) == StorageInputForm.PACKED_KV_UNIFORM
+
+
+def test_classify_input_form_presplit_leading_dim_1() -> None:
+    """Two leading-dim-1 component groups (K, V) -> PRESPLIT_COMPONENTS."""
+    ld = MemoryLayoutDesc(
+        shapes=[torch.Size([1, 28, 256]), torch.Size([1, 28, 256])],
+        dtypes=[torch.bfloat16, torch.float8_e4m3fn],
+    )
+    assert classify_input_form(ld) == StorageInputForm.PRESPLIT_COMPONENTS
+
+
+def test_classify_input_form_mixed_rejected() -> None:
+    """A layout mixing leading-dim-2 and leading-dim-1 is rejected."""
+    ld = MemoryLayoutDesc(
+        shapes=[torch.Size([2, 4, 128]), torch.Size([1, 4, 128])],
+        dtypes=[torch.bfloat16, torch.float8_e4m3fn],
+    )
+    with pytest.raises(ValueError, match="mixes or has unexpected leading dims"):
+        classify_input_form(ld)
+
+
+def test_classify_input_form_unexpected_leading_dim_rejected() -> None:
+    """A leading dim other than 1 or 2 is rejected."""
+    ld = MemoryLayoutDesc(shapes=[torch.Size([3, 4, 128])], dtypes=[torch.bfloat16])
+    with pytest.raises(ValueError, match="mixes or has unexpected leading dims"):
+        classify_input_form(ld)
+
+
+def test_classify_input_form_empty_rejected() -> None:
+    """An empty layout has no form."""
+    ld = MemoryLayoutDesc(shapes=[], dtypes=[])
+    with pytest.raises(ValueError, match="empty layout_desc"):
+        classify_input_form(ld)
+
+
+# =============================================================================
+# Gate 1 -- pass_through_presplit_component_groups (validate, no split)
+# =============================================================================
+
+
+def _presplit_kv(k_dtype: torch.dtype, v_dtype: torch.dtype) -> MemoryLayoutDesc:
+    """A canonical [K, V] pre-split layout (each leading dim 1)."""
+    return MemoryLayoutDesc(
+        shapes=[torch.Size([1, 28, 256]), torch.Size([1, 28, 256])],
+        dtypes=[k_dtype, v_dtype],
+    )
+
+
+def test_passthrough_valid_kv_is_unchanged() -> None:
+    """A canonical bf16-K / fp8-V pair passes through byte-identically."""
+    ld = _presplit_kv(torch.bfloat16, torch.float8_e4m3fn)
+    out = pass_through_presplit_component_groups(ld, v_dtype=torch.float8_e4m3fn)
+    assert out.shapes == ld.shapes
+    assert out.dtypes == ld.dtypes
+
+
+def test_passthrough_v_not_fp8_rejected() -> None:
+    """A V component that is not the required fp8 dtype fails closed."""
+    ld = _presplit_kv(torch.bfloat16, torch.bfloat16)
+    with pytest.raises(ValueError, match="V component at index 1"):
+        pass_through_presplit_component_groups(ld, v_dtype=torch.float8_e4m3fn)
+
+
+def test_passthrough_swapped_roles_same_order_rejected() -> None:
+    """K and V swapped (fp8 at the K position) is caught by dtype -- this
+    is the silent-corruption guard: order is the contract, dtype validates it."""
+    ld = _presplit_kv(torch.float8_e4m3fn, torch.bfloat16)
+    with pytest.raises(ValueError, match="K component at index 0"):
+        pass_through_presplit_component_groups(ld, v_dtype=torch.float8_e4m3fn)
+
+
+def test_passthrough_odd_group_count_rejected() -> None:
+    """An odd number of component groups is not [K, V] pairs."""
+    ld = MemoryLayoutDesc(shapes=[torch.Size([1, 28, 256])], dtypes=[torch.bfloat16])
+    with pytest.raises(ValueError, match="even, non-zero number"):
+        pass_through_presplit_component_groups(ld, v_dtype=torch.float8_e4m3fn)
+
+
+def test_passthrough_non_leading_dim_1_rejected() -> None:
+    """A component group whose leading dim is not 1 is rejected."""
+    ld = MemoryLayoutDesc(
+        shapes=[torch.Size([2, 28, 256]), torch.Size([2, 28, 256])],
+        dtypes=[torch.bfloat16, torch.float8_e4m3fn],
+    )
+    with pytest.raises(ValueError, match="must have leading dim 1"):
+        pass_through_presplit_component_groups(ld, v_dtype=torch.float8_e4m3fn)
+
+
+def test_passthrough_multi_pair_ok() -> None:
+    """Multiple [K, V] pairs (even count) all validate and pass through."""
+    ld = MemoryLayoutDesc(
+        shapes=[torch.Size([1, 8, 128])] * 4,
+        dtypes=[
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+        ],
+    )
+    out = pass_through_presplit_component_groups(ld, v_dtype=torch.float8_e4m3fn)
+    assert out.dtypes == ld.dtypes
+
+
+# =============================================================================
+# Gate 2 -- apply_layout_policy dispatch (packed split vs pre-split passthrough)
+# =============================================================================
+
+
+def test_apply_layout_policy_presplit_raw_unit_passes_through() -> None:
+    """KV_COMPONENT_GROUPS + pre-split input + RAW_UNIT scheme -> pass-through,
+    no split, no override."""
+    ld = _presplit_kv(torch.bfloat16, torch.float8_e4m3fn)
+    out = apply_layout_policy(
+        ld,
+        StorageLayoutMode.KV_COMPONENT_GROUPS,
+        v_dtype=torch.float8_e4m3fn,
+        scheme=ComponentKeyScheme.RAW_UNIT,
+    )
+    assert out.shapes == ld.shapes
+    assert out.dtypes == ld.dtypes
+
+
+def test_apply_layout_policy_presplit_requires_raw_unit_scheme() -> None:
+    """Pre-split input under COMPUTED_LEGACY is a contract violation."""
+    ld = _presplit_kv(torch.bfloat16, torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="requires the RAW_UNIT"):
+        apply_layout_policy(
+            ld,
+            StorageLayoutMode.KV_COMPONENT_GROUPS,
+            v_dtype=torch.float8_e4m3fn,
+            scheme=ComponentKeyScheme.COMPUTED_LEGACY,
+        )
+
+
+def test_apply_layout_policy_presplit_requires_v_dtype() -> None:
+    """RAW_UNIT pre-split pass-through cannot validate without v_dtype."""
+    ld = _presplit_kv(torch.bfloat16, torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="requires .*v_dtype"):
+        apply_layout_policy(
+            ld,
+            StorageLayoutMode.KV_COMPONENT_GROUPS,
+            scheme=ComponentKeyScheme.RAW_UNIT,
+        )
+
+
+def test_apply_layout_policy_packed_still_splits_under_raw_unit() -> None:
+    """A packed byte-through input (M2 synthetic) still splits with the V
+    override -- pre-split awareness must not regress the packed path."""
+    packed = MemoryLayoutDesc(shapes=[torch.Size([2, 4, 128])], dtypes=[torch.bfloat16])
+    out = apply_layout_policy(
+        packed,
+        StorageLayoutMode.KV_COMPONENT_GROUPS,
+        v_dtype=torch.float8_e4m3fn,
+        scheme=ComponentKeyScheme.RAW_UNIT,
+    )
+    assert out.dtypes == [torch.bfloat16, torch.float8_e4m3fn]
+
+
+def test_apply_layout_policy_packed_split_needs_no_scheme() -> None:
+    """The packed split path is scheme-agnostic (regression: existing
+    callers pass no scheme)."""
+    packed = MemoryLayoutDesc(shapes=[torch.Size([2, 4, 128])], dtypes=[torch.bfloat16])
+    out = apply_layout_policy(packed, StorageLayoutMode.KV_COMPONENT_GROUPS)
+    assert len(out.shapes) == 2

@@ -153,7 +153,11 @@ def test_reserve_write_rejects_pre_applied_layout() -> None:
             )
             pre_applied = sm.apply_layout_policy(packed)
             assert len(pre_applied.shapes) == 2
-            with pytest.raises(ValueError, match="leading dim 2"):
+            # A re-applied (already-split) layout no longer looks packed
+            # (leading dim is the stripped component dim, not 2), so the
+            # input-form classifier rejects it before any split -- still a
+            # loud, fail-closed double-apply guard.
+            with pytest.raises(ValueError, match="unexpected leading dims"):
                 sm.reserve_write([key], pre_applied, mode="new")
         finally:
             sm.close()
@@ -174,7 +178,10 @@ def test_submit_prefetch_task_rejects_pre_applied_layout() -> None:
                 shapes=[torch.Size([2, 4, 256, 128])], dtypes=[torch.bfloat16]
             )
             pre_applied = sm.apply_layout_policy(packed)
-            with pytest.raises(ValueError, match="leading dim 2"):
+            # Same double-apply guard as reserve_write: the re-applied
+            # layout is no longer leading-dim-2 packed, so the input-form
+            # classifier rejects it before the prefetch split.
+            with pytest.raises(ValueError, match="unexpected leading dims"):
                 sm.submit_prefetch_task(PrefetchRequestSpec([key], {0: pre_applied}))
         finally:
             sm.close()
