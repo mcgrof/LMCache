@@ -630,17 +630,79 @@ class RawBlockCore:
         # 32 bits, packed into the high half of user_data; 0 means untagged
         return (tid & 0xFFFFFFFF) or 1
 
-    def _kvio_emit(self, trace_id, op, key, size, offset, meta=None) -> None:
+    # Magic + version triplet at the front of every packed asymmetric-KV blob
+    # (see lmcache/v1/kv_codec/encoded_kv.py: CODEC_MAGIC, "Do not change").
+    # Hardcoded here so the trace path never imports the codec on the hot path.
+    _KVIO_CODEC_MAGIC = b"LMCKV\x01\x00\x01"
+
+    @staticmethod
+    def _kvio_peek_components(buf) -> Optional[dict]:
+        """Cheaply read the packed EncodedKV header to recover the K/V/scale
+        byte split of an object written as ONE device I/O.
+
+        The asymmetric-KV serde packs ``K ‖ V ‖ scales`` into one buffer, so the
+        wire trace sees a single ``part="kv"`` op; this annotates that record
+        with the internal composition (which the header carries verbatim) so the
+        offline validator can attribute the store/load bytes to K vs V without a
+        second IO. Returns None for any non-packed / opaque / truncated buffer
+        (plain objects, metadata writes) -- the caller then emits aggregate-only.
+
+        Reads only the V1 fixed-header region (magic-pinned; V2+ appends after
+        the CRC per the format spec, so these offsets stay valid). No CRC, no
+        payload hash, no imports -- must never raise on the store/load path.
+        """
+        try:
+            if len(buf) < 76 or bytes(buf[:8]) != RawBlockCore._KVIO_CODEC_MAGIC:
+                return None
+            # Fixed layout (little-endian), from encoded_kv.py _FIXED_HEADER_FMT:
+            #   [12:14] k_dtype_id  [14:16] v_dtype_id  [68:76] scale_shape_n
+            #   then scale_shape (n*8 B), then k/v/scale payload_lens (3*8 B).
+            k_dtype_id, v_dtype_id = struct.unpack_from("<HH", buf, 12)
+            (scale_shape_n,) = struct.unpack_from("<q", buf, 68)
+            if scale_shape_n < 0 or scale_shape_n > 8:
+                return None
+            lens_off = 76 + 8 * scale_shape_n
+            if len(buf) < lens_off + 24:
+                return None
+            k_len, v_len, s_len = struct.unpack_from("<qqq", buf, lens_off)
+            if min(k_len, v_len, s_len) < 0:
+                return None
+            return {
+                "k_bytes": k_len,
+                "v_bytes": v_len,
+                "scale_bytes": s_len,
+                "k_dtype_id": k_dtype_id,
+                "v_dtype_id": v_dtype_id,
+            }
+        except Exception:
+            return None
+
+    def _kvio_emit(
+        self, trace_id, op, key, size, offset, meta=None,
+        part="kv", object_id=None, components=None,
+    ) -> None:
         if not self._kvio_enabled():
             return
         rec = {
             "trace_id": trace_id,
             "op": op,
             "key": key,
+            # Logical KV object this I/O belongs to. Equal to ``key`` for packed
+            # objects (no child markers); the seam the async K/V split fills in
+            # -- split-tier emits separate part="k"/"v" records that share one
+            # object_id (the parent key, child-marker stripped).
+            "object_id": object_id if object_id is not None else key,
+            # Which component of the object this device I/O carries. "kv" = the
+            # whole packed object (K+V+scales in one op, today's only case); the
+            # ``components`` field below breaks that down. Future split-tier
+            # placement sets "k"/"v"/"scales" per separate device op.
+            "part": part,
             "bytes": int(size),
             "slot_offset": int(offset),
             "ts": time.monotonic(),
         }
+        if components is not None:
+            rec["components"] = components
         if meta is not None:
             try:
                 rec["shape"] = list(meta.shape) if meta.shape is not None else None
@@ -740,6 +802,7 @@ class RawBlockCore:
                 self._kvio_emit(
                     trace_id, "store", key.encoded,
                     inflight.meta.size, inflight.offset, inflight.meta,
+                    components=self._kvio_peek_components(obj.byte_array),
                 )
 
         return RawBlockPutManyResult(
@@ -861,6 +924,7 @@ class RawBlockCore:
                     self._kvio_emit(
                         trace_id, "load", encoded_key,
                         entry.size, entry.offset, entry.meta,
+                        components=self._kvio_peek_components(objs[i].byte_array),
                     )
                 except Exception as e:
                     if raise_on_error:
