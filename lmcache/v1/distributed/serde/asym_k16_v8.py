@@ -50,7 +50,12 @@ from lmcache.v1.distributed.serde.multi import (
     MultiSerializer,
     validate_group_size,
 )
-from lmcache.v1.kv_codec import AsymK16V8Codec, EncodedKV, ScaleScope
+from lmcache.v1.kv_codec import (
+    AsymK16V8Codec,
+    EncodedKV,
+    ScaleScheme,
+    ScaleScope,
+)
 from lmcache.v1.kv_codec.asym_k16_v8 import (
     _tensor_to_bytes_fast,
     compute_v_scales,
@@ -65,6 +70,17 @@ _GROUP_SIZE_V_ONLY = 2  # (None, V) on serialize ; (None|K_out, V_out) on deseri
 
 def _v_fp8_max_for_dtype(fp8_dtype: torch.dtype) -> float:
     return float(torch.finfo(fp8_dtype).max)
+
+
+def _is_fp8(dtype: torch.dtype) -> bool:
+    """True for any 1-byte floating-point (FP8) dtype.
+
+    Covers every ``float8_*`` variant (e4m3fn, e5m2, and the fnuz
+    forms) without enumerating names that may be absent on a given
+    torch build: an FP8 dtype is exactly a floating-point dtype whose
+    element occupies one byte, whereas fp16/bf16 occupy two.
+    """
+    return dtype.is_floating_point and dtype.itemsize == 1
 
 
 class AsymK16V8MultiSerializer(MultiSerializer):
@@ -119,6 +135,14 @@ class AsymK16V8MultiSerializer(MultiSerializer):
             )
         if dst.tensor is None:
             raise ValueError("AsymK16V8MultiSerializer: dst.tensor is None")
+        if _is_fp8(v_obj.tensor.dtype):
+            raise ValueError(
+                "AsymK16V8MultiSerializer: V is already FP8 "
+                f"({v_obj.tensor.dtype}); this serde quantizes a native-dtype "
+                "(fp16/bf16) V and would double-quantize an fp8 input.  Use "
+                "AsymBytethroughK16V8VOnlyMultiSerializer to store raw fp8 V "
+                "bytes through (K stays in L1)."
+            )
 
         enc = self._codec.encode(k_obj.tensor, v_obj.tensor)
         blob = self._codec.to_bytes(enc)
@@ -242,6 +266,14 @@ class AsymK16V8MultiDeserializer(MultiDeserializer):
             )
 
         enc = self._codec.from_bytes(blob)
+        if enc.scale_scheme != ScaleScheme.COMPUTED_PER_TENSOR:
+            raise ValueError(
+                "AsymK16V8MultiDeserializer: blob scale_scheme="
+                f"{enc.scale_scheme.name} is not COMPUTED_PER_TENSOR; a "
+                "RAW_UNIT (byte-through) blob carries raw fp8 codes with no "
+                "scales and must be decoded by "
+                "AsymBytethroughK16V8VOnlyMultiDeserializer."
+            )
         # Push the K dtype conversion into the codec so the serde
         # doesn't need a post-decode cast.
         if k_obj is not None and k_obj.tensor is not None:
@@ -360,6 +392,14 @@ class AsymK16V8VOnlyMultiSerializer(MultiSerializer):
             raise ValueError("AsymK16V8VOnlyMultiSerializer: dst.tensor is None")
 
         v = v_obj.tensor
+        if _is_fp8(v.dtype):
+            raise ValueError(
+                "AsymK16V8VOnlyMultiSerializer: V is already FP8 "
+                f"({v.dtype}); this serde quantizes a native-dtype (fp16/bf16) "
+                "V and would double-quantize an fp8 input.  Use "
+                "AsymBytethroughK16V8VOnlyMultiSerializer to store raw fp8 V "
+                "bytes through."
+            )
 
         # Compute per-tensor (or per-scope) V scales and quantize V.
         v_scales = compute_v_scales(
@@ -459,7 +499,9 @@ class AsymK16V8VOnlyMultiDeserializer(MultiDeserializer):
       from a separate source (typically the host-resident K cache).
     * ``slot 1 = V_out`` — caller-provided MemoryObj at the model's
       native dtype, populated by dequantizing the stored FP8 V.
-      ``None`` here is a deliberate skip (a no-op call).
+      ``None`` here is a contract error (fail-closed): V is the only
+      payload this mode restores, so a None target is refused rather
+      than silently skipped.
     """
 
     def __init__(
@@ -492,10 +534,14 @@ class AsymK16V8VOnlyMultiDeserializer(MultiDeserializer):
 
         _k_obj, v_obj = dst
         if v_obj is None:
-            # Nothing to materialize.  The K slot is a no-op for this
-            # mode regardless, so a (None, None) call is a deliberate
-            # skip rather than an error.
-            return
+            # Fail closed: V is the only payload this mode restores.  A
+            # None V target would silently drop it and still report
+            # success, so refuse rather than no-op.
+            raise ValueError(
+                "AsymK16V8VOnlyMultiDeserializer: V dst slot is required; a "
+                "None V target would silently drop the only payload this "
+                "serde carries"
+            )
         if v_obj.tensor is None:
             raise ValueError(
                 "AsymK16V8VOnlyMultiDeserializer: non-None V dst slot "
@@ -506,6 +552,14 @@ class AsymK16V8VOnlyMultiDeserializer(MultiDeserializer):
         blob = src_view.numpy().tobytes()
 
         enc = self._codec.from_bytes(blob)
+        if enc.scale_scheme != ScaleScheme.COMPUTED_PER_TENSOR:
+            raise ValueError(
+                "AsymK16V8VOnlyMultiDeserializer: blob scale_scheme="
+                f"{enc.scale_scheme.name} is not COMPUTED_PER_TENSOR; a "
+                "RAW_UNIT (byte-through) blob carries raw fp8 codes with no "
+                "scales and must be decoded by "
+                "AsymBytethroughK16V8VOnlyMultiDeserializer."
+            )
         if enc.k_payload_len != 0:
             raise ValueError(
                 "AsymK16V8VOnlyMultiDeserializer: blob has k_payload_len="
@@ -552,6 +606,291 @@ class AsymK16V8VOnlyMultiDeserializer(MultiDeserializer):
                 f"{tuple(target_shape)} expects {v_obj.tensor.numel()}"
             )
         v_obj.tensor.copy_(v_dq_flat.reshape(target_shape))
+
+
+class AsymBytethroughK16V8VOnlyMultiSerializer(MultiSerializer):
+    """Copy an already-FP8 V straight through, no quantization.
+
+    This is the byte-through (Mode "C") counterpart to
+    :class:`AsymK16V8VOnlyMultiSerializer`.  It exists for the vLLM
+    live-asymmetric K16/V8 layout, where V is **already** FP8 e4m3 in
+    HBM.  There is no full-precision V to compute scales from, so the
+    raw e4m3 code bytes are copied byte-for-byte into the blob and no
+    scale bytes are stored.  The result is a
+    :class:`ScaleScheme.RAW_UNIT` :class:`EncodedKV`
+    (``scale_payload_len == 0``, implicit unit scale) written at
+    :class:`CodecVersion.V2`, so a scale-aware (V1-only) reader rejects
+    it fail-closed instead of misreading the raw codes as a quantized
+    payload.
+
+    **Preconditions the caller MUST guarantee** — this serde operates
+    on bytes and cannot see the attention layer's ``_v_scale`` scalar,
+    so it cannot check them itself:
+
+    * The producing layer's ``_v_scale`` (the external per-layer scalar
+      applied symmetrically at store and read) is exactly ``1.0``.  The
+      raw e4m3 codes only mean the same values in another process if
+      the scale is unit (or the scalar travels out-of-band).  A
+      non-unit scale makes a cross-engine reload silently wrong.
+    * The restore engine's ``_v_scale`` is likewise ``1.0``.
+
+    Slot semantics (identical to the scale-aware V-only serde):
+
+    * ``slot 0 = K`` MUST be ``None`` (K stays in L1 / host).
+    * ``slot 1 = V`` (required, dtype MUST be ``float8_e4m3fn``).
+    """
+
+    def __init__(
+        self,
+        fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+        # The k_dtype tag is a NON-AUTHORITATIVE hint recorded in the
+        # header.  It is NOT the source of truth for pairing this V blob
+        # with its CPU-resident K -- that authority belongs to the
+        # two-plane logical manifest (LO1), which records the paired K
+        # dtype and is checked at re-pair time.  Restore/pairing code
+        # MUST NOT gate on this tag.  Defaults to bfloat16 only so the
+        # header has a well-formed value.
+        k_dtype_tag: torch.dtype = torch.bfloat16,
+    ) -> None:
+        if fp8_dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "AsymBytethroughK16V8VOnlyMultiSerializer: byte-through only "
+                f"supports float8_e4m3fn (got {fp8_dtype}).  The live-asym "
+                "K16/V8 layout stores e4m3; other fp8 variants would need a "
+                "distinct on-disk tag and reader."
+            )
+        # The codec is used only for header (de)serialization here; its
+        # scale_scope / scale_dtype are irrelevant because no scales are
+        # ever computed or stored on the byte-through path.
+        self._codec = AsymK16V8Codec(fp8_dtype=fp8_dtype)
+        self._fp8_dtype = fp8_dtype
+        self._k_dtype_tag = k_dtype_tag
+
+    @property
+    def group_size(self) -> int:
+        return _GROUP_SIZE_V_ONLY
+
+    def input_slot_mapping(self) -> "tuple[int | None, ...]":
+        # Split-tier: K stays in L1 / host -- never passed to this
+        # serializer.  Slot 0 is always None; slot 1 reads parent
+        # group 1 (V).
+        return (None, 1)
+
+    def serialize(self, src: MemoryObjGroup, dst: MemoryObj, key: ObjectKey) -> int:
+        # ``key`` unused: this serde is content-agnostic.
+        validate_group_size(src, _GROUP_SIZE_V_ONLY, role="src")
+        k_obj, v_obj = src
+        if k_obj is not None:
+            raise ValueError(
+                "AsymBytethroughK16V8VOnlyMultiSerializer (split-tier): K "
+                "slot must be None.  K stays in host RAM in this mode and is "
+                "not written to the byte buffer."
+            )
+        if v_obj is None or v_obj.tensor is None:
+            raise ValueError(
+                "AsymBytethroughK16V8VOnlyMultiSerializer: V slot is required "
+                "and must have a tensor set"
+            )
+        if dst.tensor is None:
+            raise ValueError(
+                "AsymBytethroughK16V8VOnlyMultiSerializer: dst.tensor is None"
+            )
+
+        v = v_obj.tensor
+        if v.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "AsymBytethroughK16V8VOnlyMultiSerializer: V must already be "
+                f"float8_e4m3fn (got {v.dtype}); this serde copies raw e4m3 "
+                "codes byte-through and does NOT quantize.  Use "
+                "AsymK16V8VOnlyMultiSerializer for a native-dtype V."
+            )
+
+        # Raw uint8 byte copy of the fp8 codes -- no numeric op, no
+        # scales.  ``_tensor_to_bytes_fast`` reinterprets the storage as
+        # uint8 and memcpys it out, so the e4m3 bit patterns are
+        # preserved exactly.
+        v_cpu = v.detach().to("cpu").contiguous()
+        v_bytes = _tensor_to_bytes_fast(v_cpu)
+
+        enc = EncodedKV(
+            k_dtype=self._k_dtype_tag,
+            v_dtype=self._fp8_dtype,
+            # RAW_UNIT stores no scales.  Advertise scale_scope=NONE
+            # (not PER_TENSOR) so nothing downstream branches on
+            # PER_TENSOR and expects a scalar that was never written.
+            # scale_scheme stays the authoritative field.
+            scale_dtype=torch.float32,
+            scale_scope=ScaleScope.NONE,
+            scale_scheme=ScaleScheme.RAW_UNIT,
+            k_payload_len=0,
+            v_payload_len=len(v_bytes),
+            scale_payload_len=0,
+            scale_shape=(),
+            payload=v_bytes,
+        )
+        blob = self._codec.to_bytes(enc)
+        n = len(blob)
+        if dst.tensor.numel() < n:
+            raise ValueError(
+                f"AsymBytethroughK16V8VOnlyMultiSerializer: dst capacity "
+                f"{dst.tensor.numel()} below required {n}"
+            )
+        dst_view = dst.tensor.view(torch.uint8)
+        dst_view[:n].copy_(torch.frombuffer(blob, dtype=torch.uint8))
+        return n
+
+    def estimate_serialized_size(
+        self,
+        layout_descs: LayoutDescGroup,
+    ) -> int:
+        validate_group_size(layout_descs, _GROUP_SIZE_V_ONLY, role="layout")
+        k_layout, v_layout = layout_descs
+        if k_layout is not None:
+            raise ValueError(
+                "AsymBytethroughK16V8VOnlyMultiSerializer."
+                "estimate_serialized_size: K layout must be None — this mode "
+                "does not write K bytes"
+            )
+        if v_layout is None:
+            raise ValueError(
+                "AsymBytethroughK16V8VOnlyMultiSerializer."
+                "estimate_serialized_size: V layout is required"
+            )
+
+        # Bytes accounting: V (fp8) = 1 byte/elem; no scales (RAW_UNIT);
+        # header <= 1 KB for dtype tags / hashes.
+        v_bytes = sum(math.prod(s) for s in v_layout.shapes)
+        header_allowance = 1024
+        return header_allowance + v_bytes
+
+
+class AsymBytethroughK16V8VOnlyMultiDeserializer(MultiDeserializer):
+    """Restore raw FP8 V codes from a byte-through (RAW_UNIT) blob.
+
+    The blob carries only raw e4m3 V codes (no scales, no K).  Restore
+    is a straight byte copy back into an ``float8_e4m3fn`` destination;
+    there is no dequantization, because the codes were never quantized
+    away from a full-precision source in the first place.
+
+    Restoring into a wider dtype (fp16/bf16) is refused: a RAW_UNIT
+    blob carries no scale, so widening would require the caller's
+    per-layer ``_v_scale`` (== 1.0 by precondition) and a kernel-side
+    interpretation that this serde deliberately does not perform.  The
+    consumer restores the raw codes into its fp8 HBM V cache and lets
+    the attention kernel consume them, exactly as the producer did.
+
+    Slot semantics (split-tier mode):
+
+    * ``slot 0 = K_out`` — left untouched (K comes from L1 / host).
+    * ``slot 1 = V_out`` — caller-provided ``float8_e4m3fn`` MemoryObj,
+      populated bit-exact from the stored codes.  ``None`` is a
+      deliberate skip.
+    """
+
+    def __init__(
+        self,
+        fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+    ) -> None:
+        if fp8_dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "AsymBytethroughK16V8VOnlyMultiDeserializer: byte-through "
+                f"only supports float8_e4m3fn (got {fp8_dtype})."
+            )
+        self._codec = AsymK16V8Codec(fp8_dtype=fp8_dtype)
+        self._fp8_dtype = fp8_dtype
+
+    @property
+    def group_size(self) -> int:
+        return _GROUP_SIZE_V_ONLY
+
+    def output_slot_mapping(self) -> "tuple[int | None, ...]":
+        # Split-tier: K is sourced from L1 / host, not from this blob.
+        return (None, 1)
+
+    def deserialize(self, src: MemoryObj, dst: MemoryObjGroup, key: ObjectKey) -> None:
+        # ``key`` unused: this serde is content-agnostic.
+        validate_group_size(dst, _GROUP_SIZE_V_ONLY, role="dst")
+        if src.tensor is None:
+            raise ValueError(
+                "AsymBytethroughK16V8VOnlyMultiDeserializer: src.tensor is None"
+            )
+
+        _k_obj, v_obj = dst
+        if v_obj is None:
+            # Fail closed: V is the ONLY payload this serde restores.  A
+            # None V target means a broken load path would silently drop
+            # V and still report success, so refuse rather than no-op.
+            raise ValueError(
+                "AsymBytethroughK16V8VOnlyMultiDeserializer: V dst slot is "
+                "required; a None V target would silently drop the only "
+                "payload this serde carries"
+            )
+        if v_obj.tensor is None:
+            raise ValueError(
+                "AsymBytethroughK16V8VOnlyMultiDeserializer: non-None V dst "
+                "slot must have a tensor set"
+            )
+
+        src_view = src.tensor.view(torch.uint8).contiguous()
+        blob = src_view.numpy().tobytes()
+
+        enc = self._codec.from_bytes(blob)
+        # Strict RAW_UNIT invariants -- fail closed on anything that is
+        # not a pure byte-through V blob.
+        if enc.scale_scheme != ScaleScheme.RAW_UNIT:
+            raise ValueError(
+                "AsymBytethroughK16V8VOnlyMultiDeserializer: blob "
+                f"scale_scheme={enc.scale_scheme.name} is not RAW_UNIT; a "
+                "COMPUTED_PER_TENSOR blob must be decoded by "
+                "AsymK16V8VOnlyMultiDeserializer."
+            )
+        if enc.scale_payload_len != 0:
+            raise ValueError(
+                "AsymBytethroughK16V8VOnlyMultiDeserializer: RAW_UNIT blob "
+                f"must carry no scales; got scale_payload_len="
+                f"{enc.scale_payload_len}"
+            )
+        if enc.k_payload_len != 0:
+            raise ValueError(
+                "AsymBytethroughK16V8VOnlyMultiDeserializer: V-only blob must "
+                f"have k_payload_len=0; got {enc.k_payload_len}"
+            )
+        if enc.v_dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "AsymBytethroughK16V8VOnlyMultiDeserializer: byte-through V "
+                f"blob must be float8_e4m3fn; got v_dtype={enc.v_dtype}"
+            )
+        # Exact payload-length check: catch a schema-bit corruption of
+        # v_payload_len that survives to here (the header parser slices
+        # payload to the declared length, so a shrunk length would
+        # otherwise silently truncate V).  CRC covers the payload bytes,
+        # not this field, so check it explicitly.
+        if enc.v_payload_len != len(enc.payload):
+            raise ValueError(
+                "AsymBytethroughK16V8VOnlyMultiDeserializer: v_payload_len="
+                f"{enc.v_payload_len} disagrees with payload byte-length "
+                f"{len(enc.payload)}"
+            )
+
+        target_v_dtype = v_obj.tensor.dtype
+        if target_v_dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "AsymBytethroughK16V8VOnlyMultiDeserializer: restore target "
+                f"must be float8_e4m3fn (raw code restore, no dequant); got "
+                f"dst V dtype {target_v_dtype}.  Restoring into a wider dtype "
+                "would require a scale, which a RAW_UNIT blob does not carry."
+            )
+
+        v_bytes = enc.payload[: enc.v_payload_len]
+        v_codes = torch.frombuffer(v_bytes, dtype=torch.float8_e4m3fn).clone()
+        target_shape = v_obj.tensor.shape
+        if v_codes.numel() != v_obj.tensor.numel():
+            raise ValueError(
+                f"AsymBytethroughK16V8VOnlyMultiDeserializer: decoded V has "
+                f"{v_codes.numel()} elements, dst V shape "
+                f"{tuple(target_shape)} expects {v_obj.tensor.numel()}"
+            )
+        v_obj.tensor.copy_(v_codes.reshape(target_shape))
 
 
 # ============================================================================
@@ -684,5 +1023,50 @@ def _create_asym_k16_v8_v_only_serde(kwargs: dict[str, object]) -> SerdeProcesso
     )
 
 
+def _create_asym_bytethrough_k16_v8_v_only_serde(
+    kwargs: dict[str, object],
+) -> SerdeProcessor:
+    """Factory for the byte-through (Mode C) V-only asym K16/V8 serde.
+
+    For the vLLM live-asymmetric K16/V8 layout where V is already FP8
+    e4m3 in HBM.  The raw e4m3 codes are copied byte-through with no
+    scales; the blob is a :class:`ScaleScheme.RAW_UNIT` /
+    :class:`CodecVersion.V2` object.
+
+    Accepted ``kwargs``:
+
+    * ``fp8_dtype`` (str, default ``"float8_e4m3fn"``): the only
+      supported value; any other raises.
+    * ``k_dtype_tag`` (str, default ``"bfloat16"``): torch dtype
+      recorded in the header for cross-config gating on restore (K
+      itself is never written in this mode).
+    * ``max_workers`` (int, default ``4``): drainer thread-pool size.
+      Byte-through does no quant, so its per-item cost is far lower
+      than the scale-aware serde; 4 is kept for parity and to hide the
+      raw memcpy + L2 write under the async drainer.
+
+    Returns an :class:`AsyncSerdeProcessor` wrapping the byte-through
+    V-only pair.  ``input_slot_mapping`` returns ``(None, 1)`` so the
+    wrapper passes no K to the serializer.
+    """
+    fp8_dtype = _resolve_dtype(str(kwargs.get("fp8_dtype", "float8_e4m3fn")))
+    k_dtype_tag = _resolve_dtype(str(kwargs.get("k_dtype_tag", "bfloat16")))
+    max_workers = int(kwargs.get("max_workers", 4))  # type: ignore[call-overload]
+    return AsyncSerdeProcessor(
+        AsymBytethroughK16V8VOnlyMultiSerializer(  # type: ignore[arg-type]
+            fp8_dtype=fp8_dtype,
+            k_dtype_tag=k_dtype_tag,
+        ),
+        AsymBytethroughK16V8VOnlyMultiDeserializer(  # type: ignore[arg-type]
+            fp8_dtype=fp8_dtype,
+        ),
+        max_workers=max_workers,
+    )
+
+
 register_serde_factory("asym_k16_v8", _create_asym_k16_v8_serde)
 register_serde_factory("asym_k16_v8_v_only", _create_asym_k16_v8_v_only_serde)
+register_serde_factory(
+    "asym_bytethrough_k16_v8_v_only",
+    _create_asym_bytethrough_k16_v8_v_only_serde,
+)
