@@ -820,7 +820,18 @@ def derive_storage_placement_mode(
 # ``lmcache/v1/distributed/serde/asym_k16_v8.py``.  Any serde not listed
 # here is treated as scale-aware (COMPUTED_LEGACY), which keeps every
 # pre-existing config on the legacy (role-only) child key.
-_RAW_UNIT_SERDE_TYPES = frozenset({"asym_bytethrough_k16_v8_v_only"})
+_RAW_UNIT_SERDE_TYPES = frozenset(
+    {
+        # V-only byte-through -> KV_SPLIT_TIER (K in L1, single-process).
+        "asym_bytethrough_k16_v8_v_only",
+        # Both-plane byte-through -> KV_TOGETHER (K+V in one durable L2
+        # object, cross-process/restart reusable).  RAW_UNIT here drives
+        # the fp8 V-component dtype + the heterogeneous pre-split layout
+        # pass-through; the KV_TOGETHER placement (from its (0,1) input
+        # slot mapping) keeps the split-tier manifest inert.
+        "asym_bytethrough_k16_v8",
+    }
+)
 
 
 def derive_component_key_scheme(
