@@ -3125,8 +3125,232 @@ impl Drop for RawBlockDevice {
     }
 }
 
+// ---------------------------------------------------------------------------
+// blk_iobuf_pool benchmark: opt-in path that exercises the kernel's per-queue
+// folio pool via IORING_REGISTER_BUFFERS_ALLOC_FOR_FILE (io_uring_register
+// opcode 38).
+//
+// The normal put/load path submits IORING_OP_URING_CMD (NVMe passthrough) with
+// an inline, page-aligned *user* buffer, which the kernel maps zero-copy -- it
+// never touches blk_iobuf_pool (allocs stays 0 under off/auto/force). The pool
+// is fed only by op-38 kernel-allocated registered buffers, or by a bounce in
+// blk_rq_map_user_iov. This helper is the opt-in that makes the pool engage so
+// it can be measured.
+//
+// Constraints baked in by the kernel op (v7.2, commit 83df08bcb3ef):
+//   * op 38 requires a *block* device fd (S_ISBLK) -- e.g. /dev/nvme1n1, NOT the
+//     /dev/ngXnY char device uring_cmd uses. So this drives the io_uring
+//     Read/Write engine on the block device, not passthrough.
+//   * the folios are kernel-owned (imu->ubuf=0, IO_REGBUF_F_KBUF); there is no
+//     userspace mapping (IORING_BUF_ALLOC_MMAP is unimplemented), so no user data
+//     transits them. That is fine here: this is a content-free storage-geometry
+//     benchmark, not a data round-trip.
+//   * iobuf_pool_allocs increments at REGISTER time (the handler allocates
+//     nr_folios from the pool), so registration alone engages the pool; the I/O
+//     loop then proves the pool-backed data path works and times it. Direction
+//     defaults to READ so the benchmark never clobbers the device.
+
+#[repr(C)]
+struct IoUringBufAllocForFile {
+    fd: u32,
+    index: u32,
+    nr_buffers: u32,
+    flags: u32,
+    buffer_size: u64,
+    min_order: u32,
+    pref_order: u32,
+    reserved: [u32; 2],
+}
+
+const IORING_REGISTER_BUFFERS: libc::c_long = 0;
+const IORING_REGISTER_BUFFERS_ALLOC_FOR_FILE: libc::c_long = 38;
+const IORING_BUF_ALLOC_REQUIRE_QUEUE_POOL: u32 = 1 << 1;
+const IORING_BUF_ALLOC_ALLOW_FALLBACK: u32 = 1 << 2;
+const IORING_BUF_ALLOC_READ: u32 = 1 << 3;
+const IORING_BUF_ALLOC_WRITE: u32 = 1 << 4;
+
+/// Benchmark the blk_iobuf_pool path on a block device.
+///
+/// Registers one pool-backed fixed buffer of `buffer_size` bytes into slot 0 via
+/// io_uring op 38, then submits `nr_ops` ReadFixed (or WriteFixed) of that buffer
+/// against `blkdev_path` at rotating offsets. Returns `(elapsed_ms, ops)`; read
+/// `iobuf_pool_allocs` from sysfs before/after to confirm engagement.
+#[pyfunction]
+#[pyo3(signature = (blkdev_path, buffer_size, nr_ops, is_write=false, use_pool=true, queue_depth=8, span_bytes=0, require_pool=true, allow_fallback=false))]
+fn iobuf_pool_bench(
+    blkdev_path: String,
+    buffer_size: u64,
+    nr_ops: u64,
+    is_write: bool,
+    use_pool: bool,
+    queue_depth: u32,
+    span_bytes: u64,
+    require_pool: bool,
+    allow_fallback: bool,
+) -> PyResult<(f64, u64)> {
+    use std::os::unix::io::AsRawFd;
+
+    if buffer_size == 0 {
+        return Err(PyValueError::new_err("buffer_size must be > 0"));
+    }
+    let dev = std::fs::OpenOptions::new()
+        .read(true)
+        .write(is_write)
+        .open(&blkdev_path)
+        .map_err(|e| PyRuntimeError::new_err(format!("open {}: {}", blkdev_path, e)))?;
+    let dev_fd = dev.as_raw_fd();
+
+    let mut ring: IoUring<SqueueEntry, Entry> = IoUring::builder()
+        .build(queue_depth.max(1))
+        .map_err(|e| PyRuntimeError::new_err(format!("io_uring init: {}", e)))?;
+    let ring_fd = ring.as_raw_fd();
+
+    // Keep a baseline user buffer alive for the whole run when use_pool=false.
+    // (In the pool arm this stays empty and unused -- the folios are kernel-owned.)
+    let mut baseline_buf: Vec<u8>;
+    let buf_ptr: *mut u8;
+
+    if use_pool {
+        baseline_buf = Vec::new();
+        let _ = &baseline_buf;
+        // Arm B (pool ON): pool-backed folios via op 38.
+        // Pre-size a sparse fixed-buffer table so op 38 has an empty slot to fill.
+        let iovs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        }; 16];
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_io_uring_register,
+                ring_fd as libc::c_long,
+                IORING_REGISTER_BUFFERS,
+                iovs.as_ptr() as usize as libc::c_long,
+                16_i64,
+            )
+        };
+        if rc < 0 {
+            return Err(PyRuntimeError::new_err(format!(
+                "IORING_REGISTER_BUFFERS (sparse 16) failed: {}",
+                io::Error::last_os_error()
+            )));
+        }
+
+        // op 38: allocate a pool-backed buffer into slot 0.
+        let mut flags = if is_write {
+            IORING_BUF_ALLOC_WRITE
+        } else {
+            IORING_BUF_ALLOC_READ
+        };
+        if require_pool {
+            flags |= IORING_BUF_ALLOC_REQUIRE_QUEUE_POOL;
+        }
+        if allow_fallback {
+            flags |= IORING_BUF_ALLOC_ALLOW_FALLBACK;
+        }
+        let req = IoUringBufAllocForFile {
+            fd: dev_fd as u32,
+            index: 0,
+            nr_buffers: 1,
+            flags,
+            buffer_size,
+            min_order: 0,
+            pref_order: 0,
+            reserved: [0, 0],
+        };
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_io_uring_register,
+                ring_fd as libc::c_long,
+                IORING_REGISTER_BUFFERS_ALLOC_FOR_FILE,
+                &req as *const IoUringBufAllocForFile as usize as libc::c_long,
+                1_i64,
+            )
+        };
+        if rc < 0 {
+            return Err(PyRuntimeError::new_err(format!(
+                "IORING_REGISTER_BUFFERS_ALLOC_FOR_FILE (op 38) failed: {} \
+                 (need a block device with an active blk_iobuf pool)",
+                io::Error::last_os_error()
+            )));
+        }
+        // KBUF fixed buffer: the SQE addr is a 0-based offset (imu->ubuf == 0),
+        // so a null pointer means "start of the buffer".
+        buf_ptr = std::ptr::null_mut();
+    } else {
+        // Arm A (pool OFF): an ordinary user buffer registered as a normal fixed
+        // buffer (IORING_REGISTER_BUFFERS, op 0). Same ReadFixed/WriteFixed loop,
+        // same device -- but the pool is never touched. This is the baseline the
+        // pool arm is compared against.
+        baseline_buf = vec![0u8; buffer_size as usize];
+        let iovs = [libc::iovec {
+            iov_base: baseline_buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buffer_size as usize,
+        }];
+        let sub = ring.submitter();
+        let result = unsafe { sub.register_buffers(&iovs) };
+        if let Err(e) = result {
+            return Err(PyRuntimeError::new_err(format!(
+                "register_buffers (baseline user buffer) failed: {}",
+                e
+            )));
+        }
+        buf_ptr = baseline_buf.as_mut_ptr();
+    }
+
+    // Rotate the file offset over a span so we are not re-touching one LBA.
+    let span = if span_bytes == 0 {
+        buffer_size.saturating_mul(1024)
+    } else {
+        span_bytes.max(buffer_size)
+    };
+
+    let start = std::time::Instant::now();
+    let mut done: u64 = 0;
+    let mut off: u64 = 0;
+    for i in 0..nr_ops {
+        // buf_ptr is null for the pool arm (KBUF, 0-based offset) and the real
+        // user-buffer address for the baseline arm.
+        let sqe = if is_write {
+            opcode::WriteFixed::new(Fd(dev_fd), buf_ptr as *const u8, buffer_size as u32, 0)
+                .offset(off)
+                .build()
+                .user_data(i)
+        } else {
+            opcode::ReadFixed::new(Fd(dev_fd), buf_ptr, buffer_size as u32, 0)
+                .offset(off)
+                .build()
+                .user_data(i)
+        };
+        unsafe {
+            ring.submission()
+                .push(&sqe)
+                .map_err(|e| PyRuntimeError::new_err(format!("sqe push: {}", e)))?;
+        }
+        ring.submit_and_wait(1)
+            .map_err(|e| PyRuntimeError::new_err(format!("submit_and_wait: {}", e)))?;
+        let cqe = ring
+            .completion()
+            .next()
+            .ok_or_else(|| PyRuntimeError::new_err("no completion"))?;
+        if cqe.result() < 0 {
+            return Err(PyOSError::new_err((
+                -cqe.result(),
+                format!("iobuf fixed I/O failed at op {}", i),
+            )));
+        }
+        done += 1;
+        off += buffer_size;
+        if off + buffer_size > span {
+            off = 0;
+        }
+    }
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    Ok((ms, done))
+}
+
 #[pymodule]
 fn lmcache_rust_raw_block_io(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RawBlockDevice>()?;
+    m.add_function(pyo3::wrap_pyfunction!(iobuf_pool_bench, m)?)?;
     Ok(())
 }
