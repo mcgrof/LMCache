@@ -52,6 +52,8 @@ from lmcache.v1.distributed.serde.multi import (
 )
 from lmcache.v1.kv_codec import (
     AsymK16V8Codec,
+    CodecHashes,
+    CodecMismatchError,
     EncodedKV,
     ScaleScheme,
     ScaleScope,
@@ -81,6 +83,74 @@ def _is_fp8(dtype: torch.dtype) -> bool:
     element occupies one byte, whereas fp16/bf16 occupy two.
     """
     return dtype.is_floating_point and dtype.itemsize == 1
+
+
+# ---------------------------------------------------------------------------
+# Cross-process layout-provenance gate (byte-through / durable KV_TOGETHER).
+#
+# The object key already pins tokens (content hash), model_name, TP topology
+# (kv_rank encodes world_size/rank/local), and the per-user salt.  What it does
+# NOT pin is the physical/semantic KV *interpretation* that can vary under one
+# key: block/page size, RoPE, attention backend, dtype/layout version, and the
+# exact model revision (a model_name string is not a model identity).  For a
+# durable object reused across processes, a mismatch on any of these silently
+# mis-restores KV.  We fold that config into a ``CodecHashes`` provenance record
+# written into the blob header, and enforce it fail-closed on restore.
+# ---------------------------------------------------------------------------
+
+# The provenance keys accepted from serde config kwargs -> CodecHashes.
+_PROVENANCE_KEYS = frozenset(CodecHashes._CHECK_ORDER)
+
+
+def _codec_hashes_from_mapping(prov: object) -> CodecHashes:
+    """Build a :class:`CodecHashes` from a serde-config provenance mapping.
+
+    Unknown keys are rejected (a typo must not silently weaken the gate);
+    absent keys default to empty (wildcard). ``None`` yields an all-empty
+    record (gate off).
+    """
+    if prov is None:
+        return CodecHashes()
+    if not isinstance(prov, dict):
+        raise ValueError(
+            "layout_provenance must be a mapping of "
+            f"{sorted(_PROVENANCE_KEYS)} -> str; got {type(prov).__name__}"
+        )
+    unknown = set(prov) - _PROVENANCE_KEYS
+    if unknown:
+        raise ValueError(
+            f"layout_provenance has unknown keys {sorted(unknown)}; "
+            f"valid keys are {sorted(_PROVENANCE_KEYS)}"
+        )
+    return CodecHashes(**{k: str(prov[k]) for k in prov})
+
+
+def _is_empty_provenance(h: CodecHashes) -> bool:
+    return not any(getattr(h, k) for k in CodecHashes._CHECK_ORDER)
+
+
+def _enforce_provenance(got: CodecHashes, expected: CodecHashes) -> None:
+    """Fail-closed cross-process provenance check.
+
+    ``AsymK16V8Codec._check_hash_match`` (via ``from_bytes``) already rejects a
+    non-empty-vs-non-empty mismatch, but it treats an *empty* field as a
+    wildcard (fail-open) — so a legacy / partial-provenance blob would be
+    accepted.  For the durable byte-through path that is unsafe: this adds the
+    fail-closed leg — if the reader requires a field (expected non-empty) but
+    the blob does not carry it (got empty), reject.  When the reader configures
+    NO provenance (expected all-empty), the gate is inert (legacy behaviour).
+    """
+    if _is_empty_provenance(expected):
+        return
+    for key in CodecHashes._CHECK_ORDER:
+        ev = getattr(expected, key)
+        gv = getattr(got, key)
+        if ev and not gv:
+            raise CodecMismatchError(
+                f"byte-through provenance gate: durable blob is missing {key!r} "
+                f"but this engine requires {ev!r}; refusing a cross-process "
+                "reuse that cannot be verified (fail-closed)."
+            )
 
 
 class AsymK16V8MultiSerializer(MultiSerializer):
@@ -933,6 +1003,7 @@ class AsymBytethroughK16V8MultiSerializer(MultiSerializer):
     def __init__(
         self,
         fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+        layout_provenance: "CodecHashes | None" = None,
     ) -> None:
         if fp8_dtype != torch.float8_e4m3fn:
             raise ValueError(
@@ -943,6 +1014,11 @@ class AsymBytethroughK16V8MultiSerializer(MultiSerializer):
         # are ever computed on the byte-through path.
         self._codec = AsymK16V8Codec(fp8_dtype=fp8_dtype)
         self._fp8_dtype = fp8_dtype
+        # Cross-process layout provenance stamped into every object header so a
+        # reader with a different physical/semantic KV config (block size,
+        # RoPE, dtype/layout version, model revision, ...) fails closed on
+        # restore rather than mis-restoring KV.  Empty = gate off (legacy).
+        self._provenance = layout_provenance or CodecHashes()
 
     @property
     def group_size(self) -> int:
@@ -1006,6 +1082,9 @@ class AsymBytethroughK16V8MultiSerializer(MultiSerializer):
             scale_dtype=torch.float32,
             scale_scope=ScaleScope.NONE,
             scale_scheme=ScaleScheme.RAW_UNIT,
+            # Stamp the cross-process provenance into the header (empty when
+            # unconfigured -> the gate is inert on restore).
+            hashes=self._provenance,
             k_payload_len=len(k_bytes),
             v_payload_len=len(v_bytes),
             scale_payload_len=0,
@@ -1068,6 +1147,7 @@ class AsymBytethroughK16V8MultiDeserializer(MultiDeserializer):
     def __init__(
         self,
         fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+        layout_provenance: "CodecHashes | None" = None,
     ) -> None:
         if fp8_dtype != torch.float8_e4m3fn:
             raise ValueError(
@@ -1076,6 +1156,11 @@ class AsymBytethroughK16V8MultiDeserializer(MultiDeserializer):
             )
         self._codec = AsymK16V8Codec(fp8_dtype=fp8_dtype)
         self._fp8_dtype = fp8_dtype
+        # The LOCAL engine's expected layout provenance.  On restore the blob's
+        # stamped provenance must match (and, if this engine requires a field,
+        # be present) or the object is refused as an unverifiable cross-process
+        # reuse.  Empty = gate off (legacy single-process behaviour).
+        self._provenance = layout_provenance or CodecHashes()
 
     @property
     def group_size(self) -> int:
@@ -1106,7 +1191,13 @@ class AsymBytethroughK16V8MultiDeserializer(MultiDeserializer):
 
         src_view = src.tensor.view(torch.uint8).contiguous()
         blob = src_view.numpy().tobytes()
-        enc = self._codec.from_bytes(blob)
+        # Cross-process provenance gate: from_bytes rejects a non-empty
+        # mismatch (block size / RoPE / model revision / layout version /...),
+        # and _enforce_provenance adds the fail-closed leg (this engine requires
+        # a field the durable blob does not carry).  Both raise
+        # CodecMismatchError, which the load path treats as a cache miss.
+        enc = self._codec.from_bytes(blob, expected_hashes=self._provenance)
+        _enforce_provenance(enc.hashes, self._provenance)
 
         # Strict RAW_UNIT invariants -- fail closed on anything that is not
         # a pure both-plane byte-through blob.
@@ -1387,15 +1478,26 @@ def _create_asym_bytethrough_k16_v8_serde(
 
     The producing and restoring layers' per-layer ``_v_scale`` MUST be
     ``1.0`` (the serde sees only bytes and cannot check it).
+
+    Cross-process provenance: pass ``layout_provenance`` (a mapping of any of
+    ``model_id``, ``model_revision_hash``, ``tokenizer_hash``,
+    ``rope_config_hash``, ``attention_backend``, ``kv_layout`` -> str) to stamp
+    the engine's KV-interpretation identity into every object and enforce it
+    fail-closed on restore.  Absent -> the gate is inert (single-process /
+    same-config only).  The connector supplies these digests from the live
+    vLLM config (block size, RoPE, layout version, model revision, ...).
     """
     fp8_dtype = _resolve_dtype(str(kwargs.get("fp8_dtype", "float8_e4m3fn")))
     max_workers = int(kwargs.get("max_workers", 4))  # type: ignore[call-overload]
+    provenance = _codec_hashes_from_mapping(kwargs.get("layout_provenance"))
     return AsyncSerdeProcessor(
         AsymBytethroughK16V8MultiSerializer(  # type: ignore[arg-type]
             fp8_dtype=fp8_dtype,
+            layout_provenance=provenance,
         ),
         AsymBytethroughK16V8MultiDeserializer(  # type: ignore[arg-type]
             fp8_dtype=fp8_dtype,
+            layout_provenance=provenance,
         ),
         max_workers=max_workers,
     )
