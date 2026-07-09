@@ -45,6 +45,7 @@ from lmcache.v1.distributed.serde.asym_k16_v8 import (
 )
 from lmcache.v1.distributed.serde.multi import MemoryObjGroup
 from lmcache.v1.kv_codec import (
+    CodecHashes,
     CodecVersion,
     ScaleScheme,
     deserialize_header,
@@ -354,3 +355,109 @@ def test_roundtrip_nontrivial_patterns() -> None:
     k_out, v_out = _roundtrip(k, v)
     assert torch.equal(k_out, k)
     assert torch.equal(_u8(v_out), _u8(v))
+
+
+# =============================================================================
+# Cross-process layout-provenance gate (fail-closed)
+# =============================================================================
+
+
+def _roundtrip_with_provenance(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    write_prov: "CodecHashes | None",
+    read_prov: "CodecHashes | None",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from lmcache.v1.distributed.serde.asym_k16_v8 import (
+        AsymBytethroughK16V8MultiDeserializer as _D,
+        AsymBytethroughK16V8MultiSerializer as _S,
+    )
+
+    s = _S(layout_provenance=write_prov)
+    layout = (
+        MemoryLayoutDesc(shapes=[k.shape], dtypes=[k.dtype]),
+        MemoryLayoutDesc(shapes=[v.shape], dtypes=[v.dtype]),
+    )
+    buf = _byte_buffer(s.estimate_serialized_size(layout))
+    s.serialize(
+        _grp(_FakeMemoryObj(tensor=k), _FakeMemoryObj(tensor=v)), buf, _TEST_KEY
+    )
+    d = _D(layout_provenance=read_prov)
+    k_out = _FakeMemoryObj(tensor=torch.empty_like(k))
+    v_out = _FakeMemoryObj(tensor=torch.empty_like(v))
+    d.deserialize(buf, _grp(k_out, v_out), _TEST_KEY)
+    return k_out.tensor, v_out.tensor
+
+
+def test_provenance_gate_inert_when_unconfigured() -> None:
+    """No provenance on either side -> legacy behaviour, byte-identical."""
+    k = _bf16_tensor(4, 8, seed=30)
+    v = _fp8_tensor(4, 8, seed=31)
+    k_out, v_out = _roundtrip_with_provenance(k, v, write_prov=None, read_prov=None)
+    assert torch.equal(k_out, k) and torch.equal(_u8(v_out), _u8(v))
+
+
+def test_provenance_matching_config_round_trips() -> None:
+    from lmcache.v1.kv_codec import CodecHashes
+
+    prov = CodecHashes(kv_layout="blk16;bf16K;fp8V;v1", model_revision_hash="abc")
+    k = _bf16_tensor(4, 8, seed=32)
+    v = _fp8_tensor(4, 8, seed=33)
+    k_out, v_out = _roundtrip_with_provenance(k, v, write_prov=prov, read_prov=prov)
+    assert torch.equal(k_out, k) and torch.equal(_u8(v_out), _u8(v))
+
+
+def test_provenance_mismatch_rejected() -> None:
+    """Different block-size/layout digest -> CodecMismatchError (=> miss)."""
+    from lmcache.v1.kv_codec import CodecHashes, CodecMismatchError
+
+    write = CodecHashes(kv_layout="blk16;bf16K;fp8V;v1")
+    read = CodecHashes(kv_layout="blk32;bf16K;fp8V;v1")  # different block size
+    k = _bf16_tensor(4, 8, seed=34)
+    v = _fp8_tensor(4, 8, seed=35)
+    with pytest.raises(CodecMismatchError, match="kv_layout"):
+        _roundtrip_with_provenance(k, v, write_prov=write, read_prov=read)
+
+
+def test_provenance_fail_closed_on_missing_field() -> None:
+    """Writer stamped NO provenance, reader requires it -> refuse (fail-closed),
+    NOT a wildcard accept."""
+    from lmcache.v1.kv_codec import CodecHashes, CodecMismatchError
+
+    read = CodecHashes(kv_layout="blk16;bf16K;fp8V;v1")
+    k = _bf16_tensor(4, 8, seed=36)
+    v = _fp8_tensor(4, 8, seed=37)
+    with pytest.raises(CodecMismatchError, match="missing 'kv_layout'|fail-closed"):
+        _roundtrip_with_provenance(k, v, write_prov=None, read_prov=read)
+
+
+def test_provenance_reader_unconfigured_accepts_stamped_blob() -> None:
+    """A reader with NO provenance configured (single-process/legacy) still
+    reads a stamped blob -- the gate only engages when the reader opts in."""
+    from lmcache.v1.kv_codec import CodecHashes
+
+    write = CodecHashes(kv_layout="blk16;bf16K;fp8V;v1")
+    k = _bf16_tensor(4, 8, seed=38)
+    v = _fp8_tensor(4, 8, seed=39)
+    k_out, v_out = _roundtrip_with_provenance(k, v, write_prov=write, read_prov=None)
+    assert torch.equal(k_out, k) and torch.equal(_u8(v_out), _u8(v))
+
+
+def test_factory_parses_layout_provenance_and_rejects_unknown_keys() -> None:
+    from lmcache.v1.distributed.serde import create_serde_processor
+    from lmcache.v1.distributed.serde.base import SerdeConfig
+
+    ok = SerdeConfig(
+        type="asym_bytethrough_k16_v8",
+        kwargs={"layout_provenance": {"kv_layout": "blk16", "model_id": "m"}},
+    )
+    p = create_serde_processor(ok)
+    p.close()  # resolves without error
+
+    bad = SerdeConfig(
+        type="asym_bytethrough_k16_v8",
+        kwargs={"layout_provenance": {"block_size": "16"}},  # unknown key
+    )
+    with pytest.raises(ValueError, match="unknown keys"):
+        create_serde_processor(bad)
