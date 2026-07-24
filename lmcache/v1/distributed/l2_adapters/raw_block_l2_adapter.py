@@ -295,6 +295,10 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             iouring_queue_depth=self.iouring_queue_depth,
             use_uring_cmd=self.use_uring_cmd,
             max_data_transfer_size=self.max_data_transfer_size,
+            # Let a batched load issue up to num_load_workers objects' reads
+            # concurrently instead of one-at-a-time (QD~1). Previously this knob
+            # only sized MP dispatch threads and the core read loop stayed serial.
+            load_parallelism=self.num_load_workers,
         )
 
 
