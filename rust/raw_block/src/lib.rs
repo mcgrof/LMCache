@@ -1273,9 +1273,9 @@ impl RawBlockDevice {
                         IoUringWrapper::Big(ring) => {
                             let mut ring = ring.lock().unwrap();
                             unsafe {
-                                ring.submission()
-                                    .push(&sqe128)
-                                    .expect("failed to push sqe128");
+                                ring.submission().push(&sqe128).map_err(|_| {
+                                    PyRuntimeError::new_err("submission queue full")
+                                })?;
                             }
                         }
                         IoUringWrapper::Standard(_) => {
@@ -1317,13 +1317,17 @@ impl RawBlockDevice {
                             let mut ring = ring.lock().unwrap();
                             let sqe128: Entry128 = sqe.into();
                             unsafe {
-                                ring.submission().push(&sqe128).expect("failed to push sqe");
+                                ring.submission().push(&sqe128).map_err(|_| {
+                                    PyRuntimeError::new_err("submission queue full")
+                                })?;
                             }
                         }
                         IoUringWrapper::Standard(ring) => {
                             let mut ring = ring.lock().unwrap();
                             unsafe {
-                                ring.submission().push(&sqe).expect("failed to push sqe");
+                                ring.submission().push(&sqe).map_err(|_| {
+                                    PyRuntimeError::new_err("submission queue full")
+                                })?;
                             }
                         }
                     }
@@ -1559,7 +1563,18 @@ impl RawBlockDevice {
                             let mut batch: Vec<IoSubmission> = std::mem::take(&mut *q);
                             let batch_len = batch.len();
 
-                            let available = ring_size - ring_clone.submission_len();
+                            // Bound OUTSTANDING I/O to the ring depth, not just the number
+                            // of unsubmitted SQEs. submission_len() drops to 0 after each
+                            // submit(), so bounding on it alone lets total in-flight grow past
+                            // the completion-queue capacity; a CQ overflow silently drops
+                            // completions, so in_flight/batch counters never reach 0 and
+                            // wait_iouring() hangs forever. in_flight.len() is the live
+                            // outstanding count on this ring; capping it at ring_size keeps a
+                            // bounded window full and never overflows the CQ.
+                            ring_clone.submission_sync();
+                            let inflight_room = ring_size.saturating_sub(in_flight.len());
+                            let sq_room = ring_size.saturating_sub(ring_clone.submission_len());
+                            let available = std::cmp::min(inflight_room, sq_room);
                             let to_submit_count = std::cmp::min(available, batch_len);
 
                             if to_submit_count < batch_len {
@@ -1574,15 +1589,33 @@ impl RawBlockDevice {
                             // Track user_data values for each submission to clean up in_flight entries
                             // if submit() fails or returns partial count
                             let mut user_data_list: Vec<u64> = Vec::with_capacity(to_submit_count);
-                            for sub in batch.iter().take(to_submit_count) {
+                            let mut pushed_count = 0usize;
+                            for (idx, sub) in batch.iter().take(to_submit_count).enumerate() {
                                 let user_data = next_user_data;
                                 next_user_data = next_user_data.wrapping_add(1);
-                                user_data_list.push(user_data);
                                 in_flight.insert(user_data, sub.clone());
 
-                                // Build and submit SQE
-                                let _ = build_and_submit_sqe(&ring_clone, sub, user_data);
+                                // Build and push the SQE. If the ring is full (or the SQE
+                                // cannot be built) this sub was NOT queued: drop its in_flight
+                                // entry, requeue it and the rest at the front, and stop pushing
+                                // for this round -- completions will free ring space. Do NOT
+                                // panic here: a dead worker leaves wait_iouring() blocked
+                                // forever (the intermittent load hang this replaces).
+                                if build_and_submit_sqe(&ring_clone, sub, user_data).is_err() {
+                                    in_flight.remove(&user_data);
+                                    let requeue: Vec<_> = batch[idx..to_submit_count].to_vec();
+                                    if !requeue.is_empty() {
+                                        let mut q = queue_clone.lock().unwrap();
+                                        q.splice(0..0, requeue);
+                                    }
+                                    break;
+                                }
+                                user_data_list.push(user_data);
+                                pushed_count += 1;
                             }
+                            // Downstream submit/EAGAIN handling operates on what actually
+                            // reached the ring, not what we intended to push.
+                            let to_submit_count = pushed_count;
 
                             let submit_result = match &ring_clone {
                                 IoUringWrapper::Standard(ring) => {
