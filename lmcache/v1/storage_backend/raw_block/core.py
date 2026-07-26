@@ -622,7 +622,46 @@ class RawBlockCore:
         if path is False:  # unresolved
             path = os.environ.get("LMCACHE_KVIO_TRACE") or None
             self._kvio_trace_path = path
+            if path is not None:
+                # Per-emitter identity: demuxes multiple RawBlockCore
+                # instances (whose trace_id counters both start at 1) when
+                # they share one trace file, and ties records to a process.
+                self._kvio_pid = os.getpid()
+                self._kvio_instance = os.urandom(4).hex()
+                self._kvio_write_meta()
         return path is not None
+
+    def _kvio_write_meta(self) -> None:
+        """One self-describing header line per emitter instance.
+
+        Makes the trace file self-contained: consumers no longer need the
+        capture-time CLI flags (header_bytes, mdts, ...) to interpret it, and
+        the monotonic+realtime pair anchors this file to wall-clock logs.
+        Uses event_type (absent from op records) so per-op consumers skip it.
+        """
+        rec = {
+            "event_type": "kvio_meta",
+            "kvio_schema": 2,
+            "hostname": os.uname().nodename,
+            "pid": self._kvio_pid,
+            "instance": self._kvio_instance,
+            "device_path": str(getattr(self, "device_path", "")),
+            "capacity_bytes": int(getattr(self, "capacity_bytes", 0) or 0),
+            "slot_bytes": int(getattr(self, "slot_bytes", 0) or 0),
+            "block_align": int(getattr(self, "block_align", 0) or 0),
+            "header_bytes": int(getattr(self, "header_bytes", 0) or 0),
+            "max_data_transfer_size": int(
+                getattr(self, "max_data_transfer_size", 0) or 0),
+            "io_engine": str(getattr(self, "io_engine", "")),
+            "use_uring_cmd": bool(getattr(self, "use_uring_cmd", False)),
+            "ts_monotonic": time.monotonic(),
+            "ts_realtime": time.time(),
+        }
+        try:
+            with open(self._kvio_trace_path, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+        except Exception:
+            pass
 
     def _kvio_next_tid(self) -> int:
         tid = getattr(self, "_kvio_tid_counter", 0) + 1
@@ -680,6 +719,7 @@ class RawBlockCore:
     def _kvio_emit(
         self, trace_id, op, key, size, offset, meta=None,
         part="kv", object_id=None, components=None,
+        ts_start=None, error=None,
     ) -> None:
         if not self._kvio_enabled():
             return
@@ -699,8 +739,19 @@ class RawBlockCore:
             "part": part,
             "bytes": int(size),
             "slot_offset": int(offset),
+            # ts = op END (emitted after the device I/O returned); ts_start =
+            # trace_id-allocation time, i.e. before buffer prep + submission —
+            # the delta over the device-visible window is Python-side cost.
             "ts": time.monotonic(),
+            "pid": self._kvio_pid,
+            "instance": self._kvio_instance,
         }
+        if ts_start is not None:
+            rec["ts_start"] = ts_start
+        if error is not None:
+            # Failed ops previously emitted nothing — a silent gap a timeline
+            # reads as "no activity" when the truth is "activity that failed".
+            rec["error"] = str(error)[:120]
         if components is not None:
             rec["components"] = components
         if meta is not None:
@@ -776,6 +827,7 @@ class RawBlockCore:
                 self._inflight[key.encoded] = _Inflight(offset=offset, meta=meta)
 
             trace_id = self._kvio_next_tid() if self._kvio_enabled() else 0
+            kvio_t0 = time.monotonic() if trace_id else None
             success = self._write_one(key, obj, offset, trace_id=trace_id)
 
             with self._lock:
@@ -789,6 +841,12 @@ class RawBlockCore:
                     )
                     self._meta_dirty_total += 1
                     results[i] = False
+                    self._kvio_emit(
+                        trace_id, "store", key.encoded,
+                        inflight.meta.size, inflight.offset, inflight.meta,
+                        ts_start=kvio_t0,
+                        error="canceled" if inflight.canceled else "write_failed",
+                    )
                     continue
 
                 self._index[key.encoded] = _Entry(
@@ -802,6 +860,7 @@ class RawBlockCore:
                 self._kvio_emit(
                     trace_id, "store", key.encoded,
                     inflight.meta.size, inflight.offset, inflight.meta,
+                    ts_start=kvio_t0,
                     components=self._kvio_peek_components(obj.byte_array),
                 )
 
@@ -880,6 +939,7 @@ class RawBlockCore:
                     continue
                 try:
                     trace_id = self._kvio_next_tid() if self._kvio_enabled() else 0
+                    kvio_t0 = time.monotonic() if trace_id else None
                     payload_len = int(entry.size)
                     total_len = (
                         round_up(payload_len, self.block_align)
@@ -924,9 +984,15 @@ class RawBlockCore:
                     self._kvio_emit(
                         trace_id, "load", encoded_key,
                         entry.size, entry.offset, entry.meta,
+                        ts_start=kvio_t0,
                         components=self._kvio_peek_components(objs[i].byte_array),
                     )
                 except Exception as e:
+                    self._kvio_emit(
+                        trace_id, "load", encoded_key,
+                        entry.size, entry.offset, entry.meta,
+                        ts_start=kvio_t0, error=type(e).__name__,
+                    )
                     if raise_on_error:
                         raise
                     logger.error("RawBlockCore load failed for %s: %s", encoded_key, e)
@@ -968,6 +1034,7 @@ class RawBlockCore:
             A list of per-key deletion booleans aligned with ``encoded_keys``.
         """
         deleted: list[bool] = []
+        kvio_removed: list = []
         with self._lock:
             for encoded_key in encoded_keys:
                 entry = self._index.get(encoded_key)
@@ -986,7 +1053,17 @@ class RawBlockCore:
                         self._offset_to_slot(int(removed_entry.offset))
                     )
                     self._meta_dirty_total += 1
+                    kvio_removed.append((encoded_key, removed_entry))
                 deleted.append(removed_entry is not None or inflight is not None)
+        # Eviction/deletion previously left no trace — slot reuse then shows
+        # up in device traces as unexplained overwrites. No device I/O here,
+        # so the fresh trace_id joins nothing (renders as an instant).
+        if kvio_removed and self._kvio_enabled():
+            for encoded_key, entry in kvio_removed:
+                self._kvio_emit(
+                    self._kvio_next_tid(), "delete", encoded_key,
+                    entry.size, entry.offset, entry.meta,
+                )
         return deleted
 
     def usage(self) -> tuple[float, float]:
