@@ -31,7 +31,7 @@ import math
 import os
 import time
 
-from kv_geometry import kv_cache_bytes
+from kv_geometry import kv_cache_bytes, shard_kv_bytes, load_hf_config
 
 # LMCache public API (no dependency on the test suite).
 from lmcache.v1.distributed.api import ObjectKey
@@ -93,12 +93,19 @@ def main():
                     default=os.path.join(here, "..", "kv_cache_calculator",
                                          "modelconfig.json"),
                     help="modelconfig.json (calculator format)")
-    ap.add_argument("--model", required=True, help="model name (key in modelconfig.json)")
+    ap.add_argument("--model", required=True,
+                    help="model name: a key in modelconfig.json, or ANY Hugging "
+                         "Face model id (its config is fetched automatically -- "
+                         "config only, no weights, no GPU)")
     ap.add_argument("--dtype", default="bfloat16",
                     choices=["float32", "float16", "bfloat16", "int8", "fp8"])
     ap.add_argument("--chunk-tokens", type=int, default=256,
                     help="tokens per KV chunk = one offloaded block (LMCache default 256)")
     ap.add_argument("--num-chunks", type=int, default=8, help="how many chunks to offload")
+    ap.add_argument("--tp", type=int, default=1,
+                    help="tensor-parallel degree: one LMCache worker per rank, so "
+                         "each chunk becomes tp offloaded objects (same chunk, "
+                         "distinct kv_rank), sized by the family's KV-head sharding")
     ap.add_argument("--device", required=True, help="/dev/ngXnY (uring_cmd) or a file path")
     ap.add_argument("--engine", choices=["posix", "io_uring", "uring_cmd"],
                     default="uring_cmd")
@@ -120,22 +127,34 @@ def main():
 
     with open(args.modelconfig) as f:
         configs = json.load(f)
-    if args.model not in configs:
-        raise SystemExit(f"{args.model!r} not in {args.modelconfig}")
-    block_bytes, detail = kv_cache_bytes(args.model, configs[args.model],
+    if args.model in configs:
+        config, cfg_src = configs[args.model], "catalog"
+    else:
+        # Not in the calculator catalog: pull the config from HF (config JSON
+        # only -- no weights, no GPU) so any model can be projected.
+        config, cfg_src = load_hf_config(args.model), "HF AutoConfig"
+    block_bytes, detail = kv_cache_bytes(args.model, config,
                                          args.chunk_tokens, args.dtype)
-    geom = project(block_bytes, args.mdts_bytes, args.header_bytes, args.block_align)
+    # Under TP, each chunk is offloaded as `ranks` per-rank objects (see
+    # shard_kv_bytes); at tp=1 this is the whole block as one object.
+    obj_bytes, ranks, shard_note = shard_kv_bytes(block_bytes, detail, args.tp)
+    geom = project(obj_bytes, args.mdts_bytes, args.header_bytes, args.block_align)
 
-    print(f"=== KV-offload IO: {args.model} ({detail['family']}), dtype={args.dtype} ===")
+    print(f"=== KV-offload IO: {args.model} ({detail['family']}, {cfg_src}), "
+          f"dtype={args.dtype} ===")
     print(f"  chunk={args.chunk_tokens} tok -> KV block = {block_bytes} B "
           f"({block_bytes / 1024 / 1024:.2f} MiB)  [{detail['total_elements']} elems]")
-    print(f"  per chunk: store {geom['store_cmds']} cmds / {geom['store_bytes']} B, "
+    if args.tp > 1:
+        print(f"  TP={args.tp}: {shard_note} -> {ranks} objects/chunk x "
+              f"{obj_bytes} B ({obj_bytes / 1024 / 1024:.2f} MiB) per rank")
+    print(f"  per object: store {geom['store_cmds']} cmds / {geom['store_bytes']} B, "
           f"load {geom['load_cmds']} cmds / {geom['load_bytes']} B "
           f"(MDTS={args.mdts_bytes // 1024} KiB, align={args.block_align})")
-    print(f"  workload: {args.num_chunks} chunks, engine={args.engine}, "
+    print(f"  workload: {args.num_chunks} chunks x {ranks} rank(s) = "
+          f"{args.num_chunks * ranks} objects, engine={args.engine}, "
           f"O_DIRECT={'on' if args.odirect else 'off'}, dev={args.device}")
 
-    slot = ((block_bytes + args.header_bytes + (1 << 20) - 1) >> 20) << 20
+    slot = ((obj_bytes + args.header_bytes + (1 << 20) - 1) >> 20) << 20
     io_engine = "posix" if args.engine == "posix" else "io_uring"
     cfg = RawBlockCoreConfig(
         device_path=args.device, capacity_bytes=args.capacity_gb * 1024 * 1024 * 1024,
@@ -148,25 +167,28 @@ def main():
         use_uring_cmd=(args.engine == "uring_cmd"))
     core = RawBlockCore(cfg, key_namespace="object")
 
-    buf = bytes(block_bytes)  # zeros; geometry is content-free
+    buf = bytes(obj_bytes)  # zeros; geometry is content-free
+    n_obj = args.num_chunks * ranks
     store_ms, load_ms = [], []
     for it in range(args.warmup + args.iters):
-        # fresh keys per pass so every store is a real write (not an index hit)
+        # fresh keys per pass so every store is a real write (not an index hit).
+        # Under TP the `ranks` objects of a chunk share the chunk hash and differ
+        # only by kv_rank -- exactly what the per-rank LMCache workers emit.
         keys = [encode_object_key(ObjectKey(
                     chunk_hash=ObjectKey.IntHash2Bytes(it * args.num_chunks + i),
-                    model_name="kvoffload", kv_rank=0))
-                for i in range(args.num_chunks)]
-        st = [0.0] * args.num_chunks
-        for i in range(args.num_chunks):
+                    model_name="kvoffload", kv_rank=r))
+                for i in range(args.num_chunks) for r in range(ranks)]
+        st = [0.0] * n_obj
+        for j in range(n_obj):
             t0 = time.perf_counter()
-            core.put_many([keys[i]], [make_memory_obj(buf)])
-            st[i] = (time.perf_counter() - t0) * 1e3
-        for i in range(args.num_chunks):
+            core.put_many([keys[j]], [make_memory_obj(buf)])
+            st[j] = (time.perf_counter() - t0) * 1e3
+        for j in range(n_obj):
             t2 = time.perf_counter()
-            core.load_many_into([keys[i].encoded], [make_empty_obj(block_bytes)])
+            core.load_many_into([keys[j].encoded], [make_empty_obj(obj_bytes)])
             dt = (time.perf_counter() - t2) * 1e3
             if it >= args.warmup:
-                store_ms.append(st[i]); load_ms.append(dt)
+                store_ms.append(st[j]); load_ms.append(dt)
     try:
         core.close()
     except Exception:
@@ -175,7 +197,7 @@ def main():
     def line(name, ms, cmds, tbytes):
         mean = sum(ms) / len(ms)
         print(f"  {name:5s}: p50 {pct(ms, .5):7.3f} ms  p99 {pct(ms, .99):7.3f} ms | "
-              f"{(block_bytes / (mean / 1e3)) / 1e6:8.1f} MB/s | "
+              f"{(obj_bytes / (mean / 1e3)) / 1e6:8.1f} MB/s | "
               f"{cmds / (mean / 1e3):9.0f} NVMe cmd/s")
     print("  --- measured (real device I/O) ---")
     line("store", store_ms, geom["store_cmds"], geom["store_bytes"])
@@ -192,9 +214,15 @@ def main():
                 "header_bytes": args.header_bytes, "slot_bytes": slot,
                 "capacity_bytes": args.capacity_gb * 1024 * 1024 * 1024,
             },
+            "tp": args.tp, "ranks_per_chunk": ranks, "shard": shard_note,
+            "chunk_block_bytes": block_bytes,
             "access_pattern": "store-all-then-load-all",
-            "objects": [{"index": i, "part": "kv", "payload_bytes": block_bytes,
-                         "ops": ["store", "load"]} for i in range(args.num_chunks)],
+            # Under TP the objects of a chunk share chunk_index and differ by
+            # kv_rank -- matching the per-rank LMCache workers.
+            "objects": [{"index": i * ranks + r, "chunk_index": i, "kv_rank": r,
+                         "part": "kv", "payload_bytes": obj_bytes,
+                         "ops": ["store", "load"]}
+                        for i in range(args.num_chunks) for r in range(ranks)],
         }
         with open(args.record, "w") as f:
             json.dump(rec, f, indent=2)
