@@ -152,9 +152,11 @@ class RawBlockCoreConfig:
     use_uring_cmd: bool = False
     # Number of KV objects whose reads may be in flight concurrently in
     # load_many_into (1 = serial, the historical behavior). Each object is a
-    # large transfer split into many independent MDTS-sized commands; issuing
-    # several objects' reads at once keeps the device queue busy instead of
-    # submitting one command and waiting for it (QD~1). See load_many_into.
+    # large transfer that WE split into max_data_transfer_size-sized commands
+    # (this engine is NVMe passthrough: no block layer, so userspace owns the
+    # split, bounded above by the device's MDTS); issuing several objects'
+    # reads at once keeps the device queue busy instead of submitting one
+    # command and waiting for it (QD~1). See load_many_into.
     load_parallelism: int = 1
 
 
