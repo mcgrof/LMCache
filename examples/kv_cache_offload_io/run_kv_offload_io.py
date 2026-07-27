@@ -107,8 +107,21 @@ def main():
                          "each chunk becomes tp offloaded objects (same chunk, "
                          "distinct kv_rank), sized by the family's KV-head sharding")
     ap.add_argument("--device", required=True, help="/dev/ngXnY (uring_cmd) or a file path")
-    ap.add_argument("--engine", choices=["posix", "io_uring", "uring_cmd"],
-                    default="uring_cmd")
+    ap.add_argument("--engine",
+                    choices=["posix", "io_uring", "uring_cmd", "cufile",
+                             "opends"],
+                    default="uring_cmd",
+                    help="kernel engines (posix/io_uring/uring_cmd) move via "
+                         "host DRAM; cufile/opends are GPU-direct (GDS) -- "
+                         "same slot layout, same semantic trace")
+    ap.add_argument("--gds-backend", default="gds",
+                    help="opends engine only: which libopends_<X>.so variant "
+                         "to load. 'gds' wraps proprietary cuFile (GPU "
+                         "memory), 'ref' is the POSIX reference (host "
+                         "memory, runs GPU-free); any future variant name "
+                         "works unmodified")
+    ap.add_argument("--gds-lib-dir",
+                    help="extra directory to search for libopends_<X>.so")
     ap.add_argument("--mdts-bytes", type=int, default=131072,
                     help="device max transfer size (LMCache max_data_transfer_size)")
     ap.add_argument("--block-align", type=int, default=4096)
@@ -150,22 +163,39 @@ def main():
     print(f"  per object: store {geom['store_cmds']} cmds / {geom['store_bytes']} B, "
           f"load {geom['load_cmds']} cmds / {geom['load_bytes']} B "
           f"(MDTS={args.mdts_bytes // 1024} KiB, align={args.block_align})")
+    engine_label = (f"opends:{args.gds_backend}" if args.engine == "opends"
+                    else args.engine)
+    odirect = args.odirect or args.engine in ("cufile", "opends")  # GDS: forced
     print(f"  workload: {args.num_chunks} chunks x {ranks} rank(s) = "
-          f"{args.num_chunks * ranks} objects, engine={args.engine}, "
-          f"O_DIRECT={'on' if args.odirect else 'off'}, dev={args.device}")
+          f"{args.num_chunks * ranks} objects, engine={engine_label}, "
+          f"O_DIRECT={'on' if odirect else 'off'}, dev={args.device}")
 
     slot = ((obj_bytes + args.header_bytes + (1 << 20) - 1) >> 20) << 20
-    io_engine = "posix" if args.engine == "posix" else "io_uring"
-    cfg = RawBlockCoreConfig(
-        device_path=args.device, capacity_bytes=args.capacity_gb * 1024 * 1024 * 1024,
-        block_align=args.block_align, header_bytes=args.header_bytes, slot_bytes=slot,
-        use_odirect=args.odirect, enable_zero_copy=False, meta_total_bytes=1 * 1024 * 1024,
-        meta_magic=b"LMCIDX01", meta_version=1, meta_checkpoint_interval_sec=60,
-        meta_idle_quiet_ms=0, meta_enable_periodic=False, meta_verify_on_load=False,
-        max_data_transfer_size=args.mdts_bytes, load_checkpoint_on_init=False,
-        io_engine=io_engine, iouring_queue_depth=8,
-        use_uring_cmd=(args.engine == "uring_cmd"))
-    core = RawBlockCore(cfg, key_namespace="object")
+    gds = args.engine in ("cufile", "opends")
+    if gds:
+        # GPU-direct path: same slot layout + semantic trace as
+        # RawBlockCore, data moved by cuFile/OpenDS instead of the kernel
+        # engines (destination GPU HBM, or host for opends ref backend).
+        from gds_engine import GdsKVEngine
+        core = GdsKVEngine(
+            path=args.device, engine=args.engine, backend=args.gds_backend,
+            lib_dir=args.gds_lib_dir, slot_bytes=slot,
+            header_bytes=args.header_bytes, block_align=args.block_align,
+            obj_bytes=obj_bytes,
+            capacity_bytes=args.capacity_gb * 1024 * 1024 * 1024,
+            mdts=args.mdts_bytes, trace_path=args.trace or None)
+    if not gds:
+        io_engine = "posix" if args.engine == "posix" else "io_uring"
+        cfg = RawBlockCoreConfig(
+            device_path=args.device, capacity_bytes=args.capacity_gb * 1024 * 1024 * 1024,
+            block_align=args.block_align, header_bytes=args.header_bytes, slot_bytes=slot,
+            use_odirect=args.odirect, enable_zero_copy=False, meta_total_bytes=1 * 1024 * 1024,
+            meta_magic=b"LMCIDX01", meta_version=1, meta_checkpoint_interval_sec=60,
+            meta_idle_quiet_ms=0, meta_enable_periodic=False, meta_verify_on_load=False,
+            max_data_transfer_size=args.mdts_bytes, load_checkpoint_on_init=False,
+            io_engine=io_engine, iouring_queue_depth=8,
+            use_uring_cmd=(args.engine == "uring_cmd"))
+        core = RawBlockCore(cfg, key_namespace="object")
 
     buf = bytes(obj_bytes)  # zeros; geometry is content-free
     n_obj = args.num_chunks * ranks
@@ -181,11 +211,17 @@ def main():
         st = [0.0] * n_obj
         for j in range(n_obj):
             t0 = time.perf_counter()
-            core.put_many([keys[j]], [make_memory_obj(buf)])
+            if gds:
+                core.store(keys[j].encoded, it * n_obj + j)
+            else:
+                core.put_many([keys[j]], [make_memory_obj(buf)])
             st[j] = (time.perf_counter() - t0) * 1e3
         for j in range(n_obj):
             t2 = time.perf_counter()
-            core.load_many_into([keys[j].encoded], [make_empty_obj(obj_bytes)])
+            if gds:
+                core.load(keys[j].encoded, it * n_obj + j)
+            else:
+                core.load_many_into([keys[j].encoded], [make_empty_obj(obj_bytes)])
             dt = (time.perf_counter() - t2) * 1e3
             if it >= args.warmup:
                 store_ms.append(st[j]); load_ms.append(dt)
@@ -209,7 +245,7 @@ def main():
             "source": f"kv_cache_offload_io: {args.model} on {args.device}",
             "model": args.model, "geometry": detail,
             "device_geometry": {
-                "engine": args.engine, "use_uring_cmd": args.engine == "uring_cmd",
+                "engine": engine_label, "use_uring_cmd": args.engine == "uring_cmd",
                 "mdts_bytes": args.mdts_bytes, "block_align": args.block_align,
                 "header_bytes": args.header_bytes, "slot_bytes": slot,
                 "capacity_bytes": args.capacity_gb * 1024 * 1024 * 1024,

@@ -11,7 +11,8 @@ tokens using the calculator's exact geometry (`kv_geometry.py`, a Python port
 that shares the same math and model families: MHA/GQA, GQA-with-`head_dim`,
 DeepSeek MLA, Hunyuan CLA), then issues that store/load workload against a real
 device through LMCache's `raw_block` engine — POSIX, io_uring, or io_uring_cmd
-NVMe passthrough.
+NVMe passthrough — or through a GPU-direct (GDS) data path (`cufile`,
+`opends`; see below).
 
 **Any model, not just the catalog.** `--model` accepts either a key in the
 calculator's `modelconfig.json` (30 curated models) **or any Hugging Face model
@@ -53,6 +54,46 @@ offloaded block; LMCache default 256), `--num-chunks` (workload size — keep it
 small for a compact trace), `--engine`, `--mdts-bytes` (device transfer limit),
 `--iters`/`--warmup` (latency sampling), `--record` (write a replay manifest),
 `--trace` (fire LMCache's `LMCACHE_KVIO_TRACE` semantic trace).
+
+## GPU-direct engines (GDS)
+
+The kernel engines above land KV in host DRAM. Two more engines move the
+*same* byte layout (same slots, same header+payload offsets, same
+schema-2 semantic trace) over the GPUDirect-Storage data path instead,
+so GDS transports can be compared against io_uring per-object,
+apples-to-apples:
+
+```bash
+# proprietary: libcufile directly (cudaMalloc buffer, cuFileWrite/Read)
+python run_kv_offload_io.py --model meta-llama/Llama-3.1-8B-Instruct \
+    --device /mnt/nvme/kv.img --engine cufile --trace /tmp/cufile.jsonl
+
+# open API: OpenDS (github.com/xnvme/opends). Backend variants are
+# separate .so files with one ABI, so --gds-backend X loads
+# libopends_X.so: 'gds' wraps cuFile (GPU memory), 'ref' is the POSIX
+# reference (host memory — runs with no GPU at all), and any future
+# variant (e.g. aisio) works unmodified.
+python run_kv_offload_io.py --model meta-llama/Llama-3.1-8B-Instruct \
+    --device /mnt/nvme/kv.img --engine opends --gds-backend gds
+python run_kv_offload_io.py ... --engine opends --gds-backend ref  # no GPU
+```
+
+Buffers for `opends` come from `opends_alloc`, so the backend picks the
+memory class (GPU for `gds`, host for `ref`) — the generator never
+touches CUDA for that engine. `--gds-lib-dir` (or `OPENDS_LIB_DIR`)
+points at the OpenDS build directory. GDS engines force O_DIRECT and
+need a file on a filesystem (not a raw char device).
+
+Measured on an H100 + Micron 7450 (32 MiB objects, single stream):
+`cufile` and `opends:gds` track within a few percent (load p50 ~19-21 ms
+= 1.6-1.7 GiB/s), device-level confirmation that the open wrapper adds
+nothing to the data path.
+
+> cuFile compat-path footgun (GDS 1.18.1.6): if a process's *first*
+> cuFile read is smaller than the 1 MiB bounce-pool slab class — or its
+> first op is a write — every read after a write is chopped into 4 KiB
+> posix reads for the process lifetime (~47x slower). The engine primes
+> the pool with one >=1 MiB read at init; see `gds_engine.py`.
 
 ## Whole workloads, not one request
 
