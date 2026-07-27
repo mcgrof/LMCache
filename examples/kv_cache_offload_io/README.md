@@ -51,7 +51,8 @@ python run_kv_offload_io.py --model deepseek-ai/DeepSeek-V3 --tp 8 \
 
 Key options: `--dtype` (fp16/bf16/int8/fp8), `--chunk-tokens` (tokens per
 offloaded block; LMCache default 256), `--num-chunks` (workload size — keep it
-small for a compact trace), `--engine`, `--mdts-bytes` (device transfer limit),
+small for a compact trace), `--engine`, `--mdts-bytes` (bytes per NVMe
+command — LMCache's `max_data_transfer_size`, ≤ the device's MDTS),
 `--iters`/`--warmup` (latency sampling), `--record` (write a replay manifest),
 `--trace` (fire LMCache's `LMCACHE_KVIO_TRACE` semantic trace).
 

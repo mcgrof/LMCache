@@ -123,7 +123,9 @@ def main():
     ap.add_argument("--gds-lib-dir",
                     help="extra directory to search for libopends_<X>.so")
     ap.add_argument("--mdts-bytes", type=int, default=131072,
-                    help="device max transfer size (LMCache max_data_transfer_size)")
+                    help="bytes per NVMe command: LMCache's "
+                         "max_data_transfer_size knob, <= the device's MDTS "
+                         "(the engine does the splitting, not the device)")
     ap.add_argument("--block-align", type=int, default=4096)
     ap.add_argument("--header-bytes", type=int, default=4096)
     ap.add_argument("--iters", type=int, default=1, help="passes over the chunk set")
@@ -162,7 +164,7 @@ def main():
               f"{obj_bytes} B ({obj_bytes / 1024 / 1024:.2f} MiB) per rank")
     print(f"  per object: store {geom['store_cmds']} cmds / {geom['store_bytes']} B, "
           f"load {geom['load_cmds']} cmds / {geom['load_bytes']} B "
-          f"(MDTS={args.mdts_bytes // 1024} KiB, align={args.block_align})")
+          f"(max_xfer={args.mdts_bytes // 1024} KiB/cmd, align={args.block_align})")
     engine_label = (f"opends:{args.gds_backend}" if args.engine == "opends"
                     else args.engine)
     odirect = args.odirect or args.engine in ("cufile", "opends")  # GDS: forced

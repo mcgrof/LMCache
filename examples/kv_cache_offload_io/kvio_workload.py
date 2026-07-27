@@ -93,7 +93,9 @@ def main():
     ap.add_argument("--tp", type=int, default=1)
     ap.add_argument("--device", required=True, help="/dev/ngXnY (uring_cmd) or a file path")
     ap.add_argument("--engine", choices=["posix", "io_uring", "uring_cmd"], default="uring_cmd")
-    ap.add_argument("--mdts-bytes", type=int, default=131072)
+    ap.add_argument("--mdts-bytes", type=int, default=131072,
+                    help="bytes per NVMe command (LMCache's "
+                         "max_data_transfer_size, <= device MDTS)")
     ap.add_argument("--block-align", type=int, default=4096)
     ap.add_argument("--header-bytes", type=int, default=4096)
     ap.add_argument("--capacity-gb", type=int, default=32)
