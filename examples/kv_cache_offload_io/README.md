@@ -6,12 +6,20 @@ The calculator tells you *how big* a model's KV cache is. This tells you what
 **offloading it to storage actually costs** — the NVMe command pattern and
 store/load latency — **without a GPU or a model**.
 
-It takes a real model config (the calculator's `modelconfig.json`), computes the
-KV-cache byte size for one chunk of tokens using the calculator's exact geometry
-(`kv_geometry.py`, a Python port that shares the same math and model families:
-MHA/GQA, GQA-with-`head_dim`, DeepSeek MLA, Hunyuan CLA), then issues that
-store/load workload against a real device through LMCache's `raw_block` engine —
-POSIX, io_uring, or io_uring_cmd NVMe passthrough.
+It takes a real model config, computes the KV-cache byte size for one chunk of
+tokens using the calculator's exact geometry (`kv_geometry.py`, a Python port
+that shares the same math and model families: MHA/GQA, GQA-with-`head_dim`,
+DeepSeek MLA, Hunyuan CLA), then issues that store/load workload against a real
+device through LMCache's `raw_block` engine — POSIX, io_uring, or io_uring_cmd
+NVMe passthrough.
+
+**Any model, not just the catalog.** `--model` accepts either a key in the
+calculator's `modelconfig.json` (30 curated models) **or any Hugging Face model
+id** — its config is fetched automatically (config JSON only, no weights, no
+GPU) and the family is inferred from the config (MLA latent, CLA sharing, or
+explicit `head_dim`), so you can size a model the catalog has never seen. For
+arbitrary models this needs `transformers` installed; catalog models need
+nothing.
 
 **Why fake KV bytes are enough:** storage IO geometry (command count, sizes,
 total bytes) depends only on the block size and the device's transfer limit
@@ -33,6 +41,11 @@ python run_kv_offload_io.py \
 # Or against a regular file (no passthrough), for a quick local try:
 python run_kv_offload_io.py --model Qwen/Qwen3-32B --device /tmp/l2.bin \
     --engine io_uring --num-chunks 4
+
+# Any HF model not in the catalog (config auto-fetched), e.g. a 671B you can't
+# run — size its offload IO on real storage with no GPU in the room:
+python run_kv_offload_io.py --model deepseek-ai/DeepSeek-V3 --tp 8 \
+    --device /dev/ng0n1 --engine uring_cmd --num-chunks 8
 ```
 
 Key options: `--dtype` (fp16/bf16/int8/fp8), `--chunk-tokens` (tokens per
@@ -40,6 +53,27 @@ offloaded block; LMCache default 256), `--num-chunks` (workload size — keep it
 small for a compact trace), `--engine`, `--mdts-bytes` (device transfer limit),
 `--iters`/`--warmup` (latency sampling), `--record` (write a replay manifest),
 `--trace` (fire LMCache's `LMCACHE_KVIO_TRACE` semantic trace).
+
+## Whole workloads, not one request
+
+`run_kv_offload_io.py` issues one request's worth of chunks. `kvio_workload.py`
+replays a *distribution* of request sizes with a store/load mix set by the cache
+hit rate — the shape of real serving traffic:
+
+```bash
+# synthetic lognormal traffic (200 requests, median 1K tokens, 60% cache hits)
+python kvio_workload.py --model meta-llama/Llama-3.1-8B-Instruct \
+    --device /dev/ng0n1 --engine uring_cmd \
+    --num-requests 200 --median-tokens 1024 --hit-rate 0.6
+
+# or drive it from a real request trace (JSONL; token count per line)
+python kvio_workload.py --model Qwen/Qwen3-8B --device /dev/ng0n1 \
+    --trace requests.jsonl --hit-rate 0.7
+```
+
+It reports the request-size profile, total KV volume, and store/load p50/p99 +
+aggregate GiB/s under the realistic mix. Each object is byte-identical to the
+single-request generator's — only the *mix* is new.
 
 ## Output
 
