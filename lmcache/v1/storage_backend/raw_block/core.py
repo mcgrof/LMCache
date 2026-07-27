@@ -405,24 +405,43 @@ class RawBlockCore:
                 f"{self.device_path} for auto max_data_transfer_size"
             )
 
-        max_hw_sectors_kb = _read_sysfs_int(f"{queue_dir}/max_hw_sectors_kb")
-        if max_hw_sectors_kb is None or max_hw_sectors_kb <= 0:
+        # Mirror the kernel's block-layer sizing policy rather than riding
+        # the hardware ceiling. On the block path the kernel splits at
+        # max_sectors, which blk_validate_limits() computes as: the sysfs
+        # max_sectors_kb override if set, else the device's optimal I/O
+        # size (io_opt, from NVMe NOWS) promoted to the default when it
+        # exceeds BLK_DEF_MAX_SECTORS_CAP, else that conservative cap --
+        # always clamped by max_hw_sectors (MDTS), but never defaulting to
+        # it. Since we split in userspace on the passthrough path, read
+        # the kernel's already-computed effective value (max_sectors_kb)
+        # so passthrough commands are sized exactly as block-path I/O
+        # would be on the same namespace, admin overrides included.
+        # max_hw_sectors_kb is only the fallback if the soft limit is
+        # unreadable.
+        max_sectors_kb = _read_sysfs_int(f"{queue_dir}/max_sectors_kb")
+        source = "max_sectors_kb"
+        if max_sectors_kb is None or max_sectors_kb <= 0:
+            max_sectors_kb = _read_sysfs_int(f"{queue_dir}/max_hw_sectors_kb")
+            source = "max_hw_sectors_kb"
+        if max_sectors_kb is None or max_sectors_kb <= 0:
             raise RuntimeError(
-                "RustRawBlockBackend: failed to read max_hw_sectors_kb from "
-                f"{queue_dir} for auto max_data_transfer_size"
+                "RustRawBlockBackend: failed to read max_sectors_kb or "
+                f"max_hw_sectors_kb from {queue_dir} for auto "
+                "max_data_transfer_size"
             )
 
-        resolved_bytes = max_hw_sectors_kb * 1024
+        resolved_bytes = max_sectors_kb * 1024
         aligned_bytes = (resolved_bytes // self.block_align) * self.block_align
         if aligned_bytes <= 0:
             aligned_bytes = self.block_align
 
         logger.info(
             "RustRawBlockBackend: auto max_data_transfer_size=%d bytes "
-            "(device=%s, max_hw_sectors_kb=%s)",
+            "(device=%s, %s=%s)",
             aligned_bytes,
             self.device_path,
-            max_hw_sectors_kb,
+            source,
+            max_sectors_kb,
         )
         return aligned_bytes
 
