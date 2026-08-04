@@ -1095,6 +1095,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         self._ctx.chunk_size,
                         object_group_id=obj_group_id,
                     )
+                    # The L1 storage-layout policy is applied inside
+                    # reserve_write (the choke point); pass the transfer-side
+                    # packed layout as-is.  Do NOT pre-apply it here or a
+                    # multi-output serde would split the layout twice.
                     reserved_dict = self._ctx.storage_manager.reserve_write(
                         obj_keys, layout_desc, "new"
                     )
