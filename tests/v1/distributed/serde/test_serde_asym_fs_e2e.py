@@ -33,7 +33,11 @@ import pytest
 import torch
 
 # First Party
-from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+from lmcache.v1.distributed.api import (
+    MemoryLayoutDesc,
+    ObjectKey,
+    PrefetchRequestSpec,
+)
 from lmcache.v1.distributed.config import (
     EvictionConfig,
     L1ManagerConfig,
@@ -150,9 +154,7 @@ class TestAsymK16V8SerdeFsRoundTrip:
             )
             sm = StorageManager(sm_cfg)
             try:
-                assert (
-                    sm.storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER
-                )
+                assert sm.storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER
             finally:
                 sm.close()
         finally:
@@ -271,9 +273,13 @@ class TestAsymK16V8SerdeFsRoundTrip:
         kv_shape = torch.Size([2, 4, 256, 128])
         kv_dtype = torch.bfloat16
         packed_layout = MemoryLayoutDesc(shapes=[kv_shape], dtypes=[kv_dtype])
-        # Canonical L1 layout: K and V as separate component groups.
-        layout = sm.apply_layout_policy(packed_layout)
-        assert len(layout.shapes) == 2, "policy did not split into K/V groups"
+        # reserve_write / submit_prefetch_task apply the layout policy
+        # internally (the layout choke point), so we pass the PACKED layout
+        # and let them split it into K/V component groups.  Sanity-check
+        # the policy does split (it must not be pre-applied by the caller).
+        assert len(sm.apply_layout_policy(packed_layout).shapes) == 2, (
+            "policy did not split into K/V groups"
+        )
 
         keys = [
             _make_key(b"\x00" * 31 + b"\x01"),
@@ -291,7 +297,7 @@ class TestAsymK16V8SerdeFsRoundTrip:
         ]
 
         # ---- Step 1: reserve, fill K/V via typed group views ----
-        reserved = sm.reserve_write(keys, layout, mode="new")
+        reserved = sm.reserve_write(keys, packed_layout, mode="new")
         assert len(reserved) == len(keys)
         for k, (k_orig, v_orig) in zip(keys, originals, strict=True):
             mem_obj = reserved[k]
@@ -322,7 +328,9 @@ class TestAsymK16V8SerdeFsRoundTrip:
         assert sm.report_status()["l1_manager"]["total_object_count"] == 0
 
         # ---- Step 4: prefetch (disk load + asym deserialize) ----
-        handle = sm.submit_prefetch_task(keys, layout)
+        handle = sm.submit_prefetch_task(
+            PrefetchRequestSpec(keys=keys, group_layout_descs={0: packed_layout})
+        )
         prefix_hits = wait_for_prefetch_status(sm, handle)
         assert prefix_hits is not None, "Prefetch never completed"
         assert prefix_hits == len(keys), (
@@ -450,9 +458,10 @@ class TestAsymK16V8VOnlySplitTierRoundTrip:
         kv_shape = torch.Size([2, 4, 256, 128])
         kv_dtype = torch.bfloat16
         packed_layout = MemoryLayoutDesc(shapes=[kv_shape], dtypes=[kv_dtype])
-        layout = sm.apply_layout_policy(packed_layout)
-        assert len(layout.shapes) == 2
-        reserved = sm.reserve_write(keys, layout, mode="new")
+        # reserve_write applies the layout policy internally (the layout choke
+        # point); pass the PACKED layout and let it split into K/V groups.
+        assert len(sm.apply_layout_policy(packed_layout).shapes) == 2
+        reserved = sm.reserve_write(keys, packed_layout, mode="new")
         assert len(reserved) == len(keys)
         for k, (k_orig, v_orig) in zip(keys, originals, strict=True):
             mem_obj = reserved[k]
@@ -462,7 +471,8 @@ class TestAsymK16V8VOnlySplitTierRoundTrip:
             k_view.copy_(k_orig)
             v_view.copy_(v_orig)
         sm.finish_write(keys)
-        return layout
+        # Return the PACKED layout; submit_prefetch_task applies the policy.
+        return packed_layout
 
     def _wait_for_l2_drain(self, sm: StorageManager, disk_path: str):
         # Files must appear on disk under the *V child* keys.  Since
@@ -545,7 +555,9 @@ class TestAsymK16V8VOnlySplitTierRoundTrip:
             self._wait_for_l2_drain(sm, disk_path)
 
             # ---- Submit prefetch under the LOGICAL key ----
-            handle = sm.submit_prefetch_task(keys, layout)
+            handle = sm.submit_prefetch_task(
+                PrefetchRequestSpec(keys=keys, group_layout_descs={0: layout})
+            )
             prefix_hits = wait_for_prefetch_status(sm, handle)
             assert prefix_hits == len(keys), (
                 f"split-tier prefetch failed: expected {len(keys)} hits, "
@@ -556,9 +568,7 @@ class TestAsymK16V8VOnlySplitTierRoundTrip:
             with sm.read_prefetched_results(keys) as mem_objs:
                 assert mem_objs is not None
                 assert len(mem_objs) == len(keys)
-                for (k_orig, v_orig), mem_obj in zip(
-                    originals, mem_objs, strict=True
-                ):
+                for (k_orig, v_orig), mem_obj in zip(originals, mem_objs, strict=True):
                     k_got = mem_obj.get_tensor(0)
                     v_got = mem_obj.get_tensor(1)
                     assert k_got is not None and v_got is not None
@@ -566,9 +576,13 @@ class TestAsymK16V8VOnlySplitTierRoundTrip:
                         "K is NOT bit-exact through split-tier load"
                     )
                     v_rel = (
-                        (v_got.float() - v_orig.float()).abs()
-                        / (v_orig.float().abs() + 1e-6)
-                    ).mean().item()
+                        (
+                            (v_got.float() - v_orig.float()).abs()
+                            / (v_orig.float().abs() + 1e-6)
+                        )
+                        .mean()
+                        .item()
+                    )
                     assert v_rel < 0.05, (
                         f"V FP8 round-trip relative error too high: {v_rel:.4f}"
                     )

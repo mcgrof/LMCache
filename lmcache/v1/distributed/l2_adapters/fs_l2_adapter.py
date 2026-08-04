@@ -787,7 +787,11 @@ class FSL2Adapter(L2AdapterInterface):
                         )
                         continue
 
-                    objects[i].set_used_size(num_read)
+                    # Full read (partial reads ``continue`` above), so the
+                    # buffer is already full-size and set_used_size is a no-op;
+                    # guard it for buffer types that do not expose the method.
+                    if hasattr(objects[i], "set_used_size"):
+                        objects[i].set_used_size(num_read)
                     bitmap.set(i)
                     logger.debug(
                         "FSL2Adapter loaded key %s (%d bytes)",

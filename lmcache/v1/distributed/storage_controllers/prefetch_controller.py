@@ -1542,7 +1542,7 @@ class PrefetchController(StorageControllerInterface):
                     self._discard_reserved(request.write_reserved_keys)
             self._release_l2_locks(request, keep={})
             if request.l1_readlocks.popcount() > 0:
-                l1_mgr.finish_read(
+                self._l1_manager.finish_read(
                     request.l1_readlocks.gather(request.keys),
                     extra_count=request.extra_count,
                 )
