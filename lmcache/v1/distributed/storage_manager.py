@@ -50,6 +50,11 @@ from lmcache.v1.distributed.storage_controllers.store_policy import (
     AdapterDescriptor,
     create_store_policy,
 )
+from lmcache.v1.distributed.storage_layout import (
+    StorageLayoutMode,
+    apply_layout_policy as _apply_layout_policy,
+    derive_storage_layout_mode,
+)
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
 from lmcache.v1.mp_observability.event import Event, EventType
@@ -76,6 +81,15 @@ class StorageManager:
             eviction_config=config.eviction_config,
         )
         self._eviction_controller.start()
+
+        # Canonical L1 storage layout mode, derived from the configured
+        # L2 adapters' serdes.  All adapters must share one mode; mixing
+        # a single-tensor serde (e.g. ``fp8``) with a multi-output serde
+        # (e.g. ``asym_k16_v8``) on the same StorageManager is rejected
+        # at config time.  See lmcache/v1/distributed/storage_layout.py.
+        self._storage_layout_mode = derive_storage_layout_mode(
+            config.l2_adapter_config.adapters
+        )
 
         # L2 adapters and store controller. When an adapter config carries
         # a ``serde_config``, the adapter is wrapped with
@@ -168,6 +182,42 @@ class StorageManager:
         )
 
     # External APIs for serving engine integration code to call
+
+    @property
+    def storage_layout_mode(self) -> StorageLayoutMode:
+        """The canonical L1 ``MemoryObj`` shape this StorageManager uses.
+
+        Derived once at construction from the configured L2 adapters'
+        serdes.  Callers hand the transfer-side packed layout straight to
+        :meth:`reserve_write` and :meth:`submit_prefetch_task`, which
+        apply the policy once at their choke point; integration layers
+        (vLLM / SGLang connectors, MP server) do not pre-apply it.
+        """
+        return self._storage_layout_mode
+
+    def apply_layout_policy(self, layout_desc: MemoryLayoutDesc) -> MemoryLayoutDesc:
+        """Adapt a transfer-side packed layout to this StorageManager's
+        canonical L1 shape.
+
+        For the default ``PACKED`` mode this is a no-op pass-through;
+        for ``KV_COMPONENT_GROUPS`` (selected when a multi-output serde
+        is configured) this splits each input group's leading-``2`` K|V
+        dim into separate K and V component groups so multi-output
+        serdes see K and V as distinct typed sub-objects via
+        ``TensorMemoryObj.get_tensor(0)`` / ``get_tensor(1)``.
+
+        Total bytes are unchanged.  The transfer kernel writes K bytes
+        followed by V bytes either way; only the typed view changes.
+
+        Args:
+            layout_desc: Packed layout as produced by the transfer side
+                (each input group has leading dim 2 for the K|V pair).
+
+        Returns:
+            Layout to pass to :meth:`reserve_write`.
+        """
+        return _apply_layout_policy(layout_desc, self._storage_layout_mode)
+
     @enable_tracing()
     def reserve_write(
         self,
@@ -180,8 +230,12 @@ class StorageManager:
 
         Args:
             keys (list[ObjectKey]): List of object keys to reserve for writing.
-            layout_desc (MemoryLayoutDesc): Description of the memory layout
-                for the objects to be reserved.
+            layout_desc (MemoryLayoutDesc): Transfer-side (packed) memory
+                layout for the objects to be reserved.  The L1 storage-layout
+                policy is applied to it internally (see
+                :meth:`apply_layout_policy`); callers pass the packed layout
+                and MUST NOT pre-apply the policy (the transform is not
+                idempotent).
             mode (Literal["new", "update", "all"]): Reservation mode.
             - "new": Reserve only new objects that do not exist.
             - "update": Reserve only existing objects for update.
@@ -192,6 +246,16 @@ class StorageManager:
                 reserved memory objects. Note that not all requested keys could be
                 reserved (e.g., out of memory or write conflict)
         """
+        # Apply the L1 storage-layout policy exactly once, at this choke
+        # point, so every store path reserves the canonical L1 shape
+        # without each caller re-deriving it.  For the default PACKED
+        # layout this is a pure identity pass-through (KV_TOGETHER traffic
+        # is byte-unchanged); for a multi-output serde
+        # (KV_COMPONENT_GROUPS) it splits each [2, ...] group into K and V
+        # component groups.  Must run BEFORE the L1 reservation so the
+        # reserved object's shape matches what will be stored.  The
+        # transform is not idempotent -- callers must NOT pre-apply it.
+        layout_desc = self.apply_layout_policy(layout_desc)
         reserve_result = self._l1_manager.reserve_write(
             keys=keys,
             is_temporary=[False] * len(keys),
@@ -407,6 +471,9 @@ class StorageManager:
 
         Args:
             spec: The L2-fetch request inputs (see :class:`PrefetchRequestSpec`).
+                Each group layout in ``spec.group_layout_descs`` is passed
+                through the L1 storage-layout policy here; callers MUST NOT
+                pre-apply it (not idempotent).
             external_request_id: Caller id for end-to-end log tracing.
             skip_l2: If True, do not load from L2. For ``LOOKUP`` only
                 already-resident L1 keys are returned; for ``WARM`` nothing is
@@ -416,6 +483,21 @@ class StorageManager:
             PrefetchHandle to track the task.
         """
         keys = spec.keys
+
+        # Apply the L1 storage-layout policy once here (the prefetch choke
+        # point), before the WARM / SPARSE / PREFIX branches, so every
+        # caller (lookup, CacheBlend, p2p, warm-prefetch) prefetches into
+        # the canonical L1 shape.  PACKED is an identity no-op; a
+        # multi-output serde (KV_COMPONENT_GROUPS) splits each [2, ...]
+        # group into K/V components.  Not idempotent -- callers must not
+        # pre-apply.
+        spec = replace(
+            spec,
+            group_layout_descs={
+                gid: self.apply_layout_policy(ld)
+                for gid, ld in spec.group_layout_descs.items()
+            },
+        )
 
         if spec.mode is PrefetchMode.WARM:
             # Warm path: load all keys, lock none. skip_l2 makes it a no-op.
