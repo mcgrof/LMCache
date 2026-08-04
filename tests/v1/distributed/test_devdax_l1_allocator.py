@@ -1042,6 +1042,8 @@ def test_hybrid_manager_get_backend_type_reports_per_object_medium(tmp_path):
         gc.collect()
     finally:
         manager.close()
+
+
 def test_devdax_manager_supports_external_memory_providers(tmp_path):
     """DevDaxL1MemoryManager builds its own allocator instead of
     chaining to super().__init__, but it must still initialize the

@@ -2,13 +2,18 @@
 """Structural interface shared by the L1 memory manager tiers."""
 
 # Standard
-from typing import Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Optional, Protocol, runtime_checkable
 
 # First Party
 from lmcache.v1.distributed.api import L1BackendType, MemoryLayoutDesc
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L1MemoryDesc
 from lmcache.v1.memory_management import MemoryObj
+
+if TYPE_CHECKING:
+    from lmcache.v1.distributed.memory_manager.l1_memory_manager import (
+        L1MemoryUsageProvider,
+    )
 
 
 @runtime_checkable
@@ -51,4 +56,23 @@ class L1ManagerProtocol(Protocol):
 
     def memcheck(self) -> bool:
         """Verify allocator bookkeeping consistency."""
+        ...
+
+    def register_external_memory_provider(
+        self, provider: "L1MemoryUsageProvider"
+    ) -> None:
+        """Register an auxiliary L1 memory-usage provider (e.g. a serde
+        slab pool) whose bytes count toward :meth:`get_memory_usage`.
+
+        Tiers that do not track external providers may implement this
+        as a no-op.
+        """
+        ...
+
+    def unregister_external_memory_provider(
+        self, provider: "L1MemoryUsageProvider"
+    ) -> None:
+        """Remove a provider registered via
+        :meth:`register_external_memory_provider`.
+        """
         ...
