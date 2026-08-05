@@ -25,6 +25,12 @@ from lmcache.v1.distributed.serde.key_provider import (
     HkdfKeyProvider,
     KeyProvider,
 )
+
+# Import for side effect: registers ``asym_k16_v8`` and
+# ``asym_k16_v8_v_only`` in the serde factory so they are selectable
+# from YAML configs alongside ``fp8``.  No symbols re-exported here
+# (the public asym types are reachable via the submodule path).
+from lmcache.v1.distributed.serde import asym_k16_v8 as _register_asym_k16_v8  # noqa: F401
 from lmcache.v1.distributed.serde.multi import (
     LayoutDescGroup,
     MemoryObjGroup,

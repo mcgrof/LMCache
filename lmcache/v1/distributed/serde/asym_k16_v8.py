@@ -333,6 +333,12 @@ class AsymK16V8VOnlyMultiSerializer(MultiSerializer):
     def group_size(self) -> int:
         return _GROUP_SIZE_V_ONLY
 
+    def input_slot_mapping(self):
+        # Split-tier: K stays in L1 / host -- never passed to this
+        # serializer.  Slot 0 is always None; slot 1 reads parent
+        # group 1 (V).
+        return (None, 1)
+
     def serialize(self, src: MemoryObjGroup, dst: MemoryObj, key: ObjectKey) -> int:
         # ``key`` unused: this serde is content-agnostic.
         validate_group_size(src, _GROUP_SIZE_V_ONLY, role="src")
@@ -472,6 +478,12 @@ class AsymK16V8VOnlyMultiDeserializer(MultiDeserializer):
     def group_size(self) -> int:
         return _GROUP_SIZE_V_ONLY
 
+    def output_slot_mapping(self):
+        # Split-tier: K is sourced from L1 / host, not from this blob.
+        # Slot 0 is always None on the dst tuple; slot 1 writes parent
+        # group 1 (V).
+        return (None, 1)
+
     def deserialize(self, src: MemoryObj, dst: MemoryObjGroup, key: ObjectKey) -> None:
         # ``key`` unused: this serde is content-agnostic.
         validate_group_size(dst, _GROUP_SIZE_V_ONLY, role="dst")
@@ -540,3 +552,124 @@ class AsymK16V8VOnlyMultiDeserializer(MultiDeserializer):
                 f"{tuple(target_shape)} expects {v_obj.tensor.numel()}"
             )
         v_obj.tensor.copy_(v_dq_flat.reshape(target_shape))
+
+
+# ============================================================================
+# Factory registration (selectable from YAML via serde_config.type)
+# ============================================================================
+#
+# AsyncSerdeProcessor is typed for the single-tensor Serializer /
+# Deserializer ABCs, but at runtime its dispatch is duck-typed -- it
+# forwards each work item to ``serialize`` / ``deserialize`` unchanged.
+# Multi-output serdes plug in via the same processor with ``# type:
+# ignore[arg-type]``; the SerdeL2AdapterWrapper detects the
+# MultiSerializer / MultiDeserializer at dispatch time and builds
+# MemoryObjGroup views over the parent grouped MemoryObj using
+# ``input_slot_mapping`` / ``output_slot_mapping``.
+
+# First Party
+from lmcache.v1.distributed.serde.async_processor import AsyncSerdeProcessor  # noqa: E402
+from lmcache.v1.distributed.serde.base import SerdeProcessor  # noqa: E402
+from lmcache.v1.distributed.serde.factory import register_serde_factory  # noqa: E402
+
+
+def _resolve_dtype(name: str) -> torch.dtype:
+    dtype = getattr(torch, name, None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"Unknown torch dtype: {name!r}")
+    return dtype
+
+
+def _resolve_scale_scope(name: str) -> ScaleScope:
+    try:
+        return ScaleScope[name]
+    except KeyError as e:
+        valid = ", ".join(s.name for s in ScaleScope)
+        raise ValueError(f"Unknown ScaleScope {name!r}. Valid: {valid}") from e
+
+
+def _create_asym_k16_v8_serde(kwargs: dict[str, object]) -> SerdeProcessor:
+    """Factory for the storage-only (Mode 1) asym K16/V8 serde.
+
+    Accepted ``kwargs``:
+
+    * ``fp8_dtype`` (str, default ``"float8_e4m3fn"``): torch fp8
+      dtype used for V quantization.
+    * ``scale_scope`` (str, default ``"PER_TENSOR"``): name of a
+      :class:`ScaleScope` member; only ``PER_TENSOR`` and
+      ``EXTERNAL`` are supported through ``estimate_serialized_size``
+      today.
+    * ``scale_dtype`` (str, default ``"float32"``): torch dtype for
+      the per-scope scale tensor.
+    * ``max_workers`` (int, default ``1``): thread pool size for the
+      async processor.
+
+    Returns an :class:`AsyncSerdeProcessor` wrapping the multi-output
+    storage-only K16/V8 pair.  The SerdeL2AdapterWrapper consumes the
+    processor's ``MultiSerializer`` / ``MultiDeserializer`` shape via
+    its ``input_slot_mapping`` / ``output_slot_mapping`` hooks (the
+    storage-only mode uses the identity mapping ``(0, 1)``).
+    """
+    fp8_dtype = _resolve_dtype(str(kwargs.get("fp8_dtype", "float8_e4m3fn")))
+    scale_scope = _resolve_scale_scope(str(kwargs.get("scale_scope", "PER_TENSOR")))
+    scale_dtype = _resolve_dtype(str(kwargs.get("scale_dtype", "float32")))
+    max_workers = int(kwargs.get("max_workers", 1))  # type: ignore[call-overload]
+    return AsyncSerdeProcessor(
+        AsymK16V8MultiSerializer(  # type: ignore[arg-type]
+            fp8_dtype=fp8_dtype,
+            scale_scope=scale_scope,
+            scale_dtype=scale_dtype,
+        ),
+        AsymK16V8MultiDeserializer(  # type: ignore[arg-type]
+            fp8_dtype=fp8_dtype,
+            scale_scope=scale_scope,
+            scale_dtype=scale_dtype,
+        ),
+        max_workers=max_workers,
+    )
+
+
+def _create_asym_k16_v8_v_only_serde(kwargs: dict[str, object]) -> SerdeProcessor:
+    """Factory for the V-only split-tier (Mode 2) asym K16/V8 serde.
+
+    Accepted ``kwargs``: same as :func:`_create_asym_k16_v8_serde`,
+    plus:
+
+    * ``k_dtype_tag`` (str, default ``"bfloat16"``): torch dtype
+      recorded in the header so cross-config gating works on
+      restoration (K itself is never written to the byte buffer in
+      this mode; the tag identifies what K's dtype would have been).
+
+    Returns an :class:`AsyncSerdeProcessor` wrapping the V-only
+    multi-output pair.  ``input_slot_mapping`` returns ``(None, 1)``
+    so the wrapper passes no K to the serializer.  Note that
+    full split-tier placement (routing K to L1 and V to L2 as
+    separate typed child outputs) requires additional wrapper
+    work tracked separately; this factory only enables the V-only
+    codec path -- with the current wrapper, V is encoded and written
+    to L2 as a single blob, and K is expected to be sourced from L1
+    by the caller.
+    """
+    fp8_dtype = _resolve_dtype(str(kwargs.get("fp8_dtype", "float8_e4m3fn")))
+    scale_scope = _resolve_scale_scope(str(kwargs.get("scale_scope", "PER_TENSOR")))
+    scale_dtype = _resolve_dtype(str(kwargs.get("scale_dtype", "float32")))
+    k_dtype_tag = _resolve_dtype(str(kwargs.get("k_dtype_tag", "bfloat16")))
+    max_workers = int(kwargs.get("max_workers", 1))  # type: ignore[call-overload]
+    return AsyncSerdeProcessor(
+        AsymK16V8VOnlyMultiSerializer(  # type: ignore[arg-type]
+            fp8_dtype=fp8_dtype,
+            scale_scope=scale_scope,
+            scale_dtype=scale_dtype,
+            k_dtype_tag=k_dtype_tag,
+        ),
+        AsymK16V8VOnlyMultiDeserializer(  # type: ignore[arg-type]
+            fp8_dtype=fp8_dtype,
+            scale_scope=scale_scope,
+            scale_dtype=scale_dtype,
+        ),
+        max_workers=max_workers,
+    )
+
+
+register_serde_factory("asym_k16_v8", _create_asym_k16_v8_serde)
+register_serde_factory("asym_k16_v8_v_only", _create_asym_k16_v8_v_only_serde)
