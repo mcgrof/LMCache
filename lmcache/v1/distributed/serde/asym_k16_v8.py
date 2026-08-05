@@ -601,8 +601,15 @@ def _create_asym_k16_v8_serde(kwargs: dict[str, object]) -> SerdeProcessor:
       today.
     * ``scale_dtype`` (str, default ``"float32"``): torch dtype for
       the per-scope scale tensor.
-    * ``max_workers`` (int, default ``1``): thread pool size for the
-      async processor.
+    * ``max_workers`` (int, default ``4``): thread-pool size for the
+      drainer-side codec.  The asym K16/V8 codec is CPU-bound.  With a
+      single worker the encode and decode run inline on the store path
+      and make stores several times slower than storing without a serde
+      at single-producer load.  Default to four workers so the codec
+      runs off the critical path at realistic multi-producer rates and
+      store latency matches the no-serde path, without oversubscribing
+      cores.  Raise it on hosts with spare CPU; beyond that the
+      producer, not the codec, bounds throughput.
 
     Returns an :class:`AsyncSerdeProcessor` wrapping the multi-output
     storage-only K16/V8 pair.  The SerdeL2AdapterWrapper consumes the
@@ -613,7 +620,7 @@ def _create_asym_k16_v8_serde(kwargs: dict[str, object]) -> SerdeProcessor:
     fp8_dtype = _resolve_dtype(str(kwargs.get("fp8_dtype", "float8_e4m3fn")))
     scale_scope = _resolve_scale_scope(str(kwargs.get("scale_scope", "PER_TENSOR")))
     scale_dtype = _resolve_dtype(str(kwargs.get("scale_dtype", "float32")))
-    max_workers = int(kwargs.get("max_workers", 1))  # type: ignore[call-overload]
+    max_workers = int(kwargs.get("max_workers", 4))  # type: ignore[call-overload]
     return AsyncSerdeProcessor(
         AsymK16V8MultiSerializer(  # type: ignore[arg-type]
             fp8_dtype=fp8_dtype,
@@ -654,7 +661,10 @@ def _create_asym_k16_v8_v_only_serde(kwargs: dict[str, object]) -> SerdeProcesso
     scale_scope = _resolve_scale_scope(str(kwargs.get("scale_scope", "PER_TENSOR")))
     scale_dtype = _resolve_dtype(str(kwargs.get("scale_dtype", "float32")))
     k_dtype_tag = _resolve_dtype(str(kwargs.get("k_dtype_tag", "bfloat16")))
-    max_workers = int(kwargs.get("max_workers", 1))  # type: ignore[call-overload]
+    # See _create_asym_k16_v8_serde for the max_workers=4 rationale
+    # (CPU-bound codec; a single worker runs it inline on the store
+    # path and is markedly slower than the no-serde path).
+    max_workers = int(kwargs.get("max_workers", 4))  # type: ignore[call-overload]
     return AsyncSerdeProcessor(
         AsymK16V8VOnlyMultiSerializer(  # type: ignore[arg-type]
             fp8_dtype=fp8_dtype,

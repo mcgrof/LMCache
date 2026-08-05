@@ -210,7 +210,9 @@ def test_create_asym_k16_v8_returns_async_processor_with_identity_mapping() -> N
         processor.close()
 
 
-def test_create_asym_k16_v8_v_only_returns_async_processor_with_skip_k_mapping() -> None:
+def test_create_asym_k16_v8_v_only_returns_async_processor_with_skip_k_mapping() -> (
+    None
+):
     """V-only Mode 2: (None, 1) slot mapping — slot 0 is absent (K stays
     in L1), slot 1 reads parent group 1 (V)."""
     processor = create_serde_processor(SerdeConfig(type="asym_k16_v8_v_only"))
@@ -239,6 +241,35 @@ def test_create_asym_k16_v8_honors_custom_kwargs() -> None:
     )
     try:
         assert isinstance(processor, AsyncSerdeProcessor)
+    finally:
+        processor.close()
+
+
+def test_create_asym_k16_v8_defaults_max_workers_to_4() -> None:
+    """Default the asym factory to four codec workers.
+
+    The codec is CPU-bound, so a single worker runs encode and decode
+    inline on the store path and is several times slower than storing
+    without a serde at single-producer load.  Default to four workers
+    so enabling asym keeps the codec off the critical path instead of
+    silently landing on the slow single-worker path."""
+    processor = create_serde_processor(SerdeConfig(type="asym_k16_v8"))
+    try:
+        assert isinstance(processor, AsyncSerdeProcessor)
+        # ThreadPoolExecutor exposes _max_workers; pin the contract so a
+        # future refactor doesn't silently flip back to 1.
+        assert processor._pool._max_workers == 4  # type: ignore[attr-defined]
+    finally:
+        processor.close()
+
+
+def test_create_asym_k16_v8_v_only_defaults_max_workers_to_4() -> None:
+    """V-only carries the same single-thread-drainer footgun as the
+    storage-only variant, so the factory default is 4 there too."""
+    processor = create_serde_processor(SerdeConfig(type="asym_k16_v8_v_only"))
+    try:
+        assert isinstance(processor, AsyncSerdeProcessor)
+        assert processor._pool._max_workers == 4  # type: ignore[attr-defined]
     finally:
         processor.close()
 
