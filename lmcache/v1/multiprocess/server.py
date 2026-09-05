@@ -50,6 +50,7 @@ from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     IPCCacheEngineKey,
     KVCache,
+    resolve_external_chunk_hashes,
 )
 from lmcache.v1.multiprocess.gpu_context import (
     GPUCacheContext,
@@ -269,11 +270,14 @@ class MPCacheEngine:
                 that signals the completion of the store operation. The second
                 element indicates whether the store operation was successful.
         """
-        session = self.session_manager.get_or_create(key.request_id)
-        session.set_tokens(list(key.token_ids))
-        chunk_hashes = [
-            TokenHasher.hash_to_bytes(h) for h in session.get_hashes(key.start, key.end)
-        ]
+        chunk_hashes = resolve_external_chunk_hashes(key, self.chunk_size)
+        if chunk_hashes is None:
+            session = self.session_manager.get_or_create(key.request_id)
+            session.set_tokens(list(key.token_ids))
+            chunk_hashes = [
+                TokenHasher.hash_to_bytes(h)
+                for h in session.get_hashes(key.start, key.end)
+            ]
 
         st = time.perf_counter()
 
@@ -407,11 +411,14 @@ class MPCacheEngine:
                 that signals the completion of the retrieve operation. The second
                 element indicates whether the key was successfully retrieved.
         """
-        session = self.session_manager.get_or_create(key.request_id)
-        session.set_tokens(list(key.token_ids))
-        chunk_hashes = [
-            TokenHasher.hash_to_bytes(h) for h in session.get_hashes(key.start, key.end)
-        ]
+        chunk_hashes = resolve_external_chunk_hashes(key, self.chunk_size)
+        if chunk_hashes is None:
+            session = self.session_manager.get_or_create(key.request_id)
+            session.set_tokens(list(key.token_ids))
+            chunk_hashes = [
+                TokenHasher.hash_to_bytes(h)
+                for h in session.get_hashes(key.start, key.end)
+            ]
 
         st = time.perf_counter()
 
@@ -619,8 +626,11 @@ class MPCacheEngine:
 
         extra_count = compute_extra_count(tp_size, world_size)
 
-        # Compute chunk hashes for all full chunks
-        chunk_hashes = self.token_hasher.compute_chunk_hashes(list(key.token_ids))
+        chunk_hashes = resolve_external_chunk_hashes(key, self.chunk_size)
+        key_source = "resolved-contract"
+        if chunk_hashes is None:
+            key_source = "tokens"
+            chunk_hashes = self.token_hasher.compute_chunk_hashes(list(key.token_ids))
         if not chunk_hashes:
             self._register_prefetch_job(
                 _PrefetchJob(
@@ -653,6 +663,7 @@ class MPCacheEngine:
                         "model_name": model_name,
                         "chunk_size": self.chunk_size,
                         "seq_len": len(key.token_ids),
+                        "key_source": key_source,
                         "dtypes": [str(d) for d in layout_desc.dtypes],
                         "shapes": [list(s) for s in layout_desc.shapes],
                     },
@@ -779,9 +790,11 @@ class MPCacheEngine:
             tp_size: Tensor-parallel size for MLA
                 multi-reader locking.
         """
-        chunk_hashes = self.token_hasher.compute_chunk_hashes(
-            list(key.token_ids), start=key.start, end=key.end
-        )
+        chunk_hashes = resolve_external_chunk_hashes(key, self.chunk_size)
+        if chunk_hashes is None:
+            chunk_hashes = self.token_hasher.compute_chunk_hashes(
+                list(key.token_ids), start=key.start, end=key.end
+            )
         if not chunk_hashes:
             return
         obj_keys = ipc_key_to_object_keys(key, chunk_hashes)

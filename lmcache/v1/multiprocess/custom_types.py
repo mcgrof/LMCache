@@ -15,7 +15,7 @@ communications.
 
 Key Types:
 - IPCCacheEngineKey: Token-based cache key
-  - Contains token_ids, start, end, request_id (all required)
+  - Contains token_ids, start, end, request_id, and optional descriptor-issued keys
   - Converted to ObjectKey for storage operations via ipc_key_to_object_keys()
 """
 
@@ -119,14 +119,38 @@ class CudaIPCWrapper:
 
 
 @dataclass(order=True, frozen=True)
+class ExternalKVKeys:
+    """Opaque cache keys issued by a resolved KV request descriptor.
+
+    The connector and cache server must not reconstruct these values from
+    tokens.  Keeping the keys in one frozen protocol object makes presence
+    explicit across both process boundaries and lets consumers fail closed
+    when a provenance-required operation loses the object.
+    """
+
+    keys: tuple[bytes, ...]
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ValueError(
+                f"unsupported external KV key schema version: {self.schema_version}"
+            )
+        for key in self.keys:
+            if not isinstance(key, bytes) or len(key) != 32:
+                raise ValueError("external KV keys must be 32-byte values")
+
+
+@dataclass(order=True, frozen=True)
 class IPCCacheEngineKey:
     """Cache key for the IPC (multiprocess) protocol.
 
     This key type is sent by the client over ZMQ (serialized via msgspec).
 
-    The client sends token_ids, start, end, and request_id (all required).
-    The server computes chunk hashes via TokenHasher and converts to
-    ObjectKey for storage operations using ipc_key_to_object_keys().
+    In legacy mode the server computes chunk hashes from token_ids.  When
+    external_keys is present, those opaque descriptor-issued values are the
+    only storage address material; malformed external keys are errors and
+    never fall back to token hashing.
 
     The request_id field is for session tracking and is NOT included
     in equality/hash comparisons (two keys with same content but different
@@ -143,6 +167,7 @@ class IPCCacheEngineKey:
 
     # === Session tracking (not part of cache identity) ===
     request_id: str = field(compare=False)
+    external_keys: ExternalKVKeys | None = None
 
     # Helper function for unit tests only
     @classmethod
@@ -155,6 +180,7 @@ class IPCCacheEngineKey:
         start: int = 0,
         end: int = 0,
         request_id: str = "",
+        external_keys: ExternalKVKeys | None = None,
     ) -> "IPCCacheEngineKey":
         """Create a key from token ids. Only used by the tests."""
         return cls(
@@ -165,6 +191,7 @@ class IPCCacheEngineKey:
             start=start,
             end=end,
             request_id=request_id,
+            external_keys=external_keys,
         )
 
     def no_worker_id_version(self) -> "IPCCacheEngineKey":
@@ -177,6 +204,44 @@ class IPCCacheEngineKey:
             start=self.start,
             end=self.end,
             request_id=self.request_id,
+            external_keys=self.external_keys,
+        )
+
+
+def resolve_external_chunk_hashes(
+    key: IPCCacheEngineKey,
+    chunk_size: int,
+) -> list[bytes] | None:
+    """Validate descriptor-issued keys for an IPC operation.
+
+    ``None`` selects the explicit legacy token-key mode.  Once an external key
+    object is present, every shape or value error is fatal; callers must never
+    recover by hashing tokens because that would address a different namespace.
+    """
+    if key.external_keys is None:
+        return None
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive")
+    if not 0 <= key.start <= key.end <= len(key.token_ids):
+        raise ValueError(
+            "external KV key range must satisfy 0 <= start <= end <= len(token_ids)"
+        )
+    if key.start % chunk_size != 0 or key.end % chunk_size != 0:
+        raise ValueError("external KV key range must be chunk aligned")
+    expected = (key.end - key.start) // chunk_size
+    if len(key.external_keys.keys) != expected:
+        raise ValueError(
+            "external KV key count does not match the operation range: "
+            f"expected {expected}, got {len(key.external_keys.keys)}"
+        )
+    return list(key.external_keys.keys)
+
+
+def reject_external_kv_keys(key: IPCCacheEngineKey, operation: str) -> None:
+    """Prevent an unsupported path from silently rehashing tokens."""
+    if key.external_keys is not None:
+        raise ValueError(
+            f"{operation} does not support descriptor-issued external KV keys"
         )
 
 

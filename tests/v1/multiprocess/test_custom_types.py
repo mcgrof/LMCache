@@ -12,6 +12,7 @@ import torch
 from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     CudaIPCWrapper,
+    ExternalKVKeys,
     IPCCacheEngineKey,
     get_customized_decoder,
     get_customized_encoder,
@@ -39,6 +40,37 @@ def test_ipc_cache_engine_key_serialization():
 
     # Verify correctness
     assert original_key == decoded_key, "IPCCacheEngineKeys do not match!"
+
+
+def test_external_kv_keys_survive_serialization():
+    """Descriptor-issued keys must survive the worker/server boundary."""
+    external_keys = ExternalKVKeys((b"a" * 32, b"b" * 32))
+    original_key = IPCCacheEngineKey.from_token_ids(
+        model_name="test_model",
+        world_size=2,
+        worker_id=1,
+        token_ids=list(range(512)),
+        start=0,
+        end=512,
+        request_id="external-request",
+        external_keys=external_keys,
+    )
+
+    encoded = msgspec.msgpack.encode(original_key)
+    decoded_key = msgspec.msgpack.decode(encoded, type=IPCCacheEngineKey)
+
+    assert decoded_key.external_keys == external_keys
+    assert decoded_key.no_worker_id_version().external_keys == external_keys
+
+
+@pytest.mark.parametrize(
+    "key",
+    [b"short", b"long" * 16, "not-bytes"],
+)
+def test_external_kv_keys_reject_malformed_values(key):
+    """A malformed opaque key is an error, not a token-key fallback."""
+    with pytest.raises(ValueError, match="32-byte"):
+        ExternalKVKeys((key,))
 
 
 @pytest.mark.skipif(

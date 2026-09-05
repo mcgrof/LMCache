@@ -16,6 +16,7 @@ from lmcache.utils import _lmcache_nvtx_annotate, init_logger
 from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     CudaIPCWrapper,
+    ExternalKVKeys,
     IPCCacheEngineKey,
     KVCache,
 )
@@ -182,7 +183,7 @@ class HeartbeatThread(PeriodicThread):
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class LoadStoreOp:
     token_ids: list[int]
     """Token IDs for the load/store operation"""
@@ -199,6 +200,18 @@ class LoadStoreOp:
     skip_first_n_tokens: int = 0
     """Number of tokens to skip writing at the beginning of the retrieve
     range. Used to avoid overwriting APC-shared GPU blocks during retrieve."""
+
+    external_keys: ExternalKVKeys | None = None
+    """Opaque keys issued by the request's resolved KV descriptor."""
+
+    require_provenance: bool = False
+    """Fail instead of reconstructing storage keys from tokens when true."""
+
+    def __post_init__(self) -> None:
+        if self.require_provenance and self.external_keys is None:
+            raise ValueError(
+                "provenance-required load/store operation has no external KV keys"
+            )
 
     def __len__(self) -> int:
         return len(self.block_ids)
@@ -325,6 +338,8 @@ class LMCacheMPSchedulerAdapter:
         request_id: str,
         token_ids: list[int],
         cache_salt: str = "",
+        external_keys: ExternalKVKeys | None = None,
+        require_provenance: bool = False,
     ):
         """
         Submit a new lookup request to LMCache if there is no ongoing request.
@@ -339,6 +354,9 @@ class LMCacheMPSchedulerAdapter:
             token_ids: Token IDs to lookup from LMCache
             cache_salt: Per-user isolation salt. Requests with different
                 cache_salt values produce separate cache entries.
+            external_keys: Opaque keys issued by a resolved request descriptor.
+            require_provenance: Reject a missing external key set instead of
+                using the legacy token-derived address.
 
         Returns:
             None
@@ -359,6 +377,9 @@ class LMCacheMPSchedulerAdapter:
             # Skip if there is already a lookup request
             return
 
+        if require_provenance and external_keys is None:
+            raise ValueError("provenance-required lookup has no external KV keys")
+
         aligned_end = (len(token_ids) // self.chunk_size) * self.chunk_size
 
         key = self._create_key(
@@ -367,6 +388,7 @@ class LMCacheMPSchedulerAdapter:
             end=aligned_end,
             request_id=request_id,
             cache_salt=cache_salt,
+            external_keys=external_keys,
         ).no_worker_id_version()
 
         future = send_lmcache_request(
@@ -461,6 +483,8 @@ class LMCacheMPSchedulerAdapter:
         end: int,
         request_id: str,
         cache_salt: str = "",
+        external_keys: ExternalKVKeys | None = None,
+        require_provenance: bool = False,
     ) -> None:
         """Release read locks acquired during lookup without a full retrieve.
 
@@ -481,9 +505,15 @@ class LMCacheMPSchedulerAdapter:
             end: End token index.
             request_id: The request ID.
             cache_salt: Per-user isolation salt.
+            external_keys: Opaque keys covering exactly the released range.
+            require_provenance: Reject a missing external key set instead of
+                using the legacy token-derived address.
         """
         if not self.is_healthy:
             return
+
+        if require_provenance and external_keys is None:
+            raise ValueError("provenance-required lock release has no external KV keys")
 
         key = self._create_key(
             token_ids,
@@ -491,6 +521,7 @@ class LMCacheMPSchedulerAdapter:
             end=end,
             request_id=request_id,
             cache_salt=cache_salt,
+            external_keys=external_keys,
         ).no_worker_id_version()
         send_lmcache_request(
             self.mq_client,
@@ -543,6 +574,7 @@ class LMCacheMPSchedulerAdapter:
         end: int,
         request_id: str,
         cache_salt: str = "",
+        external_keys: ExternalKVKeys | None = None,
     ) -> IPCCacheEngineKey:
         """Convert token IDs to an IPC cache engine key.
 
@@ -552,6 +584,7 @@ class LMCacheMPSchedulerAdapter:
             end: End token index.
             request_id: The request ID.
             cache_salt: Per-user isolation salt.
+            external_keys: Opaque descriptor-issued keys for this range.
 
         Returns:
             IPCCacheEngineKey: The constructed key.
@@ -568,6 +601,7 @@ class LMCacheMPSchedulerAdapter:
             start=start,
             end=end,
             request_id=request_id,
+            external_keys=external_keys,
         )
 
 
@@ -789,6 +823,7 @@ class LMCacheMPWorkerAdapter:
             op.end,
             request_id=request_id,
             cache_salt=cache_salt,
+            external_keys=op.external_keys,
         )
         future = send_lmcache_request(
             self.mq_client,
@@ -828,6 +863,7 @@ class LMCacheMPWorkerAdapter:
             op.end,
             request_id=request_id,
             cache_salt=cache_salt,
+            external_keys=op.external_keys,
         )
         future = send_lmcache_request(
             self.mq_client,
@@ -1073,6 +1109,7 @@ class LMCacheMPWorkerAdapter:
         end: int,
         request_id: str,
         cache_salt: str = "",
+        external_keys: ExternalKVKeys | None = None,
     ) -> IPCCacheEngineKey:
         """Convert token IDs to an IPC cache engine key.
 
@@ -1082,6 +1119,7 @@ class LMCacheMPWorkerAdapter:
             end: End token index.
             request_id: The request ID.
             cache_salt: Per-user isolation salt.
+            external_keys: Opaque descriptor-issued keys for this range.
 
         Returns:
             IPCCacheEngineKey: The constructed key.
@@ -1096,4 +1134,5 @@ class LMCacheMPWorkerAdapter:
             start=start,
             end=end,
             request_id=request_id,
+            external_keys=external_keys,
         )

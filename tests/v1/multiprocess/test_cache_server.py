@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from typing import Generator
+import hashlib
 import multiprocessing as mp
 import os
 import time
@@ -21,6 +22,7 @@ from lmcache.v1.mp_observability.config import DEFAULT_OBSERVABILITY_CONFIG
 from lmcache.v1.multiprocess.config import MPServerConfig
 from lmcache.v1.multiprocess.custom_types import (
     CudaIPCWrapper,
+    ExternalKVKeys,
     IPCCacheEngineKey,
     KVCache,
 )
@@ -142,6 +144,26 @@ def create_cache_key(index: int, model: str = "testmodel") -> IPCCacheEngineKey:
         start=0,
         end=CHUNK_SIZE,
         request_id=f"test_request_{index}",
+    )
+
+
+def create_external_cache_key(
+    descriptor: bytes,
+    *,
+    request_id: str,
+) -> IPCCacheEngineKey:
+    """Create one descriptor-addressed chunk over a fixed token payload."""
+    token_ids = list(range(CHUNK_SIZE))
+    external_key = hashlib.sha256(b"resolved-kv-contract/v1" + descriptor).digest()
+    return IPCCacheEngineKey.from_token_ids(
+        "testmodel",
+        1,
+        0,
+        token_ids,
+        start=0,
+        end=CHUNK_SIZE,
+        request_id=request_id,
+        external_keys=ExternalKVKeys((external_key,)),
     )
 
 
@@ -483,6 +505,57 @@ def test_store_retrieve_verify(
             assert torch.allclose(original_tensor, retrieved_tensor, atol=1e-4), (
                 f"Mismatch for key {i}, layer {layer}"
             )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="Store, Retrieve, and Verify require CUDA",
+)
+def test_external_key_store_hit_miss_and_restore(
+    client: MessageQueueClient,
+    client_context: ClientContext,
+    registered_instance: int,
+):
+    """Opaque descriptor keys control a real MP store/lookup/retrieve path."""
+    store_key = create_external_cache_key(
+        b"representation-a", request_id="external-store"
+    )
+    hit_key = create_external_cache_key(b"representation-a", request_id="external-hit")
+    miss_key = create_external_cache_key(
+        b"representation-b", request_id="external-miss"
+    )
+    event = torch.cuda.Event(interprocess=True)
+    event.record()
+    source_blocks = list(range(BLOCKS_PER_KEY))
+
+    store_keys(client, [store_key], registered_instance, source_blocks, event)
+
+    assert lookup_all(client, [hit_key]) == 1
+    assert lookup_all(client, [miss_key]) == 0
+
+    destination_start = BLOCKS_PER_KEY
+    destination_blocks = list(
+        range(destination_start, destination_start + BLOCKS_PER_KEY)
+    )
+    for cache in client_context.gpu_kv_caches:
+        cache[:, destination_start : destination_start + BLOCKS_PER_KEY].zero_()
+
+    event = torch.cuda.Event(interprocess=True)
+    event.record()
+    assert retrieve_keys(
+        client,
+        [hit_key],
+        registered_instance,
+        destination_blocks,
+        event,
+    ) == [True]
+
+    for layer, cache in enumerate(client_context.gpu_kv_caches):
+        source = cache[:, :BLOCKS_PER_KEY]
+        restored = cache[:, destination_start : destination_start + BLOCKS_PER_KEY]
+        assert torch.allclose(source, restored, atol=1e-4), (
+            f"restored descriptor-addressed KV differs in layer {layer}"
+        )
 
 
 @pytest.mark.skipif(

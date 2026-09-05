@@ -74,6 +74,7 @@ from lmcache.v1.multiprocess.custom_types import (
     CBMatchResult,
     IPCCacheEngineKey,
     KVCache,
+    reject_external_kv_keys,
 )
 from lmcache.v1.multiprocess.gpu_context import (
     PlainGPUCacheContext,
@@ -353,6 +354,8 @@ class BlendEngineV2(MPCacheEngine):
             List of CBMatchResult for chunks that were actually found in storage,
             ready to be passed to cb_retrieve_pre_computed.
         """
+        reject_external_kv_keys(key, "Blend pre-computed lookup")
+
         # Fast local pre-filter: find which stored chunks appear in this query
         cb_match_result = self._token_range_matcher.match_sub_sequence(
             list(key.token_ids)
@@ -562,6 +565,8 @@ class BlendEngineV2(MPCacheEngine):
             This function will discard the last partial chunk and only store the full
             chunks
         """
+        reject_external_kv_keys(key, "Blend pre-computed store")
+
         # Compute normal prefix hashes so these chunks are accessible both via
         # the CB lookup path and via the standard lookup/retrieve path.
         chunk_hashes = self.token_hasher.compute_chunk_hashes(list(key.token_ids))
@@ -626,6 +631,8 @@ class BlendEngineV2(MPCacheEngine):
         Note:
             We must call `cb_lookup_pre_computed` first before calling this function
         """
+        reject_external_kv_keys(key, "Blend pre-computed retrieve")
+
         assert instance_id in self._cb_gpu_contexts, (
             f"Instance ID {instance_id} not registered for CB KV cache"
         )
@@ -711,6 +718,8 @@ class BlendEngineV2(MPCacheEngine):
             IPC handle bytes for the event that signals the completion of storing the
             final chunks, and a boolean flag indicating if the store is successful.
         """
+        reject_external_kv_keys(key, "Blend final store")
+
         # Compute normal hash for the keys
         chunk_hashes = self.token_hasher.compute_chunk_hashes(list(key.token_ids))
 
