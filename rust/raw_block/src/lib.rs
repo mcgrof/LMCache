@@ -23,6 +23,7 @@ use pyo3::types::PyAny;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::io;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::io::RawFd;
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -995,11 +996,86 @@ struct IoSubmission {
     is_write: bool,
     completion: Arc<IoCompletion>,
     fixed_buffer_idx: Option<u16>,
+    // The fixed buffer is a dma-buf registration: the SQE carries this byte
+    // offset into the registered dma-buf instead of a user address.
+    fixed_dmabuf: Option<usize>,
     bounce: Option<std::sync::Arc<AlignedBuf>>,
     original_ptr: Option<usize>,        // For bounce buffer reads
     payload_len: Option<usize>,         // For bounce buffer reads
     batch_id: u64,                      // Batch ID for per-batch tracking
     nvme_cmd_data: Option<NvmeCmdData>, // NVMe command data for io_uring_cmd
+}
+
+type FixedBufferRange = (u16, usize, Option<usize>);
+type FixedBufferMap = HashMap<usize, FixedBufferRange>;
+
+fn fixed_buffer_for_range(
+    registrations: &FixedBufferMap,
+    ptr_addr: usize,
+    len: usize,
+) -> (Option<u16>, Option<usize>) {
+    if let Some((index, size, dmabuf_offset)) = registrations.get(&ptr_addr) {
+        if len <= *size {
+            return (Some(*index), *dmabuf_offset);
+        }
+        return (None, None);
+    }
+
+    let Some(range_end) = ptr_addr.checked_add(len) else {
+        return (None, None);
+    };
+
+    for (base, (index, size, dmabuf_offset)) in registrations {
+        let Some(base_offset) = *dmabuf_offset else {
+            continue;
+        };
+        let Some(buffer_end) = base.checked_add(*size) else {
+            continue;
+        };
+        if ptr_addr >= *base && range_end <= buffer_end {
+            return (Some(*index), Some(base_offset + (ptr_addr - *base)));
+        }
+    }
+
+    (None, None)
+}
+
+#[cfg(test)]
+mod fixed_buffer_range_tests {
+    use super::*;
+
+    #[test]
+    fn dmabuf_slice_keeps_slot_and_adjusts_offset() {
+        let mut registrations = HashMap::new();
+        registrations.insert(0x1000, (3, 0x4000, Some(0x8000)));
+
+        assert_eq!(
+            fixed_buffer_for_range(&registrations, 0x3000, 0x1000),
+            (Some(3), Some(0xa000))
+        );
+    }
+
+    #[test]
+    fn ordinary_fixed_buffer_does_not_match_an_interior_slice() {
+        let mut registrations = HashMap::new();
+        registrations.insert(0x1000, (3, 0x4000, None));
+
+        assert_eq!(
+            fixed_buffer_for_range(&registrations, 0x2000, 0x1000),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn range_cannot_extend_beyond_registered_buffer() {
+        let mut registrations = HashMap::new();
+        registrations.insert(0x1000, (3, 0x4000, Some(0x8000)));
+
+        assert_eq!(
+            fixed_buffer_for_range(&registrations, 0x4000, 0x2000),
+            (None, None)
+        );
+    }
 }
 
 impl Default for IoSubmission {
@@ -1012,6 +1088,7 @@ impl Default for IoSubmission {
             is_write: false,
             completion: Arc::new(IoCompletion::new()),
             fixed_buffer_idx: None,
+            fixed_dmabuf: None,
             bounce: None,
             original_ptr: None,
             payload_len: None,
@@ -1019,6 +1096,78 @@ impl Default for IoSubmission {
             nvme_cmd_data: None,
         }
     }
+}
+
+/// io_uring extended buffer update, as introduced by the dma-buf backed
+/// registered buffers series: `struct io_uring_rsrc_update2` gained a flags
+/// word (IORING_RSRC_UPDATE_EXTENDED) and `data` then points at an array of
+/// `struct io_uring_regbuf_desc` instead of iovecs.  The io-uring crate does
+/// not expose this yet, so the structures are spelled out here.
+#[repr(C)]
+struct IoUringRsrcUpdate2 {
+    offset: u32,
+    flags: u32,
+    data: u64,
+    tags: u64,
+    nr: u32,
+    resv2: u32,
+}
+
+#[repr(C)]
+struct IoUringRegbufDesc {
+    type_: u32,
+    flags: u32,
+    size: u64,
+    uaddr: u64,
+    dmabuf_fd: i32,
+    target_fd: i32,
+    resv: [u64; 6],
+}
+
+const IORING_REGISTER_BUFFERS_UPDATE: libc::c_uint = 16;
+const IORING_RSRC_UPDATE_EXTENDED: u32 = 1 << 1;
+const IO_REGBUF_TYPE_DMABUF: u32 = 2;
+
+/// Install `dmabuf_fd`, mapped for I/O on `target_fd`, into sparse
+/// registered-buffer slot `index` of ring `ring_fd`.
+fn io_uring_register_dmabuf(
+    ring_fd: RawFd,
+    index: u32,
+    dmabuf_fd: i32,
+    target_fd: RawFd,
+) -> io::Result<()> {
+    let desc = IoUringRegbufDesc {
+        type_: IO_REGBUF_TYPE_DMABUF,
+        flags: 0,
+        size: 0,
+        uaddr: 0,
+        dmabuf_fd,
+        target_fd,
+        resv: [0; 6],
+    };
+    let up = IoUringRsrcUpdate2 {
+        offset: index,
+        flags: IORING_RSRC_UPDATE_EXTENDED,
+        data: &desc as *const IoUringRegbufDesc as u64,
+        tags: 0,
+        nr: 1,
+        resv2: 0,
+    };
+    // For the *_UPDATE register ops the last argument is the size of the
+    // update structure, not a count; the count is up.nr.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_io_uring_register,
+            ring_fd as libc::c_long,
+            IORING_REGISTER_BUFFERS_UPDATE as libc::c_long,
+            &up as *const IoUringRsrcUpdate2 as libc::c_long,
+            std::mem::size_of::<IoUringRsrcUpdate2>() as libc::c_long,
+        )
+    };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Raw block device I/O interface for Python.
@@ -1050,7 +1199,11 @@ struct RawBlockDevice {
     shutdown: Option<Arc<AtomicBool>>,
     // Map from buffer pointer address to registered fixed buffer index
     // Used for zero-copy I/O with pre-registered buffers
-    fixed_buffer_map: Arc<Mutex<HashMap<usize, (u16, usize)>>>,
+    // The tuple is (index, size, dmabuf_offset): dmabuf_offset is Some for a
+    // buffer registered through register_fixed_dmabufs(), and is the byte
+    // offset of this buffer inside the registered dma-buf, which the SQE
+    // carries in place of a user address.
+    fixed_buffer_map: Arc<Mutex<FixedBufferMap>>,
     // Flag indicating if fixed buffers have been registered
     fixed_buffers_registered: Arc<AtomicBool>,
     // Count of currently in-flight I/O operations (global)
@@ -1420,7 +1573,10 @@ impl RawBlockDevice {
                     let mut uring_cmd =
                         opcode::UringCmd80::new(Fd(sub.fd), NVME_URING_CMD_IO).cmd(cmd_bytes);
 
-                    // Set buf_index if using fixed buffers
+                    // Set buf_index if using fixed buffers.  A dma-buf
+                    // registration cannot be imported by a passthrough command
+                    // (io_uring_cmd_import_fixed() has no dma-buf support), so
+                    // register_fixed_dmabufs() refuses use_uring_cmd engines.
                     if let Some(idx) = sub.fixed_buffer_idx {
                         uring_cmd = uring_cmd.buf_index(Some(idx));
                     }
@@ -1445,11 +1601,18 @@ impl RawBlockDevice {
                     }
                 } else {
                     // Regular read/write operations
+                    // A dma-buf registered buffer has no user address in the
+                    // kernel's eyes: the SQE address is the byte offset of
+                    // this buffer inside the registered dma-buf.
+                    let fixed_addr: *mut u8 = match sub.fixed_dmabuf {
+                        Some(off) => off as *mut u8,
+                        None => ptr,
+                    };
                     let sqe = if sub.is_write {
                         if let Some(idx) = sub.fixed_buffer_idx {
                             opcode::WriteFixed::new(
                                 Fd(sub.fd),
-                                ptr as *const u8,
+                                fixed_addr as *const u8,
                                 sub.len as u32,
                                 idx,
                             )
@@ -1461,7 +1624,7 @@ impl RawBlockDevice {
                                 .build()
                         }
                     } else if let Some(idx) = sub.fixed_buffer_idx {
-                        opcode::ReadFixed::new(Fd(sub.fd), ptr, sub.len as u32, idx)
+                        opcode::ReadFixed::new(Fd(sub.fd), fixed_addr, sub.len as u32, idx)
                             .offset(sub.offset)
                             .build()
                     } else {
@@ -2113,7 +2276,7 @@ impl RawBlockDevice {
             let mut map = self.fixed_buffer_map.lock().unwrap();
             map.clear();
             for (idx, (ptr, size)) in buffer_ptrs.iter().zip(buffer_sizes.iter()).enumerate() {
-                map.insert(*ptr, (idx as u16, *size));
+                map.insert(*ptr, (idx as u16, *size, None));
             }
         }
 
@@ -2149,6 +2312,145 @@ impl RawBlockDevice {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Register staging buffers as dma-buf backed fixed buffers.
+    ///
+    /// Each buffer is described by its user address (the key the I/O paths
+    /// look up, exactly as for `register_fixed_buffers`), its size, the
+    /// dma-buf file descriptor that exports the memory it lives in (a
+    /// udmabuf over the buffer's memfd, or the dma-buf system heap
+    /// allocation it was mmap()ed from), and the user address at which that
+    /// dma-buf is mapped.  Many buffers may share one dma-buf: the allocator's
+    /// paged buffers are slices of one big mapping.  Each distinct dma-buf
+    /// takes one registered-buffer slot; each buffer records its byte offset
+    /// inside its dma-buf, which the SQE then carries in place of a user
+    /// address.
+    ///
+    /// The dma-buf is registered against this device's fd, so the kernel maps
+    /// it to the device once, here, and every fixed read or write against it
+    /// is issued from that mapping: no DMA mapping per command, and a command
+    /// size bounded by the device's dma-buf ceiling (its MDTS on nvme-pci)
+    /// rather than the per-command mapping clamp.
+    ///
+    /// Requires a kernel with dma-buf backed registered buffers (the
+    /// io_uring extended buffer update).  On an older kernel the update
+    /// fails with EINVAL; the caller should fall back to
+    /// `register_fixed_buffers`.  Refused on a `use_uring_cmd` engine: NVMe
+    /// passthrough cannot import a dma-buf registration.
+    #[pyo3(signature = (buffer_ptrs, buffer_sizes, dmabuf_fds, dmabuf_bases))]
+    fn register_fixed_dmabufs(
+        &self,
+        buffer_ptrs: Vec<usize>,
+        buffer_sizes: Vec<usize>,
+        dmabuf_fds: Vec<i32>,
+        dmabuf_bases: Vec<usize>,
+    ) -> PyResult<()> {
+        if !self.use_iouring {
+            return Err(PyRuntimeError::new_err("io_uring not enabled"));
+        }
+        if self.use_uring_cmd {
+            return Err(PyRuntimeError::new_err(
+                "dma-buf fixed buffers are not supported with use_uring_cmd",
+            ));
+        }
+        let n = buffer_ptrs.len();
+        if n == 0 {
+            return Err(PyValueError::new_err(
+                "at least one buffer must be provided",
+            ));
+        }
+        if buffer_sizes.len() != n || dmabuf_fds.len() != n || dmabuf_bases.len() != n {
+            return Err(PyValueError::new_err(
+                "buffer_ptrs, buffer_sizes, dmabuf_fds and dmabuf_bases must have same length",
+            ));
+        }
+        for i in 0..n {
+            if buffer_ptrs[i] < dmabuf_bases[i] {
+                return Err(PyValueError::new_err(format!(
+                    "buffer {} lies below its dma-buf base",
+                    i
+                )));
+            }
+        }
+
+        // One slot per distinct dma-buf, in first-seen order.
+        let mut slot_of_fd: HashMap<i32, u16> = HashMap::new();
+        let mut fds_in_order: Vec<i32> = Vec::new();
+        for fd in dmabuf_fds.iter() {
+            if !slot_of_fd.contains_key(fd) {
+                if fds_in_order.len() >= u16::MAX as usize {
+                    return Err(PyValueError::new_err("too many dma-bufs"));
+                }
+                slot_of_fd.insert(*fd, fds_in_order.len() as u16);
+                fds_in_order.push(*fd);
+            }
+        }
+
+        let ring = match &self.ring {
+            Some(ring) => ring,
+            None => return Err(PyRuntimeError::new_err("io_uring ring not available")),
+        };
+        let ring_fd = match ring {
+            IoUringWrapper::Standard(ring) => ring.lock().unwrap().as_raw_fd(),
+            IoUringWrapper::Big(ring) => ring.lock().unwrap().as_raw_fd(),
+        };
+
+        // A sparse table of the right size, then one extended update per slot.
+        let sparse = match ring {
+            IoUringWrapper::Standard(ring) => ring
+                .lock()
+                .unwrap()
+                .submitter()
+                .register_buffers_sparse(fds_in_order.len() as u32),
+            IoUringWrapper::Big(ring) => ring
+                .lock()
+                .unwrap()
+                .submitter()
+                .register_buffers_sparse(fds_in_order.len() as u32),
+        };
+        if let Err(e) = sparse {
+            return Err(PyRuntimeError::new_err(format!(
+                "register_buffers_sparse failed: {}",
+                e
+            )));
+        }
+
+        for (idx, fd) in fds_in_order.iter().enumerate() {
+            if let Err(e) = io_uring_register_dmabuf(ring_fd, idx as u32, *fd, self.fd) {
+                // Leave no half-registered table behind.
+                let _ = match ring {
+                    IoUringWrapper::Standard(ring) => {
+                        ring.lock().unwrap().submitter().unregister_buffers()
+                    }
+                    IoUringWrapper::Big(ring) => {
+                        ring.lock().unwrap().submitter().unregister_buffers()
+                    }
+                };
+                return Err(PyRuntimeError::new_err(format!(
+                    "dma-buf registration of slot {} (fd {}) failed: {}",
+                    idx, fd, e
+                )));
+            }
+        }
+
+        {
+            let mut map = self.fixed_buffer_map.lock().unwrap();
+            map.clear();
+            for i in 0..n {
+                let slot = slot_of_fd[&dmabuf_fds[i]];
+                map.insert(
+                    buffer_ptrs[i],
+                    (
+                        slot,
+                        buffer_sizes[i],
+                        Some(buffer_ptrs[i] - dmabuf_bases[i]),
+                    ),
+                );
+            }
+        }
+        self.fixed_buffers_registered.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -2248,7 +2550,7 @@ impl RawBlockDevice {
         let use_uring_cmd = self.use_uring_cmd;
         let fixed_buffers_registered = self.fixed_buffers_registered.load(Ordering::Relaxed);
         // Clone the fixed buffer map before releasing GIL to avoid lock contention
-        let fixed_buffer_map: HashMap<usize, (u16, usize)> = if fixed_buffers_registered {
+        let fixed_buffer_map: FixedBufferMap = if fixed_buffers_registered {
             let map = self.fixed_buffer_map.lock().unwrap();
             map.clone()
         } else {
@@ -2288,7 +2590,8 @@ impl RawBlockDevice {
                 let comp = Arc::new(IoCompletion::new());
 
                 // Fixed buffers are pre-registered with io_uring, enabling true zero-copy I/O
-                let fixed_idx = fixed_buffer_map.get(&ptrs[i]).map(|(idx, _)| *idx);
+                let (fixed_idx, fixed_dmabuf) =
+                    fixed_buffer_for_range(&fixed_buffer_map, ptrs[i], total_len);
 
                 if use_odirect {
                     #[allow(clippy::manual_is_multiple_of)]
@@ -2302,7 +2605,7 @@ impl RawBlockDevice {
                 }
 
                 // Misaligned pointer is handled via bounce buffer for writes
-                let (final_ptr, bounce_opt, fixed_idx) = if use_odirect {
+                let (final_ptr, bounce_opt, fixed_idx, fixed_dmabuf) = if use_odirect {
                     let align = alignment;
                     #[allow(clippy::manual_is_multiple_of)]
                     if ptrs[i] % align != 0 {
@@ -2316,12 +2619,12 @@ impl RawBlockDevice {
                         }
                         let bounce_arc = std::sync::Arc::new(bounce);
                         let bounce_ptr = bounce_arc.as_ptr();
-                        (bounce_ptr, Some(bounce_arc), None)
+                        (bounce_ptr, Some(bounce_arc), None, None)
                     } else {
-                        (ptr, None, fixed_idx)
+                        (ptr, None, fixed_idx, fixed_dmabuf)
                     }
                 } else {
-                    (ptr, None, fixed_idx)
+                    (ptr, None, fixed_idx, fixed_dmabuf)
                 };
 
                 // Build NVMe command data
@@ -2349,6 +2652,7 @@ impl RawBlockDevice {
                     is_write: true,
                     completion: comp.clone(),
                     fixed_buffer_idx: fixed_idx,
+                    fixed_dmabuf,
                     bounce: bounce_opt,
                     original_ptr: None,
                     payload_len: None,
@@ -2552,12 +2856,11 @@ impl RawBlockDevice {
 
         // Fixed buffers are pre-registered with io_uring, enabling true zero-copy I/O
         let use_fixed = self.fixed_buffers_registered.load(Ordering::Relaxed);
-        let fixed_idx = if use_fixed && ptr_aligned {
+        let (fixed_idx, fixed_dmabuf) = if use_fixed && ptr_aligned {
             let map = self.fixed_buffer_map.lock().unwrap();
-            let ptr_addr = ptr as usize;
-            map.get(&ptr_addr).map(|(idx, _)| *idx)
+            fixed_buffer_for_range(&map, ptr as usize, total_len)
         } else {
-            None
+            (None, None)
         };
 
         // Use bounce buffer if:
@@ -2576,6 +2879,7 @@ impl RawBlockDevice {
                 is_write: false,
                 completion: comp.clone(),
                 fixed_buffer_idx: fixed_idx,
+                fixed_dmabuf,
                 bounce: None,
                 original_ptr: None,
                 payload_len: None,
@@ -2605,6 +2909,7 @@ impl RawBlockDevice {
                 is_write: false,
                 completion: comp.clone(),
                 fixed_buffer_idx: None,
+                fixed_dmabuf: None,
                 bounce: Some(bounce_arc),
                 original_ptr: Some(ptr as usize),
                 payload_len: Some(payload_len),
@@ -2688,12 +2993,11 @@ impl RawBlockDevice {
 
         // Fixed buffers are pre-registered with io_uring, enabling true zero-copy I/O
         let use_fixed = self.fixed_buffers_registered.load(Ordering::Relaxed);
-        let fixed_idx = if use_fixed && ptr_aligned {
+        let (fixed_idx, fixed_dmabuf) = if use_fixed && ptr_aligned {
             let map = self.fixed_buffer_map.lock().unwrap();
-            let ptr_addr = ptr as usize;
-            map.get(&ptr_addr).map(|(idx, _)| *idx)
+            fixed_buffer_for_range(&map, ptr as usize, total_len)
         } else {
-            None
+            (None, None)
         };
 
         let placement_id_u16 = placement_id.map(placement_id_to_u16).transpose()?;
@@ -2714,6 +3018,7 @@ impl RawBlockDevice {
                 is_write: true,
                 completion: comp.clone(),
                 fixed_buffer_idx: fixed_idx,
+                fixed_dmabuf,
                 bounce: None,
                 original_ptr: None,
                 payload_len: None,
@@ -2750,6 +3055,7 @@ impl RawBlockDevice {
                 is_write: true,
                 completion: comp.clone(),
                 fixed_buffer_idx: None,
+                fixed_dmabuf: None,
                 bounce: Some(bounce_arc),
                 original_ptr: None,
                 payload_len: Some(payload_len),
@@ -2867,7 +3173,7 @@ impl RawBlockDevice {
         let alignment = self.alignment;
         let fixed_buffers_registered = self.fixed_buffers_registered.load(Ordering::Relaxed);
         // Clone the fixed buffer map before releasing GIL to avoid lock contention
-        let fixed_buffer_map: HashMap<usize, (u16, usize)> = if fixed_buffers_registered {
+        let fixed_buffer_map: FixedBufferMap = if fixed_buffers_registered {
             let map = self.fixed_buffer_map.lock().unwrap();
             map.clone()
         } else {
@@ -2925,26 +3231,34 @@ impl RawBlockDevice {
 
                 let comp = Arc::new(IoCompletion::new());
 
-                let (ptr_addr, fixed_idx, bounce_opt, original_ptr_opt, payload_len_opt) =
-                    if use_bounce {
-                        let bounce = AlignedBuf::new(total_len, alignment)?;
-                        let bounce_arc = Arc::new(bounce);
-                        let bounce_ptr = bounce_arc.as_mut_ptr() as usize;
-                        // Copy-back bounded by caller capacity.
-                        let payload_len = std::cmp::min(cap, total_len);
-                        (
-                            bounce_ptr,
-                            None,
-                            Some(bounce_arc),
-                            Some(ptrs[i]),
-                            Some(payload_len),
-                        )
-                    } else {
-                        // Fixed buffers are pre-registered with io_uring,
-                        // enabling true zero-copy I/O.
-                        let fixed_idx = fixed_buffer_map.get(&ptrs[i]).map(|(idx, _)| *idx);
-                        (ptrs[i], fixed_idx, None, None, None)
-                    };
+                let (
+                    ptr_addr,
+                    fixed_idx,
+                    fixed_dmabuf,
+                    bounce_opt,
+                    original_ptr_opt,
+                    payload_len_opt,
+                ) = if use_bounce {
+                    let bounce = AlignedBuf::new(total_len, alignment)?;
+                    let bounce_arc = Arc::new(bounce);
+                    let bounce_ptr = bounce_arc.as_mut_ptr() as usize;
+                    // Copy-back bounded by caller capacity.
+                    let payload_len = std::cmp::min(cap, total_len);
+                    (
+                        bounce_ptr,
+                        None,
+                        None,
+                        Some(bounce_arc),
+                        Some(ptrs[i]),
+                        Some(payload_len),
+                    )
+                } else {
+                    // Fixed buffers are pre-registered with io_uring,
+                    // enabling true zero-copy I/O.
+                    let (fixed_idx, fixed_dmabuf) =
+                        fixed_buffer_for_range(&fixed_buffer_map, ptrs[i], total_len);
+                    (ptrs[i], fixed_idx, fixed_dmabuf, None, None, None)
+                };
 
                 let sub = IoSubmission {
                     fd,
@@ -2954,6 +3268,7 @@ impl RawBlockDevice {
                     is_write: false, // read operation
                     completion: comp.clone(),
                     fixed_buffer_idx: fixed_idx,
+                    fixed_dmabuf,
                     bounce: bounce_opt,
                     original_ptr: original_ptr_opt,
                     payload_len: payload_len_opt,
