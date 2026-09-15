@@ -567,9 +567,11 @@ def _allocate_dmabuf_cpu_memory(
     """Allocate a host buffer that is also exported as a dma-buf.
 
     kind is "udmabuf" (a memfd, 2 MiB hugetlb folios when use_hugepages,
-    turned into a dma-buf by /dev/udmabuf) or "system_heap" (an allocation
+    turned into a dma-buf by /dev/udmabuf), "system_heap" (an allocation
     from /dev/dma_heap/system, 1 MiB chunks upstream, 2 MiB with the
-    superpage series).  Either way the CPU sees ordinary pages: the buffer is
+    superpage series), "cma_heap" (/dev/dma_heap/reserved, the boot-time
+    cma= area, one contiguous range) or an explicit /dev/dma_heap/<name>.
+    Either way the CPU sees ordinary pages: the buffer is
     mmap()ed, wrapped as a tensor, and pinned for the GPU with
     cudaHostRegister() when CUDA is present.  The dma-buf fd is kept in
     _DMABUF_REGIONS so the raw_block backend can register the buffer with
@@ -604,10 +606,21 @@ def _allocate_dmabuf_cpu_memory(
             os.close(memfd)
             raise
         backing_fd = memfd
-    elif kind == "system_heap":
-        heap = os.open("/dev/dma_heap/system", os.O_RDONLY | os.O_CLOEXEC)
+    elif kind == "system_heap" or kind == "cma_heap" or kind.startswith("/dev/dma_heap/"):
+        # "system_heap" is the buddy-allocator heap (2 MiB chunks with the
+        # 2 MB order, best effort); "cma_heap" is the area reserved at boot
+        # with cma= (heap name "reserved"), one contiguous range per
+        # allocation that fragmentation cannot degrade; any other
+        # /dev/dma_heap/<name> (a per-NUMA CMA area, "pernuma0") is taken
+        # as given.
+        heap_path = {
+            "system_heap": "/dev/dma_heap/system",
+            "cma_heap": "/dev/dma_heap/reserved",
+        }.get(kind, kind)
+        heap = os.open(heap_path, os.O_RDONLY | os.O_CLOEXEC)
         try:
-            # struct dma_heap_allocation_data { u64 len; u32 fd; u32 fd_flags; u64 heap_flags; }
+            # struct dma_heap_allocation_data
+            #   { u64 len; u32 fd; u32 fd_flags; u64 heap_flags; }
             req = bytearray(struct.pack("QIIQ", size, 0, os.O_RDWR | os.O_CLOEXEC, 0))
             fcntl.ioctl(heap, _DMA_HEAP_IOCTL_ALLOC, req)
             dmabuf_fd = struct.unpack("QIIQ", bytes(req))[1]
