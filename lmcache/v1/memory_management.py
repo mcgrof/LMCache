@@ -544,14 +544,125 @@ def _read_hugepage_info() -> Optional[Tuple[int, int, int]]:
         return None
 
 
+# Host buffers exported as dma-bufs, keyed by the buffer's base address:
+# (dma-buf fd, mmap object, memfd or heap fd, size).  A dma-buf backed buffer
+# is plain page-backed memory to the CPU and to cudaHostRegister(); the fd is
+# what lets io_uring register it with a block device so the device maps it
+# once instead of per command.  See _allocate_dmabuf_cpu_memory().
+_DMABUF_REGIONS: dict[int, tuple[int, Any, int, int]] = {}
+
+_UDMABUF_CREATE = 0x40187542  # _IOW('u', 0x42, struct udmabuf_create)
+_UDMABUF_FLAGS_CLOEXEC = 0x01
+_DMA_HEAP_IOCTL_ALLOC = 0xC0184800  # _IOWR('H', 0, struct dma_heap_allocation_data)
+_MFD_ALLOW_SEALING = 0x0002
+_MFD_HUGETLB = 0x0004
+_MFD_HUGE_2MB = 21 << 26
+_F_SEAL_SHRINK = 0x0002
+_F_ADD_SEALS = 1033
+
+
+def _allocate_dmabuf_cpu_memory(
+    size: int, kind: str, use_hugepages: bool
+) -> torch.Tensor:
+    """Allocate a host buffer that is also exported as a dma-buf.
+
+    kind is "udmabuf" (a memfd, 2 MiB hugetlb folios when use_hugepages,
+    turned into a dma-buf by /dev/udmabuf) or "system_heap" (an allocation
+    from /dev/dma_heap/system, 1 MiB chunks upstream, 2 MiB with the
+    superpage series).  Either way the CPU sees ordinary pages: the buffer is
+    mmap()ed, wrapped as a tensor, and pinned for the GPU with
+    cudaHostRegister() when CUDA is present.  The dma-buf fd is kept in
+    _DMABUF_REGIONS so the raw_block backend can register the buffer with
+    its device through io_uring and get map-once, MDTS-sized commands.
+    """
+    import fcntl
+    import mmap
+    import os
+    import struct
+
+    page = 2 * 1024 * 1024 if use_hugepages else 4096
+    size = (size + page - 1) // page * page
+    if kind == "udmabuf":
+        flags = _MFD_ALLOW_SEALING
+        if use_hugepages:
+            flags |= _MFD_HUGETLB | _MFD_HUGE_2MB
+        memfd = os.memfd_create("lmcache-kv", flags)
+        try:
+            os.ftruncate(memfd, size)
+            fcntl.fcntl(memfd, _F_ADD_SEALS, _F_SEAL_SHRINK)
+            dev = os.open("/dev/udmabuf", os.O_RDWR | os.O_CLOEXEC)
+            try:
+                # struct udmabuf_create { u32 memfd; u32 flags; u64 offset; u64 size; }
+                # a mutable buffer makes fcntl.ioctl() return the ioctl result,
+                # which for UDMABUF_CREATE is the new dma-buf fd
+                req = bytearray(struct.pack("IIQQ", memfd, _UDMABUF_FLAGS_CLOEXEC, 0, size))
+                dmabuf_fd = fcntl.ioctl(dev, _UDMABUF_CREATE, req)
+            finally:
+                os.close(dev)
+            mm = mmap.mmap(memfd, size, flags=mmap.MAP_SHARED)
+        except BaseException:
+            os.close(memfd)
+            raise
+        backing_fd = memfd
+    elif kind == "system_heap":
+        heap = os.open("/dev/dma_heap/system", os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            # struct dma_heap_allocation_data { u64 len; u32 fd; u32 fd_flags; u64 heap_flags; }
+            req = bytearray(struct.pack("QIIQ", size, 0, os.O_RDWR | os.O_CLOEXEC, 0))
+            fcntl.ioctl(heap, _DMA_HEAP_IOCTL_ALLOC, req)
+            dmabuf_fd = struct.unpack("QIIQ", bytes(req))[1]
+        finally:
+            os.close(heap)
+        mm = mmap.mmap(dmabuf_fd, size, flags=mmap.MAP_SHARED)
+        backing_fd = -1
+    else:
+        raise ValueError(f"unknown dma-buf source {kind!r}")
+
+    buffer = torch.frombuffer(mm, dtype=torch.uint8)
+    ptr = buffer.data_ptr()
+    if torch.cuda.is_available():
+        # Pin the pages for the GPU copy engines; this is the same page-backed
+        # mapping the device will DMA to, just registered with CUDA as well.
+        err = torch.cuda.cudart().cudaHostRegister(ptr, size, 0)
+        if err != 0:
+            logger.warning(
+                "cudaHostRegister on the dma-buf backed host buffer failed (%s); "
+                "GPU copies will not be pinned",
+                err,
+            )
+    _DMABUF_REGIONS[ptr] = (dmabuf_fd, mm, backing_fd, size)
+    logger.info(
+        "Allocated %d MiB of dma-buf backed host memory from %s (fd %d)",
+        size >> 20,
+        kind,
+        dmabuf_fd,
+    )
+    return buffer
+
+
+def get_dmabuf_region(ptr: int) -> Optional[tuple[int, int]]:
+    """Return (dma-buf fd, base address) for the dma-buf backed buffer that
+    contains ptr, or None when ptr is not inside one."""
+    for base, (fd, _mm, _bfd, size) in _DMABUF_REGIONS.items():
+        if base <= ptr < base + size:
+            return fd, base
+    return None
+
+
 def _allocate_cpu_memory(
     size: int,
     numa_mapping: Optional[NUMAMapping] = None,
     shm_name: Optional[str] = None,
     use_hugepages: bool = False,
+    dmabuf: Optional[str] = None,
 ) -> torch.Tensor:
     if size == 0:
         return torch.empty(0, dtype=torch.uint8)
+
+    if dmabuf:
+        if shm_name or numa_mapping:
+            raise ValueError("dma-buf backed host memory is not supported with shm or NUMA mapping")
+        return _allocate_dmabuf_cpu_memory(size, dmabuf, use_hugepages)
 
     resolved = _resolve_pinned_alloc_free(
         numa_mapping,
@@ -604,6 +715,19 @@ def _free_cpu_memory(
 ) -> None:
     if torch_dev.is_available():
         torch_dev.synchronize()
+
+    if buffer.numel() and buffer.data_ptr() in _DMABUF_REGIONS:
+        import os
+
+        fd, mm, backing_fd, region_size = _DMABUF_REGIONS.pop(buffer.data_ptr())
+        if torch.cuda.is_available():
+            torch.cuda.cudart().cudaHostUnregister(buffer.data_ptr())
+        del buffer
+        mm.close()
+        os.close(fd)
+        if backing_fd >= 0:
+            os.close(backing_fd)
+        return
 
     resolved = _resolve_pinned_alloc_free(
         numa_mapping,

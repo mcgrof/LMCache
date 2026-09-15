@@ -99,6 +99,17 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    # Back the local CPU buffer with memory that is also a dma-buf ("udmabuf":
+    # a memfd, hugetlb when local_cpu_use_hugepages, exported through
+    # /dev/udmabuf; "system_heap": /dev/dma_heap/system).  A raw_block backend
+    # on io_uring then registers the buffer with its device once and issues
+    # each fixed read or write as a single command up to the device's dma-buf
+    # ceiling instead of DMA-mapping every command.  None keeps pinned memory.
+    "local_cpu_dmabuf": {
+        "type": Optional[str],
+        "default": None,
+        "env_converter": str,
+    },
     "reserve_local_cpu_size": {"type": float, "default": 0.0, "env_converter": float},
     "local_disk": {
         "type": Optional[str],

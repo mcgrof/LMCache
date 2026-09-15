@@ -537,10 +537,16 @@ class LocalCPUBackend(AllocatorBackendInterface):
                         else {}
                     ),
                 }
+                # A dma-buf backed buffer lets the raw_block backend register
+                # the paged buffers with its device once (map-once, MDTS-sized
+                # commands); hugetlb folios keep that path at full size on a
+                # host without IOMMU translation.
+                if config.local_cpu_dmabuf:
+                    kwargs["dmabuf"] = config.local_cpu_dmabuf
                 return MixedMemoryAllocator(
                     align_cpu_size_bytes,
                     use_paging=True,
-                    use_hugepages=False,
+                    use_hugepages=bool(config.local_cpu_dmabuf) and use_hugepages,
                     **kwargs,
                 )
 

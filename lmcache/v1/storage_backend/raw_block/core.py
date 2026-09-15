@@ -575,6 +575,36 @@ class RawBlockCore:
             return
         buffer_ptrs = [buf.data_ptr() for buf in buffers]
         buffer_sizes = [buf.numel() * buf.element_size() for buf in buffers]
+        # A dma-buf backed allocator exposes, per paged buffer, the dma-buf fd
+        # exporting its memory and the address that dma-buf is mapped at.
+        # Registering those maps the memory to the device once and lets each
+        # fixed read or write be one command up to the device's dma-buf
+        # ceiling; without it every command is DMA-mapped on its own and, on a
+        # translating IOMMU, clamped at 128 KiB.  Fall back to the classic
+        # registration when the kernel or the device refuses.
+        regions = getattr(memory_allocator, "get_paged_dmabuf_regions", None)
+        regions = regions() if callable(regions) else None
+        if regions and not self.use_uring_cmd:
+            try:
+                self._rawdev().register_fixed_dmabufs(
+                    buffer_ptrs,
+                    buffer_sizes,
+                    [fd for fd, _base in regions],
+                    [base for _fd, base in regions],
+                )
+                logger.info(
+                    "RawBlockCore: registered %d paged buffers as dma-buf "
+                    "fixed buffers (%d dma-buf(s)) for io_uring map-once I/O",
+                    len(buffers),
+                    len({fd for fd, _base in regions}),
+                )
+                return
+            except Exception as exc:
+                logger.warning(
+                    "RawBlockCore: dma-buf fixed-buffer registration refused "
+                    "(%s); falling back to per-command mapping",
+                    exc,
+                )
         self._rawdev().register_fixed_buffers(buffer_ptrs, buffer_sizes)
         logger.info(
             "RawBlockCore: registered %d paged buffers for io_uring fixed I/O",
