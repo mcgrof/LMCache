@@ -703,12 +703,39 @@ impl Drop for AlignedBuf {
     }
 }
 
-// Acquire a Python buffer view with the requested mutability.
-fn get_pybuffer<'py>(
+/// A borrowed view of the bytes behind a Python object.
+///
+/// Two kinds of object reach the engine: ordinary buffers (bytes, memoryview,
+/// CPU tensors) that implement the buffer protocol, and device tensors that
+/// do not, because their memory is not host-addressable in the buffer
+/// protocol sense.  A device tensor is accepted through the `data_ptr()` /
+/// `nbytes` interface torch exposes: the pointer is only ever used as an
+/// address the kernel resolves through a registered buffer (a dma-buf), never
+/// dereferenced here, so the bounce paths refuse it (see `fixed_dmabuf`).
+struct BufRef {
+    view: Option<pyo3::ffi::Py_buffer>,
+    ptr: *mut u8,
+    len: usize,
+    readonly: bool,
+}
+
+impl BufRef {
+    fn release(self) {
+        if let Some(mut view) = self.view {
+            // SAFETY: view was created by PyObject_GetBuffer.
+            unsafe { pyo3::ffi::PyBuffer_Release(&mut view) };
+        }
+    }
+}
+
+// Acquire the bytes behind `obj`: a buffer-protocol view with the requested
+// mutability, or, for an object without one that has `data_ptr()` and
+// `nbytes` (a torch tensor on any device), the address it reports.
+fn get_buffer<'py>(
     py: Python<'py>,
     obj: &Bound<'py, PyAny>,
     writable: bool,
-) -> Result<pyo3::ffi::Py_buffer, PyErr> {
+) -> Result<BufRef, PyErr> {
     // SAFETY: PyObject_GetBuffer follows CPython buffer protocol.
     unsafe {
         let mut view: pyo3::ffi::Py_buffer = std::mem::zeroed();
@@ -720,18 +747,33 @@ fn get_pybuffer<'py>(
             PYBUF_ANY_CONTIGUOUS
         };
         let rc = pyo3::ffi::PyObject_GetBuffer(obj.as_ptr(), &mut view, flags);
-        if rc != 0 {
-            return Err(PyErr::fetch(py));
+        if rc == 0 {
+            return Ok(BufRef {
+                ptr: view.buf as *mut u8,
+                len: view.len as usize,
+                readonly: view.readonly != 0,
+                view: Some(view),
+            });
         }
-        Ok(view)
-    }
-}
-
-// Release a buffer view previously acquired by get_pybuffer.
-fn release_pybuffer(mut view: pyo3::ffi::Py_buffer) {
-    // SAFETY: view was created by PyObject_GetBuffer.
-    unsafe {
-        pyo3::ffi::PyBuffer_Release(&mut view);
+        let err = PyErr::fetch(py);
+        if !obj.hasattr("data_ptr")? || !obj.hasattr("nbytes")? {
+            return Err(err);
+        }
+        if let Ok(is_contig) = obj.call_method0("is_contiguous") {
+            if !is_contig.extract::<bool>().unwrap_or(true) {
+                return Err(PyValueError::new_err(
+                    "tensor must be contiguous for raw block I/O",
+                ));
+            }
+        }
+        let ptr = obj.call_method0("data_ptr")?.extract::<usize>()?;
+        let len = obj.getattr("nbytes")?.extract::<usize>()?;
+        Ok(BufRef {
+            view: None,
+            ptr: ptr as *mut u8,
+            len,
+            readonly: false,
+        })
     }
 }
 
@@ -2500,14 +2542,14 @@ impl RawBlockDevice {
         };
 
         // Acquire buffer views to keep them alive until wait_iouring() completes
-        let mut views = Vec::with_capacity(n);
+        let mut views: Vec<BufRef> = Vec::with_capacity(n);
         for buffer in &buffers {
-            let view = get_pybuffer(py, buffer, false)?;
-            if view.buf.is_null() {
+            let view = get_buffer(py, buffer, false)?;
+            if view.ptr.is_null() {
                 for v in views {
-                    release_pybuffer(v);
+                    v.release();
                 }
-                release_pybuffer(view);
+                view.release();
                 return Err(PyValueError::new_err("null buffer pointer"));
             }
             views.push(view);
@@ -2537,11 +2579,11 @@ impl RawBlockDevice {
         // Extract pointers as usize before releasing GIL (raw pointers are not Send)
         let mut ptrs = Vec::with_capacity(n);
         for view in &views {
-            ptrs.push(view.buf as usize);
+            ptrs.push(view.ptr as usize);
         }
 
         for view in views {
-            release_pybuffer(view);
+            view.release();
         }
 
         let fd = self.fd;
@@ -2609,6 +2651,11 @@ impl RawBlockDevice {
                     let align = alignment;
                     #[allow(clippy::manual_is_multiple_of)]
                     if ptrs[i] % align != 0 {
+                        if fixed_dmabuf.is_some() {
+                            return Err(PyValueError::new_err(
+                                "dma-buf registered buffer must be aligned",
+                            ));
+                        }
                         let bounce = AlignedBuf::new(total_len, align)?;
                         unsafe {
                             libc::memcpy(
@@ -2807,27 +2854,27 @@ impl RawBlockDevice {
             return Err(PyRuntimeError::new_err("device is closed"));
         }
 
-        let view = get_pybuffer(py, data, true)?;
-        if view.readonly != 0 {
-            release_pybuffer(view);
+        let view = get_buffer(py, data, true)?;
+        if view.readonly {
+            view.release();
             return Err(PyValueError::new_err("output buffer is readonly"));
         }
-        let ptr = view.buf as *mut u8;
+        let ptr = view.ptr;
         if ptr.is_null() {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err("null buffer pointer"));
         }
 
-        let cap = view.len as usize;
+        let cap = view.len;
         let total_len = total_len.unwrap_or(payload_len);
         if cap < payload_len {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err(format!(
                 "output buffer too small: cap={cap} need={payload_len}"
             )));
         }
         if total_len < payload_len {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err("total_len must be >= payload_len"));
         }
 
@@ -2835,12 +2882,12 @@ impl RawBlockDevice {
         if self.use_odirect {
             #[allow(clippy::manual_is_multiple_of)]
             if (offset as usize) % align != 0 {
-                release_pybuffer(view);
+                view.release();
                 return Err(PyValueError::new_err("O_DIRECT requires aligned offset"));
             }
             #[allow(clippy::manual_is_multiple_of)]
             if total_len % align != 0 {
-                release_pybuffer(view);
+                view.release();
                 return Err(PyValueError::new_err("O_DIRECT requires aligned total_len"));
             }
         }
@@ -2867,6 +2914,14 @@ impl RawBlockDevice {
         // Buffer is not aligned (O_DIRECT or io_uring_cmd PRP requirement)
         // Buffer capacity is less than total_len
         let use_bounce = !ptr_aligned || cap < total_len;
+        // A dma-buf registered buffer may be device memory the CPU cannot
+        // touch: it is never bounced.  Misalignment or a short buffer is an
+        // error for it, not a copy.
+        if fixed_dmabuf.is_some() && use_bounce {
+            return Err(PyValueError::new_err(
+                "dma-buf registered buffer must be aligned and at least total_len bytes",
+            ));
+        }
 
         let res = if !use_bounce {
             self.in_flight_count.fetch_add(1, Ordering::Relaxed);
@@ -2927,7 +2982,7 @@ impl RawBlockDevice {
             py.allow_threads(move || comp.wait())
         };
 
-        release_pybuffer(view);
+        view.release();
         res?;
         Ok(())
     }
@@ -2950,23 +3005,23 @@ impl RawBlockDevice {
             return Err(PyRuntimeError::new_err("device is closed"));
         }
 
-        let view = get_pybuffer(py, data, false)?;
-        let ptr = view.buf as *const u8;
+        let view = get_buffer(py, data, false)?;
+        let ptr = view.ptr as *const u8;
         if ptr.is_null() {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err("null buffer pointer"));
         }
 
-        let cap = view.len as usize;
+        let cap = view.len;
         let total_len = total_len.unwrap_or(payload_len);
         if cap < payload_len {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err(format!(
                 "input buffer too small: cap={cap} need={payload_len}"
             )));
         }
         if total_len < payload_len {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err("total_len must be >= payload_len"));
         }
 
@@ -2974,12 +3029,12 @@ impl RawBlockDevice {
         if self.use_odirect {
             #[allow(clippy::manual_is_multiple_of)]
             if (offset as usize) % align != 0 {
-                release_pybuffer(view);
+                view.release();
                 return Err(PyValueError::new_err("O_DIRECT requires aligned offset"));
             }
             #[allow(clippy::manual_is_multiple_of)]
             if total_len % align != 0 {
-                release_pybuffer(view);
+                view.release();
                 return Err(PyValueError::new_err("O_DIRECT requires aligned total_len"));
             }
         }
@@ -3006,6 +3061,14 @@ impl RawBlockDevice {
         // Buffer is not aligned (O_DIRECT requirement)
         // Buffer capacity is less than total_len
         let use_bounce = !ptr_aligned || cap < total_len;
+        // A dma-buf registered buffer may be device memory the CPU cannot
+        // touch: it is never bounced.  Misalignment or a short buffer is an
+        // error for it, not a copy.
+        if fixed_dmabuf.is_some() && use_bounce {
+            return Err(PyValueError::new_err(
+                "dma-buf registered buffer must be aligned and at least total_len bytes",
+            ));
+        }
 
         let res = if !use_bounce {
             self.in_flight_count.fetch_add(1, Ordering::Relaxed);
@@ -3076,7 +3139,7 @@ impl RawBlockDevice {
             py.allow_threads(move || comp.wait())
         };
 
-        release_pybuffer(view);
+        view.release();
         res?;
         Ok(())
     }
@@ -3114,25 +3177,25 @@ impl RawBlockDevice {
         }
 
         // Acquire buffer views to keep them alive until wait_iouring() completes
-        let mut views = Vec::with_capacity(n);
+        let mut views: Vec<BufRef> = Vec::with_capacity(n);
         let mut caps = Vec::with_capacity(n);
         for buffer in &buffers {
-            let view = get_pybuffer(py, buffer, true)?;
-            if view.readonly != 0 {
+            let view = get_buffer(py, buffer, true)?;
+            if view.readonly {
                 for v in views {
-                    release_pybuffer(v);
+                    v.release();
                 }
-                release_pybuffer(view);
+                view.release();
                 return Err(PyValueError::new_err("output buffer is readonly"));
             }
-            if view.buf.is_null() {
+            if view.ptr.is_null() {
                 for v in views {
-                    release_pybuffer(v);
+                    v.release();
                 }
-                release_pybuffer(view);
+                view.release();
                 return Err(PyValueError::new_err("null buffer pointer"));
             }
-            caps.push(view.len as usize);
+            caps.push(view.len);
             views.push(view);
         }
 
@@ -3160,11 +3223,11 @@ impl RawBlockDevice {
         // Extract pointers as usize before releasing GIL (raw pointers are not Send)
         let mut ptrs = Vec::with_capacity(n);
         for view in &views {
-            ptrs.push(view.buf as usize);
+            ptrs.push(view.ptr as usize);
         }
 
         for view in views {
-            release_pybuffer(view);
+            view.release();
         }
 
         let fd = self.fd;
@@ -3228,6 +3291,15 @@ impl RawBlockDevice {
                     true
                 };
                 let use_bounce = !ptr_aligned || cap < total_len;
+                if use_bounce
+                    && fixed_buffer_for_range(&fixed_buffer_map, ptrs[i], total_len)
+                        .1
+                        .is_some()
+                {
+                    return Err(PyValueError::new_err(
+                        "dma-buf registered buffer must be aligned and at least total_len bytes",
+                    ));
+                }
 
                 let comp = Arc::new(IoCompletion::new());
 
@@ -3345,11 +3417,11 @@ impl RawBlockDevice {
         }
         let fd = self.fd;
 
-        let view = get_pybuffer(py, data, false)?;
-        let ptr = view.buf as *const u8;
-        let buf_len = view.len as usize;
+        let view = get_buffer(py, data, false)?;
+        let ptr = view.ptr as *const u8;
+        let buf_len = view.len;
         if ptr.is_null() {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err("null buffer pointer"));
         }
 
@@ -3358,12 +3430,12 @@ impl RawBlockDevice {
         // Example: payload=4100, align=4096 -> total_len=8192.
         let payload_len = payload_len.unwrap_or(buf_len);
         if payload_len > buf_len {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err("payload_len exceeds buffer length"));
         }
         let total_len = total_len.unwrap_or(payload_len);
         if total_len < payload_len {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err("total_len must be >= payload_len"));
         }
 
@@ -3371,12 +3443,12 @@ impl RawBlockDevice {
         if self.use_odirect {
             #[allow(clippy::manual_is_multiple_of)]
             if (offset as usize) % align != 0 {
-                release_pybuffer(view);
+                view.release();
                 return Err(PyValueError::new_err("O_DIRECT requires aligned offset"));
             }
             #[allow(clippy::manual_is_multiple_of)]
             if total_len % align != 0 {
-                release_pybuffer(view);
+                view.release();
                 return Err(PyValueError::new_err("O_DIRECT requires aligned total_len"));
             }
         }
@@ -3460,7 +3532,7 @@ impl RawBlockDevice {
         });
         // Always release the CPython buffer view once the blocking I/O closure
         // completes. This decrements exporter-side view count correctly.
-        release_pybuffer(view);
+        view.release();
         res?;
         Ok(())
     }
@@ -3481,21 +3553,21 @@ impl RawBlockDevice {
             return Err(PyRuntimeError::new_err("device is closed"));
         }
         let fd = self.fd;
-        let view = get_pybuffer(py, out, true)?;
-        if view.readonly != 0 {
-            release_pybuffer(view);
+        let view = get_buffer(py, out, true)?;
+        if view.readonly {
+            view.release();
             return Err(PyValueError::new_err("output buffer is readonly"));
         }
-        let cap = view.len as usize;
+        let cap = view.len;
         if cap < payload_len {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err(format!(
                 "output buffer too small: cap={cap} need={payload_len}"
             )));
         }
-        let ptr = view.buf as *mut u8;
+        let ptr = view.ptr;
         if ptr.is_null() {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err("null buffer pointer"));
         }
 
@@ -3504,7 +3576,7 @@ impl RawBlockDevice {
         // aligned up and can be larger than payload_len.
         let total_len = total_len.unwrap_or(payload_len);
         if total_len < payload_len {
-            release_pybuffer(view);
+            view.release();
             return Err(PyValueError::new_err("total_len must be >= payload_len"));
         }
 
@@ -3512,12 +3584,12 @@ impl RawBlockDevice {
         if self.use_odirect {
             #[allow(clippy::manual_is_multiple_of)]
             if (offset as usize) % align != 0 {
-                release_pybuffer(view);
+                view.release();
                 return Err(PyValueError::new_err("O_DIRECT requires aligned offset"));
             }
             #[allow(clippy::manual_is_multiple_of)]
             if total_len % align != 0 {
-                release_pybuffer(view);
+                view.release();
                 return Err(PyValueError::new_err("O_DIRECT requires aligned total_len"));
             }
         }
@@ -3584,7 +3656,7 @@ impl RawBlockDevice {
             }
             Ok(())
         });
-        release_pybuffer(view);
+        view.release();
         res?;
         Ok(())
     }
