@@ -597,7 +597,9 @@ def _allocate_dmabuf_cpu_memory(
                 # struct udmabuf_create { u32 memfd; u32 flags; u64 offset; u64 size; }
                 # a mutable buffer makes fcntl.ioctl() return the ioctl result,
                 # which for UDMABUF_CREATE is the new dma-buf fd
-                req = bytearray(struct.pack("IIQQ", memfd, _UDMABUF_FLAGS_CLOEXEC, 0, size))
+                req = bytearray(
+                    struct.pack("IIQQ", memfd, _UDMABUF_FLAGS_CLOEXEC, 0, size)
+                )
                 dmabuf_fd = fcntl.ioctl(dev, _UDMABUF_CREATE, req)
             finally:
                 os.close(dev)
@@ -606,7 +608,9 @@ def _allocate_dmabuf_cpu_memory(
             os.close(memfd)
             raise
         backing_fd = memfd
-    elif kind == "system_heap" or kind == "cma_heap" or kind.startswith("/dev/dma_heap/"):
+    elif (
+        kind == "system_heap" or kind == "cma_heap" or kind.startswith("/dev/dma_heap/")
+    ):
         # "system_heap" is the buddy-allocator heap (2 MiB chunks with the
         # 2 MB order, best effort); "cma_heap" is the area reserved at boot
         # with cma= (heap name "reserved"), one contiguous range per
@@ -653,6 +657,121 @@ def _allocate_dmabuf_cpu_memory(
     return buffer
 
 
+_DMABUF_CHUNK_BYTES = 1 << 30  # the kernel registers at most 1 GiB per dma-buf
+
+
+def _export_cuda_dmabuf(ptr: int, size: int) -> int:
+    """Export [ptr, ptr+size) of a CUDA allocation as a dma-buf fd.
+
+    cuMemGetHandleForAddressRange(CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD) on the
+    NVIDIA open kernel modules; the range must be host-page aligned.
+    """
+    import ctypes
+
+    lib = ctypes.CDLL("libcuda.so.1")
+    lib.cuMemGetHandleForAddressRange.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.c_uint64,
+    ]
+    lib.cuMemGetHandleForAddressRange.restype = ctypes.c_int
+    fd = ctypes.c_int(-1)
+    CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD = 1
+    rc = lib.cuMemGetHandleForAddressRange(
+        ctypes.byref(fd), ptr, size, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0
+    )
+    if rc != 0:
+        raise RuntimeError(
+            f"cuMemGetHandleForAddressRange failed with CUresult {rc} "
+            "(needs the NVIDIA open kernel modules and a page-aligned range)"
+        )
+    return fd.value
+
+
+def _export_hip_dmabuf(ptr: int, size: int) -> int:
+    """Export [ptr, ptr+size) of a ROCm allocation as a dma-buf fd.
+
+    hsa_amd_portable_export_dmabuf() from libhsa-runtime64; the returned
+    offset is folded into the caller's base so the region math is the same
+    as on CUDA.
+    """
+    import ctypes
+
+    lib = ctypes.CDLL("libhsa-runtime64.so.1")
+    lib.hsa_amd_portable_export_dmabuf.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+    lib.hsa_amd_portable_export_dmabuf.restype = ctypes.c_int
+    fd = ctypes.c_int(-1)
+    off = ctypes.c_uint64(0)
+    rc = lib.hsa_amd_portable_export_dmabuf(
+        ptr, size, ctypes.byref(fd), ctypes.byref(off)
+    )
+    if rc != 0:
+        raise RuntimeError(f"hsa_amd_portable_export_dmabuf failed with status {rc}")
+    if off.value != 0:
+        raise RuntimeError(
+            f"hsa_amd_portable_export_dmabuf returned a non-zero offset {off.value}; "
+            "the region is not addressable from offset 0"
+        )
+    return fd.value
+
+
+def export_device_dmabufs(tensor: torch.Tensor) -> list[tuple[int, int, int]]:
+    """Export a device tensor's memory as dma-bufs of at most 1 GiB each.
+
+    Returns [(fd, base_ptr, size)] and records each region in _DMABUF_REGIONS so
+    get_dmabuf_region() resolves any pointer inside the tensor to (fd, base). The
+    base and size must be host-page aligned, which GPUMemoryAllocator guarantees by
+    over-allocating one page and slicing; any other tensor that is not aligned is
+    refused. Both a CUDA (open kernel modules) and a ROCm export are supported; the
+    fd is what io_uring registers against the block device so the NVMe controller
+    DMAs to and from device memory directly, with no host copy of the payload.
+    """
+    page = 4096
+    base = tensor.data_ptr()
+    size = tensor.numel() * tensor.element_size()
+    if base % page or size % page:
+        raise ValueError(
+            f"device buffer at {base:#x} of {size} bytes is not page aligned; "
+            "allocate it through the aligned GPU allocator"
+        )
+    dev = tensor.device.type
+    export = (
+        _export_hip_dmabuf if torch.version.hip is not None else _export_cuda_dmabuf
+    )
+    if dev not in ("cuda",):
+        raise ValueError(f"export_device_dmabufs: unsupported device {dev}")
+    regions = []
+    off = 0
+    while off < size:
+        chunk = min(_DMABUF_CHUNK_BYTES, size - off)
+        fd = export(base + off, chunk)
+        _DMABUF_REGIONS[base + off] = (fd, None, -1, chunk)
+        regions.append((fd, base + off, chunk))
+        off += chunk
+    logger.info(
+        "Exported %d MiB of %s memory as %d dma-buf(s)", size >> 20, dev, len(regions)
+    )
+    return regions
+
+
+def release_device_dmabufs(tensor: torch.Tensor) -> None:
+    """Close the dma-bufs exported for a device tensor by export_device_dmabufs."""
+    import os
+
+    base = tensor.data_ptr()
+    size = tensor.numel() * tensor.element_size()
+    for ptr in [p for p in list(_DMABUF_REGIONS) if base <= p < base + size]:
+        fd, _mm, _bfd, _sz = _DMABUF_REGIONS.pop(ptr)
+        os.close(fd)
+
+
 def get_dmabuf_region(ptr: int) -> Optional[tuple[int, int]]:
     """Return (dma-buf fd, base address) for the dma-buf backed buffer that
     contains ptr, or None when ptr is not inside one."""
@@ -674,7 +793,9 @@ def _allocate_cpu_memory(
 
     if dmabuf:
         if shm_name or numa_mapping:
-            raise ValueError("dma-buf backed host memory is not supported with shm or NUMA mapping")
+            raise ValueError(
+                "dma-buf backed host memory is not supported with shm or NUMA mapping"
+            )
         return _allocate_dmabuf_cpu_memory(size, dmabuf, use_hugepages)
 
     resolved = _resolve_pinned_alloc_free(

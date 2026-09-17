@@ -174,6 +174,38 @@ def _read_sysfs_int(path: str) -> Optional[int]:
         return None
 
 
+def _device_payload_tensor(memory_obj: MemoryObj) -> Optional[torch.Tensor]:
+    """Return the flat device tensor behind a memory object, or None on CPU.
+
+    A memory object whose storage lives on a GPU has no buffer-protocol view,
+    so ``byte_array`` cannot describe it.  The Rust engine accepts any object
+    exposing ``data_ptr()`` and ``nbytes`` in place of a buffer, and a paged
+    GPU allocator registers its slots with io_uring as dma-bufs, so a device
+    object hands the engine the physical uint8 tensor the allocator carved
+    it from and the read or write moves VRAM to NVMe with no host copy.
+    """
+    raw = getattr(memory_obj, "raw_data", None)
+    if not isinstance(raw, torch.Tensor) or raw.device.type == "cpu":
+        return None
+    if not raw.is_contiguous():
+        raise RuntimeError(
+            "RawBlockCore: device memory object is not contiguous; the engine "
+            "needs one flat region to hand to io_uring"
+        )
+    return raw.view(-1).view(torch.uint8)
+
+
+def _logical_payload_len(memory_obj: MemoryObj) -> int:
+    """Return the logical payload length of a memory object in bytes.
+
+    Device objects have no ``byte_array`` (it would need a host copy), so
+    their logical size comes from the metadata instead.
+    """
+    if _device_payload_tensor(memory_obj) is not None:
+        return int(memory_obj.get_size())
+    return len(memory_obj.byte_array)
+
+
 @dataclass(frozen=True)
 class RawBlockCoreConfig:
     """Configuration for RawBlockCore device layout, I/O, and checkpoints."""
@@ -814,7 +846,7 @@ class RawBlockCore:
 
                 meta = DiskCacheMetadata(
                     path=f"{self.device_path}@{offset}",
-                    size=len(obj.byte_array),
+                    size=_logical_payload_len(obj),
                     shape=obj.metadata.shape,
                     dtype=obj.metadata.dtype,
                     cached_positions=obj.metadata.cached_positions,
@@ -928,19 +960,28 @@ class RawBlockCore:
                         if self._requires_transfer_alignment
                         else payload_len
                     )
-                    buf = memoryview(objs[i].byte_array)
-                    try:
-                        buf = buf.cast("B")
-                    except Exception:
-                        pass
+                    dev_buf = _device_payload_tensor(objs[i])
+                    if dev_buf is not None:
+                        # A device object is read straight into its slot; the
+                        # allocator's page-aligned slots leave room for the
+                        # O_DIRECT tail, so the whole aligned length lands in
+                        # place and nothing is bounced through the host.
+                        buf = dev_buf
+                        direct_view = dev_buf if dev_buf.nbytes >= total_len else None
+                    else:
+                        buf = memoryview(objs[i].byte_array)
+                        try:
+                            buf = buf.cast("B")
+                        except Exception:
+                            pass
 
-                    direct_view = self._build_direct_odirect_view(
-                        memory_obj=objs[i],
-                        payload_len=payload_len,
-                        total_len=total_len,
-                        buffer_len=len(buf),
-                        zero_tail=False,
-                    )
+                        direct_view = self._build_direct_odirect_view(
+                            memory_obj=objs[i],
+                            payload_len=payload_len,
+                            total_len=total_len,
+                            buffer_len=len(buf),
+                            zero_tail=False,
+                        )
                     if direct_view is not None:
                         read_buffer = direct_view
                         read_payload_len = (
@@ -1284,6 +1325,9 @@ class RawBlockCore:
         Raises:
             RuntimeError: If the aligned payload would exceed slot capacity.
         """
+        dev_buf = _device_payload_tensor(memory_obj)
+        if dev_buf is not None:
+            return self._prepare_device_write_payload(memory_obj, dev_buf)
         buf = memory_obj.byte_array
         if hasattr(buf, "cast"):
             buf = buf.cast("B")
@@ -1312,6 +1356,45 @@ class RawBlockCore:
             if direct_view is not None:
                 buf = direct_view
         return buf, payload_len, total_len
+
+    def _prepare_device_write_payload(
+        self, memory_obj: MemoryObj, dev_buf: torch.Tensor
+    ) -> tuple[Any, int, int]:
+        """Prepare a raw-block write straight out of a device memory object.
+
+        The engine writes from the object's physical slot, so the O_DIRECT
+        tail past the logical payload must fit inside that slot.  The tail is
+        not zeroed: it carries whatever the slot held before, and a load only
+        ever consumes the logical payload, so nothing leaves the process that
+        the process did not already own.
+
+        Raises:
+            RuntimeError: If the payload or its aligned length exceeds the
+                slot, or the device slot is too small for the aligned length.
+        """
+        payload_len = int(memory_obj.get_size())
+        payload_capacity = self.slot_bytes - self.header_bytes
+        if payload_len > payload_capacity:
+            raise RuntimeError(
+                f"RawBlockCore payload {payload_len} exceeds slot capacity "
+                f"{payload_capacity}"
+            )
+        total_len = payload_len
+        if self._requires_transfer_alignment:
+            total_len = round_up(payload_len, self.block_align)
+            if total_len > payload_capacity:
+                raise RuntimeError(
+                    f"Aligned payload {total_len} exceeds slot capacity "
+                    f"{payload_capacity}"
+                )
+            if dev_buf.nbytes < total_len:
+                raise RuntimeError(
+                    f"RawBlockCore: device slot of {dev_buf.nbytes} bytes cannot "
+                    f"carry the {total_len}-byte aligned payload; the GPU "
+                    "allocator must hand out slots padded to the block "
+                    "alignment"
+                )
+        return dev_buf, payload_len, total_len
 
     def _validate_io_uring_chunk(self, offset: int, total_len: int) -> None:
         """Validate one bounded io_uring transfer range.
@@ -1716,7 +1799,9 @@ class RawBlockCore:
             True when both header and payload writes complete; false otherwise.
         """
         try:
-            header = self._encode_header(key.slot_identity, len(memory_obj.byte_array))
+            header = self._encode_header(
+                key.slot_identity, _logical_payload_len(memory_obj)
+            )
             buf, payload_len, total_len = self._prepare_write_payload(memory_obj)
 
             with self._lock:
@@ -1881,7 +1966,7 @@ class RawBlockCore:
                     continue
                 if encoded_key in self._inflight:
                     continue
-                payload_len = len(obj.byte_array)
+                payload_len = _logical_payload_len(obj)
                 if not self._payload_fits_slot(payload_len):
                     logger.warning(
                         "RawBlockCore: payload for key %s does not fit slot",
@@ -1923,7 +2008,9 @@ class RawBlockCore:
         write_succeeded = True
         for i, key, obj, offset, placement_id in write_plan:
             try:
-                header = self._encode_header(key.slot_identity, len(obj.byte_array))
+                header = self._encode_header(
+                    key.slot_identity, _logical_payload_len(obj)
+                )
                 hdr_total = (
                     round_up(len(header), self.block_align)
                     if self._requires_transfer_alignment

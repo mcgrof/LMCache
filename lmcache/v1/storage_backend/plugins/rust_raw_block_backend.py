@@ -76,7 +76,7 @@ def _get_per_tp_device_path(
     return per_tp_devices.get(str(tp_rank), per_tp_devices.get(tp_rank))
 
 
-class RustRawBlockBackend(StoragePluginInterface):
+class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
     """
     Legacy raw-block storage plugin wrapper.
 
@@ -144,10 +144,25 @@ class RustRawBlockBackend(StoragePluginInterface):
             self._build_core_config(extra),
             key_namespace="legacy",
         )
+        # A GPU staging pool makes the device the endpoint of every raw-block
+        # read and write: the engine registers the pool's slots with io_uring
+        # as dma-bufs exported from device memory, stores go out of the
+        # object's VRAM slot and loads land in a VRAM slot, with no host
+        # bounce.  Without it the local CPU allocator's pinned pages are the
+        # endpoints and the GPU connector copies through the host.
+        self._gpu_allocator: Optional[Any] = None
+        gpu_buffer_bytes = int(extra.get("rust_raw_block.gpu_buffer_bytes", 0) or 0)
+        if gpu_buffer_bytes > 0:
+            self._gpu_allocator = self._build_gpu_allocator(
+                gpu_buffer_bytes,
+                extra.get("rust_raw_block.gpu_buffer_device"),
+            )
         if self._core.io_engine == "io_uring":
             try:
                 self._core.register_fixed_buffers_from_allocator(
-                    self.local_cpu_backend.get_memory_allocator()
+                    self._gpu_allocator
+                    if self._gpu_allocator is not None
+                    else self.local_cpu_backend.get_memory_allocator()
                 )
             except Exception as e:
                 logger.warning(
@@ -238,6 +253,52 @@ class RustRawBlockBackend(StoragePluginInterface):
     def apply_loaded_state(self, data: dict[str, Any]) -> bool:
         """Validate and apply a raw-block metadata checkpoint payload."""
         return self._core.apply_loaded_state(data)
+
+    def _build_gpu_allocator(self, size_bytes: int, device: Optional[str]) -> Any:
+        """Create the paged GPU staging pool used as the raw-block endpoint.
+
+        The pool is paged with the engine's KV shapes so every slot is one
+        chunk, exactly like the local CPU allocator, and the slot layout is
+        what the engine registers with io_uring.  The metadata supplies the
+        shapes and dtypes; without it there is no chunk geometry to page by.
+        """
+        # First Party
+        from lmcache.v1.memory_allocators.gpu_memory_allocator import (
+            GPUMemoryAllocator,
+        )
+        from lmcache.v1.memory_management import MemoryFormat
+
+        if self.metadata is None:
+            raise ValueError(
+                "rust_raw_block.gpu_buffer_bytes needs the engine metadata for "
+                "the KV chunk shapes"
+            )
+        kwargs: dict[str, Any] = {}
+        if device:
+            kwargs["device"] = device
+        allocator = GPUMemoryAllocator(
+            size_bytes,
+            use_paging=True,
+            shapes=self.metadata.get_shapes(),
+            dtypes=self.metadata.get_dtypes(),
+            fmt=MemoryFormat.KV_2LTD,
+            **kwargs,
+        )
+        logger.info(
+            "RustRawBlockBackend: GPU staging pool of %d MiB on %s is the "
+            "raw-block endpoint",
+            size_bytes >> 20,
+            allocator.tensor.device,
+        )
+        return allocator
+
+    def _allocate_load_target(self, shape: Any, dtype: Any, fmt: Any) -> Any:
+        """Allocate the object a load is read into: a GPU slot when the GPU
+        staging pool exists, otherwise a local CPU object."""
+        if self._gpu_allocator is not None:
+            return self._gpu_allocator.allocate(shape, dtype, fmt)
+        assert self.local_cpu_backend is not None
+        return self.local_cpu_backend.allocate(shape, dtype, fmt)
 
     def _build_core_config(self, extra: Mapping[str, Any]) -> RawBlockCoreConfig:
         block_align = int(extra.get("rust_raw_block.block_align", 4096))
@@ -589,7 +650,7 @@ class RustRawBlockBackend(StoragePluginInterface):
                     break
                 if self.local_cpu_backend is None:
                     raise RuntimeError("RustRawBlockBackend requires local_cpu_backend")
-                memory_obj = self.local_cpu_backend.allocate(
+                memory_obj = self._allocate_load_target(
                     meta.shape,
                     meta.dtype,
                     meta.fmt,
@@ -696,10 +757,73 @@ class RustRawBlockBackend(StoragePluginInterface):
         del lookup_id, transfer_spec
         return await asyncio.to_thread(self._batched_get_prefix, keys)
 
+    @property
+    def is_gpu_endpoint(self) -> bool:
+        """True when this backend's GPU staging pool is the engine's allocator,
+        so KV chunks are staged in VRAM and move to and from NVMe directly."""
+        return self._gpu_allocator is not None
+
     def get_allocator_backend(self) -> AllocatorBackendInterface:
+        if self._gpu_allocator is not None:
+            return self
         if self.local_cpu_backend is None:
             raise RuntimeError("RustRawBlockBackend requires local_cpu_backend")
         return self.local_cpu_backend
+
+    def initialize_allocator(self, config: Any, metadata: Any) -> Any:
+        return self.get_memory_allocator()
+
+    def get_memory_allocator(self) -> Any:
+        if self._gpu_allocator is not None:
+            return self._gpu_allocator
+        if self.local_cpu_backend is None:
+            raise RuntimeError("RustRawBlockBackend requires local_cpu_backend")
+        return self.local_cpu_backend.get_memory_allocator()
+
+    def allocate(
+        self,
+        shapes: Any,
+        dtypes: Any,
+        fmt: Any = None,
+        eviction: bool = True,
+        busy_loop: bool = True,
+    ) -> Optional[MemoryObj]:
+        # First Party
+        from lmcache.v1.memory_management import MemoryFormat
+
+        if fmt is None:
+            fmt = MemoryFormat.KV_2LTD
+        if self._gpu_allocator is not None:
+            # The GPU pool has no evictor: a full pool returns None and the
+            # engine skips the store, exactly like the P/D buffer does.
+            return self._gpu_allocator.allocate(shapes, dtypes, fmt)
+        if self.local_cpu_backend is None:
+            raise RuntimeError("RustRawBlockBackend requires local_cpu_backend")
+        return self.local_cpu_backend.allocate(
+            shapes, dtypes, fmt, eviction=eviction, busy_loop=busy_loop
+        )
+
+    def batched_allocate(
+        self,
+        shapes: Any,
+        dtypes: Any,
+        batch_size: int,
+        fmt: Any = None,
+        eviction: bool = True,
+        busy_loop: bool = True,
+    ) -> Optional[list[MemoryObj]]:
+        # First Party
+        from lmcache.v1.memory_management import MemoryFormat
+
+        if fmt is None:
+            fmt = MemoryFormat.KV_2LTD
+        if self._gpu_allocator is not None:
+            return self._gpu_allocator.batched_allocate(shapes, dtypes, batch_size, fmt)
+        if self.local_cpu_backend is None:
+            raise RuntimeError("RustRawBlockBackend requires local_cpu_backend")
+        return self.local_cpu_backend.batched_allocate(
+            shapes, dtypes, batch_size, fmt, eviction=eviction, busy_loop=busy_loop
+        )
 
     def close(self) -> None:
         deadline = time.monotonic() + 10.0

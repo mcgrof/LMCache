@@ -428,3 +428,53 @@ class TestStorageManagerPrefetchCallback:
             assert not obj.ref_count_down_called
         for obj in tier0_objs[4:]:
             assert obj.ref_count_down_called
+
+
+class _RecordingCPUBackend:
+    """A local CPU backend that records what it was asked to admit."""
+
+    def __init__(self, use_hot: bool):
+        self.use_hot = use_hot
+        self.admitted: list[Any] = []
+        self.allocate_calls = 0
+
+    def batched_submit_put_task(self, keys, memory_objs) -> None:
+        self.admitted.append((list(keys), list(memory_objs)))
+
+    def contains(self, key, pin: bool = False) -> bool:
+        return False
+
+    def allocate(self, *args, **kwargs):
+        self.allocate_calls += 1
+        return None
+
+
+def _device_memory_obj() -> Any:
+    """A memory object that reports itself as living on a GPU."""
+    obj = MockMemoryObj(1)
+    obj.tensor = SimpleNamespace(device=SimpleNamespace(type="cuda"))
+    obj.meta = SimpleNamespace(fmt=None)
+    obj.get_shape = lambda: torch.Size([1])
+    obj.get_dtype = lambda: torch.bfloat16
+    return obj
+
+
+@pytest.mark.parametrize("use_hot", [True, False])
+def test_write_back_to_local_cpu_skips_the_copy_when_the_hot_cache_is_off(use_hot):
+    """A load served out of device memory must not copy to the host when the
+    CPU cache would drop the admission anyway."""
+    manager = cast(Any, SimpleNamespace(internal_copy_stream=None))
+    backend = _RecordingCPUBackend(use_hot=use_hot)
+    key = CacheEngineKey("test_model", 1, 0, 1, torch.bfloat16)
+
+    StorageManager._write_back_to_local_cpu(
+        manager, cast(Any, backend), [key], [_device_memory_obj()]
+    )
+
+    if use_hot:
+        # The copy is attempted; this allocator has no memory to give, so
+        # nothing is admitted, but it was asked.
+        assert backend.allocate_calls > 0
+    else:
+        assert backend.allocate_calls == 0
+        assert backend.admitted == []
