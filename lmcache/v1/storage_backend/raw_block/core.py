@@ -231,6 +231,20 @@ class RawBlockCoreConfig:
     use_uring_cmd: bool = False
     meta_checkpoint_placement_id: PlacementId = None
     fdp_slot_affinity_enabled: bool = False
+    # "writer" owns the device: it allocates slots, stores objects and writes
+    # the on-device index checkpoints.  "reader" shares the same device from
+    # another process or host, never writes, and adopts the writer's index
+    # through refresh_index_from_device().  This is how a prefill node hands
+    # KV chunks to a decode node over a shared NVMe namespace.
+    role: str = "writer"
+    # Read each slot's header alongside its payload and reject the load when
+    # the header names a different key: protects a reader from a slot the
+    # writer has since reused.
+    verify_slot_header_on_load: bool = False
+    # Minimum spacing between two publish_index() checkpoints, so a writer
+    # that publishes after every put batch does not rewrite the index more
+    # often than this.
+    publish_min_interval_ms: int = 0
 
 
 @dataclass
@@ -301,6 +315,18 @@ class RawBlockCore:
         self.meta_enable_periodic = bool(config.meta_enable_periodic)
         self.load_checkpoint_on_init = bool(config.load_checkpoint_on_init)
         self.meta_verify_on_load = bool(config.meta_verify_on_load)
+        self.role = str(getattr(config, "role", "writer") or "writer")
+        if self.role not in ("writer", "reader"):
+            raise ValueError(
+                f"RawBlockCore role must be 'writer' or 'reader', got {self.role!r}"
+            )
+        self.verify_slot_header_on_load = bool(
+            getattr(config, "verify_slot_header_on_load", False)
+        )
+        self.publish_min_interval_ms = int(
+            getattr(config, "publish_min_interval_ms", 0) or 0
+        )
+        self._last_publish_ts: float = 0.0
         self.io_engine = normalize_raw_block_io_engine(config.io_engine)
         self.iouring_queue_depth = int(config.iouring_queue_depth)
         self.use_uring_cmd = bool(config.use_uring_cmd)
@@ -420,6 +446,12 @@ class RawBlockCore:
         self._inflight_io_count: int = 0
         self._last_io_ts: float = time.monotonic()
         self._meta_stop_evt = threading.Event()
+        # A core that did not load the device's index must still number its
+        # checkpoints after whatever is already on the device: readers adopt
+        # only a higher sequence number, so a writer restarting at 0 would be
+        # ignored until it caught up with its previous life.  Resolved at the
+        # first checkpoint write so opening and storing do no extra reads.
+        self._meta_seq_resume_pending = not bool(config.load_checkpoint_on_init)
         self._meta_thread: Optional[threading.Thread] = None
 
         try:
@@ -429,7 +461,7 @@ class RawBlockCore:
             else:
                 logger.info("RawBlockCore: skipping on-device metadata checkpoint load")
 
-            if self.meta_enable_periodic:
+            if self.meta_enable_periodic and self.role == "writer":
                 self._meta_thread = threading.Thread(
                     target=self._checkpoint_loop,
                     daemon=True,
@@ -537,7 +569,7 @@ class RawBlockCore:
                 ) from e
             self._raw = RawBlockDevice(
                 self.device_path,
-                writable=True,
+                writable=self.role == "writer",
                 use_odirect=self.use_odirect,
                 alignment=self.block_align,
                 io_engine=self.io_engine,
@@ -807,6 +839,11 @@ class RawBlockCore:
             ValueError: If either sequence is empty, sequence lengths do not
                 match, or a placement identifier is 0.
         """
+        if self.role == "reader":
+            raise RuntimeError(
+                "RawBlockCore: refusing to store on a reader core; "
+                "only the writer owns the device"
+            )
         if not keys or not objs:
             raise ValueError("keys and objs must be non-empty")
         if len(keys) != len(objs):
@@ -1000,6 +1037,21 @@ class RawBlockCore:
                     logger.error("RawBlockCore load failed for %s: %s", encoded_key, e)
 
             if read_indices:
+                # With header verification each payload read is paired with a
+                # read of its slot header in the same batch; the header must
+                # still name this key with this size, or the writer reused
+                # the slot after we adopted its index and the load is a miss.
+                header_bufs: list[bytearray] = []
+                if self.verify_slot_header_on_load:
+                    for item_idx in read_indices:
+                        entry = items[item_idx][1]
+                        assert entry is not None
+                        hdr = bytearray(self.header_bytes)
+                        header_bufs.append(hdr)
+                        read_offsets.append(entry.offset)
+                        read_buffers.append(hdr)
+                        read_payload_lens.append(self.header_bytes)
+                        read_total_lens.append(self.header_bytes)
                 try:
                     io_results = self._read_buffers(
                         read_offsets,
@@ -1009,7 +1061,29 @@ class RawBlockCore:
                     )
                 except Exception as e:
                     logger.error("RawBlockCore batched load failed: %s", e)
-                    io_results = [False] * len(read_indices)
+                    io_results = [False] * len(read_offsets)
+                if header_bufs:
+                    n = len(read_indices)
+                    payload_ok = list(io_results[:n])
+                    header_ok = list(io_results[n:])
+                    for pos, item_idx in enumerate(read_indices):
+                        if not payload_ok[pos] or not header_ok[pos]:
+                            payload_ok[pos] = False
+                            continue
+                        encoded_key, entry = items[item_idx]
+                        assert entry is not None
+                        decoded = self._decode_slot_header(bytes(header_bufs[pos]))
+                        expected = slot_identity_from_encoded_key(
+                            encoded_key, self.key_namespace
+                        )
+                        if decoded is None or decoded != (expected, int(entry.size)):
+                            logger.warning(
+                                "RawBlockCore: slot header for %s no longer matches "
+                                "(slot reused by the writer); treating as a miss",
+                                encoded_key,
+                            )
+                            payload_ok[pos] = False
+                    io_results = payload_ok
 
                 for item_idx, ok in zip(read_indices, io_results, strict=True):
                     if not ok:
@@ -1058,6 +1132,11 @@ class RawBlockCore:
         Returns:
             A list of per-key deletion booleans aligned with ``encoded_keys``.
         """
+        if self.role == "reader":
+            raise RuntimeError(
+                "RawBlockCore: refusing to delete on a reader core; "
+                "only the writer owns the device"
+            )
         deleted: list[bool] = []
         with self._lock:
             for encoded_key in encoded_keys:
@@ -1099,6 +1178,71 @@ class RawBlockCore:
     def checkpoint_now(self) -> None:
         """Synchronously write a metadata checkpoint."""
         self._checkpoint_once(force=True)
+
+    def publish_index(self) -> bool:
+        """Write the index checkpoint so a reader core can adopt it.
+
+        A writer calls this after a put batch completes.  The checkpoint is
+        the whole index serialized as JSON (about 200 bytes per entry) mirrored
+        into the metadata area, so back-to-back calls are spaced by
+        ``publish_min_interval_ms``.  Returns True when a checkpoint was
+        written.
+        """
+        if self.role != "writer":
+            return False
+        now = time.monotonic()
+        if (now - self._last_publish_ts) * 1000.0 < self.publish_min_interval_ms:
+            return False
+        written = self._checkpoint_once(force=True)
+        if written:
+            self._last_publish_ts = now
+        return written
+
+    def _max_checkpoint_seq_on_device(self) -> int:
+        """Highest checkpoint sequence number in any valid header, or 0."""
+        best = 0
+        for offset in self._meta_container_offsets():
+            header = self._read_meta_header(offset)
+            if header is not None:
+                best = max(best, int(header["seq"]))
+        return best
+
+    def refresh_index_from_device(self) -> bool:
+        """Adopt the newest on-device index checkpoint if it is newer than ours.
+
+        Only the checkpoint headers are read until a newer sequence number
+        shows up; then the payload is loaded and replaces the index wholesale,
+        so entries the writer dropped disappear here too.  Per-slot header
+        validation is skipped: with ``verify_slot_header_on_load`` each load
+        checks the slot it reads instead.  Returns True when the index changed.
+        """
+        best: Optional[dict[str, int]] = None
+        for offset in self._meta_container_offsets():
+            header = self._read_meta_header(offset)
+            if header is None:
+                continue
+            if best is None or int(header["seq"]) > int(best["seq"]):
+                best = header
+        if best is None or int(best["seq"]) <= self._meta_seq:
+            return False
+        payload = self._load_meta_payload(best)
+        if payload is None:
+            return False
+        try:
+            data = json.loads(payload.decode("utf-8"))
+        except Exception:
+            logger.warning("RawBlockCore: failed to decode refreshed metadata payload")
+            return False
+        if not self._apply_loaded_state(data, verify=False):
+            logger.warning("RawBlockCore: refreshed metadata payload rejected")
+            return False
+        self._meta_seq = int(best["seq"])
+        logger.debug(
+            "RawBlockCore adopted checkpoint seq=%d entries=%d",
+            self._meta_seq,
+            len(self._index),
+        )
+        return True
 
     def apply_loaded_state(self, data: dict[str, Any]) -> bool:
         """Validate and apply a recovered metadata checkpoint payload.
@@ -1161,10 +1305,11 @@ class RawBlockCore:
             self._meta_thread.join(timeout=5)
             self._meta_thread = None
 
-        try:
-            self._checkpoint_once(force=True)
-        except Exception as e:
-            logger.warning("RawBlockCore final checkpoint failed: %s", e)
+        if self.role == "writer":
+            try:
+                self._checkpoint_once(force=True)
+            except Exception as e:
+                logger.warning("RawBlockCore final checkpoint failed: %s", e)
 
         if self._raw is not None:
             try:
@@ -2383,6 +2528,9 @@ class RawBlockCore:
             )
             return False
 
+        if self._meta_seq_resume_pending:
+            self._meta_seq = max(self._meta_seq, self._max_checkpoint_seq_on_device())
+            self._meta_seq_resume_pending = False
         next_seq = self._meta_seq + 1
         target_idx = int((next_seq - 1) % self._meta_copy_count)
         target = self._meta_container_offsets()[target_idx]
@@ -2446,8 +2594,13 @@ class RawBlockCore:
             return False
         return 0 < size <= (self.slot_bytes - self.header_bytes)
 
-    def _apply_loaded_state(self, data: dict[str, Any]) -> bool:
-        """Apply decoded checkpoint state after validating layout fields."""
+    def _apply_loaded_state(
+        self, data: dict[str, Any], *, verify: Optional[bool] = None
+    ) -> bool:
+        """Apply decoded checkpoint state after validating layout fields.
+
+        ``verify`` overrides ``meta_verify_on_load`` for this call.
+        """
         if not isinstance(data, dict):
             return False
         if int(data.get("version", 0)) != 1:
@@ -2562,7 +2715,7 @@ class RawBlockCore:
             self._meta_dirty_total = 0
             self._meta_persisted = 0
 
-        if self.meta_verify_on_load:
+        if self.meta_verify_on_load if verify is None else verify:
             self._validate_loaded_entries()
         return True
 

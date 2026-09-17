@@ -140,6 +140,29 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                     "extra_config['rust_raw_block.device_path'] is required"
                 )
 
+        # Prefill/decode handoff over a shared NVMe namespace: the prefill
+        # side runs the "writer" role and publishes its index after every put
+        # batch; the decode side runs the "reader" role on the same namespace,
+        # never writes, and re-reads the published index when a lookup misses.
+        self._role = str(extra.get("rust_raw_block.role", "writer") or "writer")
+        if self._role not in ("writer", "reader"):
+            raise ValueError(
+                f"rust_raw_block.role must be 'writer' or 'reader', got {self._role!r}"
+            )
+        self._publish_after_put = (
+            bool(extra.get("rust_raw_block.publish_after_put", False))
+            and self._role == "writer"
+        )
+        self._index_refresh_min_ms = int(
+            extra.get("rust_raw_block.index_refresh_min_ms", 50)
+        )
+        self._index_refresh_wait_ms = int(
+            extra.get("rust_raw_block.index_refresh_wait_ms", 0)
+        )
+        self._last_refresh_ts = 0.0
+        self._refresh_lock = threading.Lock()
+        self._warned_reader_put = False
+
         self._core = RawBlockCore(
             self._build_core_config(extra),
             key_namespace="legacy",
@@ -350,7 +373,15 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         default_slot_bytes = round_up(header_bytes + full_chunk_bytes, block_align)
         slot_bytes = int(extra.get("rust_raw_block.slot_bytes", default_slot_bytes))
 
+        role = str(extra.get("rust_raw_block.role", "writer") or "writer")
         return RawBlockCoreConfig(
+            role=role,
+            verify_slot_header_on_load=bool(
+                extra.get("rust_raw_block.verify_slot_header_on_load", role == "reader")
+            ),
+            publish_min_interval_ms=int(
+                extra.get("rust_raw_block.publish_min_interval_ms", 0)
+            ),
             device_path=self.device_path,
             capacity_bytes=capacity_bytes,
             block_align=block_align,
@@ -406,7 +437,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             first_loaded_key.to_string(),
         )
 
-    def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
+    def _contains_here(self, key: CacheEngineKey, pin: bool) -> bool:
         spec = encode_legacy_key(key)
         return (
             self._pin_if_needed(spec.encoded)
@@ -416,6 +447,53 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                 lock=False,
             )
         )
+
+    def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
+        if self._contains_here(key, pin):
+            return True
+        if self._role == "reader" and self._refresh_index():
+            return self._contains_here(key, pin)
+        return False
+
+    def batched_contains(self, keys: List[CacheEngineKey], pin: bool = False) -> int:
+        """Return the prefix hit count, letting a reader wait for the writer.
+
+        A reader that misses re-reads the writer's published index and, when
+        ``rust_raw_block.index_refresh_wait_ms`` is set, keeps re-reading until
+        the keys show up or the wait runs out.  That wait is the handoff: the
+        decode side asks before the prefill side has finished publishing.
+        """
+        hit = 0
+        while hit < len(keys) and self._contains_here(keys[hit], pin):
+            hit += 1
+        if hit == len(keys) or self._role != "reader":
+            return hit
+        deadline = time.monotonic() + self._index_refresh_wait_ms / 1000.0
+        while True:
+            if self._refresh_index():
+                while hit < len(keys) and self._contains_here(keys[hit], pin):
+                    hit += 1
+                if hit == len(keys):
+                    break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(remaining, max(self._index_refresh_min_ms, 1) / 1000.0))
+        return hit
+
+    def _refresh_index(self) -> bool:
+        """Re-read the writer's index, no more often than the configured
+        minimum spacing.  Returns True when the index changed."""
+        with self._refresh_lock:
+            now = time.monotonic()
+            if (now - self._last_refresh_ts) * 1000.0 < self._index_refresh_min_ms:
+                return False
+            self._last_refresh_ts = now
+            try:
+                return bool(self._core.refresh_index_from_device())
+            except Exception as e:
+                logger.warning("RustRawBlockBackend: index refresh failed: %s", e)
+                return False
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         with self._put_lock:
@@ -430,6 +508,8 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         return self._unpin_if_needed(spec.encoded)
 
     def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
+        if self._role == "reader":
+            return False
         spec = encode_legacy_key(key)
         with self._pin_lock:
             removed = self._core.delete_many([spec.encoded], force=force)[0]
@@ -455,7 +535,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         Returns:
             Number of keys that were actually removed.
         """
-        if not keys:
+        if not keys or self._role == "reader":
             return 0
         encoded_keys = [encode_legacy_key(key).encoded for key in keys]
         with self._pin_lock:
@@ -473,6 +553,15 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> list[Future] | None:
         del transfer_spec
+        if self._role == "reader":
+            if not self._warned_reader_put:
+                self._warned_reader_put = True
+                logger.warning(
+                    "RustRawBlockBackend: reader role on %s stores nothing; "
+                    "puts are dropped",
+                    self.device_path,
+                )
+            return None
         loop = self.loop
         if loop is None:
             raise RuntimeError("RustRawBlockBackend requires an asyncio event loop")
@@ -547,6 +636,8 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             )
             if not put_result.results or not put_result.results[0]:
                 raise RuntimeError(f"Failed to persist raw-block key {spec.encoded}")
+            if self._publish_after_put:
+                await asyncio.to_thread(self._core.publish_index)
             if on_complete_callback is not None:
                 try:
                     on_complete_callback(key)
@@ -600,6 +691,8 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                     raise RuntimeError(
                         "Failed to persist raw-block keys: " + ", ".join(failed)
                     )
+            if self._publish_after_put:
+                await asyncio.to_thread(self._core.publish_index)
             if on_complete_callback is not None:
                 for key in keys:
                     try:
