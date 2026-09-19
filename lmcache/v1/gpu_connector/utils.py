@@ -404,6 +404,19 @@ def get_head_size(
     return get_spec(kv_caches, engine_kv_format).head_size(layer_idx)
 
 
+def get_kernel_head_size(
+    kv_caches: DiscoverableKVCache,
+    engine_kv_format: "lmcache_native.EngineKVFormat",
+    layer_idx: int = 0,
+) -> int:
+    """Return the head size in the transfer kernel's terms: the real per-head
+    width. Fused formats report the packed K+V content size (2 * head_size),
+    which the kernel halves back out when it splits a KV_2LTD buffer."""
+    spec = get_spec(kv_caches, engine_kv_format)
+    head_size = spec.head_size(layer_idx)
+    return head_size // 2 if getattr(spec, "is_fused_packed", False) else head_size
+
+
 def get_tokens_per_layer(
     kv_caches: DiscoverableKVCache, engine_kv_format: "lmcache_native.EngineKVFormat"
 ) -> int:
