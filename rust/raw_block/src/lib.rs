@@ -218,6 +218,14 @@ fn round_up(x: usize, align: usize) -> usize {
     (x + align - 1) / align * align
 }
 
+/// A regular read/write can be retried only after making positive progress.
+///
+/// A zero completion has no remaining-range advance. Retrying it would
+/// resubmit the same request indefinitely.
+fn is_retryable_regular_short_io(cqe_result: i32, len: usize, is_uring_cmd: bool) -> bool {
+    cqe_result > 0 && (cqe_result as usize) < len && !is_uring_cmd
+}
+
 // Fetch errno for the last libc call on this thread.
 fn errno() -> i32 {
     // SAFETY: libc call.
@@ -1526,10 +1534,11 @@ impl RawBlockDevice {
                                         let cqe_result = cqe.result();
 
                                         // Handle short I/O with resubmission (only for regular I/O, not io_uring_cmd)
-                                        if cqe_result >= 0
-                                            && (cqe_result as usize) < sub.len
-                                            && sub.nvme_cmd_data.is_none()
-                                        {
+                                        if is_retryable_regular_short_io(
+                                            cqe_result,
+                                            sub.len,
+                                            sub.nvme_cmd_data.is_some(),
+                                        ) {
                                             let bytes_transferred = cqe_result as usize;
                                             // Update offset and length for resubmission
                                             sub.offset += bytes_transferred as u64;
@@ -1607,10 +1616,11 @@ impl RawBlockDevice {
                                         let cqe_result = cqe.result();
 
                                         // Handle short I/O with resubmission (only for regular I/O, not io_uring_cmd)
-                                        if cqe_result >= 0
-                                            && (cqe_result as usize) < sub.len
-                                            && sub.nvme_cmd_data.is_none()
-                                        {
+                                        if is_retryable_regular_short_io(
+                                            cqe_result,
+                                            sub.len,
+                                            sub.nvme_cmd_data.is_some(),
+                                        ) {
                                             let bytes_transferred = cqe_result as usize;
                                             // Update offset and length for resubmission
                                             sub.offset += bytes_transferred as u64;
