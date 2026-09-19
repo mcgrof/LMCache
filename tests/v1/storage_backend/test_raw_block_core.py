@@ -139,16 +139,18 @@ def _buffer_address(buf: memoryview) -> int:
     return ctypes.addressof((ctypes.c_byte * 1).from_buffer(buf))
 
 
-def test_raw_block_core_uring_cmd_write_padding_uses_aligned_chunks(monkeypatch):
+def test_raw_block_core_bounded_io_uring_write_uses_aligned_chunks(monkeypatch):
     core = RawBlockCore.__new__(RawBlockCore)
     core.block_align = 4096
     core.max_data_transfer_size = 4096
+    core.use_odirect = True
+    core.use_uring_cmd = True
     raw_dev = _RecordingUringCmdRawDevice()
     monkeypatch.setattr(core, "_rawdev", lambda: raw_dev)
 
     payload = bytes([3]) * 5000
 
-    core._write_uring_cmd_buffers(
+    core._write_bounded_io_uring_buffers(
         offsets=[4096],
         buffers=[bytearray(payload)],
         payload_lens=[len(payload)],
@@ -162,10 +164,12 @@ def test_raw_block_core_uring_cmd_write_padding_uses_aligned_chunks(monkeypatch)
     assert b"".join(bytes(buf) for buf in raw_dev.buffers) == payload + bytes(3192)
 
 
-def test_raw_block_core_uring_cmd_read_copyback_uses_aligned_chunks(monkeypatch):
+def test_raw_block_core_bounded_io_uring_read_copyback_uses_aligned_chunks(monkeypatch):
     core = RawBlockCore.__new__(RawBlockCore)
     core.block_align = 4096
     core.max_data_transfer_size = 4096
+    core.use_odirect = True
+    core.use_uring_cmd = True
     raw_dev = _RecordingUringCmdRawDevice()
     monkeypatch.setattr(core, "_rawdev", lambda: raw_dev)
 
@@ -173,7 +177,7 @@ def test_raw_block_core_uring_cmd_read_copyback_uses_aligned_chunks(monkeypatch)
     raw_dev.read_data = payload + bytes(3192)
     dst = bytearray(len(payload))
 
-    core._read_uring_cmd_buffers(
+    core._read_bounded_io_uring_buffers(
         offsets=[4096],
         buffers=[dst],
         payload_lens=[len(payload)],
@@ -1274,6 +1278,32 @@ def test_raw_block_core_put_many_sets_same_placement_for_header_and_payload(
             [spec], [make_memory_obj(b"data")], placement_ids=[1]
         ).results == [True]
         assert [call[2] for call in raw_device.batched_write_calls] == [[1, 1]]
+    finally:
+        core.close()
+
+
+def test_raw_block_core_put_many_honors_io_uring_transfer_limit(
+    tmp_path, monkeypatch
+):
+    core, raw_device = _make_fake_io_uring_core(
+        tmp_path,
+        monkeypatch,
+        max_data_transfer_size=RAW_BLOCK_CI_BLOCK_ALIGN,
+    )
+    spec = encode_object_key(make_object_key(504))
+
+    try:
+        assert core.put_many(
+            [spec], [make_memory_obj(b"x" * (RAW_BLOCK_CI_BLOCK_ALIGN * 2))]
+        ).results == [True]
+
+        assert len(raw_device.batched_write_calls) == 1
+        _, total_lens, _ = raw_device.batched_write_calls[0]
+        assert total_lens == [
+            RAW_BLOCK_CI_BLOCK_ALIGN,
+            RAW_BLOCK_CI_BLOCK_ALIGN,
+            RAW_BLOCK_CI_BLOCK_ALIGN,
+        ]
     finally:
         core.close()
 

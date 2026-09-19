@@ -342,11 +342,10 @@ class RawBlockCore:
                     f"got {self.device_path!r}"
                 )
 
-        # Maximum data transfer size for a single I/O request.
-        # Default is 0 (no splitting).
-        # > 0 : explicit manual split size
-        # <= 0: opt-in auto-detect from device queue limits
-        if self.use_uring_cmd:
+        # io_uring_cmd resolves zero as an opt-in device-limit probe. Regular
+        # io_uring keeps zero as its historic unsplit behavior, but honors an
+        # explicitly configured transfer ceiling.
+        if self.use_uring_cmd or config.max_data_transfer_size > 0:
             self.max_data_transfer_size = self._resolve_max_data_transfer_size(
                 config.max_data_transfer_size
             )
@@ -1284,8 +1283,8 @@ class RawBlockCore:
                 buf = direct_view
         return buf, payload_len, total_len
 
-    def _validate_uring_cmd_chunk(self, offset: int, total_len: int) -> None:
-        """Validate one NVMe raw-command transfer range.
+    def _validate_io_uring_chunk(self, offset: int, total_len: int) -> None:
+        """Validate one bounded io_uring transfer range.
 
         Args:
             offset: Device byte offset for the transfer.
@@ -1294,12 +1293,14 @@ class RawBlockCore:
         Raises:
             ValueError: If either value is not block aligned.
         """
+        if not self._requires_transfer_alignment:
+            return
         if offset % self.block_align != 0:
-            raise ValueError("io_uring_cmd requires aligned offsets")
+            raise ValueError("io_uring requires aligned offsets")
         if total_len % self.block_align != 0:
-            raise ValueError("io_uring_cmd requires aligned transfer lengths")
+            raise ValueError("io_uring requires aligned transfer lengths")
 
-    def _write_uring_cmd_buffers(
+    def _write_bounded_io_uring_buffers(
         self,
         offsets: Sequence[int],
         buffers: Sequence[Any],
@@ -1307,7 +1308,7 @@ class RawBlockCore:
         total_lens: Sequence[int],
         placement_ids: Sequence[PlacementId] | None = None,
     ) -> None:
-        """Write buffers as bounded NVMe raw-command chunks.
+        """Write buffers as chunks bounded by ``max_data_transfer_size``.
 
         Args:
             offsets: Device offsets for each logical write.
@@ -1345,7 +1346,7 @@ class RawBlockCore:
             offset = int(offset)
             payload_len = int(payload_len)
             total_len = int(total_len)
-            self._validate_uring_cmd_chunk(offset, total_len)
+            self._validate_io_uring_chunk(offset, total_len)
 
             view = self._byte_view(buf)
             if len(view) < total_len:
@@ -1361,7 +1362,7 @@ class RawBlockCore:
             cursor = 0
             while cursor < total_len:
                 chunk_len = min(self.max_data_transfer_size, total_len - cursor)
-                self._validate_uring_cmd_chunk(offset + cursor, chunk_len)
+                self._validate_io_uring_chunk(offset + cursor, chunk_len)
                 chunk_offsets.append(offset + cursor)
                 chunk_buffers.append(view[cursor : cursor + chunk_len])
                 chunk_lens.append(chunk_len)
@@ -1381,13 +1382,13 @@ class RawBlockCore:
                 raw_dev,
                 batch_id,
                 len(chunk_offsets),
-                "io_uring_cmd write",
+                "bounded io_uring write",
             )
         ):
-            raise RuntimeError("raw-block io_uring_cmd write failed")
+            raise RuntimeError("raw-block bounded io_uring write failed")
         keepalive.clear()
 
-    def _read_uring_cmd_buffers(
+    def _read_bounded_io_uring_buffers(
         self,
         offsets: Sequence[int],
         buffers: Sequence[Any],
@@ -1424,7 +1425,7 @@ class RawBlockCore:
                 offset = int(offset)
                 payload_len = int(payload_len)
                 total_len = int(total_len)
-                self._validate_uring_cmd_chunk(offset, total_len)
+                self._validate_io_uring_chunk(offset, total_len)
 
                 dst = self._byte_view(buf)
                 if len(dst) < total_len:
@@ -1445,7 +1446,7 @@ class RawBlockCore:
                 )
                 while cursor < total_len:
                     chunk_len = min(max_chunk_len, total_len - cursor)
-                    self._validate_uring_cmd_chunk(offset + cursor, chunk_len)
+                    self._validate_io_uring_chunk(offset + cursor, chunk_len)
                     chunk_offsets.append(offset + cursor)
                     chunk_buffers.append(target[cursor : cursor + chunk_len])
                     chunk_lens.append(chunk_len)
@@ -1470,7 +1471,7 @@ class RawBlockCore:
                 raw_dev,
                 batch_id,
                 len(chunk_offsets),
-                "io_uring_cmd read",
+                "bounded io_uring read",
             )
         except Exception:
             return results
@@ -1526,8 +1527,8 @@ class RawBlockCore:
                 raw_dev.pwrite_from_buffer(offset, buf, payload_len, total_len)
             return
 
-        if self.use_uring_cmd:
-            self._write_uring_cmd_buffers(
+        if self.max_data_transfer_size > 0:
+            self._write_bounded_io_uring_buffers(
                 offsets,
                 buffers,
                 payload_lens,
@@ -1611,8 +1612,8 @@ class RawBlockCore:
                     results.append(False)
             return results
 
-        if self.use_uring_cmd:
-            return self._read_uring_cmd_buffers(
+        if self.max_data_transfer_size > 0:
+            return self._read_bounded_io_uring_buffers(
                 offsets,
                 buffers,
                 payload_lens,
