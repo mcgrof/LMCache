@@ -2887,3 +2887,96 @@ def test_batched_write_rejects_misaligned_total_len():
                 dev.batched_write([0], [buf], [1])  # total_len 1 is not aligned
         finally:
             dev.close()
+
+
+def _no_cpu_tier_config(dev_path: str) -> LMCacheEngineConfig:
+    config = LMCacheEngineConfig.from_defaults(
+        chunk_size=256,
+        local_cpu=False,
+        max_local_cpu_size=0,
+        lmcache_instance_id="test_rust_raw_block_backend_no_cpu_tier",
+    )
+    config.storage_plugins = []
+    config.extra_config = {
+        "rust_raw_block.device_path": dev_path,
+        "rust_raw_block.block_align": 4096,
+        "rust_raw_block.header_bytes": 4096,
+        "rust_raw_block.meta_total_bytes": 4 * 1024 * 1024,
+        "rust_raw_block.meta_enable_periodic": False,
+    }
+    return config
+
+
+_NO_CPU_TIER_METADATA = LMCacheMetadata(
+    model_name="test_model",
+    world_size=1,
+    local_world_size=1,
+    worker_id=0,
+    local_worker_id=0,
+    kv_dtype=torch.bfloat16,
+    kv_shape=(4, 2, 256, 8, 128),
+)
+
+
+def test_rust_raw_block_backend_without_any_staging_pool_is_rejected(loop_in_thread):
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(64 * 1024 * 1024)
+
+        with pytest.raises(ValueError, match="needs a staging pool"):
+            RustRawBlockBackend(
+                config=_no_cpu_tier_config(dev_path),
+                metadata=_NO_CPU_TIER_METADATA,
+                local_cpu_backend=None,
+                loop=loop_in_thread,
+                dst_device="cpu",
+            )
+
+
+@pytest.mark.skipif(
+    not _has_ext(), reason="lmcache_rust_raw_block_io extension not installed"
+)
+def test_rust_raw_block_backend_sizes_slots_without_a_cpu_tier(
+    memory_allocator, loop_in_thread, monkeypatch
+):
+    """A GPU staging pool is enough: the backend must not need the CPU tier,
+    and must size its slots exactly as the CPU tier would have."""
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(64 * 1024 * 1024)
+
+        config = _no_cpu_tier_config(dev_path)
+        config.extra_config["rust_raw_block.gpu_buffer_bytes"] = 1 << 20
+
+        monkeypatch.setattr(
+            RustRawBlockBackend,
+            "_build_gpu_allocator",
+            lambda self, size_bytes, device: object(),
+        )
+        backend = RustRawBlockBackend(
+            config=config,
+            metadata=_NO_CPU_TIER_METADATA,
+            local_cpu_backend=None,
+            loop=loop_in_thread,
+            dst_device="cpu",
+        )
+        try:
+            assert backend.is_gpu_endpoint
+            # kv_size 2 x 4 layers x 256 tokens x (8 x 128) x 2 bytes
+            expected_chunk = 2 * 4 * 256 * 8 * 128 * 2
+            assert backend._full_chunk_size_bytes() == expected_chunk
+
+            cpu_config = _no_cpu_tier_config(dev_path)
+            cpu_config.local_cpu = True
+            cpu_config.max_local_cpu_size = 0.1
+            local_cpu = LocalCPUBackend(
+                config=cpu_config,
+                metadata=_NO_CPU_TIER_METADATA,
+                dst_device="cpu",
+                memory_allocator=memory_allocator,
+            )
+            assert local_cpu.get_full_chunk_size_bytes() == expected_chunk
+        finally:
+            backend.close()
