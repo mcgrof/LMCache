@@ -1,0 +1,307 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Request-scoped completion tracking for raw-block storage handoff."""
+
+# Future
+from __future__ import annotations
+
+# Standard
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Sequence
+import threading
+
+if TYPE_CHECKING:
+    # First Party
+    from lmcache.v1.storage_backend.raw_block.core import (
+        RawBlockCore,
+        RawBlockPublicationReceipt,
+    )
+
+
+@dataclass
+class _RequestState:
+    expected_chunks: int
+    keys: list[str] = field(default_factory=list)
+    seen_keys: set[str] = field(default_factory=set)
+    completed_keys: set[str] = field(default_factory=set)
+    saw_last_batch: bool = False
+    publication_started: bool = False
+    terminal: Future[RawBlockPublicationReceipt] = field(default_factory=Future)
+
+
+class RawBlockPDRequestTracker:
+    """Turn raw-block batch completions into one publication receipt."""
+
+    def __init__(self, core: RawBlockCore) -> None:
+        self._core = core
+        self._lock = threading.Lock()
+        self._requests: dict[str, _RequestState] = {}
+        self._leased_keys: dict[str, list[str]] = {}
+        self._publisher = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="raw-block-pd-publish",
+        )
+        self._closed = False
+
+    def register_batch(
+        self,
+        req_id: str,
+        encoded_keys: Sequence[str],
+        *,
+        expected_chunks: int,
+        is_last_batch: bool,
+        completed_keys: Sequence[str] = (),
+    ) -> Future[RawBlockPublicationReceipt]:
+        """Register one request batch and return its terminal future."""
+        if not req_id:
+            raise ValueError("storage P/D requires a non-empty request id")
+        if expected_chunks <= 0:
+            raise ValueError("storage P/D requires total_chunks > 0")
+        batch_keys = list(encoded_keys)
+        batch_key_set = set(batch_keys)
+        if not batch_keys:
+            raise ValueError("storage P/D batch must contain at least one key")
+        if len(batch_key_set) != len(batch_keys):
+            raise ValueError("storage P/D batch contains duplicate keys")
+        if not set(completed_keys).issubset(batch_key_set):
+            raise ValueError("completed keys must belong to the registered batch")
+        publish: tuple[str, list[str], Future[RawBlockPublicationReceipt]] | None
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("raw-block P/D request tracker is closed")
+            state = self._requests.get(req_id)
+            if state is None:
+                state = _RequestState(expected_chunks=expected_chunks)
+                self._requests[req_id] = state
+            elif state.expected_chunks != expected_chunks:
+                self._fail_locked(
+                    state,
+                    RuntimeError(
+                        f"request {req_id} changed total_chunks from "
+                        f"{state.expected_chunks} to {expected_chunks}"
+                    ),
+                )
+                return state.terminal
+            elif state.terminal.done():
+                raise RuntimeError(f"request {req_id} is already terminal")
+            elif state.publication_started:
+                self._fail_locked(
+                    state,
+                    RuntimeError(f"request {req_id} changed after publication began"),
+                )
+                return state.terminal
+            elif state.saw_last_batch:
+                self._fail_locked(
+                    state,
+                    RuntimeError(
+                        f"request {req_id} added a batch after its last batch"
+                    ),
+                )
+                return state.terminal
+
+            duplicate_keys = batch_key_set & state.seen_keys
+            if duplicate_keys:
+                self._fail_locked(
+                    state,
+                    RuntimeError(
+                        f"request {req_id} repeated keys across batches: "
+                        + ", ".join(sorted(duplicate_keys))
+                    ),
+                )
+                return state.terminal
+
+            state.seen_keys.update(batch_keys)
+            state.keys.extend(batch_keys)
+            state.completed_keys.update(completed_keys)
+            state.saw_last_batch = state.saw_last_batch or is_last_batch
+            if len(state.seen_keys) > state.expected_chunks:
+                self._fail_locked(
+                    state,
+                    RuntimeError(
+                        f"request {req_id} supplied {len(state.seen_keys)} keys "
+                        f"for total_chunks={state.expected_chunks}"
+                    ),
+                )
+                return state.terminal
+            if state.saw_last_batch and len(state.seen_keys) != state.expected_chunks:
+                self._fail_locked(
+                    state,
+                    RuntimeError(
+                        f"request {req_id} marked its last batch with "
+                        f"{len(state.seen_keys)} of {state.expected_chunks} keys"
+                    ),
+                )
+                return state.terminal
+            publish = self._maybe_start_publication_locked(req_id, state)
+            terminal = state.terminal
+        if publish is not None:
+            self._submit_publication(*publish)
+        return terminal
+
+    def has_request(self, req_id: str) -> bool:
+        """Return whether an unfinished request has registered any batch."""
+        with self._lock:
+            state = self._requests.get(req_id)
+            return state is not None and not state.terminal.done()
+
+    def finalize_request(
+        self,
+        req_id: str,
+        *,
+        expected_chunks: int,
+    ) -> Future[RawBlockPublicationReceipt]:
+        """Mark an existing request complete when its final batch has no new keys."""
+        publish: tuple[str, list[str], Future[RawBlockPublicationReceipt]] | None
+        with self._lock:
+            state = self._requests.get(req_id)
+            if state is None:
+                raise RuntimeError(f"request {req_id} has no registered batches")
+            if state.expected_chunks != expected_chunks:
+                self._fail_locked(
+                    state,
+                    RuntimeError(
+                        f"request {req_id} changed total_chunks from "
+                        f"{state.expected_chunks} to {expected_chunks}"
+                    ),
+                )
+                return state.terminal
+            if state.terminal.done() or state.publication_started:
+                return state.terminal
+            state.saw_last_batch = True
+            if len(state.seen_keys) != state.expected_chunks:
+                self._fail_locked(
+                    state,
+                    RuntimeError(
+                        f"request {req_id} finalized with {len(state.seen_keys)} "
+                        f"of {state.expected_chunks} keys"
+                    ),
+                )
+                return state.terminal
+            publish = self._maybe_start_publication_locked(req_id, state)
+            terminal = state.terminal
+        if publish is not None:
+            self._submit_publication(*publish)
+        return terminal
+
+    def complete_batch(
+        self,
+        req_id: str,
+        encoded_keys: Sequence[str],
+    ) -> None:
+        """Record successful writes for one batch."""
+        publish: tuple[str, list[str], Future[RawBlockPublicationReceipt]] | None
+        with self._lock:
+            state = self._requests.get(req_id)
+            if state is None or state.terminal.done():
+                return
+            unknown = set(encoded_keys) - state.seen_keys
+            if unknown:
+                self._fail_locked(
+                    state,
+                    RuntimeError(
+                        f"request {req_id} completed unregistered keys: "
+                        + ", ".join(sorted(unknown))
+                    ),
+                )
+                return
+            state.completed_keys.update(encoded_keys)
+            publish = self._maybe_start_publication_locked(req_id, state)
+        if publish is not None:
+            self._submit_publication(*publish)
+
+    def fail_request(self, req_id: str, error: BaseException) -> None:
+        """Fail a request once and prevent publication."""
+        with self._lock:
+            state = self._requests.get(req_id)
+            if state is not None:
+                self._fail_locked(state, error)
+
+    def finish_request(self, req_id: str) -> None:
+        """Fail a request that ended before its final batch was registered."""
+        with self._lock:
+            state = self._requests.get(req_id)
+            if (
+                state is not None
+                and not state.terminal.done()
+                and not state.saw_last_batch
+            ):
+                self._fail_locked(
+                    state,
+                    RuntimeError(
+                        f"request {req_id} finished before its last storage batch"
+                    ),
+                )
+
+    def close(self) -> None:
+        """Fail unfinished requests, release leases, and stop publication."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            for req_id, state in self._requests.items():
+                self._fail_locked(
+                    state,
+                    RuntimeError(f"request {req_id} aborted during shutdown"),
+                )
+        self._publisher.shutdown(wait=True, cancel_futures=False)
+        with self._lock:
+            leased_keys = list(self._leased_keys.values())
+            self._leased_keys.clear()
+        for encoded_keys in leased_keys:
+            self._core.unlock_many(encoded_keys)
+
+    def _maybe_start_publication_locked(
+        self,
+        req_id: str,
+        state: _RequestState,
+    ) -> tuple[str, list[str], Future[RawBlockPublicationReceipt]] | None:
+        if state.publication_started or state.terminal.done():
+            return None
+        if not state.saw_last_batch:
+            return None
+        if len(state.seen_keys) != state.expected_chunks:
+            return None
+        if state.completed_keys != state.seen_keys:
+            return None
+        state.publication_started = True
+        return req_id, list(state.keys), state.terminal
+
+    def _submit_publication(
+        self,
+        req_id: str,
+        encoded_keys: list[str],
+        terminal: Future[RawBlockPublicationReceipt],
+    ) -> None:
+        publication = self._publisher.submit(self._core.publish_request, encoded_keys)
+
+        def finish(done: Future[RawBlockPublicationReceipt]) -> None:
+            try:
+                receipt = done.result()
+                leased = self._core.get_metadata_prefix(
+                    encoded_keys,
+                    lock=True,
+                )
+                if len(leased) != len(encoded_keys):
+                    self._core.unlock_many(encoded_keys[: len(leased)])
+                    raise RuntimeError(
+                        f"request {req_id} could not lease every published key"
+                    )
+            except BaseException as exc:
+                self.fail_request(req_id, exc)
+                return
+            with self._lock:
+                state = self._requests.get(req_id)
+                if state is not None and state.terminal is terminal:
+                    self._leased_keys[req_id] = encoded_keys
+                    if not terminal.done():
+                        terminal.set_result(receipt)
+
+        publication.add_done_callback(finish)
+
+    @staticmethod
+    def _fail_locked(
+        state: _RequestState,
+        error: BaseException,
+    ) -> None:
+        if not state.terminal.done():
+            state.terminal.set_exception(error)
