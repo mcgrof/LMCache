@@ -4,10 +4,11 @@
 from __future__ import annotations
 
 # Standard
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 import ctypes
+import hashlib
 import json
 import os
 import re
@@ -15,6 +16,7 @@ import stat
 import struct
 import threading
 import time
+import uuid
 import zlib
 
 # Third Party
@@ -165,6 +167,45 @@ def _resolve_sysfs_queue_dir(device_path: str) -> Optional[str]:
     return None
 
 
+def _resolve_namespace_identity(device_path: str) -> str:
+    """Return a stable-enough identity for checkpoint and handoff receipts."""
+    try:
+        device_stat = os.stat(device_path)
+    except OSError:
+        # Unit-test fakes and file-backed development targets may not exist
+        # until the native engine opens them.  A canonical path is sufficient
+        # to fence two such endpoints; production block devices still require
+        # a persistent hardware identity below.
+        return f"path:{os.path.realpath(device_path)}"
+    if stat.S_ISREG(device_stat.st_mode):
+        return f"file:{device_stat.st_dev}:{device_stat.st_ino}"
+    if stat.S_ISBLK(device_stat.st_mode):
+        major = os.major(device_stat.st_rdev)
+        minor = os.minor(device_stat.st_rdev)
+        sysfs_device = f"/sys/dev/block/{major}:{minor}"
+        for field in ("wwid", "uuid", "nguid", "eui"):
+            for candidate in (
+                os.path.join(sysfs_device, field),
+                os.path.join(sysfs_device, "device", field),
+            ):
+                try:
+                    with open(candidate, "r", encoding="utf-8") as identity_file:
+                        value = identity_file.read().strip()
+                except OSError:
+                    continue
+                if value:
+                    return f"block:{field}:{value}"
+        raise ValueError(
+            "raw-block storage P/D requires a persistent block namespace "
+            "identity; configure rust_raw_block.namespace_identity"
+        )
+    # A character device (the io_uring_cmd passthrough node) is identified by
+    # the device it refers to, not by the filesystem its node lives on:
+    # st_dev names devtmpfs and would differ between a container and its host
+    # for the same namespace.
+    return f"device:{os.major(device_stat.st_rdev)}:{os.minor(device_stat.st_rdev)}"
+
+
 def _read_sysfs_int(path: str) -> Optional[int]:
     """Read an integer value from sysfs and return None on failure."""
     try:
@@ -245,6 +286,18 @@ class RawBlockCoreConfig:
     # that publishes after every put batch does not rewrite the index more
     # often than this.
     publish_min_interval_ms: int = 0
+    # Refuse startup unless every staging buffer is registered through the
+    # dma-buf io_uring path. This is used by correctness runs that must not
+    # silently fall back to classic fixed or per-command mapped buffers.
+    require_dmabuf_registration: bool = False
+    # Unique writer incarnation carried in every checkpoint. An empty value
+    # creates a fresh UUID for a writer and is populated from checkpoints by a
+    # reader.
+    writer_epoch: str = ""
+    # Persistent namespace identity carried in request receipts. When omitted,
+    # regular files use device/inode identity and block devices use sysfs WWID,
+    # UUID, NGUID, or EUI data.
+    namespace_identity: str = ""
 
 
 @dataclass
@@ -267,6 +320,19 @@ class RawBlockPutManyResult:
 
     results: list[bool]
     stored_keys: list[str]
+
+
+@dataclass(frozen=True)
+class RawBlockPublicationReceipt:
+    """Identify one published request manifest."""
+
+    writer_epoch: str
+    checkpoint_seq: int
+    key_count: int
+    manifest_digest: str
+    namespace_identity: str = ""
+    total_logical_bytes: int = 0
+    total_padded_bytes: int = 0
 
 
 class RawBlockCore:
@@ -326,10 +392,30 @@ class RawBlockCore:
         self.publish_min_interval_ms = int(
             getattr(config, "publish_min_interval_ms", 0) or 0
         )
+        self.require_dmabuf_registration = bool(
+            getattr(config, "require_dmabuf_registration", False)
+        )
         self._last_publish_ts: float = 0.0
+        self._buffer_registration_mode = "none"
+        configured_namespace = str(getattr(config, "namespace_identity", "") or "")
+        self.namespace_identity = configured_namespace or _resolve_namespace_identity(
+            self.device_path
+        )
+        configured_epoch = str(getattr(config, "writer_epoch", "") or "")
+        self._writer_epoch = (
+            configured_epoch
+            if configured_epoch
+            else str(uuid.uuid4())
+            if self.role == "writer"
+            else ""
+        )
+        self._published_keys: frozenset[str] = frozenset()
+        self._published_manifest: dict[str, dict[str, Any]] = {}
+        self._published_writer_epoch = ""
         self.io_engine = normalize_raw_block_io_engine(config.io_engine)
         self.iouring_queue_depth = int(config.iouring_queue_depth)
         self.use_uring_cmd = bool(config.use_uring_cmd)
+        self.max_data_transfer_size = 0
         self.fdp_slot_affinity_enabled = bool(config.fdp_slot_affinity_enabled)
         self.meta_checkpoint_placement_id = normalize_raw_block_placement_ids(
             [config.meta_checkpoint_placement_id],
@@ -378,6 +464,29 @@ class RawBlockCore:
         )
         if self.use_uring_cmd and self.io_engine != "io_uring":
             raise ValueError("use_uring_cmd requires io_uring as io_engine")
+        if self.require_dmabuf_registration:
+            if self.io_engine != "io_uring":
+                raise ValueError(
+                    "require_dmabuf_registration requires io_engine='io_uring'"
+                )
+            if not self.use_odirect:
+                raise ValueError(
+                    "require_dmabuf_registration requires use_odirect=true"
+                )
+            if self.use_uring_cmd:
+                raise ValueError(
+                    "require_dmabuf_registration is incompatible with use_uring_cmd"
+                )
+            try:
+                target_mode = os.stat(self.device_path).st_mode
+            except OSError as exc:
+                raise ValueError(
+                    "require_dmabuf_registration requires an existing block device"
+                ) from exc
+            if not stat.S_ISBLK(target_mode):
+                raise ValueError(
+                    "require_dmabuf_registration requires a block-device target"
+                )
         if self.use_uring_cmd:
             try:
                 mode = os.stat(self.device_path).st_mode
@@ -423,6 +532,7 @@ class RawBlockCore:
             )
 
         self._lock = threading.Lock()
+        self._checkpoint_lock = threading.Lock()
         self._index: dict[str, _Entry] = {}
         self._lock_refcnt: dict[str, int] = {}
         self._inflight: dict[str, _Inflight] = {}
@@ -625,6 +735,10 @@ class RawBlockCore:
             return
         paged_buffers = getattr(memory_allocator, "get_paged_buffers", None)
         if not callable(paged_buffers):
+            if self.require_dmabuf_registration:
+                raise RuntimeError(
+                    "strict dma-buf mode requires an allocator with paged buffers"
+                )
             logger.warning(
                 "RawBlockCore: allocator does not expose paged buffers; "
                 "io_uring fixed-buffer zero-copy is disabled"
@@ -632,6 +746,10 @@ class RawBlockCore:
             return
         buffers = paged_buffers()
         if not buffers:
+            if self.require_dmabuf_registration:
+                raise RuntimeError(
+                    "strict dma-buf mode requires non-empty paged buffers"
+                )
             logger.warning(
                 "RawBlockCore: allocator returned no paged buffers; "
                 "io_uring fixed-buffer zero-copy is disabled"
@@ -662,14 +780,24 @@ class RawBlockCore:
                     len(buffers),
                     len({fd for fd, _base in regions}),
                 )
+                self._buffer_registration_mode = "dmabuf"
                 return
             except Exception as exc:
+                if self.require_dmabuf_registration:
+                    raise RuntimeError(
+                        "strict dma-buf fixed-buffer registration failed"
+                    ) from exc
                 logger.warning(
                     "RawBlockCore: dma-buf fixed-buffer registration refused "
                     "(%s); falling back to per-command mapping",
                     exc,
                 )
+        if self.require_dmabuf_registration:
+            raise RuntimeError(
+                "strict dma-buf mode requires dma-buf regions for every paged buffer"
+            )
         self._rawdev().register_fixed_buffers(buffer_ptrs, buffer_sizes)
+        self._buffer_registration_mode = "classic"
         logger.info(
             "RawBlockCore: registered %d paged buffers for io_uring fixed I/O",
             len(buffers),
@@ -1190,13 +1318,116 @@ class RawBlockCore:
         """
         if self.role != "writer":
             return False
-        now = time.monotonic()
-        if (now - self._last_publish_ts) * 1000.0 < self.publish_min_interval_ms:
+        with self._checkpoint_lock:
+            now = time.monotonic()
+            if (now - self._last_publish_ts) * 1000.0 < self.publish_min_interval_ms:
+                return False
+            written = self._checkpoint_once_locked(force=True)
+            if written:
+                self._last_publish_ts = now
+            return written
+
+    def publish_request(
+        self, encoded_keys: Sequence[str]
+    ) -> RawBlockPublicationReceipt:
+        """Publish and identify a checkpoint containing all request keys.
+
+        Args:
+            encoded_keys: Ordered keys that form the request manifest.
+
+        Returns:
+            A receipt that a reader can match against the same ordered keys.
+
+        Raises:
+            RuntimeError: If called on a reader, a key is absent, or the
+                checkpoint cannot be written.
+        """
+        if self.role != "writer":
+            raise RuntimeError("only a writer core can publish a request")
+        if not encoded_keys:
+            raise ValueError("request publication requires at least one key")
+        with self._checkpoint_lock:
+            if (
+                self._manifest_digest_from_records(
+                    encoded_keys,
+                    self._manifest_from_index(),
+                )
+                is None
+            ):
+                raise RuntimeError("request publication contains an uncommitted key")
+            needs_checkpoint = (
+                self._published_writer_epoch != self._writer_epoch
+                or not set(encoded_keys).issubset(self._published_keys)
+            )
+            if needs_checkpoint:
+                if not self._checkpoint_once_locked(force=True, rewrite_clean=True):
+                    raise RuntimeError("failed to publish the request checkpoint")
+                if not set(encoded_keys).issubset(self._published_keys):
+                    raise RuntimeError("published checkpoint is missing request keys")
+            digest = self._published_manifest_digest(encoded_keys)
+            if digest is None:
+                raise RuntimeError(
+                    "published checkpoint is missing request manifest metadata"
+                )
+            self._last_publish_ts = time.monotonic()
+            manifest_records = [
+                self._published_manifest[encoded_key] for encoded_key in encoded_keys
+            ]
+            total_logical_bytes = sum(
+                int(record["size"]) for record in manifest_records
+            )
+            return RawBlockPublicationReceipt(
+                writer_epoch=self._writer_epoch,
+                checkpoint_seq=self._meta_seq,
+                key_count=len(encoded_keys),
+                manifest_digest=digest,
+                namespace_identity=self.namespace_identity,
+                total_logical_bytes=total_logical_bytes,
+                total_padded_bytes=sum(
+                    round_up(int(record["size"]), self.block_align)
+                    for record in manifest_records
+                ),
+            )
+
+    def publication_matches(
+        self,
+        receipt: RawBlockPublicationReceipt,
+        encoded_keys: Sequence[str],
+    ) -> bool:
+        """Return whether the adopted checkpoint contains a request receipt."""
+        if len(encoded_keys) != receipt.key_count:
             return False
-        written = self._checkpoint_once(force=True)
-        if written:
-            self._last_publish_ts = now
-        return written
+        if receipt.namespace_identity != self.namespace_identity:
+            return False
+        if self._writer_epoch != receipt.writer_epoch:
+            return False
+        if self._meta_seq < receipt.checkpoint_seq:
+            return False
+        digest = self._published_manifest_digest(encoded_keys)
+        return digest == receipt.manifest_digest
+
+    def refresh_until_publication(
+        self,
+        receipt: RawBlockPublicationReceipt,
+        encoded_keys: Sequence[str],
+        *,
+        timeout_ms: int,
+        refresh_interval_ms: int,
+    ) -> bool:
+        """Wait until a reader adopts the advertised or a compatible checkpoint."""
+        if self.role != "reader":
+            raise RuntimeError("only a reader core can adopt a publication receipt")
+        deadline = time.monotonic() + max(timeout_ms, 0) / 1000.0
+        while True:
+            if self.publication_matches(receipt, encoded_keys):
+                return True
+            self.refresh_index_from_device()
+            if self.publication_matches(receipt, encoded_keys):
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(remaining, max(refresh_interval_ms, 1) / 1000.0))
 
     def _max_checkpoint_seq_on_device(self) -> int:
         """Highest checkpoint sequence number in any valid header, or 0."""
@@ -1237,6 +1468,9 @@ class RawBlockCore:
             logger.warning("RawBlockCore: refreshed metadata payload rejected")
             return False
         self._meta_seq = int(best["seq"])
+        self._published_keys = frozenset(self._index)
+        self._published_manifest = self._manifest_from_index()
+        self._published_writer_epoch = self._writer_epoch
         logger.debug(
             "RawBlockCore adopted checkpoint seq=%d entries=%d",
             self._meta_seq,
@@ -1278,6 +1512,7 @@ class RawBlockCore:
                 "next_slot": self._next_slot,
                 "max_slots": self._max_slots,
                 "metadata_seq": self._meta_seq,
+                "writer_epoch": self._writer_epoch,
                 "metadata_dirty_total": self._meta_dirty_total,
                 "metadata_persisted": self._meta_persisted,
                 "inflight_io_count": self._inflight_io_count,
@@ -1286,6 +1521,8 @@ class RawBlockCore:
                 "io_engine": self.io_engine,
                 "iouring_queue_depth": self.iouring_queue_depth,
                 "use_uring_cmd": self.use_uring_cmd,
+                "buffer_registration_mode": self._buffer_registration_mode,
+                "require_dmabuf_registration": self.require_dmabuf_registration,
                 "fdp_slot_affinity_enabled": self.fdp_slot_affinity_enabled,
                 "fdp_slot_affinity_hit_count": (self._fdp_slot_affinity_hit_count),
                 "fdp_slot_affinity_fallback_count": (
@@ -2464,6 +2701,7 @@ class RawBlockCore:
             dirty_total = self._meta_dirty_total
             snapshot = {
                 "version": 1,
+                "writer_epoch": self._writer_epoch,
                 "device_path": self.device_path,
                 "capacity_bytes": self.capacity_bytes,
                 "block_align": self.block_align,
@@ -2502,6 +2740,57 @@ class RawBlockCore:
             }
         return snapshot, dirty_total
 
+    @staticmethod
+    def _manifest_digest_from_records(
+        encoded_keys: Sequence[str],
+        records: Mapping[str, dict[str, Any]],
+    ) -> str | None:
+        """Hash ordered key identities and compatibility metadata."""
+        manifest: list[dict[str, Any]] = []
+        for encoded_key in encoded_keys:
+            record = records.get(encoded_key)
+            if record is None:
+                return None
+            manifest.append(record)
+        payload = json.dumps(
+            manifest,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _published_manifest_digest(self, encoded_keys: Sequence[str]) -> str | None:
+        """Hash a request against the exact serialized checkpoint generation."""
+        return self._manifest_digest_from_records(
+            encoded_keys,
+            self._published_manifest,
+        )
+
+    def _manifest_from_index_locked(self) -> dict[str, dict[str, Any]]:
+        """Build compatibility records while ``_lock`` is held."""
+        return {
+            encoded_key: {
+                "key": encoded_key,
+                "size": int(entry.meta.size),
+                "shape": list(entry.meta.shape)
+                if entry.meta.shape is not None
+                else None,
+                "dtype": self._checkpoint_dtype_name(entry.meta.dtype),
+                "fmt": entry.meta.fmt.name
+                if entry.meta.fmt is not None and hasattr(entry.meta.fmt, "name")
+                else str(entry.meta.fmt)
+                if entry.meta.fmt is not None
+                else None,
+            }
+            for encoded_key, entry in self._index.items()
+        }
+
+    def _manifest_from_index(self) -> dict[str, dict[str, Any]]:
+        """Return detached compatibility records for the current index."""
+        with self._lock:
+            return self._manifest_from_index_locked()
+
     def _checkpoint_dtype_name(self, dtype: torch.dtype | None) -> str | None:
         """Return a durable checkpoint string for a torch dtype.
 
@@ -2516,7 +2805,13 @@ class RawBlockCore:
             return None
         return TORCH_DTYPE_TO_STR_DTYPE.get(dtype, str(dtype))
 
-    def _write_checkpoint(self, payload: bytes, dirty_total_snapshot: int) -> bool:
+    def _write_checkpoint(
+        self,
+        payload: bytes,
+        dirty_total_snapshot: int,
+        published_manifest: dict[str, dict[str, Any]],
+        published_writer_epoch: str,
+    ) -> bool:
         """Write one checkpoint copy and advance persisted metadata counters."""
         payload_cap = self._meta_payload_capacity()
         if len(payload) > payload_cap:
@@ -2550,37 +2845,72 @@ class RawBlockCore:
         )
 
         placement_id = self.meta_checkpoint_placement_id
+        # The header is the checkpoint's commit record.  Do not batch it with
+        # the payload: independent io_uring requests may complete out of order,
+        # exposing a valid new header before its payload is durable/readable.
         self._write_buffers(
-            [payload_off, target],
-            [payload, header_block],
-            [payload_len, self.block_align],
-            [payload_total_len, self.block_align],
-            [placement_id, placement_id],
+            [payload_off],
+            [payload],
+            [payload_len],
+            [payload_total_len],
+            [placement_id],
+        )
+        self._write_buffers(
+            [target],
+            [header_block],
+            [self.block_align],
+            [self.block_align],
+            [placement_id],
         )
 
         with self._lock:
             self._meta_seq = int(next_seq)
             self._meta_persisted = max(self._meta_persisted, int(dirty_total_snapshot))
+            self._published_manifest = published_manifest
+            self._published_keys = frozenset(published_manifest)
+            self._published_writer_epoch = published_writer_epoch
         return True
 
     def _checkpoint_once(self, force: bool) -> bool:
         """Write a metadata checkpoint when dirty and sufficiently idle."""
+        with self._checkpoint_lock:
+            return self._checkpoint_once_locked(force)
+
+    def _checkpoint_once_locked(
+        self, force: bool, *, rewrite_clean: bool = False
+    ) -> bool:
+        """Write a checkpoint while ``_checkpoint_lock`` is held."""
         with self._lock:
             dirty = self._meta_dirty_total > self._meta_persisted
             idle_ok = self._inflight_io_count == 0 and (
                 time.monotonic() - self._last_io_ts
             ) >= (self.meta_idle_quiet_ms / 1000.0)
 
-        if not dirty:
+        if not dirty and not rewrite_clean:
             return False
         if not force and not idle_ok:
             return False
 
         snapshot, dirty_total_snapshot = self._snapshot_state()
+        published_manifest = {
+            str(encoded_key): {
+                "key": str(encoded_key),
+                "size": int(entry["size"]),
+                "shape": entry.get("shape"),
+                "dtype": entry.get("dtype"),
+                "fmt": entry.get("fmt"),
+            }
+            for encoded_key, entry in snapshot["entries"].items()
+        }
         payload = json.dumps(snapshot, separators=(",", ":"), ensure_ascii=True).encode(
             "utf-8"
         )
-        return self._write_checkpoint(payload, dirty_total_snapshot)
+        return self._write_checkpoint(
+            payload,
+            dirty_total_snapshot,
+            published_manifest,
+            str(snapshot.get("writer_epoch", "")),
+        )
 
     def _is_valid_checkpoint_entry(self, offset: int, size: int) -> bool:
         """Return whether a checkpoint entry references a valid data slot."""
@@ -2604,6 +2934,10 @@ class RawBlockCore:
         if not isinstance(data, dict):
             return False
         if int(data.get("version", 0)) != 1:
+            return False
+        writer_epoch = data.get("writer_epoch", "")
+        if not isinstance(writer_epoch, str):
+            logger.warning("Device metadata writer_epoch is invalid; ignoring metadata")
             return False
         checkpoint_device_path = data.get("device_path")
         if checkpoint_device_path and checkpoint_device_path != self.device_path:
@@ -2714,6 +3048,11 @@ class RawBlockCore:
 
             self._meta_dirty_total = 0
             self._meta_persisted = 0
+            self._published_writer_epoch = writer_epoch
+            self._published_manifest = self._manifest_from_index_locked()
+            self._published_keys = frozenset(self._published_manifest)
+            if self.role == "reader":
+                self._writer_epoch = writer_epoch
 
         if self.meta_verify_on_load if verify is None else verify:
             self._validate_loaded_entries()
@@ -2824,6 +3163,9 @@ class RawBlockCore:
             logger.warning("RawBlockCore: metadata payload rejected by checks")
             return
         self._meta_seq = int(header["seq"])
+        self._published_keys = frozenset(self._index)
+        self._published_manifest = self._manifest_from_index()
+        self._published_writer_epoch = str(data.get("writer_epoch", ""))
         logger.info(
             "RawBlockCore loaded checkpoint (entries=%d next_slot=%d seq=%d device=%s)",
             len(self._index),

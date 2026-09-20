@@ -8,6 +8,7 @@ reader never writes, and it verifies the slot header it reads so a slot the
 writer has since reused is reported as a miss instead of wrong data.
 """
 
+# Future
 from __future__ import annotations
 
 # Standard
@@ -200,5 +201,87 @@ def test_publish_is_spaced_by_min_interval(tmp_path):
         ]
         # Dirty again, but inside the minimum spacing.
         assert writer.publish_index() is False
+    finally:
+        writer.close()
+
+
+@requires_rust_raw_block_io
+@pytest.mark.skipif(sys.platform != "linux", reason="raw-block is Linux only")
+def test_request_receipt_adopts_exact_and_compatible_later_generation(tmp_path):
+    path = make_raw_block_file(tmp_path)
+    writer = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    reader = RawBlockCore(_reader_config(path), key_namespace="object")
+    try:
+        first = encode_object_key(make_object_key(1))
+        second = encode_object_key(make_object_key(2))
+        assert writer.put_many([first], [make_memory_obj(b"a" * 1024)]).results == [
+            True
+        ]
+
+        first_receipt = writer.publish_request([first.encoded])
+        assert reader.refresh_until_publication(
+            first_receipt,
+            [first.encoded],
+            timeout_ms=1_000,
+            refresh_interval_ms=1,
+        )
+
+        assert writer.put_many([second], [make_memory_obj(b"b" * 1024)]).results == [
+            True
+        ]
+        second_receipt = writer.publish_request([second.encoded])
+        assert second_receipt.checkpoint_seq > first_receipt.checkpoint_seq
+        assert reader.refresh_until_publication(
+            second_receipt,
+            [second.encoded],
+            timeout_ms=1_000,
+            refresh_interval_ms=1,
+        )
+        assert reader.publication_matches(first_receipt, [first.encoded])
+
+        loaded = make_empty_memory_obj(1024)
+        assert reader.load_many_into([first.encoded], [loaded]) == [True]
+        assert memory_obj_bytes(loaded) == b"a" * 1024
+    finally:
+        reader.close()
+        writer.close()
+
+
+@requires_rust_raw_block_io
+@pytest.mark.skipif(sys.platform != "linux", reason="raw-block is Linux only")
+def test_request_receipt_fences_a_restarted_writer(tmp_path):
+    path = make_raw_block_file(tmp_path)
+    first = encode_object_key(make_object_key(1))
+    writer = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    assert writer.put_many([first], [make_memory_obj(b"a" * 1024)]).results == [True]
+    stale_receipt = writer.publish_request([first.encoded])
+    writer.close()
+
+    reader = RawBlockCore(_reader_config(path), key_namespace="object")
+    restarted = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    try:
+        fresh_receipt = restarted.publish_request([first.encoded])
+        assert fresh_receipt.writer_epoch != stale_receipt.writer_epoch
+        assert reader.refresh_until_publication(
+            fresh_receipt,
+            [first.encoded],
+            timeout_ms=1_000,
+            refresh_interval_ms=1,
+        )
+        assert not reader.publication_matches(stale_receipt, [first.encoded])
+    finally:
+        restarted.close()
+        reader.close()
+
+
+@requires_rust_raw_block_io
+@pytest.mark.skipif(sys.platform != "linux", reason="raw-block is Linux only")
+def test_request_publication_rejects_a_missing_key(tmp_path):
+    path = make_raw_block_file(tmp_path)
+    writer = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    try:
+        missing = encode_object_key(make_object_key(1))
+        with pytest.raises(RuntimeError, match="uncommitted key"):
+            writer.publish_request([missing.encoded])
     finally:
         writer.close()

@@ -12,6 +12,7 @@ from unittest.mock import patch
 import ctypes
 import dataclasses
 import importlib.util
+import os
 import stat
 import sys
 import types
@@ -1150,7 +1151,9 @@ def _make_fake_io_uring_core(
 
         def fake_stat(path: Any, *args: Any, **kwargs: Any) -> Any:
             if str(path) == str(device_path):
-                return types.SimpleNamespace(st_mode=stat.S_IFCHR)
+                return types.SimpleNamespace(
+                    st_mode=stat.S_IFCHR, st_rdev=os.makedev(234, 0)
+                )
             return real_stat(path, *args, **kwargs)
 
         monkeypatch.setattr(
@@ -1202,9 +1205,13 @@ def test_raw_block_core_checkpoint_uses_metadata_placement_id(tmp_path, monkeypa
         assert core.put_many([spec], [make_memory_obj(b"checkpoint")]).results == [True]
         core.checkpoint_now()
 
+        # The checkpoint is committed in two submissions -- metadata first,
+        # then the header that advertises it -- so a reader cannot observe a
+        # header pointing at metadata that is not on the device yet.  Each
+        # carries the metadata placement id.
         checkpoint_calls = raw_device.batched_write_calls[1:]
-        assert checkpoint_calls
-        assert checkpoint_calls[-1][2] == [7, 7]
+        assert len(checkpoint_calls) == 2
+        assert [call[2] for call in checkpoint_calls] == [[7], [7]]
     finally:
         core.close()
 
