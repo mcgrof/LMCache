@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections.abc import Iterable
+from concurrent.futures import CancelledError, Future
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import math
 import os
 import sys
+import threading
 
 # Third Party
 from vllm.config import (
@@ -23,6 +25,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import RequestStatus
 from vllm.version import __version__ as VLLM_VERSION
+import msgspec
 import torch
 
 # First Party
@@ -46,6 +49,13 @@ from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.manager import LMCacheManager
+from lmcache.v1.storage_backend.raw_block import RawBlockPublicationReceipt
+from lmcache.v1.storage_backend.storage_pd_protocol import (
+    StoragePDReadAck,
+    StoragePDState,
+    StoragePDStatus,
+    StoragePDStatusSender,
+)
 
 if TYPE_CHECKING:
     # Third Party
@@ -137,6 +147,10 @@ class RequestTracker:
     # The number of tokens that are cached in LMCache for this request
     num_lmcache_cached_tokens: int = 0
 
+    # Per-rank durable shared-storage publications supplied by the proxy.
+    storage_pd_statuses: Optional[list[dict[str, Any]]] = None
+    storage_pd_request_id: Optional[str] = None
+
     @_lmcache_nvtx_annotate
     @staticmethod
     def from_new_request(
@@ -185,6 +199,26 @@ class RequestTracker:
 
         mm_hashes, mm_positions = extract_mm_features(new_request, modify=True)
 
+        kv_transfer_params = getattr(new_request, "kv_transfer_params", None)
+        storage_pd_statuses = None
+        storage_pd_request_id = None
+        if isinstance(kv_transfer_params, dict):
+            raw_statuses = kv_transfer_params.get("lmcache.storage_pd_statuses")
+            if raw_statuses is not None:
+                if not isinstance(raw_statuses, list) or not all(
+                    isinstance(status, dict) for status in raw_statuses
+                ):
+                    raise ValueError(
+                        "lmcache.storage_pd_statuses must be a list of mappings"
+                    )
+                storage_pd_statuses = raw_statuses
+                raw_request_id = kv_transfer_params.get("lmcache.storage_pd_request_id")
+                if not isinstance(raw_request_id, str) or not raw_request_id:
+                    raise ValueError(
+                        "lmcache.storage_pd_request_id must be a non-empty string"
+                    )
+                storage_pd_request_id = raw_request_id
+
         return RequestTracker(
             req_id=new_request.req_id,
             prompt_len=len(new_request.prompt_token_ids),
@@ -197,6 +231,8 @@ class RequestTracker:
             skip_save=skip_save,
             request_configs=request_configs,
             num_lmcache_cached_tokens=lmcache_cached_tokens,
+            storage_pd_statuses=storage_pd_statuses,
+            storage_pd_request_id=storage_pd_request_id,
         )
 
     def update(
@@ -287,6 +323,8 @@ class ReqMeta:
     disagg_spec: Optional[DisaggSpec] = None
     # the configs of the request
     request_configs: Optional[dict] = None
+    storage_pd_statuses: Optional[list[dict[str, Any]]] = None
+    storage_pd_request_id: Optional[str] = None
 
     @staticmethod
     def from_request_tracker(
@@ -426,6 +464,8 @@ class ReqMeta:
             load_spec=load_spec,
             disagg_spec=tracker.disagg_spec,
             request_configs=tracker.request_configs,
+            storage_pd_statuses=tracker.storage_pd_statuses,
+            storage_pd_request_id=tracker.storage_pd_request_id,
         )
 
 
@@ -523,6 +563,51 @@ class LMCacheConnectorV1Impl:
             str, Generator[Optional[torch.Tensor], None, None]
         ] = {}
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
+        extra_config = config.extra_config or {}
+        self._storage_pd_mode = bool(
+            extra_config.get("rust_raw_block.storage_pd_mode", False)
+        )
+        self._storage_pd_raw_role = str(
+            extra_config.get("rust_raw_block.role", "writer") or "writer"
+        )
+        self._storage_pd_store_futures: dict[str, Future] = {}
+        self._storage_pd_wire_req_ids: dict[str, str] = {}
+        self._storage_pd_engine_finished: set[str] = set()
+        self._storage_pd_returned: set[str] = set()
+        self._storage_pd_aborted: set[str] = set()
+        self._storage_pd_failures: dict[str, str] = {}
+        self._storage_pd_terminal_states: dict[str, StoragePDState] = {}
+        self._storage_pd_receipts: dict[str, RawBlockPublicationReceipt] = {}
+        self._storage_pd_status_sent: set[str] = set()
+        self._storage_pd_acks_sent: set[str] = set()
+        self._storage_pd_lock = threading.Lock()
+        self._storage_pd_tp_rank = 0
+        self._storage_pd_status_sender: Optional[StoragePDStatusSender] = None
+        if self._storage_pd_mode and role != KVConnectorRole.SCHEDULER:
+            engine_metadata = getattr(self.lmcache_engine, "metadata", None)
+            self._storage_pd_tp_rank = int(
+                getattr(engine_metadata, "worker_id", os.environ.get("LOCAL_RANK", 0))
+            )
+            skip_notification = bool(config.pd_skip_proxy_notification)
+            if (
+                self._storage_pd_raw_role in ("writer", "reader")
+                and not skip_notification
+            ):
+                if config.pd_proxy_host is None or config.pd_proxy_port is None:
+                    raise ValueError(
+                        "raw-block storage P/D requires pd_proxy_host and "
+                        "pd_proxy_port, or pd_skip_proxy_notification=true"
+                    )
+                self._storage_pd_status_sender = StoragePDStatusSender(
+                    config.pd_proxy_host,
+                    config.pd_proxy_port,
+                    timeout_s=float(
+                        extra_config.get(
+                            "rust_raw_block.status_send_timeout_s",
+                            5.0,
+                        )
+                    ),
+                )
 
         # Role-specific initialization
         if role == KVConnectorRole.SCHEDULER:
@@ -820,6 +905,9 @@ class LMCacheConnectorV1Impl:
             token_mask[:masked_token_count] = False
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+            adopted_publication: tuple[StoragePDStatus, int] | None = None
+            if request.storage_pd_statuses is not None:
+                adopted_publication = self._adopt_storage_pd_publication(request)
             if self.use_layerwise:
                 if idx == last_idx:
                     sync = True
@@ -886,6 +974,94 @@ class LMCacheConnectorV1Impl:
                         slot_mapping[:lmcache_cached_tokens],
                     )
                     self._invalid_block_ids.update(missing_blocks)
+                elif adopted_publication is not None:
+                    status, published_tokens = adopted_publication
+                    resident_tokens = min(
+                        request.load_spec.vllm_cached_tokens,
+                        published_tokens,
+                    )
+                    restored_tokens = int(
+                        ret_token_mask[:published_tokens].sum().item()
+                    )
+                    if lmcache_cached_tokens < published_tokens or (
+                        resident_tokens + restored_tokens < published_tokens
+                    ):
+                        raise RuntimeError(
+                            "storage P/D restore did not cover the advertised "
+                            f"manifest for {request.req_id}: published_tokens="
+                            f"{published_tokens}, lmcache_cached_tokens="
+                            f"{lmcache_cached_tokens}, resident_tokens="
+                            f"{resident_tokens}, restored_tokens={restored_tokens}"
+                        )
+                    self._ack_storage_pd_restore(request.req_id, status)
+
+    def _adopt_storage_pd_publication(
+        self, request: ReqMeta
+    ) -> tuple[StoragePDStatus, int]:
+        """Adopt this worker rank's advertised checkpoint before KV restore."""
+        assert request.storage_pd_statuses is not None
+        statuses = [
+            msgspec.convert(raw_status, type=StoragePDStatus)
+            for raw_status in request.storage_pd_statuses
+        ]
+        matching = [
+            status for status in statuses if status.tp_rank == self._storage_pd_tp_rank
+        ]
+        if len(matching) != 1:
+            raise RuntimeError(
+                "storage P/D requires exactly one READY status for TP rank "
+                f"{self._storage_pd_tp_rank}, got {len(matching)}"
+            )
+        status = matching[0]
+        if (
+            request.storage_pd_request_id is None
+            or status.req_id != request.storage_pd_request_id
+            or status.state != "READY"
+        ):
+            raise RuntimeError(
+                "storage P/D status does not identify this READY request"
+            )
+        assert self.lmcache_engine is not None
+        timeout_ms = int(
+            (self.config.extra_config or {}).get(
+                "rust_raw_block.publication_adopt_timeout_ms",
+                5000,
+            )
+        )
+        published_tokens = self.lmcache_engine.adopt_storage_publication(
+            request.token_ids,
+            status.publication_receipt(),
+            request_configs=request.request_configs,
+            timeout_ms=timeout_ms,
+        )
+        if published_tokens is None:
+            raise RuntimeError(
+                "storage P/D reader could not adopt the advertised request "
+                f"manifest for {request.req_id} rank {self._storage_pd_tp_rank}"
+            )
+        return status, published_tokens
+
+    def _ack_storage_pd_restore(
+        self,
+        req_id: str,
+        status: StoragePDStatus,
+    ) -> None:
+        """Report that the advertised bytes reached this rank's GPU cache."""
+        if req_id in self._storage_pd_acks_sent:
+            return
+        if self._storage_pd_status_sender is not None:
+            self._storage_pd_status_sender.send(
+                StoragePDReadAck(
+                    req_id=req_id,
+                    producer_instance_id=status.producer_instance_id,
+                    consumer_instance_id=f"pid:{os.getpid()}",
+                    tp_rank=self._storage_pd_tp_rank,
+                    writer_epoch=status.writer_epoch,
+                    checkpoint_seq=status.checkpoint_seq,
+                    manifest_digest=status.manifest_digest,
+                )
+            )
+        self._storage_pd_acks_sent.add(req_id)
 
     def record_failed_blocks(
         self,
@@ -1138,6 +1314,11 @@ class LMCacheConnectorV1Impl:
             # unpin the kv caches according to req_id
             self.lmcache_engine.lookup_unpin(request.req_id)
 
+            if self._storage_pd_mode and request.disagg_spec is not None:
+                self._storage_pd_wire_req_ids[request.req_id] = (
+                    request.disagg_spec.req_id
+                )
+
             save_spec = request.save_spec
             if (
                 save_spec is None or not save_spec.can_save
@@ -1158,6 +1339,11 @@ class LMCacheConnectorV1Impl:
                     len(slot_mapping),
                     len(token_ids),
                 )
+                if self._storage_pd_mode:
+                    self._record_storage_pd_failure(
+                        request.req_id,
+                        "slot_mapping/token_ids length mismatch",
+                    )
                 continue
 
             # TODO: have a pre-allocated buffer to hold the slot_mappings
@@ -1171,6 +1357,32 @@ class LMCacheConnectorV1Impl:
                 )
 
             if skip_leading_tokens == len(token_ids):
+                if self._storage_pd_mode:
+                    if request.disagg_spec is None:
+                        self._record_storage_pd_failure(
+                            request.req_id,
+                            "storage P/D request is missing its transfer spec",
+                        )
+                    else:
+                        try:
+                            completion = (
+                                self.lmcache_engine.publish_existing_storage_request(
+                                    token_ids,
+                                    request.disagg_spec,
+                                    request_configs=request.request_configs,
+                                )
+                            )
+                        except Exception as exc:
+                            self._record_storage_pd_failure(
+                                request.req_id,
+                                str(exc),
+                            )
+                        else:
+                            with self._storage_pd_lock:
+                                self._storage_pd_store_futures.setdefault(
+                                    request.req_id,
+                                    completion,
+                                )
                 continue  # skip this request
             # Align to lmcache chunk size
             skip_leading_tokens = (
@@ -1216,16 +1428,35 @@ class LMCacheConnectorV1Impl:
                         e,
                     )
 
-            self.lmcache_engine.store(
-                token_ids,
-                mask=store_mask,
-                kvcaches=kvcaches,
-                slot_mapping=slot_mapping,
-                offset=skip_leading_tokens,
-                transfer_spec=request.disagg_spec,
-                request_configs=request.request_configs,
-                req_id=request.req_id,
-            )
+            try:
+                completion = self.lmcache_engine.store(
+                    token_ids,
+                    mask=store_mask,
+                    kvcaches=kvcaches,
+                    slot_mapping=slot_mapping,
+                    offset=skip_leading_tokens,
+                    transfer_spec=request.disagg_spec,
+                    request_configs=request.request_configs,
+                    req_id=request.req_id,
+                )
+            except Exception as exc:
+                if not self._storage_pd_mode:
+                    raise
+                self._record_storage_pd_failure(request.req_id, str(exc))
+                continue
+            if self._storage_pd_mode:
+                with self._storage_pd_lock:
+                    if completion is None:
+                        self._storage_pd_failures[request.req_id] = (
+                            "store returned no request completion"
+                        )
+                        self._storage_pd_terminal_states[request.req_id] = "FAILED"
+                        self._storage_pd_aborted.add(request.req_id)
+                    else:
+                        self._storage_pd_store_futures.setdefault(
+                            request.req_id,
+                            completion,
+                        )
 
             # Probe decoder cache after store
             if (
@@ -1331,7 +1562,108 @@ class LMCacheConnectorV1Impl:
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
-        return None, None
+        if not self._storage_pd_mode or self._storage_pd_raw_role != "writer":
+            return None, None
+
+        releasable: set[str] = set()
+        with self._storage_pd_lock:
+            if self.lmcache_engine is not None:
+                storage_manager = self.lmcache_engine.storage_manager
+                if storage_manager is not None:
+                    for req_id in finished_req_ids:
+                        storage_manager.finish_request(
+                            self._storage_pd_wire_req_ids.get(req_id, req_id)
+                        )
+            self._storage_pd_engine_finished.update(finished_req_ids)
+            for req_id in list(self._storage_pd_engine_finished):
+                if req_id in self._storage_pd_returned:
+                    self._storage_pd_engine_finished.discard(req_id)
+                    continue
+                completion = self._storage_pd_store_futures.get(req_id)
+                if completion is None and req_id not in self._storage_pd_aborted:
+                    self._storage_pd_failures[req_id] = (
+                        "request finished without a raw-block publication"
+                    )
+                    self._storage_pd_terminal_states[req_id] = "FAILED"
+                    self._storage_pd_aborted.add(req_id)
+                if completion is not None and not completion.done():
+                    continue
+                if completion is not None:
+                    try:
+                        results = completion.result()
+                        if isinstance(results, RawBlockPublicationReceipt):
+                            results = [results]
+                        receipts = [
+                            result
+                            for result in results
+                            if isinstance(result, RawBlockPublicationReceipt)
+                        ]
+                        if len(receipts) != 1:
+                            raise RuntimeError(
+                                "storage P/D expected exactly one raw-block receipt"
+                            )
+                        self._storage_pd_receipts[req_id] = receipts[0]
+                    except BaseException as exc:
+                        self._storage_pd_failures[req_id] = str(exc)
+                        self._storage_pd_terminal_states[req_id] = (
+                            "CANCELLED" if isinstance(exc, CancelledError) else "FAILED"
+                        )
+                        self._storage_pd_aborted.add(req_id)
+                        logger.error(
+                            "Raw-block storage P/D store failed for request %s: %s",
+                            req_id,
+                            exc,
+                        )
+                    self._storage_pd_store_futures.pop(req_id, None)
+
+                if req_id not in self._storage_pd_status_sent:
+                    try:
+                        wire_req_id = self._storage_pd_wire_req_ids.get(req_id, req_id)
+                        if req_id in self._storage_pd_aborted:
+                            status = StoragePDStatus(
+                                req_id=wire_req_id,
+                                producer_instance_id=f"pid:{os.getpid()}",
+                                tp_rank=self._storage_pd_tp_rank,
+                                state=self._storage_pd_terminal_states.get(
+                                    req_id, "FAILED"
+                                ),
+                                error_stage="WRITE_OR_PUBLISH",
+                                error_text=self._storage_pd_failures.get(
+                                    req_id, "storage P/D request failed"
+                                ),
+                            )
+                        else:
+                            receipt = self._storage_pd_receipts.get(req_id)
+                            if receipt is None:
+                                continue
+                            status = StoragePDStatus.ready(
+                                wire_req_id,
+                                self._storage_pd_tp_rank,
+                                receipt,
+                            )
+                        if self._storage_pd_status_sender is not None:
+                            self._storage_pd_status_sender.send(status)
+                        self._storage_pd_status_sent.add(req_id)
+                    except BaseException as exc:
+                        logger.error(
+                            "Raw-block storage P/D status send failed for "
+                            "request %s: %s",
+                            req_id,
+                            exc,
+                        )
+                        continue
+
+                releasable.add(req_id)
+                self._storage_pd_engine_finished.discard(req_id)
+            self._storage_pd_returned.update(releasable)
+        return releasable, None
+
+    def _record_storage_pd_failure(self, req_id: str, error: str) -> None:
+        """Record a terminal producer failure for proxy notification."""
+        with self._storage_pd_lock:
+            self._storage_pd_failures[req_id] = error
+            self._storage_pd_terminal_states[req_id] = "FAILED"
+            self._storage_pd_aborted.add(req_id)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         invalid_blocks = self._invalid_block_ids.copy()
@@ -1342,7 +1674,11 @@ class LMCacheConnectorV1Impl:
     def shutdown(self):
         """Shutdown the connector by delegating to LMCacheManager."""
         logger.info("Starting LMCacheConnector shutdown...")
-        self._manager.stop_services()
+        try:
+            self._manager.stop_services()
+        finally:
+            if self._storage_pd_status_sender is not None:
+                self._storage_pd_status_sender.close()
 
     ###################
     # Scheduler side APIs
@@ -1927,7 +2263,12 @@ class LMCacheConnectorV1Impl:
                     request_tracker.num_lmcache_cached_tokens
                 )
 
-        return False, return_params
+        defer_free = (
+            self._storage_pd_mode
+            and self._storage_pd_raw_role == "writer"
+            and request.status != RequestStatus.FINISHED_ABORTED
+        )
+        return defer_free, return_params
 
     @_lmcache_nvtx_annotate
     def get_kv_events(self) -> Iterable[CacheStoreEvent]:
