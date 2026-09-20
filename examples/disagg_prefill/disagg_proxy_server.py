@@ -11,6 +11,7 @@ import json
 import math
 import os
 import time
+import uuid
 
 # Third Party
 from fastapi import FastAPI, Request
@@ -26,6 +27,11 @@ from lmcache.logging import init_logger
 from lmcache.v1.storage_backend.pd_backend import (
     PDMsg,
     ProxyNotif,
+    StoragePDReadAck,
+    StoragePDStatus,
+)
+from lmcache.v1.storage_backend.storage_pd_protocol import (
+    order_storage_pd_ready_statuses,
 )
 
 logger = init_logger(__name__)
@@ -287,6 +293,17 @@ def parse_args():
     parser.add_argument("--num-decoders", type=int, default=1)
     parser.add_argument("--proxy-host", type=str, default="localhost")
     parser.add_argument("--proxy-port", type=int, default=8500)
+    parser.add_argument(
+        "--storage-pd",
+        action="store_true",
+        help="Require durable per-rank raw-block READY statuses before decode.",
+    )
+    parser.add_argument(
+        "--storage-pd-ready-timeout-s",
+        type=float,
+        default=30.0,
+        help="Maximum time to wait for every storage-P/D READY status.",
+    )
 
     # PD buffer concurrency limiting. A weighted semaphore caps in-flight
     # chunk slots to prevent decoder buffer exhaustion deadlocks.
@@ -319,6 +336,8 @@ def parse_args():
     )
 
     args = parser.parse_args()
+    if args.storage_pd_ready_timeout_s <= 0:
+        parser.error("--storage-pd-ready-timeout-s must be positive")
     return args
 
 
@@ -344,6 +363,8 @@ app.state.bound_clients = {}
 
 # Keep finished reqs
 app.state.finished_reqs = defaultdict(int)
+app.state.storage_pd_statuses = defaultdict(dict)
+app.state.storage_pd_failures = {}
 
 pd_buffer_semaphore: Optional[WeightedSemaphore] = None
 
@@ -384,8 +405,55 @@ async def zmq_pull_server():
             logger.exception("ZMQ message decode failed: %s", exc)
             continue
 
+        if isinstance(msg, StoragePDStatus):
+            req_id = msg.req_id
+            if msg.state != "READY":
+                app.state.storage_pd_failures[req_id] = msg
+                logger.error(
+                    "Storage P/D producer failed req %s rank %d at %s: %s",
+                    req_id,
+                    msg.tp_rank,
+                    msg.error_stage,
+                    msg.error_text,
+                )
+                continue
+            previous = app.state.storage_pd_statuses[req_id].get(msg.tp_rank)
+            if previous is not None and previous != msg:
+                app.state.storage_pd_failures[req_id] = StoragePDStatus(
+                    req_id=req_id,
+                    producer_instance_id=msg.producer_instance_id,
+                    tp_rank=msg.tp_rank,
+                    state="FAILED",
+                    error_stage="PROXY_BARRIER",
+                    error_text="conflicting READY statuses for one TP rank",
+                )
+                continue
+            app.state.storage_pd_statuses[req_id][msg.tp_rank] = msg
+            logger.debug(
+                "Storage P/D req %s rank %d published checkpoint %d.",
+                req_id,
+                msg.tp_rank,
+                msg.checkpoint_seq,
+            )
+            continue
+
+        if isinstance(msg, StoragePDReadAck):
+            logger.debug(
+                "Storage P/D read ACK for req %s rank %d.",
+                msg.req_id,
+                msg.tp_rank,
+            )
+            continue
+
         if not isinstance(msg, ProxyNotif):
             logger.debug("ZMQ ignored message type: %s", type(msg).__name__)
+            continue
+
+        if global_args.storage_pd:
+            logger.debug(
+                "Ignoring legacy prefill notification for storage P/D req %s",
+                msg.req_id,
+            )
             continue
 
         req_id = msg.req_id
@@ -439,11 +507,56 @@ def round_robin_pick_clients() -> tuple[ClientInfo, ClientInfo, ClientInfo]:
     return tokenization_client, prefill_client, decode_client
 
 
-async def wait_decode_kv_ready(req_id: str, num_tp_rank: int):
-    while app.state.finished_reqs[req_id] < num_tp_rank:
-        await asyncio.sleep(0.0001)  # sleep for 0.1 ms
-    logger.debug(f"Prefill node signaled kv ready for req {req_id}")
-    app.state.finished_reqs.pop(req_id)
+def _clear_pd_request_state(req_id: str) -> None:
+    app.state.storage_pd_failures.pop(req_id, None)
+    app.state.storage_pd_statuses.pop(req_id, None)
+    app.state.finished_reqs.pop(req_id, None)
+
+
+async def wait_decode_kv_ready(
+    req_id: str,
+    num_tp_rank: int,
+    *,
+    storage_pd: bool,
+    timeout_s: float,
+):
+    deadline = time.monotonic() + timeout_s
+    expected_ranks = set(range(num_tp_rank))
+    while True:
+        failure = app.state.storage_pd_failures.get(req_id)
+        if failure is not None:
+            _clear_pd_request_state(req_id)
+            raise RuntimeError(
+                f"storage P/D request {req_id} failed on TP rank "
+                f"{failure.tp_rank} at {failure.error_stage}: {failure.error_text}"
+            )
+        statuses = app.state.storage_pd_statuses.get(req_id, {})
+        unexpected_ranks = set(statuses) - expected_ranks
+        if unexpected_ranks:
+            _clear_pd_request_state(req_id)
+            raise RuntimeError(
+                f"storage P/D request {req_id} reported unexpected TP ranks "
+                f"{sorted(unexpected_ranks)}"
+            )
+        if set(statuses) == expected_ranks:
+            try:
+                ordered = order_storage_pd_ready_statuses(statuses, num_tp_rank)
+            finally:
+                _clear_pd_request_state(req_id)
+            logger.debug("Storage P/D signaled kv ready for req %s", req_id)
+            return ordered
+        if not storage_pd and app.state.finished_reqs[req_id] >= num_tp_rank:
+            _clear_pd_request_state(req_id)
+            logger.debug("Prefill node signaled kv ready for req %s", req_id)
+            return []
+        if storage_pd and time.monotonic() >= deadline:
+            missing_ranks = expected_ranks - set(statuses)
+            _clear_pd_request_state(req_id)
+            raise TimeoutError(
+                f"storage P/D request {req_id} timed out waiting for TP ranks "
+                f"{sorted(missing_ranks)}"
+            )
+        await asyncio.sleep(0.001)
 
 
 BOUND_CLIENTS_MAX_NUM = 1024 * 1024
@@ -475,7 +588,7 @@ def pick_up_clients(request: Request) -> tuple[ClientInfo, ClientInfo, ClientInf
 async def handle_completions(request: Request):
     global counter, stats_calculator
     counter += 1
-    req_id = str(counter)  # we use counter as req_id
+    req_id = uuid.uuid4().hex if global_args.storage_pd else str(counter)
 
     st = time.time()
     slots = 0  # slots to release on error; set after successful acquire only
@@ -534,6 +647,25 @@ async def handle_completions(request: Request):
         if stream_options is not None:
             req_data["stream_options"] = stream_options
 
+        try:
+            statuses = await wait_decode_kv_ready(
+                req_id,
+                num_tp_rank,
+                storage_pd=global_args.storage_pd,
+                timeout_s=global_args.storage_pd_ready_timeout_s,
+            )
+            if statuses:
+                req_data["kv_transfer_params"] = {
+                    "lmcache.storage_pd_request_id": req_id,
+                    "lmcache.storage_pd_statuses": [
+                        msgspec.to_builtins(status) for status in statuses
+                    ],
+                }
+        finally:
+            if pd_buffer_semaphore is not None:
+                acquired = False
+                await pd_buffer_semaphore.release(slots)
+
         # Stream response from decode service
         async def generate_stream():
             head_chunk = {
@@ -555,12 +687,6 @@ async def handle_completions(request: Request):
             yield (
                 "data: " + json.dumps(head_chunk, separators=(",", ":")) + "\n\n"
             ).encode()
-
-            try:
-                await wait_decode_kv_ready(req_id, num_tp_rank)
-            finally:
-                if pd_buffer_semaphore is not None:
-                    await pd_buffer_semaphore.release(slots)
 
             async for chunk in stream_service_response(
                 decode_client.client, "/v1/completions", req_data
@@ -587,7 +713,7 @@ async def handle_completions(request: Request):
 async def handle_chat_completions(request: Request):
     global counter, stats_calculator
     counter += 1
-    req_id = str(counter)
+    req_id = uuid.uuid4().hex if global_args.storage_pd else str(counter)
 
     st = time.time()
     slots = 0  # slots to release on error; set after successful acquire only
@@ -658,6 +784,25 @@ async def handle_chat_completions(request: Request):
         if stream_options is not None:
             req_data["stream_options"] = stream_options
 
+        try:
+            statuses = await wait_decode_kv_ready(
+                req_id,
+                num_tp_rank,
+                storage_pd=global_args.storage_pd,
+                timeout_s=global_args.storage_pd_ready_timeout_s,
+            )
+            if statuses:
+                req_data["kv_transfer_params"] = {
+                    "lmcache.storage_pd_request_id": req_id,
+                    "lmcache.storage_pd_statuses": [
+                        msgspec.to_builtins(status) for status in statuses
+                    ],
+                }
+        finally:
+            if pd_buffer_semaphore is not None:
+                acquired = False
+                await pd_buffer_semaphore.release(slots)
+
         # Stream response from decode service
         async def generate_stream():
             initial_chunk = {
@@ -695,12 +840,6 @@ async def handle_chat_completions(request: Request):
             yield (
                 "data: " + json.dumps(head_chunk, separators=(",", ":")) + "\n\n"
             ).encode()
-
-            try:
-                await wait_decode_kv_ready(req_id, num_tp_rank)
-            finally:
-                if pd_buffer_semaphore is not None:
-                    await pd_buffer_semaphore.release(slots)
 
             # Stream and convert completion format chunks to chat completion format
             async for chunk in stream_service_response(
