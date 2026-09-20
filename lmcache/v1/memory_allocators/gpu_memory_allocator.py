@@ -23,7 +23,6 @@ from lmcache.v1.memory_management import (
     MemoryObj,
 )
 
-
 logger = init_logger(__name__)
 
 
@@ -83,6 +82,7 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
         # a raw_block backend register the paged buffers with its NVMe device so
         # loads and stores DMA straight to device memory.
         self._dmabuf_regions: Optional[list[tuple[int, int, int]]] = None
+        self._closed = False
 
     @_lmcache_nvtx_annotate
     def allocate(
@@ -201,3 +201,21 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
         if any(r is None for r in regions):
             return None
         return regions  # type: ignore[return-value]
+
+    def close(self) -> None:
+        """Release dma-buf handles exported for the GPU arena."""
+        if self._closed:
+            return
+        try:
+            if self._dmabuf_regions:
+                memory_management.release_device_dmabufs(self.tensor)
+        finally:
+            self._dmabuf_regions = []
+            self.allocator.close()
+            self._closed = True
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass

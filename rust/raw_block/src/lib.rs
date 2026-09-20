@@ -717,6 +717,7 @@ struct BufRef {
     ptr: *mut u8,
     len: usize,
     readonly: bool,
+    host_accessible: bool,
 }
 
 impl BufRef {
@@ -752,6 +753,7 @@ fn get_buffer<'py>(
                 ptr: view.buf as *mut u8,
                 len: view.len as usize,
                 readonly: view.readonly != 0,
+                host_accessible: true,
                 view: Some(view),
             });
         }
@@ -773,6 +775,7 @@ fn get_buffer<'py>(
             ptr: ptr as *mut u8,
             len,
             readonly: false,
+            host_accessible: false,
         })
     }
 }
@@ -1210,6 +1213,20 @@ fn io_uring_register_dmabuf(
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+fn dmabuf_extent_bytes(fd: RawFd) -> io::Result<usize> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::fstat(fd, &mut stat) };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    usize::try_from(stat.st_size).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("dma-buf fd {fd} reports an invalid size {}", stat.st_size),
+        )
+    })
 }
 
 /// Raw block device I/O interface for Python.
@@ -2408,12 +2425,64 @@ impl RawBlockDevice {
                 "buffer_ptrs, buffer_sizes, dmabuf_fds and dmabuf_bases must have same length",
             ));
         }
+        let mut extent_by_fd: HashMap<i32, (usize, usize)> = HashMap::new();
+        let mut registration_by_ptr: HashMap<usize, (usize, i32, usize)> = HashMap::new();
         for i in 0..n {
-            if buffer_ptrs[i] < dmabuf_bases[i] {
+            let fd = dmabuf_fds[i];
+            if fd < 0 {
+                return Err(PyValueError::new_err(format!(
+                    "buffer {i} has an invalid dma-buf fd {fd}"
+                )));
+            }
+            if buffer_sizes[i] == 0 {
+                return Err(PyValueError::new_err(format!("buffer {i} has zero size")));
+            }
+            let base = dmabuf_bases[i];
+            let extent = match extent_by_fd.get(&fd) {
+                Some((known_base, known_extent)) => {
+                    if *known_base != base {
+                        return Err(PyValueError::new_err(format!(
+                            "dma-buf fd {fd} has inconsistent bases: {known_base:#x} and {base:#x}"
+                        )));
+                    }
+                    *known_extent
+                }
+                None => {
+                    let extent = dmabuf_extent_bytes(fd).map_err(|e| {
+                        PyValueError::new_err(format!("failed to query dma-buf fd {fd} size: {e}"))
+                    })?;
+                    if extent == 0 {
+                        return Err(PyValueError::new_err(format!(
+                            "dma-buf fd {fd} reports a zero-byte extent"
+                        )));
+                    }
+                    extent_by_fd.insert(fd, (base, extent));
+                    extent
+                }
+            };
+            if buffer_ptrs[i] < base {
                 return Err(PyValueError::new_err(format!(
                     "buffer {} lies below its dma-buf base",
                     i
                 )));
+            }
+            let offset = buffer_ptrs[i] - base;
+            let end = offset.checked_add(buffer_sizes[i]).ok_or_else(|| {
+                PyValueError::new_err(format!("buffer {i} range overflows usize"))
+            })?;
+            if end > extent {
+                return Err(PyValueError::new_err(format!(
+                    "buffer {i} range [{offset}, {end}) exceeds dma-buf fd {fd} extent {extent}"
+                )));
+            }
+            let registration = (buffer_sizes[i], fd, offset);
+            if let Some(previous) = registration_by_ptr.insert(buffer_ptrs[i], registration) {
+                if previous != registration {
+                    return Err(PyValueError::new_err(format!(
+                        "buffer pointer {:#x} has conflicting dma-buf registrations",
+                        buffer_ptrs[i]
+                    )));
+                }
             }
         }
 
@@ -2578,8 +2647,12 @@ impl RawBlockDevice {
 
         // Extract pointers as usize before releasing GIL (raw pointers are not Send)
         let mut ptrs = Vec::with_capacity(n);
+        let mut caps = Vec::with_capacity(n);
+        let mut host_accessible = Vec::with_capacity(n);
         for view in &views {
             ptrs.push(view.ptr as usize);
+            caps.push(view.len);
+            host_accessible.push(view.host_accessible);
         }
 
         for view in views {
@@ -2629,11 +2702,23 @@ impl RawBlockDevice {
                 let total_len = total_lens[i];
                 let offset = offsets[i];
 
+                if total_len > caps[i] {
+                    return Err(PyValueError::new_err(format!(
+                        "input buffer too small: cap={} need={total_len}",
+                        caps[i]
+                    )));
+                }
+
                 let comp = Arc::new(IoCompletion::new());
 
                 // Fixed buffers are pre-registered with io_uring, enabling true zero-copy I/O
                 let (fixed_idx, fixed_dmabuf) =
                     fixed_buffer_for_range(&fixed_buffer_map, ptrs[i], total_len);
+                if !host_accessible[i] && fixed_dmabuf.is_none() {
+                    return Err(PyValueError::new_err(
+                        "pointer-only buffer is not fully covered by a dma-buf registration",
+                    ));
+                }
 
                 if use_odirect {
                     #[allow(clippy::manual_is_multiple_of)]
@@ -2909,6 +2994,12 @@ impl RawBlockDevice {
         } else {
             (None, None)
         };
+        if !view.host_accessible && fixed_dmabuf.is_none() {
+            view.release();
+            return Err(PyValueError::new_err(
+                "pointer-only buffer is not fully covered by a dma-buf registration",
+            ));
+        }
 
         // Use bounce buffer if:
         // Buffer is not aligned (O_DIRECT or io_uring_cmd PRP requirement)
@@ -2918,6 +3009,7 @@ impl RawBlockDevice {
         // touch: it is never bounced.  Misalignment or a short buffer is an
         // error for it, not a copy.
         if fixed_dmabuf.is_some() && use_bounce {
+            view.release();
             return Err(PyValueError::new_err(
                 "dma-buf registered buffer must be aligned and at least total_len bytes",
             ));
@@ -3054,6 +3146,12 @@ impl RawBlockDevice {
         } else {
             (None, None)
         };
+        if !view.host_accessible && fixed_dmabuf.is_none() {
+            view.release();
+            return Err(PyValueError::new_err(
+                "pointer-only buffer is not fully covered by a dma-buf registration",
+            ));
+        }
 
         let placement_id_u16 = placement_id.map(placement_id_to_u16).transpose()?;
 
@@ -3065,6 +3163,7 @@ impl RawBlockDevice {
         // touch: it is never bounced.  Misalignment or a short buffer is an
         // error for it, not a copy.
         if fixed_dmabuf.is_some() && use_bounce {
+            view.release();
             return Err(PyValueError::new_err(
                 "dma-buf registered buffer must be aligned and at least total_len bytes",
             ));
@@ -3179,6 +3278,7 @@ impl RawBlockDevice {
         // Acquire buffer views to keep them alive until wait_iouring() completes
         let mut views: Vec<BufRef> = Vec::with_capacity(n);
         let mut caps = Vec::with_capacity(n);
+        let mut host_accessible = Vec::with_capacity(n);
         for buffer in &buffers {
             let view = get_buffer(py, buffer, true)?;
             if view.readonly {
@@ -3196,6 +3296,7 @@ impl RawBlockDevice {
                 return Err(PyValueError::new_err("null buffer pointer"));
             }
             caps.push(view.len);
+            host_accessible.push(view.host_accessible);
             views.push(view);
         }
 
@@ -3290,12 +3391,15 @@ impl RawBlockDevice {
                 } else {
                     true
                 };
+                let (fixed_idx, fixed_dmabuf) =
+                    fixed_buffer_for_range(&fixed_buffer_map, ptrs[i], total_len);
+                if !host_accessible[i] && fixed_dmabuf.is_none() {
+                    return Err(PyValueError::new_err(
+                        "pointer-only buffer is not fully covered by a dma-buf registration",
+                    ));
+                }
                 let use_bounce = !ptr_aligned || cap < total_len;
-                if use_bounce
-                    && fixed_buffer_for_range(&fixed_buffer_map, ptrs[i], total_len)
-                        .1
-                        .is_some()
-                {
+                if use_bounce && fixed_dmabuf.is_some() {
                     return Err(PyValueError::new_err(
                         "dma-buf registered buffer must be aligned and at least total_len bytes",
                     ));
@@ -3327,8 +3431,6 @@ impl RawBlockDevice {
                 } else {
                     // Fixed buffers are pre-registered with io_uring,
                     // enabling true zero-copy I/O.
-                    let (fixed_idx, fixed_dmabuf) =
-                        fixed_buffer_for_range(&fixed_buffer_map, ptrs[i], total_len);
                     (ptrs[i], fixed_idx, fixed_dmabuf, None, None, None)
                 };
 
@@ -3418,6 +3520,12 @@ impl RawBlockDevice {
         let fd = self.fd;
 
         let view = get_buffer(py, data, false)?;
+        if !view.host_accessible {
+            view.release();
+            return Err(PyValueError::new_err(
+                "pointer-only buffers require io_uring dma-buf registration",
+            ));
+        }
         let ptr = view.ptr as *const u8;
         let buf_len = view.len;
         if ptr.is_null() {
@@ -3554,6 +3662,12 @@ impl RawBlockDevice {
         }
         let fd = self.fd;
         let view = get_buffer(py, out, true)?;
+        if !view.host_accessible {
+            view.release();
+            return Err(PyValueError::new_err(
+                "pointer-only buffers require io_uring dma-buf registration",
+            ));
+        }
         if view.readonly {
             view.release();
             return Err(PyValueError::new_err("output buffer is readonly"));
