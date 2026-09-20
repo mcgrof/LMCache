@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Standard
+from typing import Any, cast
+
 # Third Party
 import msgspec
 import pytest
+import torch
 
 # First Party
+from lmcache.utils import CacheEngineKey
+from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.storage_backend.pd_backend import PDMsg
 from lmcache.v1.storage_backend.raw_block import RawBlockPublicationReceipt
 from lmcache.v1.storage_backend.storage_pd_protocol import (
@@ -51,6 +57,8 @@ def test_storage_pd_failure_cannot_be_converted_to_a_receipt() -> None:
         assert "not READY" in str(exc)
     else:
         raise AssertionError("FAILED status produced a publication receipt")
+
+
 def test_storage_pd_ready_barrier_requires_the_exact_rank_set() -> None:
     receipt = RawBlockPublicationReceipt("writer", 1, 1, "digest")
     statuses = {
@@ -80,3 +88,47 @@ def test_storage_pd_ready_barrier_rejects_mixed_request_ids() -> None:
 def test_storage_pd_status_sender_rejects_nonpositive_timeout() -> None:
     with pytest.raises(ValueError, match="timeout must be positive"):
         StoragePDStatusSender("localhost", 1, timeout_s=0)
+
+
+def test_decoder_adoption_retries_without_the_continuation_token() -> None:
+    class TokenDatabase:
+        def process_tokens(self, *, tokens, request_configs):
+            del request_configs
+            yield (
+                0,
+                len(tokens),
+                CacheEngineKey(
+                    "model",
+                    1,
+                    0,
+                    hash(tuple(tokens)),
+                    torch.bfloat16,
+                ),
+            )
+
+    class Backend:
+        def __init__(self) -> None:
+            self.keys: list[int] = []
+
+        def adopt_publication(self, receipt, keys, *, timeout_ms):
+            del receipt, timeout_ms
+            self.keys.append(keys[0].chunk_hash)
+            return keys[0].chunk_hash == hash((1, 2, 3))
+
+    backend = Backend()
+    engine = LMCacheEngine.__new__(LMCacheEngine)
+    engine.token_database = cast(Any, TokenDatabase())
+    engine.storage_manager = type(
+        "StorageManager",
+        (),
+        {"storage_backends": {"raw": backend}},
+    )()
+    receipt = RawBlockPublicationReceipt(
+        writer_epoch="writer",
+        checkpoint_seq=1,
+        key_count=1,
+        manifest_digest="digest",
+    )
+
+    assert engine.adopt_storage_publication([1, 2, 3, 4], receipt) == 3
+    assert backend.keys == [hash((1, 2, 3, 4)), hash((1, 2, 3))]
