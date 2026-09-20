@@ -32,6 +32,10 @@ from lmcache.v1.memory_management import (
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.rpc_utils import get_zmq_context, get_zmq_socket
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
+from lmcache.v1.storage_backend.storage_pd_protocol import (
+    StoragePDReadAck,
+    StoragePDStatus,
+)
 from lmcache.v1.transfer_channel import CreateTransferChannel
 from lmcache.v1.transfer_channel.transfer_utils import get_correct_device
 
@@ -82,7 +86,13 @@ class CacheQueryResponse(PDMsgBase):
 
 
 PDMsg = Union[
-    AllocRequest, AllocResponse, ProxyNotif, CacheQueryRequest, CacheQueryResponse
+    AllocRequest,
+    AllocResponse,
+    ProxyNotif,
+    CacheQueryRequest,
+    CacheQueryResponse,
+    StoragePDStatus,
+    StoragePDReadAck,
 ]
 
 
