@@ -36,6 +36,10 @@ from lmcache.v1.memory_management import (
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.rpc_utils import get_zmq_context
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
+from lmcache.v1.storage_backend.storage_pd_protocol import (
+    StoragePDReadAck,
+    StoragePDStatus,
+)
 from lmcache.v1.transfer_channel import CreateTransferChannel
 from lmcache.v1.transfer_channel.transfer_utils import get_correct_device
 
@@ -92,7 +96,14 @@ class CancelNotif(PDMsgBase):
     keys: list[str]  # keys that receiver should release
 
 
-PDMsg = Union[AllocRequest, AllocResponse, ProxyNotif, CancelNotif]
+PDMsg = Union[
+    AllocRequest,
+    AllocResponse,
+    ProxyNotif,
+    CancelNotif,
+    StoragePDStatus,
+    StoragePDReadAck,
+]
 
 
 class ReservationManager:
