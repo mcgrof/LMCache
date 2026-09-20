@@ -20,10 +20,13 @@ locks in that behavior by feeding ``wait_for_save`` a request whose
 """
 
 # Standard
+from concurrent.futures import Future
 from types import SimpleNamespace
 import logging
+import threading
 
 # Third Party
+from vllm.v1.request import RequestStatus
 import pytest
 import torch
 
@@ -35,6 +38,8 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorV1Impl,
     SaveSpec,
 )
+from lmcache.v1.storage_backend.raw_block import RawBlockPublicationReceipt
+from lmcache.v1.storage_backend.storage_pd_protocol import StoragePDStatus
 
 
 class _FakeParent:
@@ -96,6 +101,135 @@ def _make_connector(
     connector.kv_caches = {"layer0": torch.zeros(1)}
     connector.config = SimpleNamespace(pd_bidirectional=False)
     return connector, engine
+
+
+def _make_storage_pd_connector() -> LMCacheConnectorV1Impl:
+    connector = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    connector._storage_pd_mode = True
+    connector._storage_pd_raw_role = "writer"
+    connector._storage_pd_store_futures = {}
+    connector._storage_pd_wire_req_ids = {}
+    connector._storage_pd_engine_finished = set()
+    connector._storage_pd_returned = set()
+    connector._storage_pd_aborted = set()
+    connector._storage_pd_failures = {}
+    connector._storage_pd_terminal_states = {}
+    connector._storage_pd_receipts = {}
+    connector._storage_pd_status_sent = set()
+    connector._storage_pd_acks_sent = set()
+    connector._storage_pd_status_sender = None
+    connector._storage_pd_tp_rank = 0
+    connector._storage_pd_lock = threading.Lock()
+    connector._manager = SimpleNamespace(  # type: ignore[assignment]
+        lmcache_engine=None
+    )
+    connector.use_layerwise = False
+    connector.async_loading = False
+    connector._request_trackers = {}
+    connector.config = SimpleNamespace(
+        get_extra_config_value=lambda _key, default: default
+    )
+    return connector
+
+
+def test_storage_pd_reader_does_not_run_writer_completion() -> None:
+    connector = _make_storage_pd_connector()
+    connector._storage_pd_raw_role = "reader"
+
+    assert connector.get_finished({"request-1"}) == (None, None)
+
+
+def test_storage_pd_writer_defers_source_block_free_until_publication() -> None:
+    connector = _make_storage_pd_connector()
+    request = SimpleNamespace(
+        request_id="request-1",
+        status=RequestStatus.FINISHED_STOPPED,
+        kv_transfer_params=None,
+    )
+
+    assert connector.request_finished(request, [1, 2]) == (True, None)
+
+
+def test_storage_pd_reader_does_not_defer_source_block_free() -> None:
+    connector = _make_storage_pd_connector()
+    connector._storage_pd_raw_role = "reader"
+    request = SimpleNamespace(
+        request_id="request-1",
+        status=RequestStatus.FINISHED_STOPPED,
+        kv_transfer_params=None,
+    )
+
+    assert connector.request_finished(request, [1, 2]) == (False, None)
+
+
+def test_storage_pd_aborted_writer_does_not_defer_source_block_free() -> None:
+    connector = _make_storage_pd_connector()
+    request = SimpleNamespace(
+        request_id="request-1",
+        status=RequestStatus.FINISHED_ABORTED,
+        kv_transfer_params=None,
+    )
+
+    assert connector.request_finished(request, [1, 2]) == (False, None)
+
+
+def test_storage_pd_get_finished_waits_for_store_publication() -> None:
+    connector = _make_storage_pd_connector()
+    completion: Future[list[RawBlockPublicationReceipt]] = Future()
+    connector._storage_pd_store_futures["request-1"] = completion
+
+    assert connector.get_finished({"request-1"}) == (set(), None)
+    receipt = RawBlockPublicationReceipt("writer", 1, 1, "digest")
+    completion.set_result([receipt])
+    assert connector.get_finished(set()) == ({"request-1"}, None)
+    assert connector._storage_pd_receipts == {"request-1": receipt}
+    assert connector.get_finished({"request-1"}) == (set(), None)
+
+
+def test_storage_pd_get_finished_keeps_wire_and_vllm_request_ids_distinct() -> None:
+    class StorageManager:
+        def __init__(self) -> None:
+            self.finished: list[str] = []
+
+        def finish_request(self, req_id: str) -> None:
+            self.finished.append(req_id)
+
+    class Sender:
+        def __init__(self) -> None:
+            self.statuses: list[StoragePDStatus] = []
+
+        def send(self, status: StoragePDStatus) -> None:
+            self.statuses.append(status)
+
+    connector = _make_storage_pd_connector()
+    storage_manager = StorageManager()
+    connector._manager = SimpleNamespace(  # type: ignore[assignment]
+        lmcache_engine=SimpleNamespace(storage_manager=storage_manager)
+    )
+    sender = Sender()
+    connector._storage_pd_status_sender = sender  # type: ignore[assignment]
+    connector._storage_pd_wire_req_ids["cmpl-internal-0"] = "proxy-uuid"
+    completion: Future[list[RawBlockPublicationReceipt]] = Future()
+    completion.set_result([RawBlockPublicationReceipt("writer", 1, 1, "digest")])
+    connector._storage_pd_store_futures["cmpl-internal-0"] = completion
+
+    assert connector.get_finished({"cmpl-internal-0"}) == (
+        {"cmpl-internal-0"},
+        None,
+    )
+    assert storage_manager.finished == ["proxy-uuid"]
+    assert [status.req_id for status in sender.statuses] == ["proxy-uuid"]
+
+
+def test_storage_pd_get_finished_reports_failure_but_releases_source_blocks() -> None:
+    connector = _make_storage_pd_connector()
+    completion: Future[list[RawBlockPublicationReceipt]] = Future()
+    connector._storage_pd_store_futures["request-failed"] = completion
+    completion.set_exception(OSError("write failed"))
+
+    assert connector.get_finished({"request-failed"}) == ({"request-failed"}, None)
+    assert connector._storage_pd_failures == {"request-failed": "write failed"}
+    assert connector.get_finished({"request-failed"}) == (set(), None)
 
 
 def test_wait_for_save_skips_desynced_request_and_keeps_engine_alive() -> None:
