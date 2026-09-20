@@ -1437,6 +1437,15 @@ class StorageManager:
         for backend in self.storage_backends.values():
             backend.cancel_request(req_id)
 
+    def finish_request(self, req_id: str) -> None:
+        """Notify storage backends that no more request batches will arrive.
+
+        Args:
+            req_id: Request identifier that finished on the model worker.
+        """
+        for backend in self.storage_backends.values():
+            backend.finish_request(req_id)
+
     def close(self):
         logger.info("Closing StorageManager...")
 
