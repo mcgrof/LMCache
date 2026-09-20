@@ -6,6 +6,7 @@ from lmcache.v1.storage_backend.raw_block.core import (
     RAW_BLOCK_IO_ENGINES,
     RawBlockCore,
     RawBlockCoreConfig,
+    RawBlockPublicationReceipt,
     RawBlockPutManyResult,
     normalize_raw_block_io_engine,
     normalize_raw_block_placement_ids,
@@ -22,6 +23,7 @@ from lmcache.v1.storage_backend.raw_block.key_codec import (
     object_key_to_string,
     slot_identity_from_encoded_key,
 )
+from lmcache.v1.storage_backend.raw_block.pd import RawBlockPDRequestTracker
 
 __all__ = [
     "RawBlockCore",
@@ -31,6 +33,8 @@ __all__ = [
     "RawBlockKeyNamespace",
     "RawBlockKeySpec",
     "RawBlockPutManyResult",
+    "RawBlockPublicationReceipt",
+    "RawBlockPDRequestTracker",
     "decode_legacy_key",
     "normalize_raw_block_placement_ids",
     "decode_object_key",

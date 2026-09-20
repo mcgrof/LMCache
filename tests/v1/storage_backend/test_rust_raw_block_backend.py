@@ -56,9 +56,16 @@ def _has_ext() -> bool:
 
 
 class _FakeRawBlockDevice:
-    def __init__(self, path: str, *, size_bytes: int, **kwargs):
+    def __init__(
+        self,
+        path: str,
+        *,
+        size_bytes: int,
+        data: bytearray | None = None,
+        **kwargs,
+    ):
         del path, kwargs
-        self._data = bytearray(size_bytes)
+        self._data = data if data is not None else bytearray(size_bytes)
         self._next_batch_id = 1
         self._batch_results: dict[int, list[bool]] = {}
         self.batched_reads: list[tuple[list[int], list[int]]] = []
@@ -123,9 +130,26 @@ class _FakeRawBlockDevice:
         return None
 
 
-def _install_fake_raw_block_device(monkeypatch, *, size_bytes: int = 64 * 1024):
+def _install_fake_raw_block_device(
+    monkeypatch,
+    *,
+    size_bytes: int = 64 * 1024,
+    shared_by_path: bool = False,
+):
+    shared_data: dict[str, bytearray] = {}
+
     def create_fake_device(path: str, **kwargs):
-        return _FakeRawBlockDevice(path, size_bytes=size_bytes, **kwargs)
+        data = (
+            shared_data.setdefault(path, bytearray(size_bytes))
+            if shared_by_path
+            else None
+        )
+        return _FakeRawBlockDevice(
+            path,
+            size_bytes=size_bytes,
+            data=data,
+            **kwargs,
+        )
 
     monkeypatch.setitem(
         sys.modules,
@@ -2663,6 +2687,8 @@ def _make_raw_block_backend(
     loop: asyncio.AbstractEventLoop,
     *,
     io_engine: str = "io_uring",
+    role: str = "writer",
+    storage_pd_mode: bool = False,
 ) -> RustRawBlockBackend:
     """Build a RustRawBlockBackend over a fake raw-block device.
 
@@ -2682,6 +2708,7 @@ def _make_raw_block_backend(
         lmcache_instance_id="test_rust_raw_block_backend_plugin_dedup",
     )
     config.storage_plugins = []
+    config.save_unfull_chunk = storage_pd_mode
     config.extra_config = {
         "rust_raw_block.device_path": dev_path,
         "rust_raw_block.block_align": 4096,
@@ -2689,6 +2716,9 @@ def _make_raw_block_backend(
         "rust_raw_block.meta_total_bytes": 4 * 1024 * 1024,
         "rust_raw_block.meta_enable_periodic": False,
         "rust_raw_block.io_engine": io_engine,
+        "rust_raw_block.role": role,
+        "rust_raw_block.storage_pd_mode": storage_pd_mode,
+        "rust_raw_block.allow_unsafe_pd_io_for_testing": storage_pd_mode,
     }
     metadata = LMCacheMetadata(
         model_name="test_model",
@@ -2712,6 +2742,81 @@ def _make_raw_block_backend(
         loop=loop,
         dst_device="cpu",
     )
+
+
+def test_storage_pd_backend_publishes_then_reader_adopts(
+    monkeypatch,
+    memory_allocator,
+    loop_in_thread,
+):
+    """Request completion includes writes and an adoptable generation."""
+    _install_fake_raw_block_device(
+        monkeypatch,
+        size_bytes=64 * 1024 * 1024,
+        shared_by_path=True,
+    )
+    path = "/tmp/raw-block-storage-pd"
+    writer = _make_raw_block_backend(
+        path,
+        memory_allocator,
+        loop_in_thread,
+        io_engine="posix",
+        role="writer",
+        storage_pd_mode=True,
+    )
+    reader = _make_raw_block_backend(
+        path,
+        memory_allocator,
+        loop_in_thread,
+        io_engine="posix",
+        role="reader",
+        storage_pd_mode=True,
+    )
+    allocator = AdHocMemoryAllocator(device="cpu")
+    keys = [
+        CacheEngineKey("test_model", 1, 0, 9001 + i, torch.bfloat16) for i in range(2)
+    ]
+    objs = [
+        allocator.allocate(
+            [torch.Size([2, 16, 8, 128])],
+            [torch.bfloat16],
+            fmt=MemoryFormat.KV_T2D,
+        )
+        for _ in keys
+    ]
+    assert all(obj is not None for obj in objs)
+    typed_objs = [obj for obj in objs if obj is not None]
+    typed_objs[0].tensor.fill_(17)
+    typed_objs[1].tensor.fill_(23)
+    expected = [bytes(obj.byte_array) for obj in typed_objs]
+    transfer_spec = types.SimpleNamespace(
+        req_id="request-storage-pd",
+        total_chunks=2,
+        is_last_prefill=True,
+    )
+
+    try:
+        futures = writer.batched_submit_put_task(
+            keys,
+            typed_objs,
+            transfer_spec=transfer_spec,
+        )
+        assert futures is not None and len(futures) == 1
+        receipt = futures[0].result(timeout=5)
+        assert receipt.key_count == 2
+        assert reader.adopt_publication(receipt, keys, timeout_ms=1_000)
+
+        loaded = reader.batched_get_blocking(keys)
+        assert all(obj is not None for obj in loaded)
+        for obj, payload in zip(loaded, expected, strict=True):
+            assert obj is not None
+            assert bytes(obj.byte_array) == payload
+            obj.ref_count_down()
+    finally:
+        for obj in typed_objs:
+            obj.ref_count_down()
+        reader.close()
+        writer.close()
 
 
 def test_rust_raw_block_backend_batched_submit_rolls_back_refs_on_dispatch_failure(
@@ -2858,6 +2963,87 @@ def test_batched_write_rejects_misaligned_offset():
                 dev.batched_write([1], [buf], [align])  # offset 1 is not aligned
         finally:
             dev.close()
+
+
+@pytest.mark.skipif(
+    not _has_ext(), reason="lmcache_rust_raw_block_io extension not installed"
+)
+def test_pointer_only_buffers_require_dmabuf_registration():
+    """A device pointer must never fall through to host-memory dereference."""
+    # Third Party
+    from lmcache_rust_raw_block_io import RawBlockDevice
+
+    class PointerOnlyBuffer:
+        nbytes = 4096
+
+        @staticmethod
+        def data_ptr() -> int:
+            return 0x1000
+
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+
+        dev = RawBlockDevice(
+            dev_path,
+            writable=True,
+            use_odirect=False,
+            alignment=4096,
+            io_engine="io_uring",
+        )
+        try:
+            pointer = PointerOnlyBuffer()
+            with pytest.raises(ValueError, match="dma-buf registration"):
+                dev.batched_write([0], [pointer], [4096])
+            with pytest.raises(ValueError, match="dma-buf registration"):
+                dev.batched_read([0], [pointer], [4096])
+        finally:
+            dev.close()
+
+
+@pytest.mark.skipif(
+    not _has_ext(), reason="lmcache_rust_raw_block_io extension not installed"
+)
+def test_dmabuf_registration_rejects_ranges_outside_exported_extent():
+    """Registration validates every pointer range before touching io_uring."""
+    # Third Party
+    from lmcache_rust_raw_block_io import RawBlockDevice
+
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        dmabuf_path = os.path.join(td, "dmabuf.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+        with open(dmabuf_path, "wb") as f:
+            f.truncate(4096)
+
+        dmabuf_fd = os.open(dmabuf_path, os.O_RDWR)
+        dev = RawBlockDevice(
+            dev_path,
+            writable=True,
+            use_odirect=False,
+            alignment=4096,
+            io_engine="io_uring",
+        )
+        try:
+            with pytest.raises(ValueError, match="exceeds.*extent"):
+                dev.register_fixed_dmabufs(
+                    [0x1000],
+                    [8192],
+                    [dmabuf_fd],
+                    [0x1000],
+                )
+            with pytest.raises(ValueError, match="inconsistent bases"):
+                dev.register_fixed_dmabufs(
+                    [0x1000, 0x2000],
+                    [4096, 4096],
+                    [dmabuf_fd, dmabuf_fd],
+                    [0x1000, 0x2000],
+                )
+        finally:
+            dev.close()
+            os.close(dmabuf_fd)
 
 
 @pytest.mark.skipif(

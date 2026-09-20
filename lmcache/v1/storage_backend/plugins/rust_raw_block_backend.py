@@ -5,6 +5,7 @@ from __future__ import annotations
 
 # Standard
 from collections.abc import Mapping
+from concurrent.futures import CancelledError
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
 import threading
@@ -21,6 +22,8 @@ from lmcache.v1.storage_backend.raw_block import (
     RawBlockCore,
     RawBlockCoreConfig,
     RawBlockKeySpec,
+    RawBlockPDRequestTracker,
+    RawBlockPublicationReceipt,
     decode_legacy_key,
     encode_legacy_key,
     normalize_raw_block_io_engine,
@@ -174,6 +177,43 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         self._last_refresh_ts = 0.0
         self._refresh_lock = threading.Lock()
         self._warned_reader_put = False
+        self._storage_pd_mode = bool(extra.get("rust_raw_block.storage_pd_mode", False))
+        if self._storage_pd_mode:
+            if bool(getattr(self.config, "use_layerwise", False)):
+                raise ValueError(
+                    "rust_raw_block.storage_pd_mode requires use_layerwise=false"
+                )
+            if bool(getattr(self.config, "enable_async_loading", False)):
+                raise ValueError(
+                    "rust_raw_block.storage_pd_mode requires enable_async_loading=false"
+                )
+            if not bool(getattr(self.config, "save_unfull_chunk", False)):
+                raise ValueError(
+                    "rust_raw_block.storage_pd_mode requires save_unfull_chunk=true"
+                )
+            if self._publish_after_put:
+                raise ValueError(
+                    "rust_raw_block.storage_pd_mode requires "
+                    "publish_after_put=false; the request tracker owns publication"
+                )
+            allow_unsafe_test_io = bool(
+                extra.get("rust_raw_block.allow_unsafe_pd_io_for_testing", False)
+            )
+            if not allow_unsafe_test_io and not bool(
+                extra.get("rust_raw_block.require_dmabuf_registration", False)
+            ):
+                raise ValueError(
+                    "rust_raw_block.storage_pd_mode requires strict dma-buf "
+                    "registration; set require_dmabuf_registration=true"
+                )
+            if (
+                not allow_unsafe_test_io
+                and int(extra.get("rust_raw_block.gpu_buffer_bytes", 0) or 0) <= 0
+            ):
+                raise ValueError(
+                    "rust_raw_block.storage_pd_mode requires a GPU staging "
+                    "arena; set rust_raw_block.gpu_buffer_bytes"
+                )
 
         self._core = RawBlockCore(
             self._build_core_config(extra),
@@ -198,12 +238,29 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                     self.get_memory_allocator()
                 )
             except Exception as e:
+                if self._core.require_dmabuf_registration:
+                    self._core.close()
+                    if self._gpu_allocator is not None:
+                        close_gpu_allocator = getattr(
+                            self._gpu_allocator, "close", None
+                        )
+                        if callable(close_gpu_allocator):
+                            close_gpu_allocator()
+                    raise RuntimeError(
+                        "RustRawBlockBackend requires dma-buf fixed-buffer "
+                        "registration, but registration failed"
+                    ) from e
                 logger.warning(
                     "RustRawBlockBackend: failed to register io_uring fixed "
                     "buffers: %s. Falling back to non-fixed buffer mode.",
                     e,
                 )
         self._warn_if_loaded_metadata_looks_cross_rank()
+        self._pd_tracker = (
+            RawBlockPDRequestTracker(self._core)
+            if self._storage_pd_mode and self._role == "writer"
+            else None
+        )
 
         self._put_lock = threading.Lock()
         self._put_tasks: set[CacheEngineKey] = set()
@@ -350,13 +407,16 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                 "RustRawBlockBackend needs engine metadata to size a slot "
                 "when there is no local CPU backend to ask"
             )
+        config = self.config
+        if config is None:
+            raise ValueError("RustRawBlockBackend requires config to size a slot")
         # kv_shape is [num_layers, kv_size, chunk_size, num_heads, head_size],
         # already divided by the tensor-parallel world size.
         num_layers, kv_size, _, num_heads, head_size = self.metadata.kv_shape
-        chunk_tokens = self.config.chunk_size
+        chunk_tokens = config.chunk_size
         hidden_dim = num_heads * head_size
         dtype_size = self.metadata.kv_dtype.itemsize
-        if self.config.use_layerwise:
+        if config.use_layerwise:
             # One key per layer: [chunk_tokens, kv_size, hidden_dim].
             return chunk_tokens * kv_size * hidden_dim * dtype_size
         # One key per chunk: [kv_size, num_layers, chunk_tokens, hidden_dim].
@@ -401,11 +461,19 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         role = str(extra.get("rust_raw_block.role", "writer") or "writer")
         return RawBlockCoreConfig(
             role=role,
-            verify_slot_header_on_load=bool(
+            verify_slot_header_on_load=self._storage_pd_mode
+            or bool(
                 extra.get("rust_raw_block.verify_slot_header_on_load", role == "reader")
             ),
-            publish_min_interval_ms=int(
-                extra.get("rust_raw_block.publish_min_interval_ms", 0)
+            publish_min_interval_ms=0
+            if self._storage_pd_mode
+            else int(extra.get("rust_raw_block.publish_min_interval_ms", 0)),
+            require_dmabuf_registration=bool(
+                extra.get("rust_raw_block.require_dmabuf_registration", False)
+            ),
+            writer_epoch=str(extra.get("rust_raw_block.writer_epoch", "") or ""),
+            namespace_identity=str(
+                extra.get("rust_raw_block.namespace_identity", "") or ""
             ),
             device_path=self.device_path,
             capacity_bytes=capacity_bytes,
@@ -524,6 +592,61 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         with self._put_lock:
             return key in self._put_tasks
 
+    def cancel_request(self, req_id: str) -> None:
+        """Prevent an aborted storage-P/D request from being published."""
+        if self._pd_tracker is not None:
+            self._pd_tracker.fail_request(
+                req_id,
+                CancelledError(f"storage P/D request {req_id} was cancelled"),
+            )
+
+    def finish_request(self, req_id: str) -> None:
+        """Fail an incomplete request after its model execution has ended."""
+        if self._pd_tracker is not None:
+            self._pd_tracker.finish_request(req_id)
+
+    def adopt_publication(
+        self,
+        receipt: RawBlockPublicationReceipt,
+        keys: Sequence[CacheEngineKey],
+        *,
+        timeout_ms: int,
+    ) -> bool:
+        """Adopt the request generation advertised by a storage-P/D writer."""
+        if self._role != "reader":
+            raise RuntimeError("only a raw-block reader can adopt a publication")
+        encoded_keys = [encode_legacy_key(key).encoded for key in keys]
+        return self._core.refresh_until_publication(
+            receipt,
+            encoded_keys,
+            timeout_ms=timeout_ms,
+            refresh_interval_ms=max(self._index_refresh_min_ms, 1),
+        )
+
+    def publish_existing_request(
+        self,
+        keys: Sequence[CacheEngineKey],
+        transfer_spec: Any,
+    ) -> Future:
+        """Publish a final P/D request whose last iteration wrote no new KV."""
+        if self._pd_tracker is None or self._role != "writer":
+            raise RuntimeError("raw-block storage P/D writer is unavailable")
+        req_id = str(getattr(transfer_spec, "req_id", "") or "")
+        expected_chunks = int(getattr(transfer_spec, "total_chunks", 0) or 0)
+        if self._pd_tracker.has_request(req_id):
+            return self._pd_tracker.finalize_request(
+                req_id,
+                expected_chunks=expected_chunks,
+            )
+        encoded_keys = [encode_legacy_key(key).encoded for key in keys]
+        return self._pd_tracker.register_batch(
+            req_id,
+            encoded_keys,
+            expected_chunks=expected_chunks,
+            is_last_batch=True,
+            completed_keys=encoded_keys,
+        )
+
     def pin(self, key: CacheEngineKey) -> bool:
         spec = encode_legacy_key(key)
         return self._pin_if_needed(spec.encoded)
@@ -537,7 +660,10 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             return False
         spec = encode_legacy_key(key)
         with self._pin_lock:
-            removed = self._core.delete_many([spec.encoded], force=force)[0]
+            removed = self._core.delete_many(
+                [spec.encoded],
+                force=force and not self._storage_pd_mode,
+            )[0]
             if removed:
                 self._pinned_keys.discard(spec.encoded)
         return removed
@@ -564,7 +690,10 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             return 0
         encoded_keys = [encode_legacy_key(key).encoded for key in keys]
         with self._pin_lock:
-            results = self._core.delete_many(encoded_keys, force=force)
+            results = self._core.delete_many(
+                encoded_keys,
+                force=force and not self._storage_pd_mode,
+            )
             for encoded_key, removed in zip(encoded_keys, results, strict=True):
                 if removed:
                     self._pinned_keys.discard(encoded_key)
@@ -574,9 +703,16 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         self,
         keys: Sequence[CacheEngineKey],
         objs: List[MemoryObj],
-        transfer_spec: Any = None,  # noqa: ARG002
+        transfer_spec: Any = None,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> list[Future] | None:
+        if self._storage_pd_mode:
+            return self._batched_submit_pd_request(
+                keys,
+                objs,
+                transfer_spec,
+                on_complete_callback,
+            )
         del transfer_spec
         if self._role == "reader":
             if not self._warned_reader_put:
@@ -645,6 +781,173 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                 for key, _, _ in pending[scheduled_count:]:
                     self._put_tasks.discard(key)
             raise
+
+    def _batched_submit_pd_request(
+        self,
+        keys: Sequence[CacheEngineKey],
+        objs: List[MemoryObj],
+        transfer_spec: Any,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]],
+    ) -> list[Future] | None:
+        """Submit one storage-P/D batch and return request-level completion."""
+        if self._role == "reader":
+            if not self._warned_reader_put:
+                self._warned_reader_put = True
+                logger.warning(
+                    "RustRawBlockBackend: reader role on %s stores nothing; "
+                    "puts are dropped",
+                    self.device_path,
+                )
+            return None
+        if self._pd_tracker is None:
+            raise RuntimeError("raw-block P/D request tracker is unavailable")
+        if transfer_spec is None:
+            raise ValueError("storage P/D puts require transfer_spec")
+        if len(keys) != len(objs):
+            raise ValueError("storage P/D keys and objects must have equal length")
+
+        req_id = str(getattr(transfer_spec, "req_id", "") or "")
+        expected_chunks = int(getattr(transfer_spec, "total_chunks", 0) or 0)
+        is_last_batch = bool(getattr(transfer_spec, "is_last_prefill", False))
+        specs = [encode_legacy_key(key) for key in keys]
+        encoded_keys = [spec.encoded for spec in specs]
+        if len(set(encoded_keys)) != len(encoded_keys):
+            terminal = self._pd_tracker.register_batch(
+                req_id,
+                list(dict.fromkeys(encoded_keys)),
+                expected_chunks=expected_chunks,
+                is_last_batch=is_last_batch,
+            )
+            self._pd_tracker.fail_request(
+                req_id,
+                RuntimeError("storage P/D batch contains duplicate keys"),
+            )
+            return [terminal]
+
+        pending: list[tuple[CacheEngineKey, RawBlockKeySpec, MemoryObj]] = []
+        completed_keys: list[str] = []
+        conflict: str | None = None
+        for key, spec, obj in zip(keys, specs, objs, strict=True):
+            with self._put_lock:
+                already_scheduled = key in self._put_tasks
+                if not already_scheduled:
+                    self._put_tasks.add(key)
+            if already_scheduled or self._core.exists_inflight(spec.encoded):
+                conflict = spec.encoded
+                if not already_scheduled:
+                    with self._put_lock:
+                        self._put_tasks.discard(key)
+                break
+            if self._core.contains_key(spec.encoded, lock=False):
+                completed_keys.append(spec.encoded)
+                with self._put_lock:
+                    self._put_tasks.discard(key)
+                continue
+            obj.ref_count_up()
+            pending.append((key, spec, obj))
+
+        terminal = self._pd_tracker.register_batch(
+            req_id,
+            encoded_keys,
+            expected_chunks=expected_chunks,
+            is_last_batch=is_last_batch,
+            completed_keys=completed_keys,
+        )
+
+        if conflict is not None or terminal.done():
+            for key, _spec, obj in pending:
+                obj.ref_count_down()
+                with self._put_lock:
+                    self._put_tasks.discard(key)
+            if conflict is not None:
+                self._pd_tracker.fail_request(
+                    req_id,
+                    RuntimeError(
+                        "storage P/D refuses an in-flight dedup dependency for key "
+                        f"{conflict}"
+                    ),
+                )
+            return [terminal]
+
+        if on_complete_callback is not None:
+            callback_keys = list(keys)
+
+            def complete_callbacks(done: Future) -> None:
+                try:
+                    done.result()
+                except BaseException:
+                    return
+                for key in callback_keys:
+                    try:
+                        on_complete_callback(key)
+                    except Exception as exc:
+                        logger.warning(
+                            "on_complete_callback failed for key %s: %s",
+                            key,
+                            exc,
+                        )
+
+            terminal.add_done_callback(complete_callbacks)
+
+        if not pending:
+            return [terminal]
+
+        loop = self.loop
+        if loop is None:
+            self._pd_tracker.fail_request(
+                req_id,
+                RuntimeError("RustRawBlockBackend requires an asyncio event loop"),
+            )
+            return [terminal]
+        coro = self._submit_pd_put_many(req_id, pending)
+        try:
+            asyncio.run_coroutine_threadsafe(coro, loop)
+        except Exception as exc:
+            coro.close()
+            for key, _spec, obj in pending:
+                obj.ref_count_down()
+                with self._put_lock:
+                    self._put_tasks.discard(key)
+            self._pd_tracker.fail_request(req_id, exc)
+        return [terminal]
+
+    async def _submit_pd_put_many(
+        self,
+        req_id: str,
+        pending: Sequence[tuple[CacheEngineKey, RawBlockKeySpec, MemoryObj]],
+    ) -> None:
+        """Persist a P/D batch and report only whole-batch success."""
+        specs = [item[1] for item in pending]
+        memory_objs = [item[2] for item in pending]
+        try:
+            put_result = await asyncio.to_thread(
+                self._core.put_many,
+                specs,
+                memory_objs,
+            )
+            if len(put_result.results) != len(pending) or not all(put_result.results):
+                failed = [
+                    spec.encoded
+                    for spec, ok in zip(specs, put_result.results, strict=False)
+                    if not ok
+                ]
+                raise RuntimeError(
+                    "storage P/D failed to persist request keys: "
+                    + ", ".join(failed or ["unknown completion mismatch"])
+                )
+            assert self._pd_tracker is not None
+            self._pd_tracker.complete_batch(
+                req_id,
+                [spec.encoded for spec in specs],
+            )
+        except BaseException as exc:
+            assert self._pd_tracker is not None
+            self._pd_tracker.fail_request(req_id, exc)
+        finally:
+            for key, _spec, memory_obj in pending:
+                memory_obj.ref_count_down()
+                with self._put_lock:
+                    self._put_tasks.discard(key)
 
     async def _submit_put_one(
         self,
@@ -949,7 +1252,13 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             if pending == 0 or time.monotonic() >= deadline:
                 break
             time.sleep(0.01)
+        if self._pd_tracker is not None:
+            self._pd_tracker.close()
         self._core.close()
+        if self._gpu_allocator is not None:
+            close_gpu_allocator = getattr(self._gpu_allocator, "close", None)
+            if callable(close_gpu_allocator):
+                close_gpu_allocator()
 
     def _pin_if_needed(self, encoded_key: str) -> bool:
         with self._pin_lock:
