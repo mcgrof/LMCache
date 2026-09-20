@@ -55,6 +55,42 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _aggregate_futures(futures: Sequence[Future]) -> Future | None:
+    """Return one future that succeeds after every input future succeeds."""
+    if not futures:
+        return None
+    aggregate: Future = Future()
+    results: list[Any] = [None] * len(futures)
+    remaining = len(futures)
+    first_error: BaseException | None = None
+    result_lock = threading.Lock()
+
+    def completed(index: int, done: Future) -> None:
+        nonlocal first_error, remaining
+        error: BaseException | None
+        try:
+            value = done.result()
+        except BaseException as exc:
+            value = None
+            error = exc
+        else:
+            error = None
+        with result_lock:
+            results[index] = value
+            if error is not None and first_error is None:
+                first_error = error
+            remaining -= 1
+            if remaining == 0 and not aggregate.done():
+                if first_error is not None:
+                    aggregate.set_exception(first_error)
+                else:
+                    aggregate.set_result(results)
+
+    for index, future in enumerate(futures):
+        future.add_done_callback(functools.partial(completed, index))
+    return aggregate
+
+
 # Helper function to get the class name of the backend
 def get_backend_cname(backend: StorageBackendInterface) -> str:
     return backend.__class__.__name__
@@ -400,7 +436,7 @@ class StorageManager:
         memory_objs: List[MemoryObj],
         transfer_spec=None,
         location: Optional[str] = None,
-    ) -> None:
+    ) -> Future | None:
         """
         Non-blocking function to batched put the memory objects into the
         storage backends.
@@ -420,30 +456,40 @@ class StorageManager:
             memory_objs,
         )
 
-        for backend_name, backend in self.storage_backends.items():
-            if location and backend_name != location:
-                continue
-            # Skip bypassed backends
-            with self._bypass_lock:
-                if backend_name in self._bypassed_backends:
+        futures: list[Future] = []
+        try:
+            for backend_name, backend in self.storage_backends.items():
+                if location and backend_name != location:
                     continue
 
-            allocator_backend = backend.get_allocator_backend()
-            cname = get_backend_cname(allocator_backend)
-            if cname not in obj_dict:
-                new_keys, new_objs = allocate_and_copy_objects(
-                    allocator_backend, keys, memory_objs, self.internal_copy_stream
+                # Skip bypassed backends
+                with self._bypass_lock:
+                    if backend_name in self._bypassed_backends:
+                        continue
+
+                allocator_backend = backend.get_allocator_backend()
+                cname = get_backend_cname(allocator_backend)
+                if cname not in obj_dict:
+                    new_keys, new_objs = allocate_and_copy_objects(
+                        allocator_backend, keys, memory_objs, self.internal_copy_stream
+                    )
+                    obj_dict[cname] = (new_keys, new_objs)
+
+                # NOTE: the handling of exists_in_put_tasks
+                # is done in the backend
+                ks, objs = obj_dict[cname]
+                submitted = backend.batched_submit_put_task(
+                    ks,
+                    objs,
+                    transfer_spec=transfer_spec,
                 )
-                obj_dict[cname] = (new_keys, new_objs)
-
-            # NOTE: the handling of exists_in_put_tasks
-            # is done in the backend
-            ks, objs = obj_dict[cname]
-            backend.batched_submit_put_task(ks, objs, transfer_spec=transfer_spec)
-
-        for cname, (ks, objs) in obj_dict.items():
-            for memory_obj in objs:
-                memory_obj.ref_count_down()
+                if submitted:
+                    futures.extend(submitted)
+        finally:
+            for _cname, (_ks, objs) in obj_dict.items():
+                for memory_obj in objs:
+                    memory_obj.ref_count_down()
+        return _aggregate_futures(futures)
 
     def get(
         self,
