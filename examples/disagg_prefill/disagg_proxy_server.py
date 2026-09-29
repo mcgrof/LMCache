@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections import defaultdict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import Optional
 import argparse
@@ -197,15 +197,24 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown: Close clients
-    for client in app.state.prefill_clients:
-        await client.aclose()
-    for client in app.state.decode_clients:
-        await client.aclose()
-
+    # Shutdown: stop the receiver before the clients it feeds, and close
+    # every client even if one of them raises on the way out.
     global run_proxy
     run_proxy = False
-    await app.state.zmq_task  # Wait for background task to finish
+    zmq_task = app.state.zmq_task
+    try:
+        # The receiver spends its idle time inside recv(), which the flag
+        # alone cannot interrupt: an idle proxy would wait here forever.
+        # Cancelling wakes it, and its own cleanup closes the socket.
+        zmq_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await zmq_task
+    finally:
+        for client in app.state.total_clients:
+            try:
+                await client.aclose()
+            except Exception:
+                logger.exception("Failed to close a proxy HTTP client")
 
 
 # Update FastAPI app initialization to use lifespan
@@ -379,93 +388,98 @@ run_proxy = True  # Shutdown flag
 
 async def zmq_pull_server():
     socket = zmq_ctx.socket(zmq.PULL)
-    proxy_url = f"{global_args.proxy_host}:{global_args.proxy_port}"
+    # Close the socket from one place that every exit runs through: a bind
+    # failure, the shutdown flag, and the cancellation that wakes a blocked
+    # recv() all leave this coroutine by a different route.
     try:
-        socket.bind(f"tcp://{proxy_url}")
-    except zmq.ZMQError:
-        logger.exception("ZMQ proxy server failed to bind on %s", proxy_url)
-        return
-    logger.info("ZMQ proxy server started on %s", proxy_url)
-
-    while run_proxy:
+        proxy_url = f"{global_args.proxy_host}:{global_args.proxy_port}"
         try:
-            msg_bytes = await socket.recv()
-        except zmq.Again:
-            await asyncio.sleep(0.01)  # Avoid busy loop
-            continue
-        except zmq.ZMQError as exc:
-            if exc.errno in (zmq.ETERM, zmq.ENOTSOCK):
-                break
-            logger.warning("ZMQ recv error: %s", exc)
-            await asyncio.sleep(0.05)
-            continue
+            socket.bind(f"tcp://{proxy_url}")
+        except zmq.ZMQError:
+            logger.exception("ZMQ proxy server failed to bind on %s", proxy_url)
+            return
+        logger.info("ZMQ proxy server started on %s", proxy_url)
 
-        try:
-            msg = msgspec.msgpack.decode(msg_bytes, type=PDMsg)
-        except msgspec.DecodeError as exc:
-            logger.warning("ZMQ received non-PD message: %s", exc)
-            continue
-        except Exception as exc:
-            logger.exception("ZMQ message decode failed: %s", exc)
-            continue
+        while run_proxy:
+            try:
+                msg_bytes = await socket.recv()
+            except zmq.Again:
+                await asyncio.sleep(0.01)  # Avoid busy loop
+                continue
+            except zmq.ZMQError as exc:
+                if exc.errno in (zmq.ETERM, zmq.ENOTSOCK):
+                    break
+                logger.warning("ZMQ recv error: %s", exc)
+                await asyncio.sleep(0.05)
+                continue
 
-        if isinstance(msg, StoragePDStatus):
-            req_id = msg.req_id
-            if msg.state != "READY":
-                app.state.storage_pd_failures[req_id] = msg
-                logger.error(
-                    "Storage P/D producer failed req %s rank %d at %s: %s",
+            try:
+                msg = msgspec.msgpack.decode(msg_bytes, type=PDMsg)
+            except msgspec.DecodeError as exc:
+                logger.warning("ZMQ received non-PD message: %s", exc)
+                continue
+            except Exception as exc:
+                logger.exception("ZMQ message decode failed: %s", exc)
+                continue
+
+            if isinstance(msg, StoragePDStatus):
+                req_id = msg.req_id
+                if msg.state != "READY":
+                    app.state.storage_pd_failures[req_id] = msg
+                    logger.error(
+                        "Storage P/D producer failed req %s rank %d at %s: %s",
+                        req_id,
+                        msg.tp_rank,
+                        msg.error_stage,
+                        msg.error_text,
+                    )
+                    continue
+                previous = app.state.storage_pd_statuses[req_id].get(msg.tp_rank)
+                if previous is not None and previous != msg:
+                    app.state.storage_pd_failures[req_id] = StoragePDStatus(
+                        req_id=req_id,
+                        producer_instance_id=msg.producer_instance_id,
+                        tp_rank=msg.tp_rank,
+                        state="FAILED",
+                        error_stage="PROXY_BARRIER",
+                        error_text="conflicting READY statuses for one TP rank",
+                    )
+                    continue
+                app.state.storage_pd_statuses[req_id][msg.tp_rank] = msg
+                logger.debug(
+                    "Storage P/D req %s rank %d published checkpoint %d.",
                     req_id,
                     msg.tp_rank,
-                    msg.error_stage,
-                    msg.error_text,
+                    msg.checkpoint_seq,
                 )
                 continue
-            previous = app.state.storage_pd_statuses[req_id].get(msg.tp_rank)
-            if previous is not None and previous != msg:
-                app.state.storage_pd_failures[req_id] = StoragePDStatus(
-                    req_id=req_id,
-                    producer_instance_id=msg.producer_instance_id,
-                    tp_rank=msg.tp_rank,
-                    state="FAILED",
-                    error_stage="PROXY_BARRIER",
-                    error_text="conflicting READY statuses for one TP rank",
+
+            if isinstance(msg, StoragePDReadAck):
+                logger.debug(
+                    "Storage P/D read ACK for req %s rank %d.",
+                    msg.req_id,
+                    msg.tp_rank,
                 )
                 continue
-            app.state.storage_pd_statuses[req_id][msg.tp_rank] = msg
-            logger.debug(
-                "Storage P/D req %s rank %d published checkpoint %d.",
-                req_id,
-                msg.tp_rank,
-                msg.checkpoint_seq,
-            )
-            continue
 
-        if isinstance(msg, StoragePDReadAck):
-            logger.debug(
-                "Storage P/D read ACK for req %s rank %d.",
-                msg.req_id,
-                msg.tp_rank,
-            )
-            continue
+            if not isinstance(msg, ProxyNotif):
+                logger.debug("ZMQ ignored message type: %s", type(msg).__name__)
+                continue
 
-        if not isinstance(msg, ProxyNotif):
-            logger.debug("ZMQ ignored message type: %s", type(msg).__name__)
-            continue
+            if global_args.storage_pd:
+                logger.debug(
+                    "Ignoring legacy prefill notification for storage P/D req %s",
+                    msg.req_id,
+                )
+                continue
 
-        if global_args.storage_pd:
-            logger.debug(
-                "Ignoring legacy prefill notification for storage P/D req %s",
-                msg.req_id,
-            )
-            continue
+            req_id = msg.req_id
+            app.state.finished_reqs[req_id] += 1
+            logger.debug("Prefill of req %s done.", req_id)
 
-        req_id = msg.req_id
-        app.state.finished_reqs[req_id] += 1
-        logger.debug("Prefill of req %s done.", req_id)
-
-    socket.close()
-    logger.info("ZMQ PULL server stopped.")
+    finally:
+        socket.close(linger=0)
+        logger.info("ZMQ PULL server stopped.")
 
 
 async def send_request_to_service(
