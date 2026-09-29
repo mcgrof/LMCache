@@ -36,21 +36,30 @@ case "$role" in
         ;;
 esac
 
+# Two spellings reach the same route. LMCACHE_PD_DATA_PATH=raw_block says it
+# through LMCache's own prefill/decode switch, which derives the storage role
+# from LMCACHE_PD_ROLE and requires the plugin, so neither is repeated here.
+# Any other value keeps the older spelling, where the plugin settings carry
+# everything and the prefill/decode switch stays off.
+pd_data_path=${LMCACHE_PD_DATA_PATH:-raw_block}
+if [ "$pd_data_path" = "raw_block" ]; then
+    role_settings=""
+else
+    printf -v role_settings \
+        '"rust_raw_block.role":"%s","rust_raw_block.storage_pd_mode":true,' \
+        "$raw_role"
+fi
+
 printf -v extra_config \
-    '{"storage_plugin.raw_block.module_path":"lmcache.v1.storage_backend.plugins.rust_raw_block_backend","storage_plugin.raw_block.class_name":"RustRawBlockBackend","storage_plugin.raw_block.required":true,"rust_raw_block.device_path":"%s","rust_raw_block.role":"%s","rust_raw_block.slot_bytes":%s,"rust_raw_block.storage_pd_mode":true,"rust_raw_block.io_engine":"io_uring","rust_raw_block.use_odirect":true,"rust_raw_block.use_uring_cmd":false,"rust_raw_block.gpu_buffer_bytes":%s,"rust_raw_block.require_dmabuf_registration":true,"rust_raw_block.publish_after_put":false,"rust_raw_block.publish_min_interval_ms":0,"rust_raw_block.meta_enable_periodic":false,"rust_raw_block.index_refresh_min_ms":1,"rust_raw_block.publication_adopt_timeout_ms":30000,"rust_raw_block.status_send_timeout_s":5}' \
-    "$device" "$raw_role" "$slot_bytes" "$gpu_buffer_bytes"
+    '{"storage_plugin.raw_block.module_path":"lmcache.v1.storage_backend.plugins.rust_raw_block_backend","storage_plugin.raw_block.class_name":"RustRawBlockBackend","storage_plugin.raw_block.required":true,%s"rust_raw_block.device_path":"%s","rust_raw_block.slot_bytes":%s,"rust_raw_block.io_engine":"io_uring","rust_raw_block.use_odirect":true,"rust_raw_block.use_uring_cmd":false,"rust_raw_block.gpu_buffer_bytes":%s,"rust_raw_block.require_dmabuf_registration":true,"rust_raw_block.publish_after_put":false,"rust_raw_block.publish_min_interval_ms":0,"rust_raw_block.meta_enable_periodic":false,"rust_raw_block.index_refresh_min_ms":1,"rust_raw_block.publication_adopt_timeout_ms":30000,"rust_raw_block.status_send_timeout_s":5}' \
+    "$role_settings" "$device" "$slot_bytes" "$gpu_buffer_bytes"
 
 export PYTHONHASHSEED=0
 export LMCACHE_CHUNK_SIZE=${LMCACHE_CHUNK_SIZE:-256}
 export LMCACHE_LOCAL_CPU=false
 export LMCACHE_MAX_LOCAL_CPU_SIZE=0
-# Two spellings reach the same route. LMCACHE_PD_DATA_PATH=raw_block says it
-# through LMCache's own prefill/decode switch, which then derives the storage
-# role from LMCACHE_PD_ROLE and requires the plugin. Leaving it unset keeps
-# the older spelling, where the plugin settings carry everything and the
-# prefill/decode switch stays off.
-export LMCACHE_PD_DATA_PATH=${LMCACHE_PD_DATA_PATH:-raw_block}
-if [ "$LMCACHE_PD_DATA_PATH" = "raw_block" ]; then
+export LMCACHE_PD_DATA_PATH=$pd_data_path
+if [ "$pd_data_path" = "raw_block" ]; then
     export LMCACHE_ENABLE_PD=true
 else
     export LMCACHE_ENABLE_PD=false
