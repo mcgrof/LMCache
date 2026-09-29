@@ -157,3 +157,68 @@ async def test_idle_receiver_stops_when_cancelled_not_when_flagged() -> None:
             del proxy.global_args
         else:
             proxy.global_args = original_args
+
+
+@pytest.mark.asyncio
+async def test_handoff_budget_covers_a_prefiller_that_never_answers() -> None:
+    """A stalled prefiller must not hold a request open indefinitely.
+
+    The prefill clients carry no timeout of their own, and the wait for
+    READY only starts its clock once the prefill call returns, so a
+    prefiller that stops answering used to stall the handoff with nothing
+    bounding it.
+    """
+    # Standard
+    import asyncio
+    import time
+    from types import SimpleNamespace
+
+    original_args = getattr(proxy, "global_args", None)
+    original_send = proxy.send_request_to_service
+    proxy.global_args = SimpleNamespace(storage_pd=True, storage_pd_ready_timeout_s=0.3)
+
+    async def never_answers(*args, **kwargs):
+        await asyncio.sleep(3600)
+
+    proxy.send_request_to_service = never_answers  # type: ignore[assignment]
+    try:
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="waiting for the prefiller"):
+            await proxy.prefill_within_handoff_budget(None, {}, "request")
+        assert time.monotonic() - started < 2
+    finally:
+        proxy.send_request_to_service = original_send  # type: ignore[assignment]
+        if original_args is None:
+            del proxy.global_args
+        else:
+            proxy.global_args = original_args
+
+
+@pytest.mark.asyncio
+async def test_handoff_budget_passes_the_remainder_to_the_ready_wait() -> None:
+    """What the prefiller spends comes out of the same budget."""
+    # Standard
+    import asyncio
+    from types import SimpleNamespace
+
+    original_args = getattr(proxy, "global_args", None)
+    original_send = proxy.send_request_to_service
+    proxy.global_args = SimpleNamespace(storage_pd=True, storage_pd_ready_timeout_s=1.0)
+
+    async def answers_slowly(*args, **kwargs):
+        await asyncio.sleep(0.3)
+        return "response"
+
+    proxy.send_request_to_service = answers_slowly  # type: ignore[assignment]
+    try:
+        response, remaining = await proxy.prefill_within_handoff_budget(
+            None, {}, "request"
+        )
+        assert response == "response"
+        assert 0.4 < remaining < 0.8
+    finally:
+        proxy.send_request_to_service = original_send  # type: ignore[assignment]
+        if original_args is None:
+            del proxy.global_args
+        else:
+            proxy.global_args = original_args
