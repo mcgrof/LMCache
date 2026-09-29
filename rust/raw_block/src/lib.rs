@@ -1797,6 +1797,34 @@ impl RawBlockDevice {
                                                     );
                                                 }
                                             }
+                                            // A fixed SQE takes its address from
+                                            // fixed_dmabuf, never from ptr_addr, so a
+                                            // retry that advances only ptr_addr would
+                                            // transfer the remainder to the start of
+                                            // the registered buffer again. The new
+                                            // offset stays inside the original request,
+                                            // because a short result is shorter than
+                                            // the length that was asked for.
+                                            if let Some(off) = sub.fixed_dmabuf {
+                                                match off.checked_add(bytes_transferred) {
+                                                    Some(next) => sub.fixed_dmabuf = Some(next),
+                                                    None => {
+                                                        let result = handle_completion_result(
+                                                            &mut sub,
+                                                            -libc::EOVERFLOW,
+                                                            false,
+                                                        );
+                                                        sub.completion.set(result);
+                                                        decrement_in_flight(
+                                                            &in_flight_count_clone,
+                                                            &in_flight_cvar_clone,
+                                                            &batch_in_flight_clone,
+                                                            batch_id,
+                                                        );
+                                                        continue;
+                                                    }
+                                                }
+                                            }
                                             // Re-insert into in_flight with updated values
                                             // Don't decrement in_flight_count since we're resubmitting
                                             in_flight.insert(user_data, sub.clone());
@@ -1877,6 +1905,34 @@ impl RawBlockDevice {
                                                         payload_len
                                                             .saturating_sub(bytes_transferred),
                                                     );
+                                                }
+                                            }
+                                            // A fixed SQE takes its address from
+                                            // fixed_dmabuf, never from ptr_addr, so a
+                                            // retry that advances only ptr_addr would
+                                            // transfer the remainder to the start of
+                                            // the registered buffer again. The new
+                                            // offset stays inside the original request,
+                                            // because a short result is shorter than
+                                            // the length that was asked for.
+                                            if let Some(off) = sub.fixed_dmabuf {
+                                                match off.checked_add(bytes_transferred) {
+                                                    Some(next) => sub.fixed_dmabuf = Some(next),
+                                                    None => {
+                                                        let result = handle_completion_result(
+                                                            &mut sub,
+                                                            -libc::EOVERFLOW,
+                                                            false,
+                                                        );
+                                                        sub.completion.set(result);
+                                                        decrement_in_flight(
+                                                            &in_flight_count_clone,
+                                                            &in_flight_cvar_clone,
+                                                            &batch_in_flight_clone,
+                                                            batch_id,
+                                                        );
+                                                        continue;
+                                                    }
                                                 }
                                             }
                                             // Re-insert into in_flight with updated values
