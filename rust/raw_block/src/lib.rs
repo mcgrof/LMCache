@@ -29,7 +29,7 @@ use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use io_uring::cqueue::{Entry, Entry32};
 use io_uring::squeue::{Entry as SqueueEntry, Entry128};
@@ -1743,6 +1743,10 @@ impl RawBlockDevice {
                     // their entries in in_flight, so the worker retries the
                     // submit rather than building them a second time.
                     let mut resident_sqes = false;
+                    // Buffers a submitted request may still have the device
+                    // writing into. They outlive the worker rather than return
+                    // to the allocator with a live DMA target inside them.
+                    let mut retained_buffers: Vec<std::sync::Arc<AlignedBuf>> = Vec::new();
 
                     while !shutdown_clone.load(Ordering::Relaxed) {
                         // This drains all completed I/O operations from the completion queue (CQ).
@@ -2176,7 +2180,13 @@ impl RawBlockDevice {
                                                 sub.completion.set(Err(PyRuntimeError::new_err(
                                                     format!("io_uring submit error: {:?}", e),
                                                 )));
-                                                let _ = sub.bounce.take();
+                                                // The SQE stayed resident through a
+                                                // failed submit, so the kernel can
+                                                // still reach this buffer. Resolve
+                                                // the waiter, but keep the memory.
+                                                if let Some(buf) = sub.bounce.take() {
+                                                    retained_buffers.push(buf);
+                                                }
                                                 decrement_in_flight(
                                                     &in_flight_count_clone,
                                                     &in_flight_cvar_clone,
@@ -2212,62 +2222,74 @@ impl RawBlockDevice {
                         }
                     }
 
-                    // Process any remaining in-flight requests
-                    // Wait for kernel to complete the requests or force-cancel them
-                    // Note: This 1000 milliseconds is a rough estimate
-                    let graceful_shutdown = Duration::from_millis(1000);
-                    thread::sleep(graceful_shutdown);
-                    {
-                        // Process completions for standard ring
-                        if let IoUringWrapper::Standard(ring) = &ring_clone {
-                            let completions: Vec<_> = {
-                                let mut ring = ring.lock().unwrap();
-                                ring.completion().collect()
-                            };
-                            for cqe in completions {
-                                let user_data = cqe.user_data();
-                                if let Some(mut sub) = in_flight.remove(&user_data) {
-                                    let batch_id = sub.batch_id;
-                                    let result =
-                                        handle_completion_result(&mut sub, cqe.result(), true);
-                                    sub.completion.set(result);
-                                    decrement_in_flight(
-                                        &in_flight_count_clone,
-                                        &in_flight_cvar_clone,
-                                        &batch_in_flight_clone,
-                                        batch_id,
-                                    );
-                                }
+                    // Drain what the kernel still owns rather than guess at
+                    // a duration. A submitted request points the device at this
+                    // process's memory, so releasing that memory on a timer can
+                    // let a late completion land in a buffer already reused.
+                    let drain_deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        // Deliver any SQE still resident so it can complete or
+                        // report an error instead of waiting for a submit that
+                        // the shutdown path would never make.
+                        let _ = match &ring_clone {
+                            IoUringWrapper::Standard(ring) => {
+                                let ring = ring.lock().unwrap();
+                                ring.submitter().submit()
                             }
-                        } else if let IoUringWrapper::Big(ring) = &ring_clone {
-                            let completions: Vec<_> = {
+                            IoUringWrapper::Big(ring) => {
+                                let ring = ring.lock().unwrap();
+                                ring.submitter().submit()
+                            }
+                        };
+                        let completions: Vec<(u64, i32)> = match &ring_clone {
+                            IoUringWrapper::Standard(ring) => {
                                 let mut ring = ring.lock().unwrap();
-                                ring.completion().collect()
-                            };
-                            for cqe in completions {
-                                let user_data = cqe.user_data();
-                                if let Some(mut sub) = in_flight.remove(&user_data) {
-                                    let batch_id = sub.batch_id;
-                                    let result =
-                                        handle_completion_result(&mut sub, cqe.result(), true);
-                                    sub.completion.set(result);
-                                    decrement_in_flight(
-                                        &in_flight_count_clone,
-                                        &in_flight_cvar_clone,
-                                        &batch_in_flight_clone,
-                                        batch_id,
-                                    );
-                                }
+                                ring.completion()
+                                    .map(|cqe| (cqe.user_data(), cqe.result()))
+                                    .collect()
+                            }
+                            IoUringWrapper::Big(ring) => {
+                                let mut ring = ring.lock().unwrap();
+                                ring.completion()
+                                    .map(|cqe| (cqe.user_data(), cqe.result()))
+                                    .collect()
+                            }
+                        };
+                        let reaped = completions.len();
+                        for (user_data, cqe_result) in completions {
+                            if let Some(mut sub) = in_flight.remove(&user_data) {
+                                let batch_id = sub.batch_id;
+                                let result = handle_completion_result(&mut sub, cqe_result, true);
+                                sub.completion.set(result);
+                                decrement_in_flight(
+                                    &in_flight_count_clone,
+                                    &in_flight_cvar_clone,
+                                    &batch_in_flight_clone,
+                                    batch_id,
+                                );
                             }
                         }
                         ring_clone.submission_sync();
+                        if in_flight.is_empty() || Instant::now() >= drain_deadline {
+                            break;
+                        }
+                        if reaped == 0 {
+                            thread::sleep(Duration::from_millis(1));
+                        }
                     }
 
                     // Any remaining in_flight requests, force wake with error
                     // (these were submitted to kernel but won't get completions)
                     for (_user_data, mut sub) in in_flight.drain() {
                         let batch_id = sub.batch_id;
-                        let _ = sub.bounce.take();
+                        // No completion ever reported this request, so the
+                        // device may still write into its buffer. Wake the
+                        // waiter, and keep the buffer for the life of the
+                        // process instead of handing a live target back to
+                        // the allocator.
+                        if let Some(buf) = sub.bounce.take() {
+                            retained_buffers.push(buf);
+                        }
                         sub.completion.set(Err(PyRuntimeError::new_err(
                             "io_uring worker shutting down - request cancelled",
                         )));
@@ -2277,6 +2299,14 @@ impl RawBlockDevice {
                             &batch_in_flight_clone,
                             batch_id,
                         );
+                    }
+
+                    if !retained_buffers.is_empty() {
+                        eprintln!(
+                            "raw_block: retaining {} I/O buffer(s) that never reported completion",
+                            retained_buffers.len()
+                        );
+                        std::mem::forget(retained_buffers);
                     }
 
                     // Final notification in case any thread is waiting on in_flight_count
