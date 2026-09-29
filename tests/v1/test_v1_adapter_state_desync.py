@@ -20,6 +20,7 @@ locks in that behavior by feeding ``wait_for_save`` a request whose
 """
 
 # Standard
+from collections import OrderedDict
 from concurrent.futures import Future
 from types import SimpleNamespace
 import logging
@@ -113,13 +114,13 @@ def _make_storage_pd_connector() -> LMCacheConnectorV1Impl:
     connector._storage_pd_store_futures = {}
     connector._storage_pd_wire_req_ids = {}
     connector._storage_pd_engine_finished = set()
-    connector._storage_pd_returned = set()
+    connector._storage_pd_returned = OrderedDict()
     connector._storage_pd_aborted = set()
     connector._storage_pd_failures = {}
     connector._storage_pd_terminal_states = {}
     connector._storage_pd_receipts = {}
     connector._storage_pd_status_sent = set()
-    connector._storage_pd_acks_sent = set()
+    connector._storage_pd_acks_sent = OrderedDict()
     connector._storage_pd_status_sender = None
     connector._storage_pd_notify_required = False
     connector._storage_pd_tp_rank = 0
@@ -178,15 +179,25 @@ def test_storage_pd_aborted_writer_does_not_defer_source_block_free() -> None:
 
 
 def test_storage_pd_get_finished_waits_for_store_publication() -> None:
+    class Sender:
+        def __init__(self) -> None:
+            self.statuses: list[StoragePDStatus] = []
+
+        def send(self, status: StoragePDStatus) -> None:
+            self.statuses.append(status)
+
     connector = _make_storage_pd_connector()
+    sender = Sender()
+    connector._storage_pd_status_sender = sender  # type: ignore[assignment]
     completion: Future[list[RawBlockPublicationReceipt]] = Future()
     connector._storage_pd_store_futures["request-1"] = completion
 
     assert connector.get_finished({"request-1"}) == (set(), None)
+    assert sender.statuses == []
     receipt = RawBlockPublicationReceipt("writer", 1, 1, "digest")
     completion.set_result([receipt])
     assert connector.get_finished(set()) == ({"request-1"}, None)
-    assert connector._storage_pd_receipts == {"request-1": receipt}
+    assert [status.manifest_digest for status in sender.statuses] == ["digest"]
     assert connector.get_finished({"request-1"}) == (set(), None)
 
 
@@ -307,7 +318,7 @@ def test_storage_pd_get_finished_refuses_to_release_without_a_consumer() -> None
 
     with pytest.raises(RuntimeError, match="no status sender"):
         connector.get_finished({"request-1"})
-    assert connector._storage_pd_returned == set()
+    assert not connector._storage_pd_returned
 
 
 def test_storage_pd_get_finished_releases_when_notification_is_disabled() -> None:
@@ -358,14 +369,88 @@ def test_storage_pd_read_ack_carries_the_published_request_identity() -> None:
     assert len(sender.acks) == 1
 
 
-def test_storage_pd_get_finished_reports_failure_but_releases_source_blocks() -> None:
+def test_storage_pd_releasing_a_request_clears_its_state() -> None:
+    """A finished request must not leave one entry per container behind.
+
+    Every map here holds something the request needs while it is in
+    flight. Keeping them costs the engine one entry per request served,
+    for as long as it runs.
+    """
     connector = _make_storage_pd_connector()
+
+    class Sender:
+        def send(self, status) -> None:
+            return None
+
+    connector._storage_pd_status_sender = Sender()  # type: ignore[assignment]
+    connector._storage_pd_wire_req_ids["request-1"] = "proxy-uuid"
+    completion: Future[list[RawBlockPublicationReceipt]] = Future()
+    completion.set_result([RawBlockPublicationReceipt("writer", 1, 1, "digest")])
+    connector._storage_pd_store_futures["request-1"] = completion
+
+    assert connector.get_finished({"request-1"}) == ({"request-1"}, None)
+
+    assert connector._storage_pd_store_futures == {}
+    assert connector._storage_pd_wire_req_ids == {}
+    assert connector._storage_pd_receipts == {}
+    assert connector._storage_pd_status_sent == set()
+    assert connector._storage_pd_engine_finished == set()
+    assert connector._storage_pd_failures == {}
+    assert connector._storage_pd_terminal_states == {}
+    # The identifier survives, so a late status is not taken for new work.
+    assert list(connector._storage_pd_returned) == ["request-1"]
+    assert connector.get_finished({"request-1"}) == (set(), None)
+
+
+def test_storage_pd_forgets_the_oldest_finished_requests() -> None:
+    """The record of finished requests is bounded, not merely smaller."""
+    # First Party
+    from lmcache.integration.vllm import vllm_v1_adapter
+
+    connector = _make_storage_pd_connector()
+
+    class Sender:
+        def send(self, status) -> None:
+            return None
+
+    connector._storage_pd_status_sender = Sender()  # type: ignore[assignment]
+    original = vllm_v1_adapter.STORAGE_PD_REQUEST_HISTORY
+    vllm_v1_adapter.STORAGE_PD_REQUEST_HISTORY = 3
+    try:
+        for index in range(8):
+            req_id = f"request-{index}"
+            completion: Future[list[RawBlockPublicationReceipt]] = Future()
+            completion.set_result(
+                [RawBlockPublicationReceipt("writer", 1, 1, "digest")]
+            )
+            connector._storage_pd_store_futures[req_id] = completion
+            assert connector.get_finished({req_id}) == ({req_id}, None)
+        assert list(connector._storage_pd_returned) == [
+            f"request-{i}" for i in range(5, 8)
+        ]
+    finally:
+        vllm_v1_adapter.STORAGE_PD_REQUEST_HISTORY = original
+
+
+def test_storage_pd_get_finished_reports_failure_but_releases_source_blocks() -> None:
+    class Sender:
+        def __init__(self) -> None:
+            self.statuses: list[StoragePDStatus] = []
+
+        def send(self, status: StoragePDStatus) -> None:
+            self.statuses.append(status)
+
+    connector = _make_storage_pd_connector()
+    sender = Sender()
+    connector._storage_pd_status_sender = sender  # type: ignore[assignment]
     completion: Future[list[RawBlockPublicationReceipt]] = Future()
     connector._storage_pd_store_futures["request-failed"] = completion
     completion.set_exception(OSError("write failed"))
 
     assert connector.get_finished({"request-failed"}) == ({"request-failed"}, None)
-    assert connector._storage_pd_failures == {"request-failed": "write failed"}
+    assert [(s.state, s.error_text) for s in sender.statuses] == [
+        ("FAILED", "write failed")
+    ]
     assert connector.get_finished({"request-failed"}) == (set(), None)
 
 

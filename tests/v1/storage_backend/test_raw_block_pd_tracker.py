@@ -392,3 +392,85 @@ def test_publication_releases_extents_when_the_request_ended_first() -> None:
         assert _wait_until(lambda: core.held == {}), core.held
     finally:
         tracker.close()
+
+
+def test_tracker_drops_a_finished_request_but_remembers_its_answer() -> None:
+    """Working state is for requests in flight; answers outlive them.
+
+    Keeping every request's key sets grows without bound for the life of
+    the writer. Forgetting a request entirely is worse, because a caller
+    that arrives late would start it over.
+    """
+    core = _MappingCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    try:
+        terminal = _publish_one(tracker, core)
+        core.allow_publish.set()
+        receipt = terminal.result(timeout=5)
+        assert _wait_until(lambda: not tracker._requests), tracker._requests
+
+        # A late finalize gets the answer it already had, not a new request.
+        again = tracker.finalize_request("request-1", expected_chunks=2)
+        assert again.result(timeout=5) is receipt
+        assert not tracker._requests
+
+        # Registering it again is a protocol error, not a second publication.
+        with pytest.raises(RuntimeError, match="already finished"):
+            tracker.register_batch(
+                "request-1",
+                ["key-1"],
+                expected_chunks=1,
+                is_last_batch=True,
+            )
+        assert core.held == {"key-1": 1, "key-2": 1}
+    finally:
+        core.allow_publish.set()
+        tracker.close()
+
+
+def test_tracker_drops_a_failed_request_too() -> None:
+    """A request that failed holds no more state than one that succeeded."""
+    core = _MappingCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    try:
+        terminal = tracker.register_batch(
+            "request-1",
+            ["key-1"],
+            expected_chunks=1,
+            is_last_batch=False,
+        )
+        tracker.fail_request("request-1", RuntimeError("gave up"))
+        with pytest.raises(RuntimeError, match="gave up"):
+            terminal.result(timeout=5)
+        assert not tracker._requests
+        assert tracker.has_request("request-1") is False
+    finally:
+        tracker.close()
+
+
+def test_tracker_forgets_the_oldest_finished_requests() -> None:
+    """The record of finished requests is bounded, not merely smaller."""
+    # First Party
+    from lmcache.v1.storage_backend.raw_block import pd as pd_module
+
+    core = _MappingCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    original = pd_module._FINISHED_HISTORY
+    pd_module._FINISHED_HISTORY = 4
+    try:
+        for index in range(10):
+            req_id = f"request-{index}"
+            terminal = tracker.register_batch(
+                req_id,
+                [f"key-{index}"],
+                expected_chunks=1,
+                is_last_batch=False,
+            )
+            tracker.fail_request(req_id, RuntimeError("gave up"))
+            with pytest.raises(RuntimeError):
+                terminal.result(timeout=5)
+        assert len(tracker._finished) == 4
+        assert list(tracker._finished) == [f"request-{i}" for i in range(6, 10)]
+    finally:
+        pd_module._FINISHED_HISTORY = original
+        tracker.close()

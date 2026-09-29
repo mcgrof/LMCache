@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from collections import OrderedDict
 from collections.abc import Iterable
 from concurrent.futures import CancelledError, Future
 from dataclasses import dataclass, field
@@ -102,6 +103,11 @@ class DisaggSpec:
     total_chunks: int = 0
     receiver_query_port: Optional[list[int]] = None
 
+
+# How many finished storage P/D requests to remember. A finished request
+# keeps only its identifier, so a status that arrives after it ended is
+# recognised instead of starting it again. The oldest are forgotten.
+STORAGE_PD_REQUEST_HISTORY = 4096
 
 tmp_disagg_tracker: dict[str, DisaggSpec] = {}
 
@@ -573,13 +579,13 @@ class LMCacheConnectorV1Impl:
         self._storage_pd_store_futures: dict[str, Future] = {}
         self._storage_pd_wire_req_ids: dict[str, str] = {}
         self._storage_pd_engine_finished: set[str] = set()
-        self._storage_pd_returned: set[str] = set()
+        self._storage_pd_returned: OrderedDict[str, None] = OrderedDict()
         self._storage_pd_aborted: set[str] = set()
         self._storage_pd_failures: dict[str, str] = {}
         self._storage_pd_terminal_states: dict[str, StoragePDState] = {}
         self._storage_pd_receipts: dict[str, RawBlockPublicationReceipt] = {}
         self._storage_pd_status_sent: set[str] = set()
-        self._storage_pd_acks_sent: set[str] = set()
+        self._storage_pd_acks_sent: OrderedDict[str, None] = OrderedDict()
         self._storage_pd_lock = threading.Lock()
         self._storage_pd_tp_rank = 0
         self._storage_pd_status_sender: Optional[StoragePDStatusSender] = None
@@ -1081,7 +1087,10 @@ class LMCacheConnectorV1Impl:
                     manifest_digest=status.manifest_digest,
                 )
             )
-        self._storage_pd_acks_sent.add(req_id)
+        self._storage_pd_acks_sent.pop(req_id, None)
+        self._storage_pd_acks_sent[req_id] = None
+        while len(self._storage_pd_acks_sent) > STORAGE_PD_REQUEST_HISTORY:
+            self._storage_pd_acks_sent.popitem(last=False)
 
     def record_failed_blocks(
         self,
@@ -1579,6 +1588,29 @@ class LMCacheConnectorV1Impl:
         )
 
     @_lmcache_nvtx_annotate
+    def _storage_pd_retire_locked(self, req_id: str) -> None:
+        """Drop a finished request's state, keeping only that it finished.
+
+        Every container here holds something a request needs while it is in
+        flight and nothing anyone reads afterwards, so keeping them costs
+        one entry per request served for the life of the engine. Dropping
+        the identifier as well would let a late status be taken for a new
+        request, so that one identifier is kept, and the record of them is
+        bounded.
+        """
+        self._storage_pd_store_futures.pop(req_id, None)
+        self._storage_pd_wire_req_ids.pop(req_id, None)
+        self._storage_pd_engine_finished.discard(req_id)
+        self._storage_pd_aborted.discard(req_id)
+        self._storage_pd_failures.pop(req_id, None)
+        self._storage_pd_terminal_states.pop(req_id, None)
+        self._storage_pd_receipts.pop(req_id, None)
+        self._storage_pd_status_sent.discard(req_id)
+        self._storage_pd_returned.pop(req_id, None)
+        self._storage_pd_returned[req_id] = None
+        while len(self._storage_pd_returned) > STORAGE_PD_REQUEST_HISTORY:
+            self._storage_pd_returned.popitem(last=False)
+
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
@@ -1679,7 +1711,8 @@ class LMCacheConnectorV1Impl:
 
                 releasable.add(req_id)
                 self._storage_pd_engine_finished.discard(req_id)
-            self._storage_pd_returned.update(releasable)
+            for req_id in releasable:
+                self._storage_pd_retire_locked(req_id)
 
         if pending_sends and self._storage_pd_status_sender is None:
             # Releasing these would tell the engine the handoff is done
@@ -1709,11 +1742,9 @@ class LMCacheConnectorV1Impl:
 
         if sent:
             with self._storage_pd_lock:
-                self._storage_pd_status_sent.update(sent)
                 for req_id in sent:
                     releasable.add(req_id)
-                    self._storage_pd_engine_finished.discard(req_id)
-                self._storage_pd_returned.update(sent)
+                    self._storage_pd_retire_locked(req_id)
         return releasable, None
 
     def _record_storage_pd_failure(self, req_id: str, error: str) -> None:

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 # Standard
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Sequence
@@ -29,6 +30,13 @@ class _RequestState:
     terminal: Future[RawBlockPublicationReceipt] = field(default_factory=Future)
 
 
+# How many finished requests to remember. A finished request keeps only
+# its terminal future, so a late caller gets the answer it already had
+# instead of starting the request again. The oldest are forgotten, which
+# means an identifier reused after this many requests is treated as new.
+_FINISHED_HISTORY = 4096
+
+
 class RawBlockPDRequestTracker:
     """Turn raw-block batch completions into one publication receipt."""
 
@@ -36,6 +44,9 @@ class RawBlockPDRequestTracker:
         self._core = core
         self._lock = threading.Lock()
         self._requests: dict[str, _RequestState] = {}
+        self._finished: OrderedDict[str, Future[RawBlockPublicationReceipt]] = (
+            OrderedDict()
+        )
         self._leased_keys: dict[str, list[str]] = {}
         self._publisher = ThreadPoolExecutor(
             max_workers=1,
@@ -69,12 +80,18 @@ class RawBlockPDRequestTracker:
         with self._lock:
             if self._closed:
                 raise RuntimeError("raw-block P/D request tracker is closed")
+            if req_id in self._finished:
+                raise RuntimeError(
+                    f"request {req_id} has already finished and cannot be "
+                    "registered again"
+                )
             state = self._requests.get(req_id)
             if state is None:
                 state = _RequestState(expected_chunks=expected_chunks)
                 self._requests[req_id] = state
             elif state.expected_chunks != expected_chunks:
                 self._fail_locked(
+                    req_id,
                     state,
                     RuntimeError(
                         f"request {req_id} changed total_chunks from "
@@ -86,12 +103,14 @@ class RawBlockPDRequestTracker:
                 raise RuntimeError(f"request {req_id} is already terminal")
             elif state.publication_started:
                 self._fail_locked(
+                    req_id,
                     state,
                     RuntimeError(f"request {req_id} changed after publication began"),
                 )
                 return state.terminal
             elif state.saw_last_batch:
                 self._fail_locked(
+                    req_id,
                     state,
                     RuntimeError(
                         f"request {req_id} added a batch after its last batch"
@@ -102,6 +121,7 @@ class RawBlockPDRequestTracker:
             duplicate_keys = batch_key_set & state.seen_keys
             if duplicate_keys:
                 self._fail_locked(
+                    req_id,
                     state,
                     RuntimeError(
                         f"request {req_id} repeated keys across batches: "
@@ -116,6 +136,7 @@ class RawBlockPDRequestTracker:
             state.saw_last_batch = state.saw_last_batch or is_last_batch
             if len(state.seen_keys) > state.expected_chunks:
                 self._fail_locked(
+                    req_id,
                     state,
                     RuntimeError(
                         f"request {req_id} supplied {len(state.seen_keys)} keys "
@@ -125,6 +146,7 @@ class RawBlockPDRequestTracker:
                 return state.terminal
             if state.saw_last_batch and len(state.seen_keys) != state.expected_chunks:
                 self._fail_locked(
+                    req_id,
                     state,
                     RuntimeError(
                         f"request {req_id} marked its last batch with "
@@ -153,11 +175,15 @@ class RawBlockPDRequestTracker:
         """Mark an existing request complete when its final batch has no new keys."""
         publish: tuple[str, list[str], Future[RawBlockPublicationReceipt]] | None
         with self._lock:
+            remembered = self._finished.get(req_id)
+            if remembered is not None:
+                return remembered
             state = self._requests.get(req_id)
             if state is None:
                 raise RuntimeError(f"request {req_id} has no registered batches")
             if state.expected_chunks != expected_chunks:
                 self._fail_locked(
+                    req_id,
                     state,
                     RuntimeError(
                         f"request {req_id} changed total_chunks from "
@@ -170,6 +196,7 @@ class RawBlockPDRequestTracker:
             state.saw_last_batch = True
             if len(state.seen_keys) != state.expected_chunks:
                 self._fail_locked(
+                    req_id,
                     state,
                     RuntimeError(
                         f"request {req_id} finalized with {len(state.seen_keys)} "
@@ -197,6 +224,7 @@ class RawBlockPDRequestTracker:
             unknown = set(encoded_keys) - state.seen_keys
             if unknown:
                 self._fail_locked(
+                    req_id,
                     state,
                     RuntimeError(
                         f"request {req_id} completed unregistered keys: "
@@ -214,7 +242,7 @@ class RawBlockPDRequestTracker:
         with self._lock:
             state = self._requests.get(req_id)
             if state is not None:
-                self._fail_locked(state, error)
+                self._fail_locked(req_id, state, error)
 
     def finish_request(self, req_id: str) -> None:
         """Fail a request that ended before its final batch was registered."""
@@ -226,6 +254,7 @@ class RawBlockPDRequestTracker:
                 and not state.saw_last_batch
             ):
                 self._fail_locked(
+                    req_id,
                     state,
                     RuntimeError(
                         f"request {req_id} finished before its last storage batch"
@@ -238,8 +267,11 @@ class RawBlockPDRequestTracker:
             if self._closed:
                 return
             self._closed = True
-            for req_id, state in self._requests.items():
+            # Failing a request retires it, which removes it from this
+            # table, so take the entries before walking them.
+            for req_id, state in list(self._requests.items()):
                 self._fail_locked(
+                    req_id,
                     state,
                     RuntimeError(f"request {req_id} aborted during shutdown"),
                 )
@@ -312,6 +344,7 @@ class RawBlockPDRequestTracker:
                 if owned:
                     self._leased_keys[req_id] = encoded_keys
                     terminal.set_result(receipt)
+                    self._retire_locked(req_id, terminal)
             if not owned:
                 # The request ended while this was in flight, so nothing
                 # will ever release these extents by name. Let them go
@@ -320,10 +353,31 @@ class RawBlockPDRequestTracker:
 
         publication.add_done_callback(finish)
 
-    @staticmethod
     def _fail_locked(
+        self,
+        req_id: str,
         state: _RequestState,
         error: BaseException,
     ) -> None:
         if not state.terminal.done():
             state.terminal.set_exception(error)
+        self._retire_locked(req_id, state.terminal)
+
+    def _retire_locked(
+        self,
+        req_id: str,
+        terminal: Future[RawBlockPublicationReceipt],
+    ) -> None:
+        """Drop a finished request's working state, keeping its answer.
+
+        The batch and key sets a request accumulates are only useful while
+        it is in flight, but a caller can still arrive after it ends, and
+        forgetting the request entirely would let that caller start it
+        again. Keep the terminal future, which is small, and bound how many
+        of those are kept.
+        """
+        self._requests.pop(req_id, None)
+        self._finished.pop(req_id, None)
+        self._finished[req_id] = terminal
+        while len(self._finished) > _FINISHED_HISTORY:
+            self._finished.popitem(last=False)
