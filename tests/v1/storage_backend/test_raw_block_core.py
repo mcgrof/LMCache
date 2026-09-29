@@ -1289,9 +1289,7 @@ def test_raw_block_core_put_many_sets_same_placement_for_header_and_payload(
         core.close()
 
 
-def test_raw_block_core_put_many_honors_io_uring_transfer_limit(
-    tmp_path, monkeypatch
-):
+def test_raw_block_core_put_many_honors_io_uring_transfer_limit(tmp_path, monkeypatch):
     core, raw_device = _make_fake_io_uring_core(
         tmp_path,
         monkeypatch,
@@ -1619,9 +1617,7 @@ def test_paged_memory_object_reports_its_own_shape_not_the_pool_slot():
 
     class _Obj:
         metadata = meta
-        raw_data = torch.zeros(
-            tail_shape.numel(), dtype=dtype, device="meta"
-        ).view(-1)
+        raw_data = torch.zeros(tail_shape.numel(), dtype=dtype, device="meta").view(-1)
 
         def get_size(self):
             return meta.get_size()
@@ -1662,9 +1658,7 @@ def _grouped_device_obj(tail_tokens=9, with_override=False):
     class _Grouped:
         metadata = meta
         raw_data = torch.zeros(shape.numel(), dtype=dtype, device="meta").view(-1)
-        _used_size_override = (
-            shape.numel() * dtype.itemsize if with_override else None
-        )
+        _used_size_override = shape.numel() * dtype.itemsize if with_override else None
 
         def get_size(self):
             return meta.get_size()
@@ -1710,6 +1704,56 @@ def test_raw_block_core_refuses_a_grouped_device_object(tmp_path, with_override)
         # The refused key cost no capacity: an ordinary put still succeeds.
         good = encode_object_key(make_object_key(42))
         assert core.put_many([good], [make_memory_obj(b"after-refusal")]).results == [
+            True
+        ]
+    finally:
+        core.close()
+
+
+@pytest.mark.parametrize("with_override", [False, True])
+@pytest.mark.parametrize("unsupported_first", [False, True])
+def test_raw_block_core_batch_with_one_unsupported_object(
+    tmp_path, with_override, unsupported_first
+):
+    """One unsupported object fails its own key and strands nothing.
+
+    Planning walks a batch in order and reserves a slot per key as it goes.
+    A refusal partway through therefore has reservations behind it when the
+    unsupported object comes second, and none when it comes first, so both
+    orderings have to be driven. The supported key still stores, the
+    unsupported one still fails, nothing is left in flight, and the capacity
+    the refusal touched is usable afterwards.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = make_raw_block_core_config(path)
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        good_spec = encode_object_key(make_object_key(51))
+        bad_spec = encode_object_key(make_object_key(52))
+        good_obj = make_memory_obj(b"supported-payload")
+        bad_obj = _grouped_device_obj(with_override=with_override)
+
+        if unsupported_first:
+            specs = [bad_spec, good_spec]
+            objs = [bad_obj, good_obj]
+            expected = [False, True]
+        else:
+            specs = [good_spec, bad_spec]
+            objs = [good_obj, bad_obj]
+            expected = [True, False]
+
+        result = core.put_many(specs, objs)
+
+        assert result.results == expected
+        assert result.stored_keys == [good_spec.encoded]
+        assert not core.exists_inflight(good_spec.encoded)
+        assert not core.exists_inflight(bad_spec.encoded)
+        assert core.contains_key(good_spec.encoded)
+        assert not core.contains_key(bad_spec.encoded)
+
+        # The refused key cost no capacity: a later put still succeeds.
+        after = encode_object_key(make_object_key(53))
+        assert core.put_many([after], [make_memory_obj(b"after-mixed")]).results == [
             True
         ]
     finally:
