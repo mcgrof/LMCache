@@ -243,6 +243,32 @@ def _logical_payload_len(memory_obj: MemoryObj) -> int:
     their logical size comes from the metadata instead.
     """
     if _device_payload_tensor(memory_obj) is not None:
+        # TensorMemoryObj.get_size() returns a group prefix sum computed once
+        # at construction from the pool's grouped shapes.  A paged allocator
+        # rebinds a free block by updating the scalar meta.shape and slicing
+        # raw_data, and never refreshes that sum, so a reused block reports
+        # the pool's full chunk even when it now holds the final partial
+        # chunk of a request.  The engine writes from raw_data, so take the
+        # length from what this object actually describes.
+        #
+        # An explicit used-length override is already the logical length, and
+        # a grouped object's length is the sum over its groups: neither may be
+        # replaced by the scalar shape.  This lane supports only the
+        # single-group device representation, so refuse anything else rather
+        # than silently truncating it.
+        if getattr(memory_obj, "_used_size_override", None) is not None:
+            return int(memory_obj.get_size())
+        meta = memory_obj.metadata
+        shapes = getattr(meta, "shapes", None)
+        if shapes is not None and len(shapes) > 1:
+            raise RuntimeError(
+                "RawBlockCore: a device object with "
+                f"{len(shapes)} representation groups is not supported by "
+                "the raw-block lane; its logical length is the sum over the "
+                "groups, not the scalar shape"
+            )
+        if meta.shape is not None and meta.dtype is not None:
+            return int(meta.shape.numel()) * int(meta.dtype.itemsize)
         return int(memory_obj.get_size())
     return len(memory_obj.byte_array)
 
@@ -1754,7 +1780,7 @@ class RawBlockCore:
             RuntimeError: If the payload or its aligned length exceeds the
                 slot, or the device slot is too small for the aligned length.
         """
-        payload_len = int(memory_obj.get_size())
+        payload_len = _logical_payload_len(memory_obj)
         payload_capacity = self.slot_bytes - self.header_bytes
         if payload_len > payload_capacity:
             raise RuntimeError(
@@ -1770,11 +1796,19 @@ class RawBlockCore:
                     f"{payload_capacity}"
                 )
             if dev_buf.nbytes < total_len:
+                raw = getattr(memory_obj, "raw_data", None)
+                meta = getattr(memory_obj, "metadata", None)
                 raise RuntimeError(
-                    f"RawBlockCore: device slot of {dev_buf.nbytes} bytes cannot "
-                    f"carry the {total_len}-byte aligned payload; the GPU "
-                    "allocator must hand out slots padded to the block "
-                    "alignment"
+                    f"RawBlockCore: the object's GPU slot holds "
+                    f"{dev_buf.nbytes} bytes but its payload needs "
+                    f"{total_len} aligned ({payload_len} logical); the slot "
+                    "the allocator carved is smaller than the size the object "
+                    "reports, so the allocator's paging shape and the object's "
+                    "shape disagree "
+                    f"[object={type(memory_obj).__name__} "
+                    f"raw={tuple(raw.shape) if raw is not None else None} "
+                    f"meta_shape={getattr(meta, 'shape', None)} "
+                    f"fmt={getattr(meta, 'fmt', None)}]"
                 )
         return dev_buf, payload_len, total_len
 
