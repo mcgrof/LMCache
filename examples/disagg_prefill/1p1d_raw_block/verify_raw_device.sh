@@ -10,13 +10,47 @@ if [[ ! $device =~ ^/dev/disk/by-id/[A-Za-z0-9._:+-]+$ ]]; then
     exit 1
 fi
 
-resolved=$(readlink -f -- "$device")
+resolved=$(readlink -f -- "$device" 2>/dev/null || true)
+block_name=$(basename -- "${resolved:-$device}")
+
+# Every other check in this script asks whether the device is in use. None of
+# them can ask whether it matters: a pristine reference drive kept for
+# comparison is blank, unmounted, unheld and signature-free, so it passes all
+# of them. An operator lists such devices here and they are refused by name,
+# before anything else, so the refusal says why.
+protected_file=${LMCACHE_PROTECTED_DEVICES_FILE:-/etc/lmcache/protected-devices}
+if [[ -n ${LMCACHE_PROTECTED_DEVICES_FILE:-} && ! -r $protected_file ]]; then
+    echo "Cannot read the protected-device list: $protected_file" >&2
+    exit 1
+fi
+if [[ -r $protected_file ]]; then
+    serial_path=/sys/class/block/$block_name/device/serial
+    wwid_path=/sys/class/block/$block_name/wwid
+    device_serial=""
+    device_wwid=""
+    [[ -r $serial_path ]] && device_serial=$(tr -d '[:space:]' < "$serial_path")
+    [[ -r $wwid_path ]] && device_wwid=$(tr -d '[:space:]' < "$wwid_path")
+    while IFS= read -r entry; do
+        entry=${entry%%#*}
+        entry=$(printf '%s' "$entry" | tr -d '[:space:]')
+        [[ -z $entry ]] && continue
+        entry_resolved=$(readlink -f -- "$entry" 2>/dev/null || true)
+        if [[ $entry == "$device" ]] \
+            || [[ -n $entry_resolved && $entry_resolved == "$resolved" ]] \
+            || [[ -n $device_serial && $entry == "$device_serial" ]] \
+            || [[ -n $device_wwid && $entry == "$device_wwid" ]]; then
+            echo "Refusing a device listed as protected in $protected_file" >&2
+            echo "  requested: $device -> ${resolved:-<unresolved>}" >&2
+            exit 1
+        fi
+    done < "$protected_file"
+fi
+
 if [[ ! -b "$resolved" ]]; then
-    echo "Refusing non-block device: $device -> $resolved" >&2
+    echo "Refusing non-block device: $device -> ${resolved:-<unresolved>}" >&2
     exit 1
 fi
 
-block_name=$(basename -- "$resolved")
 if [[ -e "/sys/class/block/$block_name/partition" ]]; then
     echo "Refusing partition device: $resolved" >&2
     exit 1
@@ -68,3 +102,5 @@ if [[ ${LMCACHE_CONFIRM_RAW_DEVICE_ERASE:-} != "$device" ]]; then
 fi
 
 echo "Raw-device preflight passed: $device -> $resolved"
+echo "This means the device is unused and confirmed, not that its"
+echo "contents are expendable. Keep $protected_file current."
