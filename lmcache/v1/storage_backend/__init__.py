@@ -322,7 +322,10 @@ def CreateStorageBackends(
         backend_name = str(remote_backend)
         storage_backends[backend_name] = remote_backend
 
-    if not config.enable_pd or config.local_cpu:
+    # On the transfer-channel route a storage plugin would be a separate
+    # cache tier, and prefill/decode does not use one. On the shared-storage
+    # route the plugin is the data path, so it has to be loaded.
+    if not config.enable_pd or config.pd_uses_shared_storage or config.local_cpu:
         # Load storage backends from configuration
         storage_plugin_launcher(
             config,

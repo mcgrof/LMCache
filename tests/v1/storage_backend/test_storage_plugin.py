@@ -555,6 +555,10 @@ def test_the_plugin_named_as_the_pd_data_path_is_required(standalone_async_loop)
     config.enable_pd = True
     config.pd_role = "sender"
     config.pd_data_path = "raw_block"
+    # local_cpu opens a separate route into the plugin loader, so turn it off:
+    # this has to exercise the shared-storage route and nothing else.
+    config.local_cpu = False
+    config.max_local_cpu_size = 0.0
     assert config.pd_uses_shared_storage is True
 
     with pytest.raises(RuntimeError, match="raw_block"):
