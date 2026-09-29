@@ -285,3 +285,53 @@ def test_request_publication_rejects_a_missing_key(tmp_path):
             writer.publish_request([missing.encoded])
     finally:
         writer.close()
+
+
+def test_namespace_identity_of_a_block_device_without_hardware_identity():
+    """A namespace exposing no hardware identity still resolves locally.
+
+    Requiring a persistent identity at construction turned every block
+    target without the selected sysfs attributes into a startup failure,
+    including ordinary local caches that never publish anything to
+    another node.
+    """
+    # Standard
+    import os
+    import stat as stat_module
+    from unittest import mock
+
+    # First Party
+    from lmcache.v1.storage_backend.raw_block import core as core_module
+
+    # Device numbers no namespace claims, so no sysfs directory exists.
+    major, minor = 4095, 4095
+    fake = os.stat_result(
+        (stat_module.S_IFBLK | 0o660, 0, 0, 1, 0, 0, 0, 0, 0, 0),
+        {"st_rdev": os.makedev(major, minor)},
+    )
+    with mock.patch.object(core_module.os, "stat", return_value=fake):
+        identity = core_module._resolve_namespace_identity("/dev/does-not-exist")
+
+    assert identity == f"block-local:{major}:{minor}"
+    assert not core_module.namespace_identity_is_shareable(identity)
+
+
+@requires_rust_raw_block_io
+@pytest.mark.skipif(sys.platform != "linux", reason="raw-block is Linux only")
+def test_publication_refuses_an_identity_another_node_cannot_resolve(tmp_path):
+    """Sharing is where a persistent identity actually matters.
+
+    Device numbers are assigned by the local kernel, so a receipt built
+    on them would name a different device on the node that reads it.
+    """
+    path = make_raw_block_file(tmp_path)
+    writer = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    try:
+        key = encode_object_key(make_object_key(1))
+        assert writer.put_many([key], [make_memory_obj(b"a" * 1024)]).results == [True]
+
+        writer.namespace_identity = "block-local:4095:4095"
+        with pytest.raises(ValueError, match="persistent block namespace identity"):
+            writer.publish_request([key.encoded])
+    finally:
+        writer.close()
