@@ -1738,6 +1738,11 @@ impl RawBlockDevice {
                 .spawn(move || {
                     let mut in_flight: HashMap<u64, IoSubmission> = HashMap::new();
                     let mut next_user_data: u64 = 1;
+                    // Set when a submit leaves SQEs the kernel has not taken.
+                    // They stay resident in the submission ring and belong to
+                    // their entries in in_flight, so the worker retries the
+                    // submit rather than building them a second time.
+                    let mut resident_sqes = false;
 
                     while !shutdown_clone.load(Ordering::Relaxed) {
                         // This drains all completed I/O operations from the completion queue (CQ).
@@ -2022,9 +2027,33 @@ impl RawBlockDevice {
                         // signal_producer(): eventfd is a counter, so a wake-up between the
                         // check and wait() is buffered, not lost.
                         if !shutdown_clone.load(Ordering::Relaxed)
+                            && !resident_sqes
                             && queue_clone.lock().unwrap().is_empty()
                         {
                             batch_ready_clone.wait();
+                        }
+
+                        // Flush SQEs an earlier submit left behind before
+                        // looking for new work, so their waiters are not
+                        // blocked on entries that sit in the ring untouched.
+                        if resident_sqes {
+                            let flushed = match &ring_clone {
+                                IoUringWrapper::Standard(ring) => {
+                                    let ring = ring.lock().unwrap();
+                                    ring.submitter().submit()
+                                }
+                                IoUringWrapper::Big(ring) => {
+                                    let ring = ring.lock().unwrap();
+                                    ring.submitter().submit()
+                                }
+                            };
+                            ring_clone.submission_sync();
+                            resident_sqes = flushed.is_err() || ring_clone.submission_len() > 0;
+                            // Yield to the kernel when the ring still will not
+                            // drain, so a full ring cannot become a spin.
+                            if resident_sqes && queue_clone.lock().unwrap().is_empty() {
+                                thread::sleep(Duration::from_micros(50));
+                            }
                         }
 
                         let mut q = queue_clone.lock().unwrap();
@@ -2111,19 +2140,14 @@ impl RawBlockDevice {
                                 Ok(submitted) => {
                                     // Any remaining requests in batch that weren't submitted
                                     // will be retried in the next iteration of the loop
+                                    // An SQE the kernel did not take is still
+                                    // resident in the ring and the next submit
+                                    // delivers it. Requeuing it would issue the
+                                    // same I/O twice and point the resident copy
+                                    // at a bounce buffer whose owner has already
+                                    // been released, so ownership stays here.
                                     if submitted < built_count {
-                                        // Remove in_flight entries for unsubmitted requests
-                                        for user_data in user_data_list[submitted..].iter() {
-                                            in_flight.remove(user_data);
-                                        }
-                                        // Put unsubmitted requests back in the queue for retry
-                                        let unsubmitted: Vec<_> =
-                                            built_submissions[submitted..].to_vec();
-                                        if !unsubmitted.is_empty() {
-                                            let mut q = queue_clone.lock().unwrap();
-                                            // Insert unsubmitted requests back at the front preserving order
-                                            q.splice(0..0, unsubmitted);
-                                        }
+                                        resident_sqes = true;
                                     }
                                 }
                                 Err(e) => {
@@ -2131,18 +2155,14 @@ impl RawBlockDevice {
                                     let error_code = e.raw_os_error();
                                     match error_code {
                                         Some(libc::EAGAIN) | Some(libc::EINTR) => {
-                                            // Ring is full, or the operation was interrupted due
-                                            // to signal. We need to wait for completions and then retry
-                                            // Remove in_flight entries for all submissions in this batch
-                                            for user_data in user_data_list.iter() {
-                                                in_flight.remove(user_data);
-                                            }
-                                            // Put unsubmitted requests back in queue for next iteration
+                                            // A full ring or an interrupted call
+                                            // consumed nothing, so every SQE this
+                                            // batch pushed is still resident and
+                                            // still owned by its in_flight entry.
+                                            // Reaping completions frees room and
+                                            // the retry delivers the same SQEs.
                                             if built_count > 0 {
-                                                let unsubmitted = built_submissions.clone();
-                                                let mut q = queue_clone.lock().unwrap();
-                                                // Insert unsubmitted requests back at the front preserving order
-                                                q.splice(0..0, unsubmitted);
+                                                resident_sqes = true;
                                             }
                                         }
                                         _ => {
