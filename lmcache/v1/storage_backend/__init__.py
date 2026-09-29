@@ -65,6 +65,13 @@ def storage_plugin_launcher(
         return
 
     for storage_plugin in storage_plugins:
+        # A plugin that only adds a cache tier can be skipped when it fails to
+        # build: the engine is slower without it but still correct. A plugin
+        # that carries the payload cannot, because serving without it means
+        # serving without the data. The deployment says which it is.
+        required = bool(
+            config.extra_config.get(f"storage_plugin.{storage_plugin}.required", False)
+        )
         try:
             module_path = config.extra_config.get(
                 f"storage_plugin.{storage_plugin}.module_path"
@@ -74,9 +81,10 @@ def storage_plugin_launcher(
             )
 
             if not module_path or not class_name:
-                logger.warning(
-                    f"Backend {storage_plugin} missing module_path or class_name"
-                )
+                message = f"Backend {storage_plugin} missing module_path or class_name"
+                if required:
+                    raise ValueError(message)
+                logger.warning(message)
                 continue
 
             logger.warning(
@@ -105,6 +113,11 @@ def storage_plugin_launcher(
             logger.info(f"Created dynamic backend: {storage_plugin}")
 
         except Exception as e:
+            if required:
+                raise RuntimeError(
+                    f"Required storage backend {storage_plugin} could not be "
+                    f"created: {e}"
+                ) from e
             logger.error(f"Failed to create backend {storage_plugin}: {str(e)}")
 
 

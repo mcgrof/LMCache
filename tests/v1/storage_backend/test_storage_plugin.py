@@ -448,6 +448,51 @@ class TestCreateDynamicBackends:
         for backend in storage_backends.values():
             backend.close()
 
+    def test_required_backend_that_cannot_be_built_stops_startup(self, async_loop):
+        """A backend the deployment depends on must not be skipped.
+
+        An optional cache tier that fails to build leaves the engine
+        slower but correct. A backend that carries the payload leaves it
+        serving without the data it was configured to move, which looked
+        identical to a healthy start.
+        """
+        extra_config = {
+            "storage_plugin.payload_backend.module_path": "nonexistent.module.path",
+            "storage_plugin.payload_backend.class_name": "NonexistentClass",
+            "storage_plugin.payload_backend.required": True,
+        }
+        config = create_test_config(
+            extra_config=extra_config,
+            storage_plugins=["payload_backend"],
+        )
+
+        with pytest.raises(RuntimeError, match="payload_backend"):
+            CreateStorageBackends(
+                config=config,
+                metadata=create_test_metadata(),
+                loop=async_loop,
+                dst_device="cpu",
+            )
+
+    def test_required_backend_missing_its_class_stops_startup(self, async_loop):
+        """An incomplete declaration is a configuration error, not a skip."""
+        extra_config = {
+            "storage_plugin.payload_backend.module_path": "some.module",
+            "storage_plugin.payload_backend.required": True,
+        }
+        config = create_test_config(
+            extra_config=extra_config,
+            storage_plugins=["payload_backend"],
+        )
+
+        with pytest.raises(RuntimeError, match="payload_backend"):
+            CreateStorageBackends(
+                config=config,
+                metadata=create_test_metadata(),
+                loop=async_loop,
+                dst_device="cpu",
+            )
+
     def test_dynamic_backend_with_invalid_module_path(self, async_loop):
         """
         Test that invalid module path is handled gracefully.
