@@ -236,6 +236,15 @@ def _device_payload_tensor(memory_obj: MemoryObj) -> Optional[torch.Tensor]:
     return raw.view(-1).view(torch.uint8)
 
 
+class UnsupportedDevicePayload(Exception):
+    """A device object this lane cannot describe a transfer for.
+
+    Raised while planning, before any slot is reserved, so a caller turns it
+    into a failed result for that key rather than abandoning storage it has
+    already allocated.
+    """
+
+
 def _logical_payload_len(memory_obj: MemoryObj) -> int:
     """Return the logical payload length of a memory object in bytes.
 
@@ -256,17 +265,19 @@ def _logical_payload_len(memory_obj: MemoryObj) -> int:
         # replaced by the scalar shape.  This lane supports only the
         # single-group device representation, so refuse anything else rather
         # than silently truncating it.
-        if getattr(memory_obj, "_used_size_override", None) is not None:
-            return int(memory_obj.get_size())
+        # Decide whether the representation is supported before trusting any
+        # length from it.  An override narrows a length; it does not make a
+        # grouped object single-group, so it cannot be returned first.
         meta = memory_obj.metadata
         shapes = getattr(meta, "shapes", None)
         if shapes is not None and len(shapes) > 1:
-            raise RuntimeError(
-                "RawBlockCore: a device object with "
-                f"{len(shapes)} representation groups is not supported by "
-                "the raw-block lane; its logical length is the sum over the "
-                "groups, not the scalar shape"
+            raise UnsupportedDevicePayload(
+                f"a device object with {len(shapes)} representation groups "
+                "is not supported by the raw-block lane; its logical length "
+                "is the sum over the groups, not the scalar shape"
             )
+        if getattr(memory_obj, "_used_size_override", None) is not None:
+            return int(memory_obj.get_size())
         if meta.shape is not None and meta.dtype is not None:
             return int(meta.shape.numel()) * int(meta.dtype.itemsize)
         return int(memory_obj.get_size())
@@ -1026,6 +1037,17 @@ class RawBlockCore:
                 if key.encoded in self._inflight:
                     continue
 
+                # Establish the length first: an unsupported representation
+                # must not leave a reserved slot behind.
+                try:
+                    payload_len = _logical_payload_len(obj)
+                except UnsupportedDevicePayload as exc:
+                    logger.warning(
+                        "RawBlockCore: refusing key %s: %s", key.encoded, exc
+                    )
+                    results[i] = False
+                    continue
+
                 try:
                     offset = self._allocate_slot_locked(placement_id)
                 except RuntimeError:
@@ -1037,7 +1059,7 @@ class RawBlockCore:
 
                 meta = DiskCacheMetadata(
                     path=f"{self.device_path}@{offset}",
-                    size=_logical_payload_len(obj),
+                    size=payload_len,
                     shape=obj.metadata.shape,
                     dtype=obj.metadata.dtype,
                     cached_positions=obj.metadata.cached_positions,
@@ -2367,48 +2389,66 @@ class RawBlockCore:
         batch_duplicates: list[tuple[int, str]] = []
 
         # Reserve slots for eligible first-occurrence keys under the lock.
-        with self._lock:
-            for i, (key, obj, placement_id) in enumerate(
-                zip(keys, objs, placement_ids, strict=True)
-            ):
-                if self._closed:
-                    break
-                encoded_key = key.encoded
-                if encoded_key in self._index:
-                    results[i] = True
-                    continue
-                if encoded_key in planned_keys:
-                    batch_duplicates.append((i, encoded_key))
-                    continue
-                if encoded_key in self._inflight:
-                    continue
-                payload_len = _logical_payload_len(obj)
-                if not self._payload_fits_slot(payload_len):
-                    logger.warning(
-                        "RawBlockCore: payload for key %s does not fit slot",
-                        encoded_key,
+        # A reservation that is neither written nor freed costs its slot
+        # for the life of the process, so give back everything this call
+        # reserved if planning cannot finish.
+        try:
+            with self._lock:
+                for i, (key, obj, placement_id) in enumerate(
+                    zip(keys, objs, placement_ids, strict=True)
+                ):
+                    if self._closed:
+                        break
+                    encoded_key = key.encoded
+                    if encoded_key in self._index:
+                        results[i] = True
+                        continue
+                    if encoded_key in planned_keys:
+                        batch_duplicates.append((i, encoded_key))
+                        continue
+                    if encoded_key in self._inflight:
+                        continue
+                    try:
+                        payload_len = _logical_payload_len(obj)
+                    except UnsupportedDevicePayload as exc:
+                        logger.warning(
+                            "RawBlockCore: refusing key %s: %s", encoded_key, exc
+                        )
+                        results[i] = False
+                        continue
+                    if not self._payload_fits_slot(payload_len):
+                        logger.warning(
+                            "RawBlockCore: payload for key %s does not fit slot",
+                            encoded_key,
+                        )
+                        continue
+                    try:
+                        offset = self._allocate_slot_locked(placement_id)
+                    except RuntimeError:
+                        logger.warning(
+                            "RawBlockCore: no free slot available for key %s",
+                            key.encoded,
+                        )
+                        continue
+                    meta = DiskCacheMetadata(
+                        path=f"{self.device_path}@{offset}",
+                        size=payload_len,
+                        shape=obj.metadata.shape,
+                        dtype=obj.metadata.dtype,
+                        cached_positions=obj.metadata.cached_positions,
+                        fmt=obj.metadata.fmt,
+                        pin_count=0,
                     )
-                    continue
-                try:
-                    offset = self._allocate_slot_locked(placement_id)
-                except RuntimeError:
-                    logger.warning(
-                        "RawBlockCore: no free slot available for key %s",
-                        key.encoded,
-                    )
-                    continue
-                meta = DiskCacheMetadata(
-                    path=f"{self.device_path}@{offset}",
-                    size=payload_len,
-                    shape=obj.metadata.shape,
-                    dtype=obj.metadata.dtype,
-                    cached_positions=obj.metadata.cached_positions,
-                    fmt=obj.metadata.fmt,
-                    pin_count=0,
-                )
-                self._inflight[encoded_key] = _Inflight(offset=offset, meta=meta)
-                planned_keys.add(encoded_key)
-                write_plan.append((i, key, obj, offset, placement_id))
+                    self._inflight[encoded_key] = _Inflight(offset=offset, meta=meta)
+                    planned_keys.add(encoded_key)
+                    write_plan.append((i, key, obj, offset, placement_id))
+        except BaseException:
+            with self._lock:
+                for encoded_key in planned_keys:
+                    inflight = self._inflight.pop(encoded_key, None)
+                    if inflight is not None:
+                        self._append_free_slot_locked(inflight.offset)
+            raise
 
         if not write_plan:
             return RawBlockPutManyResult(results=results, stored_keys=stored_keys)
