@@ -272,29 +272,51 @@ class RawBlockPDRequestTracker:
         encoded_keys: list[str],
         terminal: Future[RawBlockPublicationReceipt],
     ) -> None:
-        publication = self._publisher.submit(self._core.publish_request, encoded_keys)
+        def pin_then_publish() -> RawBlockPublicationReceipt:
+            """Hold the extents, then describe them.
+
+            A receipt identifies a checkpoint by a digest over where these
+            keys live. Taking the hold afterwards leaves an interval in
+            which a key can be deleted and written again somewhere else:
+            the hold would then pin the replacement while the receipt still
+            describes what was there before, and a reader matching that
+            receipt would be pointed at bytes nobody promised it.
+            """
+            leased = self._core.get_metadata_prefix(encoded_keys, lock=True)
+            if len(leased) != len(encoded_keys):
+                self._core.unlock_many(encoded_keys[: len(leased)])
+                raise RuntimeError(
+                    f"request {req_id} could not lease every published key"
+                )
+            try:
+                return self._core.publish_request(encoded_keys)
+            except BaseException:
+                self._core.unlock_many(encoded_keys)
+                raise
+
+        publication = self._publisher.submit(pin_then_publish)
 
         def finish(done: Future[RawBlockPublicationReceipt]) -> None:
             try:
                 receipt = done.result()
-                leased = self._core.get_metadata_prefix(
-                    encoded_keys,
-                    lock=True,
-                )
-                if len(leased) != len(encoded_keys):
-                    self._core.unlock_many(encoded_keys[: len(leased)])
-                    raise RuntimeError(
-                        f"request {req_id} could not lease every published key"
-                    )
             except BaseException as exc:
                 self.fail_request(req_id, exc)
                 return
             with self._lock:
                 state = self._requests.get(req_id)
-                if state is not None and state.terminal is terminal:
+                owned = (
+                    state is not None
+                    and state.terminal is terminal
+                    and not terminal.done()
+                )
+                if owned:
                     self._leased_keys[req_id] = encoded_keys
-                    if not terminal.done():
-                        terminal.set_result(receipt)
+                    terminal.set_result(receipt)
+            if not owned:
+                # The request ended while this was in flight, so nothing
+                # will ever release these extents by name. Let them go
+                # rather than hold them for the life of the writer.
+                self._core.unlock_many(encoded_keys)
 
         publication.add_done_callback(finish)
 

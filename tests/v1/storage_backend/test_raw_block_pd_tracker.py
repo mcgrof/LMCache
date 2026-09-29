@@ -252,3 +252,143 @@ def test_tracker_finished_request_does_not_cancel_publication() -> None:
     finally:
         core.allow_publish.set()
         tracker.close()
+
+
+class _MappingCore:
+    """A core whose keys can be moved, and which refuses to move a held one."""
+
+    def __init__(self) -> None:
+        self.mapping: dict[str, str] = {"key-1": "slot-a", "key-2": "slot-b"}
+        self.held: dict[str, int] = {}
+        self.publish_started = Event()
+        self.allow_publish = Event()
+        self.held_when_publishing: dict[str, int] = {}
+        self.publish_error: BaseException | None = None
+
+    def get_metadata_prefix(
+        self,
+        encoded_keys: list[str],
+        *,
+        lock: bool = False,
+    ) -> list[object]:
+        out: list[object] = []
+        for encoded_key in encoded_keys:
+            if encoded_key not in self.mapping:
+                break
+            if lock:
+                self.held[encoded_key] = self.held.get(encoded_key, 0) + 1
+            out.append(object())
+        return out
+
+    def unlock_many(self, encoded_keys: list[str]) -> None:
+        for encoded_key in encoded_keys:
+            remaining = self.held.get(encoded_key, 0) - 1
+            if remaining > 0:
+                self.held[encoded_key] = remaining
+            else:
+                self.held.pop(encoded_key, None)
+
+    def publish_request(self, encoded_keys: list[str]) -> RawBlockPublicationReceipt:
+        self.held_when_publishing = dict(self.held)
+        self.publish_started.set()
+        if not self.allow_publish.wait(timeout=5):
+            raise TimeoutError("test publication gate timed out")
+        if self.publish_error is not None:
+            raise self.publish_error
+        return RawBlockPublicationReceipt(
+            writer_epoch="writer-1",
+            checkpoint_seq=7,
+            key_count=len(encoded_keys),
+            manifest_digest="|".join(self.mapping[k] for k in encoded_keys),
+        )
+
+    def rebind(self, encoded_key: str, slot: str) -> None:
+        """Delete a key and write it again elsewhere, if nothing holds it."""
+        if encoded_key in self.held:
+            raise RuntimeError(f"{encoded_key} is held")
+        self.mapping[encoded_key] = slot
+
+
+def _wait_until(predicate, timeout: float = 5.0) -> bool:
+    """Poll until a predicate holds, for state a background callback sets."""
+    # Standard
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
+
+
+def _publish_one(tracker, core, keys=("key-1", "key-2")):
+    terminal = tracker.register_batch(
+        "request-1",
+        list(keys),
+        expected_chunks=len(keys),
+        is_last_batch=True,
+    )
+    tracker.complete_batch("request-1", list(keys))
+    assert core.publish_started.wait(timeout=5)
+    return terminal
+
+
+def test_publication_holds_the_extents_before_it_describes_them() -> None:
+    """A receipt describes where keys live, so they must already be held.
+
+    Taking the hold afterwards leaves an interval in which a key can be
+    deleted and written somewhere else, which would leave the hold on the
+    replacement and the receipt on what was there before.
+    """
+    core = _MappingCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    try:
+        terminal = _publish_one(tracker, core)
+
+        assert core.held_when_publishing == {"key-1": 1, "key-2": 1}, (
+            "publication began describing keys it had not taken a hold on"
+        )
+        with pytest.raises(RuntimeError, match="is held"):
+            core.rebind("key-1", "slot-moved")
+
+        core.allow_publish.set()
+        receipt = terminal.result(timeout=5)
+        assert receipt.manifest_digest == "slot-a|slot-b"
+        assert core.held == {"key-1": 1, "key-2": 1}
+    finally:
+        core.allow_publish.set()
+        tracker.close()
+
+
+def test_publication_that_fails_releases_the_extents_it_held() -> None:
+    """A hold taken for a receipt that never exists has no owner."""
+    core = _MappingCore()
+    core.publish_error = RuntimeError("checkpoint write failed")
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    try:
+        terminal = _publish_one(tracker, core)
+        core.allow_publish.set()
+        with pytest.raises(RuntimeError, match="checkpoint write failed"):
+            terminal.result(timeout=5)
+        assert _wait_until(lambda: core.held == {}), core.held
+        core.rebind("key-1", "slot-moved")
+    finally:
+        tracker.close()
+
+
+def test_publication_releases_extents_when_the_request_ended_first() -> None:
+    """Nothing will release a hold recorded against a request that is gone."""
+    core = _MappingCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    try:
+        terminal = _publish_one(tracker, core)
+        tracker.fail_request("request-1", RuntimeError("request abandoned"))
+        core.allow_publish.set()
+        with pytest.raises(RuntimeError, match="request abandoned"):
+            terminal.result(timeout=5)
+        # The failure is visible as soon as it is recorded; releasing the
+        # extents waits for the publication already in flight to return.
+        assert _wait_until(lambda: core.held == {}), core.held
+    finally:
+        tracker.close()
