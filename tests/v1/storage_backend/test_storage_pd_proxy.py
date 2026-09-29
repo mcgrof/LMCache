@@ -70,3 +70,26 @@ async def test_legacy_barrier_still_accepts_prefill_notification() -> None:
         await proxy.wait_decode_kv_ready("request", 1, storage_pd=False, timeout_s=0.1)
         == []
     )
+
+
+@pytest.mark.asyncio
+async def test_client_info_closes_the_client_it_owns() -> None:
+    """The proxy holds client records, not clients.
+
+    Shutdown iterates those records, so the close has to belong to the
+    record. Without it the call raises and every HTTP client stays open,
+    and shutdown never reaches the receiver it was about to stop.
+    """
+
+    class RecordingClient:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    client = RecordingClient()
+    info = proxy.ClientInfo(client)  # type: ignore[arg-type]
+    await info.aclose()
+
+    assert client.closed
