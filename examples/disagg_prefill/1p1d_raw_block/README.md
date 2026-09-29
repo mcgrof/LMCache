@@ -20,6 +20,15 @@ export LMCACHE_RAW_DEVICE=/dev/disk/by-id/nvme-REPLACE_WITH_DEDICATED_NAMESPACE
 export LMCACHE_CONFIRM_RAW_DEVICE_ERASE=$LMCACHE_RAW_DEVICE
 ```
 
+Those checks establish that a device is not in use. They cannot establish that
+its contents are expendable, and the difference matters: a reference drive kept
+untouched for comparison is blank, unmounted, unheld and free of signatures, so
+it passes every one of them. List anything that must never be written in
+`/etc/lmcache/protected-devices`, one entry per line, each a `by-id` path, a
+serial, or a WWID, with `#` starting a comment. The preflight refuses a listed
+device before any other check, and refuses to run at all if
+`LMCACHE_PROTECTED_DEVICES_FILE` names a file it cannot read.
+
 The kernel must provide dma-buf-backed io_uring fixed-buffer registration, and
 the GPU driver must export the staging allocation as dma-buf. Initialization
 fails closed if that registration is unavailable; there is no host-buffer
