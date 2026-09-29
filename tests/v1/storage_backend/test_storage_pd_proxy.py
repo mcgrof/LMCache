@@ -93,3 +93,67 @@ async def test_client_info_closes_the_client_it_owns() -> None:
     await info.aclose()
 
     assert client.closed
+
+
+@pytest.mark.asyncio
+async def test_idle_receiver_stops_when_cancelled_not_when_flagged() -> None:
+    """An idle receiver waits inside recv(), where the flag cannot reach it.
+
+    Shutdown used to clear the flag and then wait for the task, so a proxy
+    that happened to be idle never shut down at all. Cancelling is what
+    wakes a blocked recv(), and the receiver closes its socket on the way
+    out whichever route it leaves by.
+    """
+    # Standard
+    import asyncio
+    import socket as socket_module
+    from types import SimpleNamespace
+
+    probe = socket_module.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    original_args = getattr(proxy, "global_args", None)
+    original_flag = proxy.run_proxy
+    proxy.global_args = SimpleNamespace(
+        proxy_host="127.0.0.1", proxy_port=port, storage_pd=True
+    )
+    proxy.run_proxy = True
+
+    made: list = []
+    original_socket = proxy.zmq_ctx.socket
+
+    def recording_socket(*args, **kwargs):
+        sock = original_socket(*args, **kwargs)
+        made.append(sock)
+        return sock
+
+    proxy.zmq_ctx.socket = recording_socket  # type: ignore[method-assign]
+    task = asyncio.create_task(proxy.zmq_pull_server())
+    try:
+        # Let it bind and settle into recv(). The coroutine body does not
+        # run until this point, so the socket factory stays patched until
+        # after it has taken one.
+        await asyncio.sleep(0.2)
+        proxy.zmq_ctx.socket = original_socket  # type: ignore[method-assign]
+        assert not task.done()
+
+        proxy.run_proxy = False
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(task), timeout=0.3)
+
+        task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+        assert task.done()
+        assert made, "the receiver never created its socket"
+        assert made[0].closed, "a cancelled receiver left its socket open"
+    finally:
+        proxy.zmq_ctx.socket = original_socket  # type: ignore[method-assign]
+        if not task.done():
+            task.cancel()
+        proxy.run_proxy = original_flag
+        if original_args is None:
+            del proxy.global_args
+        else:
+            proxy.global_args = original_args
