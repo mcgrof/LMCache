@@ -1580,7 +1580,16 @@ class LMCacheConnectorV1Impl:
                     self._storage_pd_engine_finished.discard(req_id)
                     continue
                 completion = self._storage_pd_store_futures.get(req_id)
-                if completion is None and req_id not in self._storage_pd_aborted:
+                # A recorded receipt is proof the publication happened. The
+                # future is dropped once its result is taken, so a request
+                # whose status still has to go out reaches here with neither
+                # a future nor a failure, and only the receipt distinguishes
+                # it from one that never published at all.
+                if (
+                    completion is None
+                    and req_id not in self._storage_pd_receipts
+                    and req_id not in self._storage_pd_aborted
+                ):
                     self._storage_pd_failures[req_id] = (
                         "request finished without a raw-block publication"
                     )

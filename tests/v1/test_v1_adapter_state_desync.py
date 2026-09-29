@@ -221,6 +221,43 @@ def test_storage_pd_get_finished_keeps_wire_and_vllm_request_ids_distinct() -> N
     assert [status.req_id for status in sender.statuses] == ["proxy-uuid"]
 
 
+def test_storage_pd_get_finished_resends_ready_after_a_failed_send() -> None:
+    """A send that fails must not turn a durable publication into a failure.
+
+    The publication already happened and its receipt is recorded, so the
+    only thing left is telling the peer. Reporting FAILED instead would
+    send the consumer looking elsewhere for an object that is on the
+    device and correct.
+    """
+
+    class FlakySender:
+        def __init__(self) -> None:
+            self.statuses: list[StoragePDStatus] = []
+            self.fail_next = True
+
+        def send(self, status: StoragePDStatus) -> None:
+            if self.fail_next:
+                self.fail_next = False
+                raise OSError("peer not reachable")
+            self.statuses.append(status)
+
+    connector = _make_storage_pd_connector()
+    sender = FlakySender()
+    connector._storage_pd_status_sender = sender  # type: ignore[assignment]
+    receipt = RawBlockPublicationReceipt("writer", 1, 1, "digest")
+    completion: Future[list[RawBlockPublicationReceipt]] = Future()
+    completion.set_result([receipt])
+    connector._storage_pd_store_futures["request-1"] = completion
+
+    assert connector.get_finished({"request-1"}) == (set(), None)
+    assert sender.statuses == []
+
+    assert connector.get_finished(set()) == ({"request-1"}, None)
+    assert [status.state for status in sender.statuses] == ["READY"]
+    assert connector._storage_pd_failures == {}
+    assert "request-1" not in connector._storage_pd_aborted
+
+
 def test_storage_pd_get_finished_reports_failure_but_releases_source_blocks() -> None:
     connector = _make_storage_pd_connector()
     completion: Future[list[RawBlockPublicationReceipt]] = Future()
