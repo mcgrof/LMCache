@@ -39,7 +39,10 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     SaveSpec,
 )
 from lmcache.v1.storage_backend.raw_block import RawBlockPublicationReceipt
-from lmcache.v1.storage_backend.storage_pd_protocol import StoragePDStatus
+from lmcache.v1.storage_backend.storage_pd_protocol import (
+    StoragePDReadAck,
+    StoragePDStatus,
+)
 
 
 class _FakeParent:
@@ -316,6 +319,43 @@ def test_storage_pd_get_finished_releases_when_notification_is_disabled() -> Non
     connector._storage_pd_store_futures["request-1"] = completion
 
     assert connector.get_finished({"request-1"}) == ({"request-1"}, None)
+
+
+def test_storage_pd_read_ack_carries_the_published_request_identity() -> None:
+    """The acknowledgement must name the request the producer published.
+
+    A proxy assigns the identity that both sides agreed on, and the
+    decoder's engine gives the same request a different local name.
+    READY is checked against the published identity, so the
+    acknowledgement has to use it too, or the producer cannot match it to
+    anything and the extents it is holding stay held.
+    """
+
+    class Sender:
+        def __init__(self) -> None:
+            self.acks: list[StoragePDReadAck] = []
+
+        def send(self, message) -> None:
+            self.acks.append(message)
+
+    connector = _make_storage_pd_connector()
+    sender = Sender()
+    connector._storage_pd_status_sender = sender  # type: ignore[assignment]
+    receipt = RawBlockPublicationReceipt("writer-epoch", 7, 1, "digest")
+    status = StoragePDStatus.ready("proxy-uuid", 0, receipt)
+
+    connector._ack_storage_pd_restore("cmpl-internal-0", status)
+
+    assert [ack.req_id for ack in sender.acks] == ["proxy-uuid"]
+    ack = sender.acks[0]
+    assert ack.writer_epoch == "writer-epoch"
+    assert ack.checkpoint_seq == 7
+    assert ack.manifest_digest == "digest"
+    assert ack.tp_rank == connector._storage_pd_tp_rank
+
+    # The local name still governs sending it only once.
+    connector._ack_storage_pd_restore("cmpl-internal-0", status)
+    assert len(sender.acks) == 1
 
 
 def test_storage_pd_get_finished_reports_failure_but_releases_source_blocks() -> None:

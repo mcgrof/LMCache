@@ -1056,13 +1056,23 @@ class LMCacheConnectorV1Impl:
         req_id: str,
         status: StoragePDStatus,
     ) -> None:
-        """Report that the advertised bytes reached this rank's GPU cache."""
+        """Report that the advertised bytes reached this rank's GPU cache.
+
+        ``req_id`` names the request inside this engine and is only used to
+        avoid acknowledging it twice. What goes on the wire is the identity
+        the producer published, which the adopted status carries.
+        """
         if req_id in self._storage_pd_acks_sent:
             return
         if self._storage_pd_status_sender is not None:
             self._storage_pd_status_sender.send(
                 StoragePDReadAck(
-                    req_id=req_id,
+                    # The producer knows this request by the identity it
+                    # published and checked READY against, not by the name
+                    # this engine happens to give it. The two differ, and an
+                    # acknowledgement carrying the local name matches nothing
+                    # on the side that has to act on it.
+                    req_id=status.req_id,
                     producer_instance_id=status.producer_instance_id,
                     consumer_instance_id=f"pid:{os.getpid()}",
                     tp_rank=self._storage_pd_tp_rank,
