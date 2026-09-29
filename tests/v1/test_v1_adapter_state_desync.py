@@ -104,6 +104,11 @@ def _make_connector(
     connector._lmcache_chunk_size = 8
     connector.kv_caches = {"layer0": torch.zeros(1)}
     connector.config = SimpleNamespace(pd_bidirectional=False)
+    # This fixture builds the connector without running __init__, so every
+    # attribute the code under test reads has to be set here. wait_for_save
+    # consults the storage handoff mode to decide whether to record a wire
+    # request id; this connector is not in that mode.
+    connector._storage_pd_mode = False
     return connector, engine
 
 
