@@ -583,6 +583,16 @@ class LMCacheConnectorV1Impl:
         self._storage_pd_lock = threading.Lock()
         self._storage_pd_tp_rank = 0
         self._storage_pd_status_sender: Optional[StoragePDStatusSender] = None
+        # Whether a consumer is waiting to be told about this producer's
+        # publications. It does not depend on which role this instance
+        # plays, so an instance that completes requests without a sender
+        # can tell that it is misconfigured rather than assume nobody
+        # needed to hear from it.
+        self._storage_pd_notify_required = bool(
+            self._storage_pd_mode
+            and self._storage_pd_raw_role in ("writer", "reader")
+            and not bool(config.pd_skip_proxy_notification)
+        )
         if self._storage_pd_mode and role != KVConnectorRole.SCHEDULER:
             engine_metadata = getattr(self.lmcache_engine, "metadata", None)
             self._storage_pd_tp_rank = int(
@@ -1660,6 +1670,19 @@ class LMCacheConnectorV1Impl:
                 releasable.add(req_id)
                 self._storage_pd_engine_finished.discard(req_id)
             self._storage_pd_returned.update(releasable)
+
+        if pending_sends and self._storage_pd_status_sender is None:
+            # Releasing these would tell the engine the handoff is done
+            # while the consumer is still waiting to hear that anything
+            # was published. Nothing here can reach it, so say so instead
+            # of recording a delivery that never happened.
+            if self._storage_pd_notify_required:
+                raise RuntimeError(
+                    "raw-block storage P/D has statuses to send and no "
+                    "status sender; set pd_proxy_host and pd_proxy_port, "
+                    "or pd_skip_proxy_notification=true to run without a "
+                    "consumer"
+                )
 
         sent: list[str] = []
         for req_id, status in pending_sends:
