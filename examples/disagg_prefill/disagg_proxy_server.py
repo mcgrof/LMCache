@@ -311,7 +311,10 @@ def parse_args():
         "--storage-pd-ready-timeout-s",
         type=float,
         default=30.0,
-        help="Maximum time to wait for every storage-P/D READY status.",
+        help=(
+            "Maximum time for one storage-P/D handoff, covering both the "
+            "prefiller's answer and every READY status after it."
+        ),
     )
 
     # PD buffer concurrency limiting. A weighted semaphore caps in-flight
@@ -531,6 +534,35 @@ def _clear_pd_request_state(req_id: str) -> None:
     app.state.finished_reqs.pop(req_id, None)
 
 
+async def prefill_within_handoff_budget(
+    client: httpx.AsyncClient,
+    req_data: dict,
+    req_id: str,
+) -> tuple[httpx.Response, float]:
+    """Post to the prefiller under the handoff budget; return what is left.
+
+    The prefill clients carry no timeout of their own, so a prefiller that
+    stops answering holds the request open for as long as it likes. The
+    wait for READY that follows only starts its clock once this returns,
+    which leaves the part of the handoff most likely to stall as the part
+    nothing bounds. Spend one budget across both.
+    """
+    budget = float(global_args.storage_pd_ready_timeout_s)
+    started = time.monotonic()
+    try:
+        response = await asyncio.wait_for(
+            send_request_to_service(client, "/v1/completions", req_data),
+            timeout=budget,
+        )
+    except (asyncio.TimeoutError, TimeoutError) as exc:
+        _clear_pd_request_state(req_id)
+        raise TimeoutError(
+            f"storage P/D request {req_id} timed out after {budget:g}s "
+            f"waiting for the prefiller to answer"
+        ) from exc
+    return response, budget - (time.monotonic() - started)
+
+
 async def wait_decode_kv_ready(
     req_id: str,
     num_tp_rank: int,
@@ -649,9 +681,16 @@ async def handle_completions(request: Request):
         stream_options = req_data.pop("stream_options", None)
 
         # Send request to prefill service, ignore the response
-        prefill_output = await send_request_to_service(
-            prefill_client.client, "/v1/completions", req_data
-        )
+        if global_args.storage_pd:
+            prefill_response, ready_budget = await prefill_within_handoff_budget(
+                prefill_client.client, req_data, req_id
+            )
+        else:
+            prefill_response = await send_request_to_service(
+                prefill_client.client, "/v1/completions", req_data
+            )
+            ready_budget = float(global_args.storage_pd_ready_timeout_s)
+        prefill_output = prefill_response
 
         prefill_output = prefill_output.json()
 
@@ -670,7 +709,7 @@ async def handle_completions(request: Request):
                 req_id,
                 num_tp_rank,
                 storage_pd=global_args.storage_pd,
-                timeout_s=global_args.storage_pd_ready_timeout_s,
+                timeout_s=ready_budget,
             )
             if statuses:
                 req_data["kv_transfer_params"] = {
@@ -781,9 +820,16 @@ async def handle_chat_completions(request: Request):
         stream_options = req_data.pop("stream_options", None)
 
         # Send request to prefill service, get the response
-        prefill_output = await send_request_to_service(
-            prefill_client.client, "/v1/completions", req_data
-        )
+        if global_args.storage_pd:
+            prefill_response, ready_budget = await prefill_within_handoff_budget(
+                prefill_client.client, req_data, req_id
+            )
+        else:
+            prefill_response = await send_request_to_service(
+                prefill_client.client, "/v1/completions", req_data
+            )
+            ready_budget = float(global_args.storage_pd_ready_timeout_s)
+        prefill_output = prefill_response
 
         prefill_output = prefill_output.json()
 
@@ -807,7 +853,7 @@ async def handle_chat_completions(request: Request):
                 req_id,
                 num_tp_rank,
                 storage_pd=global_args.storage_pd,
-                timeout_s=global_args.storage_pd_ready_timeout_s,
+                timeout_s=ready_budget,
             )
             if statuses:
                 req_data["kv_transfer_params"] = {
