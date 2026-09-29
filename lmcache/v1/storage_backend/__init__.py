@@ -71,7 +71,7 @@ def storage_plugin_launcher(
         # serving without the data. The deployment says which it is.
         required = bool(
             config.extra_config.get(f"storage_plugin.{storage_plugin}.required", False)
-        )
+        ) or (config.pd_uses_shared_storage and storage_plugin == config.pd_data_path)
         try:
             module_path = config.extra_config.get(
                 f"storage_plugin.{storage_plugin}.module_path"
@@ -142,7 +142,14 @@ def CreateStorageBackends(
         "enable_nixl_storage"
     )
 
-    if config.enable_pd and "PDBackend" not in _skip:
+    # The transfer-channel backend is the data path itself, so it is only
+    # built when that is the path in use. A handoff through shared storage
+    # reaches the decoder through the storage plugin instead.
+    if (
+        config.enable_pd
+        and not config.pd_uses_shared_storage
+        and "PDBackend" not in _skip
+    ):
         # First Party
         if config.pd_backend_mode == "async":
             # First Party
@@ -185,6 +192,7 @@ def CreateStorageBackends(
             )
     elif (
         not config.enable_pd
+        or config.pd_uses_shared_storage
         or config.local_cpu
         or (enable_nixl_storage and config.nixl_buffer_device == "cpu")
     ):

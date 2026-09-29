@@ -2,7 +2,17 @@
 
 This example runs one vLLM prefiller and one decoder against one dedicated raw
 NVMe namespace. Payload I/O is ordinary block `io_uring` with O_DIRECT and
-registered GPU dma-bufs. It is not the LMCache `enable_pd=true` NIXL path.
+registered GPU dma-bufs. Nothing here uses NIXL.
+
+There are two ways to select this route. `pd_data_path=raw_block` says it
+through LMCache's own prefill/decode switch: `enable_pd=true` with that data
+path skips the transfer channel entirely, derives the storage role from
+`pd_role`, and requires the `raw_block` plugin rather than treating it as an
+optional cache tier. The settings that describe the transfer channel, its peer
+addresses and buffers, are not needed and not asked for. The older spelling
+still works, where `enable_pd` stays off and the plugin settings carry
+everything; `launch_vllm.sh` uses the newer one and honours
+`LMCACHE_PD_DATA_PATH` if you want the other.
 
 This proof retains every published extent until the writer exits. That prevents
 reuse during a decoder read, but it also means the namespace must not wrap and

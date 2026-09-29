@@ -79,6 +79,23 @@ def _get_per_tp_device_path(
     return per_tp_devices.get(str(tp_rank), per_tp_devices.get(tp_rank))
 
 
+def _resolve_role(config, extra: dict) -> str:
+    """Return which side of a handoff this node runs, writer or reader.
+
+    A handoff configured through ``pd_data_path`` already says which side
+    this node is, in ``pd_role``. Reading it from there means a deployment
+    states it once instead of twice, where the two could disagree. An
+    explicit plugin setting still wins, for a raw-block pairing set up
+    without the P/D switch at all.
+    """
+    explicit = str(extra.get("rust_raw_block.role", "") or "")
+    if explicit:
+        return explicit
+    if getattr(config, "pd_uses_shared_storage", False):
+        return "reader" if config.pd_role == "receiver" else "writer"
+    return "writer"
+
+
 class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
     """
     Legacy raw-block storage plugin wrapper.
@@ -159,7 +176,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         # side runs the "writer" role and publishes its index after every put
         # batch; the decode side runs the "reader" role on the same namespace,
         # never writes, and re-reads the published index when a lookup misses.
-        self._role = str(extra.get("rust_raw_block.role", "writer") or "writer")
+        self._role = _resolve_role(self.config, extra)
         if self._role not in ("writer", "reader"):
             raise ValueError(
                 f"rust_raw_block.role must be 'writer' or 'reader', got {self._role!r}"
@@ -177,7 +194,11 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         self._last_refresh_ts = 0.0
         self._refresh_lock = threading.Lock()
         self._warned_reader_put = False
-        self._storage_pd_mode = bool(extra.get("rust_raw_block.storage_pd_mode", False))
+        # A handoff configured through pd_data_path says the same thing as
+        # the plugin-level switch, so either turns the mode on.
+        self._storage_pd_mode = bool(
+            extra.get("rust_raw_block.storage_pd_mode", False)
+        ) or bool(getattr(self.config, "pd_uses_shared_storage", False))
         if self._storage_pd_mode:
             if bool(getattr(self.config, "use_layerwise", False)):
                 raise ValueError(
@@ -458,7 +479,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         default_slot_bytes = round_up(header_bytes + full_chunk_bytes, block_align)
         slot_bytes = int(extra.get("rust_raw_block.slot_bytes", default_slot_bytes))
 
-        role = str(extra.get("rust_raw_block.role", "writer") or "writer")
+        role = _resolve_role(self.config, extra)
         return RawBlockCoreConfig(
             role=role,
             verify_slot_header_on_load=self._storage_pd_mode

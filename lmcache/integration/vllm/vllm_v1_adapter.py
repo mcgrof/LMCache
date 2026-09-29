@@ -570,12 +570,18 @@ class LMCacheConnectorV1Impl:
         ] = {}
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
         extra_config = config.extra_config or {}
-        self._storage_pd_mode = bool(
-            extra_config.get("rust_raw_block.storage_pd_mode", False)
+        # A handoff configured through pd_data_path says the same thing as
+        # the plugin-level switch, and it already names which side this node
+        # is, so neither has to be repeated as a plugin setting.
+        config_storage_pd = bool(getattr(config, "pd_uses_shared_storage", False))
+        self._storage_pd_mode = (
+            bool(extra_config.get("rust_raw_block.storage_pd_mode", False))
+            or config_storage_pd
         )
-        self._storage_pd_raw_role = str(
-            extra_config.get("rust_raw_block.role", "writer") or "writer"
-        )
+        raw_role = str(extra_config.get("rust_raw_block.role", "") or "")
+        if not raw_role and config_storage_pd:
+            raw_role = "reader" if config.pd_role == "receiver" else "writer"
+        self._storage_pd_raw_role = raw_role or "writer"
         self._storage_pd_store_futures: dict[str, Future] = {}
         self._storage_pd_wire_req_ids: dict[str, str] = {}
         self._storage_pd_engine_finished: set[str] = set()

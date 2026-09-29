@@ -355,7 +355,7 @@ class StorageManager:
             for backend in self.storage_backends.values()
             if getattr(backend, "is_gpu_endpoint", False)
         ]
-        if self.enable_pd:
+        if self.enable_pd and not self.config.pd_uses_shared_storage:
             allocator_backend = self.storage_backends["PDBackend"]
         elif gpu_endpoints:
             # A backend that stages KV chunks in device memory (the raw-block

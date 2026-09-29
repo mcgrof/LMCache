@@ -527,3 +527,40 @@ class TestCreateDynamicBackends:
         # Close all backends
         for backend in storage_backends.values():
             backend.close()
+
+
+@pytest.fixture
+def standalone_async_loop():
+    """An event loop for tests outside the class that owns its own."""
+    loop = asyncio.new_event_loop()
+    yield loop
+    loop.close()
+
+
+def test_the_plugin_named_as_the_pd_data_path_is_required(standalone_async_loop):
+    """A handoff's data path is not an optional cache tier.
+
+    A deployment that names raw_block as where its key-value data travels
+    cannot serve without it, so a construction failure has to stop startup
+    whether or not the plugin was separately marked required.
+    """
+    extra_config = {
+        "storage_plugin.raw_block.module_path": "nonexistent.module.path",
+        "storage_plugin.raw_block.class_name": "NonexistentClass",
+    }
+    config = create_test_config(
+        extra_config=extra_config,
+        storage_plugins=["raw_block"],
+    )
+    config.enable_pd = True
+    config.pd_role = "sender"
+    config.pd_data_path = "raw_block"
+    assert config.pd_uses_shared_storage is True
+
+    with pytest.raises(RuntimeError, match="raw_block"):
+        CreateStorageBackends(
+            config=config,
+            metadata=create_test_metadata(),
+            loop=standalone_async_loop,
+            dst_device="cpu",
+        )

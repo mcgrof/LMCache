@@ -474,3 +474,37 @@ def test_tracker_forgets_the_oldest_finished_requests() -> None:
     finally:
         pd_module._FINISHED_HISTORY = original
         tracker.close()
+
+
+class _RoleConfig:
+    """The parts of an engine config that decide the raw-block role."""
+
+    def __init__(self, *, shared: bool, pd_role: str | None) -> None:
+        self.pd_uses_shared_storage = shared
+        self.pd_role = pd_role
+
+
+def test_raw_block_role_follows_the_pd_role_when_storage_is_the_data_path():
+    """A deployment should name which side it is once, not twice.
+
+    The P/D role already says it, so a handoff configured that way does not
+    have to repeat it as a plugin setting where the two could disagree.
+    """
+    # First Party
+    from lmcache.v1.storage_backend.plugins.rust_raw_block_backend import (
+        _resolve_role,
+    )
+
+    assert _resolve_role(_RoleConfig(shared=True, pd_role="sender"), {}) == "writer"
+    assert _resolve_role(_RoleConfig(shared=True, pd_role="receiver"), {}) == "reader"
+    # An explicit plugin setting still wins, for a pairing set up without the
+    # P/D switch at all.
+    assert (
+        _resolve_role(
+            _RoleConfig(shared=True, pd_role="receiver"),
+            {"rust_raw_block.role": "writer"},
+        )
+        == "writer"
+    )
+    # Without the switch the plugin default stands.
+    assert _resolve_role(_RoleConfig(shared=False, pd_role=None), {}) == "writer"

@@ -194,7 +194,15 @@ class LMCacheEngine:
         # NOTE (Jiayi): This is currently used to support
         # dropping the kv cache from the buffer in PD backend
         # at decoder.
-        self.remove_after_retrieve = config.enable_pd and config.pd_role == "receiver"
+        # A transfer-channel handoff hands the decoder its own copy, which
+        # the decoder then owns. A handoff through shared storage does not:
+        # the writer still owns those extents, so removing on retrieve would
+        # drop a mapping the writer is holding for its own reasons.
+        self.remove_after_retrieve = (
+            config.enable_pd
+            and not config.pd_uses_shared_storage
+            and config.pd_role == "receiver"
+        )
 
         # asymmetric store/retrieve location can be specified
         # this is typically used (but not limited) in PD system
@@ -2029,7 +2037,11 @@ class LMCacheEngine:
         :return: True when PD is enabled and ``pd_backend_mode`` is ``"sync"``.
         :rtype: bool
         """
-        return self.config.enable_pd and self.config.pd_backend_mode == "sync"
+        return (
+            self.config.enable_pd
+            and not self.config.pd_uses_shared_storage
+            and self.config.pd_backend_mode == "sync"
+        )
 
     def _get_slot_mapping_list(
         self,

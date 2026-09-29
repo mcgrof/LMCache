@@ -307,6 +307,20 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
             "Set to 0 (default) to skip the check."
         ),
     },
+    "pd_data_path": {
+        "type": Optional[str],
+        "default": "transfer_channel",
+        "env_converter": str,
+        "description": (
+            "Where a prefill/decode handoff carries key-value data. "
+            "'transfer_channel' (default) sends it straight to the decoder "
+            "over a configured transfer channel, which needs the peer "
+            "addresses and buffers that describe that route. 'raw_block' "
+            "writes it to a raw block device both nodes can reach and gives "
+            "the decoder a reference to read, which needs the raw_block "
+            "storage plugin configured and no transfer channel at all."
+        ),
+    },
     "pd_backend_mode": {
         "type": Optional[str],
         "default": "async",
@@ -701,6 +715,16 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
 
 
 # Specialized methods that are unique to LMCacheEngineConfig
+def _pd_uses_shared_storage(self) -> bool:
+    """Whether a P/D handoff moves data through storage both nodes reach.
+
+    The alternative sends it over a transfer channel. Which one is in use
+    decides whether the transfer-channel backend exists at all, so several
+    places ask, and none of them should be comparing strings.
+    """
+    return bool(self.enable_pd) and self.pd_data_path == "raw_block"
+
+
 def _validate_config(self):
     """Validate configuration"""
 
@@ -761,9 +785,25 @@ def _validate_config(self):
     )
     if self.enable_pd:
         assert self.pd_role is not None
-        assert self.pd_buffer_size is not None
-        assert self.pd_buffer_device is not None
         assert self.enable_p2p is False, "PD only supports enable_p2p=False"
+        if self.pd_data_path not in ("transfer_channel", "raw_block"):
+            raise ValueError(
+                "pd_data_path must be 'transfer_channel' or 'raw_block', "
+                f"got {self.pd_data_path!r}"
+            )
+        if self.pd_uses_shared_storage:
+            # The peer addresses, buffer size and buffer device describe the
+            # transfer channel's route. This path does not take it: the data
+            # goes to a device both nodes can read, and the plugin that owns
+            # that device has to be configured.
+            if "raw_block" not in (self.storage_plugins or []):
+                raise ValueError(
+                    "pd_data_path='raw_block' needs 'raw_block' in "
+                    "storage_plugins, which is what reaches the device"
+                )
+        else:
+            assert self.pd_buffer_size is not None
+            assert self.pd_buffer_device is not None
         if self.pd_backend_mode not in ("sync", "async"):
             raise ValueError(
                 f"pd_backend_mode must be 'sync' or 'async', "
@@ -790,7 +830,7 @@ def _validate_config(self):
         # for receiver, PDBackend is for retrieve location
         # can't take PDBackend as store location
         # as PDBackend is now one way from producer to receiver only
-        if self.pd_role == "receiver":
+        if self.pd_role == "receiver" and not self.pd_uses_shared_storage:
             assert self.store_location != "PDBackend", (
                 "store_location cannot be PDBackend for receiver"
             )
@@ -1063,6 +1103,7 @@ LMCacheEngineConfig = create_config_class(
     deprecated_configs=_DEPRECATED_CONFIGS,
     namespace_extras={
         "validate": _validate_config,
+        "pd_uses_shared_storage": property(_pd_uses_shared_storage),
         "log_config": _log_config,
         "get_extra_config_value": _get_extra_config_value,
         "get_lmcache_worker_ids": _get_lmcache_worker_ids,

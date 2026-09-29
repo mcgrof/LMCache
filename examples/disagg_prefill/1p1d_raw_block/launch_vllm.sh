@@ -44,7 +44,17 @@ export PYTHONHASHSEED=0
 export LMCACHE_CHUNK_SIZE=${LMCACHE_CHUNK_SIZE:-256}
 export LMCACHE_LOCAL_CPU=false
 export LMCACHE_MAX_LOCAL_CPU_SIZE=0
-export LMCACHE_ENABLE_PD=false
+# Two spellings reach the same route. LMCACHE_PD_DATA_PATH=raw_block says it
+# through LMCache's own prefill/decode switch, which then derives the storage
+# role from LMCACHE_PD_ROLE and requires the plugin. Leaving it unset keeps
+# the older spelling, where the plugin settings carry everything and the
+# prefill/decode switch stays off.
+export LMCACHE_PD_DATA_PATH=${LMCACHE_PD_DATA_PATH:-raw_block}
+if [ "$LMCACHE_PD_DATA_PATH" = "raw_block" ]; then
+    export LMCACHE_ENABLE_PD=true
+else
+    export LMCACHE_ENABLE_PD=false
+fi
 export LMCACHE_PD_ROLE=$pd_role
 export LMCACHE_PD_PROXY_HOST=${LMCACHE_PD_PROXY_HOST:-localhost}
 export LMCACHE_PD_PROXY_PORT=${LMCACHE_PD_PROXY_PORT:-7500}
