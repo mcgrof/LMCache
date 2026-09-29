@@ -32,7 +32,11 @@ device before any other check, and refuses to run at all if
 The kernel must provide dma-buf-backed io_uring fixed-buffer registration, and
 the GPU driver must export the staging allocation as dma-buf. Initialization
 fails closed if that registration is unavailable; there is no host-buffer
-fallback in this mode. Size `LMCACHE_GPU_BUFFER_BYTES` for the largest
+fallback in this mode. The launcher marks the backend required
+(`storage_plugin.raw_block.required`), so a device that cannot be opened, a
+registration that is refused, or any other construction failure stops startup
+instead of leaving an engine that serves without the storage it was configured
+to hand off through. Size `LMCACHE_GPU_BUFFER_BYTES` for the largest
 simultaneous batch (the default is 4 GiB).
 
 ## Launch
