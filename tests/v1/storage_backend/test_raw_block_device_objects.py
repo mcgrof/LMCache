@@ -89,7 +89,7 @@ def test_device_write_payload_uses_the_slot_and_aligned_length(tmp_path):
         # A slot too small for the O_DIRECT tail is refused rather than
         # bounced through the host.
         cramped = _meta_device_obj(1000, 1000)
-        with pytest.raises(RuntimeError, match="device slot"):
+        with pytest.raises(RuntimeError, match="GPU slot"):
             core._prepare_write_payload(cramped)
     finally:
         core.close()

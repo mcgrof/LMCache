@@ -1580,3 +1580,54 @@ def test_raw_block_core_does_not_restore_slot_affinity_from_checkpoint(tmp_path)
         assert status["fdp_slot_affinity_fallback_count"] == 1
     finally:
         recovered.close()
+
+
+def test_paged_memory_object_reports_its_own_shape_not_the_pool_slot():
+    """A partial chunk must report the bytes its own shape implies.
+
+    The paged allocator carves every slot to a full chunk and hands the
+    metadata the pool's paging shapes.  ``get_size()`` prefers those shapes,
+    so an object holding the final partial chunk of a request reports the
+    full-chunk size while ``raw_data`` holds only its own bytes.  The
+    raw-block write path takes the payload length from ``get_size()`` and the
+    buffer from ``raw_data``, so the mismatch makes every request that ends on
+    a partial chunk unwritable -- and the storage P/D lane enables
+    ``save_unfull_chunk``, so nearly every request ends on one.
+    """
+    # Third Party
+    import torch
+
+    # First Party
+    from lmcache.v1.memory_management import MemoryFormat, MemoryObjMetadata
+
+    full_tokens, tail_tokens = 256, 9
+    kv, layers, hidden = 2, 16, 512
+    dtype = torch.bfloat16
+    pool_shapes = [torch.Size([kv, layers, full_tokens, hidden])]
+    tail_shape = torch.Size([kv, layers, tail_tokens, hidden])
+
+    meta = MemoryObjMetadata(
+        shape=tail_shape,
+        dtype=dtype,
+        address=0,
+        phy_size=tail_shape.numel() * dtype.itemsize,
+        ref_count=1,
+        fmt=MemoryFormat.KV_2LTD,
+        shapes=pool_shapes,
+        dtypes=[dtype],
+    )
+
+    class _Obj:
+        metadata = meta
+        raw_data = torch.zeros(
+            tail_shape.numel(), dtype=dtype, device="meta"
+        ).view(-1)
+
+        def get_size(self):
+            return meta.get_size()
+
+    # First Party
+    from lmcache.v1.storage_backend.raw_block.core import _logical_payload_len
+
+    assert meta.get_size() != tail_shape.numel() * dtype.itemsize
+    assert _logical_payload_len(_Obj()) == tail_shape.numel() * dtype.itemsize
