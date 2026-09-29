@@ -118,6 +118,7 @@ def _make_storage_pd_connector() -> LMCacheConnectorV1Impl:
     connector._storage_pd_status_sent = set()
     connector._storage_pd_acks_sent = set()
     connector._storage_pd_status_sender = None
+    connector._storage_pd_notify_required = False
     connector._storage_pd_tp_rank = 0
     connector._storage_pd_lock = threading.Lock()
     connector._manager = SimpleNamespace(  # type: ignore[assignment]
@@ -285,6 +286,36 @@ def test_storage_pd_get_finished_sends_status_without_holding_the_state_lock() -
 
     assert connector.get_finished({"request-1"}) == ({"request-1"}, None)
     assert observed == [True], "the state lock was held across the status send"
+
+
+def test_storage_pd_get_finished_refuses_to_release_without_a_consumer() -> None:
+    """A producer that owes a consumer a status must not pretend it sent one.
+
+    Releasing the request would tell the engine the handoff is done while
+    the consumer is still waiting to hear that anything was published.
+    Nothing in this instance can reach it, so the misconfiguration has to
+    surface rather than pass for a delivery.
+    """
+    connector = _make_storage_pd_connector()
+    connector._storage_pd_notify_required = True
+    completion: Future[list[RawBlockPublicationReceipt]] = Future()
+    completion.set_result([RawBlockPublicationReceipt("writer", 1, 1, "digest")])
+    connector._storage_pd_store_futures["request-1"] = completion
+
+    with pytest.raises(RuntimeError, match="no status sender"):
+        connector.get_finished({"request-1"})
+    assert connector._storage_pd_returned == set()
+
+
+def test_storage_pd_get_finished_releases_when_notification_is_disabled() -> None:
+    """Running without a consumer stays supported when it is asked for."""
+    connector = _make_storage_pd_connector()
+    connector._storage_pd_notify_required = False
+    completion: Future[list[RawBlockPublicationReceipt]] = Future()
+    completion.set_result([RawBlockPublicationReceipt("writer", 1, 1, "digest")])
+    connector._storage_pd_store_futures["request-1"] = completion
+
+    assert connector.get_finished({"request-1"}) == ({"request-1"}, None)
 
 
 def test_storage_pd_get_finished_reports_failure_but_releases_source_blocks() -> None:
