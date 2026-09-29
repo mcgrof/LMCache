@@ -348,6 +348,10 @@ class ClientInfo:
     init_port: Optional[list[int]] = None
     alloc_port: Optional[list[int]] = None
 
+    async def aclose(self) -> None:
+        """Close the HTTP client this record owns."""
+        await self.client.aclose()
+
 
 # Initialize variables to hold the persistent clients
 app.state.prefill_clients = []
