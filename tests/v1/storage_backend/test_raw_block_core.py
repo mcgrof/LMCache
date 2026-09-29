@@ -1631,3 +1631,86 @@ def test_paged_memory_object_reports_its_own_shape_not_the_pool_slot():
 
     assert meta.get_size() != tail_shape.numel() * dtype.itemsize
     assert _logical_payload_len(_Obj()) == tail_shape.numel() * dtype.itemsize
+
+
+def _grouped_device_obj(tail_tokens=9, with_override=False):
+    """A device object this lane cannot describe: two representation groups.
+
+    ``meta`` device tensors stand in for GPU memory: they are not CPU, so the
+    device payload path selects them, and planning refuses them before any
+    transfer is attempted.
+    """
+    # Third Party
+    import torch
+
+    # First Party
+    from lmcache.v1.memory_management import MemoryFormat, MemoryObjMetadata
+
+    kv, layers, hidden, dtype = 2, 16, 512, torch.bfloat16
+    shape = torch.Size([kv, layers, tail_tokens, hidden])
+    meta = MemoryObjMetadata(
+        shape=shape,
+        dtype=dtype,
+        address=0,
+        phy_size=shape.numel() * dtype.itemsize,
+        ref_count=1,
+        fmt=MemoryFormat.KV_2LTD,
+        shapes=[shape, shape],
+        dtypes=[dtype, dtype],
+    )
+
+    class _Grouped:
+        metadata = meta
+        raw_data = torch.zeros(shape.numel(), dtype=dtype, device="meta").view(-1)
+        _used_size_override = (
+            shape.numel() * dtype.itemsize if with_override else None
+        )
+
+        def get_size(self):
+            return meta.get_size()
+
+    return _Grouped()
+
+
+@pytest.mark.parametrize("with_override", [False, True])
+def test_raw_block_core_refuses_a_grouped_device_object(tmp_path, with_override):
+    """An unsupported representation fails its key and reserves nothing.
+
+    An explicit used-length override narrows a length; it does not make a
+    grouped object single-group, so it must not let one through.  The refusal
+    happens while planning, so no slot may be left reserved and the capacity
+    must remain usable by a later put.
+    """
+    # First Party
+    from lmcache.v1.storage_backend.raw_block.core import (
+        UnsupportedDevicePayload,
+        _logical_payload_len,
+    )
+
+    obj = _grouped_device_obj(with_override=with_override)
+
+    # Pin the refusal itself, not just its consequence: a grouped object that
+    # carries an override was previously returned before the representation
+    # was examined, and a meta tensor fails at the transfer either way, so the
+    # public result alone cannot tell the two apart.
+    with pytest.raises(UnsupportedDevicePayload):
+        _logical_payload_len(obj)
+
+    path = make_raw_block_file(tmp_path)
+    config = make_raw_block_core_config(path)
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        spec = encode_object_key(make_object_key(41))
+        result = core.put_many([spec], [obj])
+
+        assert result.results == [False]
+        assert result.stored_keys == []
+        assert not core.exists_inflight(spec.encoded)
+
+        # The refused key cost no capacity: an ordinary put still succeeds.
+        good = encode_object_key(make_object_key(42))
+        assert core.put_many([good], [make_memory_obj(b"after-refusal")]).results == [
+            True
+        ]
+    finally:
+        core.close()
