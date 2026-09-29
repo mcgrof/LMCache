@@ -1828,19 +1828,41 @@ impl RawBlockDevice {
                                             // Re-insert into in_flight with updated values
                                             // Don't decrement in_flight_count since we're resubmitting
                                             in_flight.insert(user_data, sub.clone());
-                                            // Push a new SQE for the remaining data
-                                            let _ =
-                                                build_and_submit_sqe(&ring_clone, &sub, user_data);
-                                            let _ = match &ring_clone {
-                                                IoUringWrapper::Standard(ring) => {
-                                                    let ring = ring.lock().unwrap();
-                                                    ring.submitter().submit()
-                                                }
-                                                IoUringWrapper::Big(ring) => {
-                                                    let ring = ring.lock().unwrap();
-                                                    ring.submitter().submit()
-                                                }
-                                            };
+                                            // An operation that was never queued can
+                                            // never complete, so a failed build or
+                                            // submit ends it here; leaving it in flight
+                                            // would block the waiter on a completion
+                                            // that cannot arrive.
+                                            let mut queued =
+                                                build_and_submit_sqe(&ring_clone, &sub, user_data)
+                                                    .is_ok();
+                                            if queued {
+                                                queued = match &ring_clone {
+                                                    IoUringWrapper::Standard(ring) => {
+                                                        let ring = ring.lock().unwrap();
+                                                        ring.submitter().submit().is_ok()
+                                                    }
+                                                    IoUringWrapper::Big(ring) => {
+                                                        let ring = ring.lock().unwrap();
+                                                        ring.submitter().submit().is_ok()
+                                                    }
+                                                };
+                                            }
+                                            if !queued {
+                                                in_flight.remove(&user_data);
+                                                let result = handle_completion_result(
+                                                    &mut sub,
+                                                    -libc::EIO,
+                                                    false,
+                                                );
+                                                sub.completion.set(result);
+                                                decrement_in_flight(
+                                                    &in_flight_count_clone,
+                                                    &in_flight_cvar_clone,
+                                                    &batch_in_flight_clone,
+                                                    batch_id,
+                                                );
+                                            }
                                             continue;
                                         }
 
@@ -1938,19 +1960,41 @@ impl RawBlockDevice {
                                             // Re-insert into in_flight with updated values
                                             // Don't decrement in_flight_count since we're resubmitting
                                             in_flight.insert(user_data, sub.clone());
-                                            // Push a new SQE for the remaining data
-                                            let _ =
-                                                build_and_submit_sqe(&ring_clone, &sub, user_data);
-                                            let _ = match &ring_clone {
-                                                IoUringWrapper::Standard(ring) => {
-                                                    let ring = ring.lock().unwrap();
-                                                    ring.submitter().submit()
-                                                }
-                                                IoUringWrapper::Big(ring) => {
-                                                    let ring = ring.lock().unwrap();
-                                                    ring.submitter().submit()
-                                                }
-                                            };
+                                            // An operation that was never queued can
+                                            // never complete, so a failed build or
+                                            // submit ends it here; leaving it in flight
+                                            // would block the waiter on a completion
+                                            // that cannot arrive.
+                                            let mut queued =
+                                                build_and_submit_sqe(&ring_clone, &sub, user_data)
+                                                    .is_ok();
+                                            if queued {
+                                                queued = match &ring_clone {
+                                                    IoUringWrapper::Standard(ring) => {
+                                                        let ring = ring.lock().unwrap();
+                                                        ring.submitter().submit().is_ok()
+                                                    }
+                                                    IoUringWrapper::Big(ring) => {
+                                                        let ring = ring.lock().unwrap();
+                                                        ring.submitter().submit().is_ok()
+                                                    }
+                                                };
+                                            }
+                                            if !queued {
+                                                in_flight.remove(&user_data);
+                                                let result = handle_completion_result(
+                                                    &mut sub,
+                                                    -libc::EIO,
+                                                    false,
+                                                );
+                                                sub.completion.set(result);
+                                                decrement_in_flight(
+                                                    &in_flight_count_clone,
+                                                    &in_flight_cvar_clone,
+                                                    &batch_in_flight_clone,
+                                                    batch_id,
+                                                );
+                                            }
                                             continue;
                                         }
 
