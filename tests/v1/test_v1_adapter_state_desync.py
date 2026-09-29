@@ -258,6 +258,35 @@ def test_storage_pd_get_finished_resends_ready_after_a_failed_send() -> None:
     assert "request-1" not in connector._storage_pd_aborted
 
 
+def test_storage_pd_get_finished_sends_status_without_holding_the_state_lock() -> None:
+    """A peer that stops reading must not be able to freeze the connector.
+
+    The status socket can block for as long as the consumer likes, so the
+    send has to happen with the state lock released; otherwise every
+    other user of this connector waits on an unrelated peer.
+    """
+    observed: list[bool] = []
+
+    class LockProbingSender:
+        def __init__(self, connector: LMCacheConnectorV1Impl) -> None:
+            self._connector = connector
+
+        def send(self, status: StoragePDStatus) -> None:
+            acquired = self._connector._storage_pd_lock.acquire(blocking=False)
+            observed.append(acquired)
+            if acquired:
+                self._connector._storage_pd_lock.release()
+
+    connector = _make_storage_pd_connector()
+    connector._storage_pd_status_sender = LockProbingSender(connector)  # type: ignore[assignment]
+    completion: Future[list[RawBlockPublicationReceipt]] = Future()
+    completion.set_result([RawBlockPublicationReceipt("writer", 1, 1, "digest")])
+    connector._storage_pd_store_futures["request-1"] = completion
+
+    assert connector.get_finished({"request-1"}) == ({"request-1"}, None)
+    assert observed == [True], "the state lock was held across the status send"
+
+
 def test_storage_pd_get_finished_reports_failure_but_releases_source_blocks() -> None:
     connector = _make_storage_pd_connector()
     completion: Future[list[RawBlockPublicationReceipt]] = Future()

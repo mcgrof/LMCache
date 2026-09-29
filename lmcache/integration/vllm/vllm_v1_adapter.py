@@ -1566,6 +1566,7 @@ class LMCacheConnectorV1Impl:
             return None, None
 
         releasable: set[str] = set()
+        pending_sends: list[tuple[str, StoragePDStatus]] = []
         with self._storage_pd_lock:
             if self.lmcache_engine is not None:
                 storage_manager = self.lmcache_engine.storage_manager
@@ -1626,45 +1627,60 @@ class LMCacheConnectorV1Impl:
                     self._storage_pd_store_futures.pop(req_id, None)
 
                 if req_id not in self._storage_pd_status_sent:
-                    try:
-                        wire_req_id = self._storage_pd_wire_req_ids.get(req_id, req_id)
-                        if req_id in self._storage_pd_aborted:
-                            status = StoragePDStatus(
-                                req_id=wire_req_id,
-                                producer_instance_id=f"pid:{os.getpid()}",
-                                tp_rank=self._storage_pd_tp_rank,
-                                state=self._storage_pd_terminal_states.get(
-                                    req_id, "FAILED"
-                                ),
-                                error_stage="WRITE_OR_PUBLISH",
-                                error_text=self._storage_pd_failures.get(
-                                    req_id, "storage P/D request failed"
-                                ),
-                            )
-                        else:
-                            receipt = self._storage_pd_receipts.get(req_id)
-                            if receipt is None:
-                                continue
-                            status = StoragePDStatus.ready(
-                                wire_req_id,
-                                self._storage_pd_tp_rank,
-                                receipt,
-                            )
-                        if self._storage_pd_status_sender is not None:
-                            self._storage_pd_status_sender.send(status)
-                        self._storage_pd_status_sent.add(req_id)
-                    except BaseException as exc:
-                        logger.error(
-                            "Raw-block storage P/D status send failed for "
-                            "request %s: %s",
-                            req_id,
-                            exc,
+                    wire_req_id = self._storage_pd_wire_req_ids.get(req_id, req_id)
+                    if req_id in self._storage_pd_aborted:
+                        status = StoragePDStatus(
+                            req_id=wire_req_id,
+                            producer_instance_id=f"pid:{os.getpid()}",
+                            tp_rank=self._storage_pd_tp_rank,
+                            state=self._storage_pd_terminal_states.get(
+                                req_id, "FAILED"
+                            ),
+                            error_stage="WRITE_OR_PUBLISH",
+                            error_text=self._storage_pd_failures.get(
+                                req_id, "storage P/D request failed"
+                            ),
                         )
-                        continue
+                    else:
+                        receipt = self._storage_pd_receipts.get(req_id)
+                        if receipt is None:
+                            continue
+                        status = StoragePDStatus.ready(
+                            wire_req_id,
+                            self._storage_pd_tp_rank,
+                            receipt,
+                        )
+                    # Hand the status to the send below rather than reach the
+                    # peer from here: a consumer that has stopped reading can
+                    # block this socket for as long as it likes, and every
+                    # other user of this state would wait behind it.
+                    pending_sends.append((req_id, status))
+                    continue
 
                 releasable.add(req_id)
                 self._storage_pd_engine_finished.discard(req_id)
             self._storage_pd_returned.update(releasable)
+
+        sent: list[str] = []
+        for req_id, status in pending_sends:
+            try:
+                if self._storage_pd_status_sender is not None:
+                    self._storage_pd_status_sender.send(status)
+                sent.append(req_id)
+            except BaseException as exc:
+                logger.error(
+                    "Raw-block storage P/D status send failed for request %s: %s",
+                    req_id,
+                    exc,
+                )
+
+        if sent:
+            with self._storage_pd_lock:
+                self._storage_pd_status_sent.update(sent)
+                for req_id in sent:
+                    releasable.add(req_id)
+                    self._storage_pd_engine_finished.discard(req_id)
+                self._storage_pd_returned.update(sent)
         return releasable, None
 
     def _record_storage_pd_failure(self, req_id: str, error: str) -> None:
