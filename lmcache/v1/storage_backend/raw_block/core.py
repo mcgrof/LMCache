@@ -167,6 +167,17 @@ def _resolve_sysfs_queue_dir(device_path: str) -> Optional[str]:
     return None
 
 
+# A block namespace that exposes no hardware identity gets one built from
+# its device numbers. Those are assigned by the local kernel, so they say
+# nothing about which device another node would reach by the same numbers.
+_LOCAL_BLOCK_IDENTITY_PREFIX = "block-local:"
+
+
+def namespace_identity_is_shareable(identity: str) -> bool:
+    """Return whether an identity names the same namespace on another node."""
+    return bool(identity) and not identity.startswith(_LOCAL_BLOCK_IDENTITY_PREFIX)
+
+
 def _resolve_namespace_identity(device_path: str) -> str:
     """Return a stable-enough identity for checkpoint and handoff receipts."""
     try:
@@ -195,10 +206,11 @@ def _resolve_namespace_identity(device_path: str) -> str:
                     continue
                 if value:
                     return f"block:{field}:{value}"
-        raise ValueError(
-            "raw-block storage P/D requires a persistent block namespace "
-            "identity; configure rust_raw_block.namespace_identity"
-        )
+        # No hardware identity is exposed for this namespace. That only
+        # matters for a target two nodes share, so name it in a way that
+        # says as much and let publication be the thing that refuses it.
+        # An ordinary local cache on such a device stays usable.
+        return f"{_LOCAL_BLOCK_IDENTITY_PREFIX}{major}:{minor}"
     # A character device (the io_uring_cmd passthrough node) is identified by
     # the device it refers to, not by the filesystem its node lives on:
     # st_dev names devtmpfs and would differ between a container and its host
@@ -333,7 +345,10 @@ class RawBlockCoreConfig:
     writer_epoch: str = ""
     # Persistent namespace identity carried in request receipts. When omitted,
     # regular files use device/inode identity and block devices use sysfs WWID,
-    # UUID, NGUID, or EUI data.
+    # UUID, NGUID, or EUI data. Setting it is an operator's assertion that
+    # every node using this string reaches the same namespace; nothing here
+    # verifies that, so two nodes given the same string for different
+    # devices will read each other's receipts as their own.
     namespace_identity: str = ""
 
 
@@ -1416,6 +1431,14 @@ class RawBlockCore:
             if digest is None:
                 raise RuntimeError(
                     "published checkpoint is missing request manifest metadata"
+                )
+            if not namespace_identity_is_shareable(self.namespace_identity):
+                raise ValueError(
+                    "raw-block storage P/D requires a persistent block "
+                    "namespace identity; this device exposes none, so "
+                    "configure rust_raw_block.namespace_identity with an "
+                    "identity that names the same namespace on every node "
+                    "that shares it"
                 )
             self._last_publish_ts = time.monotonic()
             manifest_records = [
