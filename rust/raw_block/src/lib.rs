@@ -227,6 +227,40 @@ fn is_retryable_regular_short_io(cqe_result: i32, len: usize, is_uring_cmd: bool
     cqe_result > 0 && (cqe_result as usize) < len && !is_uring_cmd
 }
 
+/// What to do about a completion that moved fewer bytes than were asked for.
+#[derive(Debug, PartialEq, Eq)]
+enum ShortIoAction {
+    /// Not short, or not a case this engine retries: take the result as it is.
+    Complete,
+    /// Push the remainder as a new submission for the same operation.
+    Retry,
+    /// End the operation now, with an error, pushing nothing.
+    FailTerminally,
+}
+
+/// Decide a short completion before anything is pushed.
+///
+/// A fixed submission addresses its buffer as a byte offset into a dma-buf
+/// registered with the ring rather than as a process address. Retrying the
+/// remainder means re-expressing that offset, and getting it wrong sends the
+/// rest of a transfer to the start of the registered buffer. This engine
+/// does not carry that second addressing path, so such an operation ends at
+/// its completion instead.
+fn short_io_action(
+    cqe_result: i32,
+    len: usize,
+    is_uring_cmd: bool,
+    has_fixed_dmabuf: bool,
+) -> ShortIoAction {
+    if !is_retryable_regular_short_io(cqe_result, len, is_uring_cmd) {
+        return ShortIoAction::Complete;
+    }
+    if has_fixed_dmabuf {
+        return ShortIoAction::FailTerminally;
+    }
+    ShortIoAction::Retry
+}
+
 // Fetch errno for the last libc call on this thread.
 fn errno() -> i32 {
     // SAFETY: libc call.
@@ -1743,10 +1777,16 @@ impl RawBlockDevice {
                     // their entries in in_flight, so the worker retries the
                     // submit rather than building them a second time.
                     let mut resident_sqes = false;
-                    // Buffers a submitted request may still have the device
-                    // writing into. They outlive the worker rather than return
-                    // to the allocator with a live DMA target inside them.
-                    let mut retained_buffers: Vec<std::sync::Arc<AlignedBuf>> = Vec::new();
+                    // Operations whose access by the device was never shown to
+                    // have ended. Quarantining the whole submission keeps every
+                    // owner it holds alive, not just its bounce allocation, and
+                    // they outlive the worker rather than return anything to an
+                    // allocator while the kernel may still act on it.
+                    let mut quarantined: Vec<IoSubmission> = Vec::new();
+                    // Set when a submit fails in a way that leaves the ring's
+                    // state unknown. No new work is admitted after that: the
+                    // engine cannot say what the kernel is still doing.
+                    let mut admissions_closed = false;
 
                     while !shutdown_clone.load(Ordering::Relaxed) {
                         // This drains all completed I/O operations from the completion queue (CQ).
@@ -1768,12 +1808,31 @@ impl RawBlockDevice {
                                         let batch_id = sub.batch_id;
                                         let cqe_result = cqe.result();
 
-                                        // Handle short I/O with resubmission (only for regular I/O, not io_uring_cmd)
-                                        if is_retryable_regular_short_io(
+                                        // Decide a short completion before pushing
+                                        // anything. io_uring_cmd is never retried, and
+                                        // a registered dma-buf transfer ends here.
+                                        let short_action = short_io_action(
                                             cqe_result,
                                             sub.len,
                                             sub.nvme_cmd_data.is_some(),
-                                        ) {
+                                            sub.fixed_dmabuf.is_some(),
+                                        );
+                                        if short_action == ShortIoAction::FailTerminally {
+                                            let result = handle_completion_result(
+                                                &mut sub,
+                                                -libc::EIO,
+                                                false,
+                                            );
+                                            sub.completion.set(result);
+                                            decrement_in_flight(
+                                                &in_flight_count_clone,
+                                                &in_flight_cvar_clone,
+                                                &batch_in_flight_clone,
+                                                batch_id,
+                                            );
+                                            continue;
+                                        }
+                                        if short_action == ShortIoAction::Retry {
                                             let bytes_transferred = cqe_result as usize;
                                             // Update offset and length for resubmission
                                             sub.offset += bytes_transferred as u64;
@@ -1806,71 +1865,42 @@ impl RawBlockDevice {
                                                     );
                                                 }
                                             }
-                                            // A fixed SQE takes its address from
-                                            // fixed_dmabuf, never from ptr_addr, so a
-                                            // retry that advances only ptr_addr would
-                                            // transfer the remainder to the start of
-                                            // the registered buffer again. The new
-                                            // offset stays inside the original request,
-                                            // because a short result is shorter than
-                                            // the length that was asked for.
-                                            if let Some(off) = sub.fixed_dmabuf {
-                                                match off.checked_add(bytes_transferred) {
-                                                    Some(next) => sub.fixed_dmabuf = Some(next),
-                                                    None => {
-                                                        let result = handle_completion_result(
-                                                            &mut sub,
-                                                            -libc::EOVERFLOW,
-                                                            false,
-                                                        );
-                                                        sub.completion.set(result);
-                                                        decrement_in_flight(
-                                                            &in_flight_count_clone,
-                                                            &in_flight_cvar_clone,
-                                                            &batch_in_flight_clone,
-                                                            batch_id,
-                                                        );
-                                                        continue;
-                                                    }
-                                                }
-                                            }
                                             // Re-insert into in_flight with updated values
                                             // Don't decrement in_flight_count since we're resubmitting
                                             in_flight.insert(user_data, sub.clone());
-                                            // An operation that was never queued can
-                                            // never complete, so a failed build or
-                                            // submit ends it here; leaving it in flight
-                                            // would block the waiter on a completion
-                                            // that cannot arrive.
-                                            let mut queued =
-                                                build_and_submit_sqe(&ring_clone, &sub, user_data)
-                                                    .is_ok();
-                                            if queued {
-                                                queued = match &ring_clone {
-                                                    IoUringWrapper::Standard(ring) => {
-                                                        let ring = ring.lock().unwrap();
-                                                        ring.submitter().submit().is_ok()
-                                                    }
-                                                    IoUringWrapper::Big(ring) => {
-                                                        let ring = ring.lock().unwrap();
-                                                        ring.submitter().submit().is_ok()
-                                                    }
-                                                };
-                                            }
-                                            if !queued {
-                                                in_flight.remove(&user_data);
-                                                let result = handle_completion_result(
-                                                    &mut sub,
-                                                    -libc::EIO,
-                                                    false,
-                                                );
-                                                sub.completion.set(result);
-                                                decrement_in_flight(
-                                                    &in_flight_count_clone,
-                                                    &in_flight_cvar_clone,
-                                                    &batch_in_flight_clone,
-                                                    batch_id,
-                                                );
+                                            // Push the remainder and account for it the
+                                            // way an initial submission is accounted
+                                            // for: the entry stays owned and the ring
+                                            // is marked as holding work, which the top
+                                            // of the loop flushes. Deciding here from
+                                            // one submit call cannot distinguish an
+                                            // error from a zero return or a partial
+                                            // acceptance, and treating any of those as
+                                            // "nothing was queued" reports the
+                                            // operation finished while the kernel may
+                                            // still act on it.
+                                            match build_and_submit_sqe(&ring_clone, &sub, user_data)
+                                            {
+                                                Ok(()) => {
+                                                    resident_sqes = true;
+                                                }
+                                                Err(_) => {
+                                                    // The ring never took it, so no
+                                                    // completion can arrive for it.
+                                                    in_flight.remove(&user_data);
+                                                    let result = handle_completion_result(
+                                                        &mut sub,
+                                                        -libc::EIO,
+                                                        false,
+                                                    );
+                                                    sub.completion.set(result);
+                                                    decrement_in_flight(
+                                                        &in_flight_count_clone,
+                                                        &in_flight_cvar_clone,
+                                                        &batch_in_flight_clone,
+                                                        batch_id,
+                                                    );
+                                                }
                                             }
                                             continue;
                                         }
@@ -1900,12 +1930,31 @@ impl RawBlockDevice {
                                         let batch_id = sub.batch_id;
                                         let cqe_result = cqe.result();
 
-                                        // Handle short I/O with resubmission (only for regular I/O, not io_uring_cmd)
-                                        if is_retryable_regular_short_io(
+                                        // Decide a short completion before pushing
+                                        // anything. io_uring_cmd is never retried, and
+                                        // a registered dma-buf transfer ends here.
+                                        let short_action = short_io_action(
                                             cqe_result,
                                             sub.len,
                                             sub.nvme_cmd_data.is_some(),
-                                        ) {
+                                            sub.fixed_dmabuf.is_some(),
+                                        );
+                                        if short_action == ShortIoAction::FailTerminally {
+                                            let result = handle_completion_result(
+                                                &mut sub,
+                                                -libc::EIO,
+                                                false,
+                                            );
+                                            sub.completion.set(result);
+                                            decrement_in_flight(
+                                                &in_flight_count_clone,
+                                                &in_flight_cvar_clone,
+                                                &batch_in_flight_clone,
+                                                batch_id,
+                                            );
+                                            continue;
+                                        }
+                                        if short_action == ShortIoAction::Retry {
                                             let bytes_transferred = cqe_result as usize;
                                             // Update offset and length for resubmission
                                             sub.offset += bytes_transferred as u64;
@@ -1938,71 +1987,42 @@ impl RawBlockDevice {
                                                     );
                                                 }
                                             }
-                                            // A fixed SQE takes its address from
-                                            // fixed_dmabuf, never from ptr_addr, so a
-                                            // retry that advances only ptr_addr would
-                                            // transfer the remainder to the start of
-                                            // the registered buffer again. The new
-                                            // offset stays inside the original request,
-                                            // because a short result is shorter than
-                                            // the length that was asked for.
-                                            if let Some(off) = sub.fixed_dmabuf {
-                                                match off.checked_add(bytes_transferred) {
-                                                    Some(next) => sub.fixed_dmabuf = Some(next),
-                                                    None => {
-                                                        let result = handle_completion_result(
-                                                            &mut sub,
-                                                            -libc::EOVERFLOW,
-                                                            false,
-                                                        );
-                                                        sub.completion.set(result);
-                                                        decrement_in_flight(
-                                                            &in_flight_count_clone,
-                                                            &in_flight_cvar_clone,
-                                                            &batch_in_flight_clone,
-                                                            batch_id,
-                                                        );
-                                                        continue;
-                                                    }
-                                                }
-                                            }
                                             // Re-insert into in_flight with updated values
                                             // Don't decrement in_flight_count since we're resubmitting
                                             in_flight.insert(user_data, sub.clone());
-                                            // An operation that was never queued can
-                                            // never complete, so a failed build or
-                                            // submit ends it here; leaving it in flight
-                                            // would block the waiter on a completion
-                                            // that cannot arrive.
-                                            let mut queued =
-                                                build_and_submit_sqe(&ring_clone, &sub, user_data)
-                                                    .is_ok();
-                                            if queued {
-                                                queued = match &ring_clone {
-                                                    IoUringWrapper::Standard(ring) => {
-                                                        let ring = ring.lock().unwrap();
-                                                        ring.submitter().submit().is_ok()
-                                                    }
-                                                    IoUringWrapper::Big(ring) => {
-                                                        let ring = ring.lock().unwrap();
-                                                        ring.submitter().submit().is_ok()
-                                                    }
-                                                };
-                                            }
-                                            if !queued {
-                                                in_flight.remove(&user_data);
-                                                let result = handle_completion_result(
-                                                    &mut sub,
-                                                    -libc::EIO,
-                                                    false,
-                                                );
-                                                sub.completion.set(result);
-                                                decrement_in_flight(
-                                                    &in_flight_count_clone,
-                                                    &in_flight_cvar_clone,
-                                                    &batch_in_flight_clone,
-                                                    batch_id,
-                                                );
+                                            // Push the remainder and account for it the
+                                            // way an initial submission is accounted
+                                            // for: the entry stays owned and the ring
+                                            // is marked as holding work, which the top
+                                            // of the loop flushes. Deciding here from
+                                            // one submit call cannot distinguish an
+                                            // error from a zero return or a partial
+                                            // acceptance, and treating any of those as
+                                            // "nothing was queued" reports the
+                                            // operation finished while the kernel may
+                                            // still act on it.
+                                            match build_and_submit_sqe(&ring_clone, &sub, user_data)
+                                            {
+                                                Ok(()) => {
+                                                    resident_sqes = true;
+                                                }
+                                                Err(_) => {
+                                                    // The ring never took it, so no
+                                                    // completion can arrive for it.
+                                                    in_flight.remove(&user_data);
+                                                    let result = handle_completion_result(
+                                                        &mut sub,
+                                                        -libc::EIO,
+                                                        false,
+                                                    );
+                                                    sub.completion.set(result);
+                                                    decrement_in_flight(
+                                                        &in_flight_count_clone,
+                                                        &in_flight_cvar_clone,
+                                                        &batch_in_flight_clone,
+                                                        batch_id,
+                                                    );
+                                                }
                                             }
                                             continue;
                                         }
@@ -2061,6 +2081,27 @@ impl RawBlockDevice {
                         }
 
                         let mut q = queue_clone.lock().unwrap();
+                        if admissions_closed {
+                            // The ring's state is unknown, so nothing new can be
+                            // reasoned about. Fail what is waiting rather than add
+                            // to it.
+                            let abandoned: Vec<IoSubmission> = std::mem::take(&mut *q);
+                            drop(q);
+                            for sub in abandoned {
+                                let batch_id = sub.batch_id;
+                                sub.completion.set(Err(PyRuntimeError::new_err(
+                                    "io_uring worker stopped admitting work after a \
+                                     submit failure left the ring's state unknown",
+                                )));
+                                decrement_in_flight(
+                                    &in_flight_count_clone,
+                                    &in_flight_cvar_clone,
+                                    &batch_in_flight_clone,
+                                    batch_id,
+                                );
+                            }
+                            continue;
+                        }
                         if !q.is_empty() {
                             // Take all pending requests from our queue and submit them to io_uring.
                             //
@@ -2172,6 +2213,17 @@ impl RawBlockDevice {
                                         _ => {
                                             // Error: fail all pending submissions in this batch.
                                             // Remove in_flight entries since these won't generate completions
+                                            // This submit failed in a way that says
+                                            // nothing about what the ring already
+                                            // holds. Stop admitting work, because the
+                                            // engine can no longer describe what the
+                                            // kernel is doing, and tell each waiter
+                                            // its operation failed so none of them
+                                            // hangs. Do not treat that logical
+                                            // failure as the end of the device's
+                                            // access: quarantine every submission,
+                                            // with all the owners it holds.
+                                            admissions_closed = true;
                                             for user_data in user_data_list.iter() {
                                                 in_flight.remove(user_data);
                                             }
@@ -2180,13 +2232,7 @@ impl RawBlockDevice {
                                                 sub.completion.set(Err(PyRuntimeError::new_err(
                                                     format!("io_uring submit error: {:?}", e),
                                                 )));
-                                                // The SQE stayed resident through a
-                                                // failed submit, so the kernel can
-                                                // still reach this buffer. Resolve
-                                                // the waiter, but keep the memory.
-                                                if let Some(buf) = sub.bounce.take() {
-                                                    retained_buffers.push(buf);
-                                                }
+                                                quarantined.push(sub.clone());
                                                 decrement_in_flight(
                                                     &in_flight_count_clone,
                                                     &in_flight_cvar_clone,
@@ -2278,20 +2324,20 @@ impl RawBlockDevice {
                         }
                     }
 
-                    // Any remaining in_flight requests, force wake with error
-                    // (these were submitted to kernel but won't get completions)
-                    for (_user_data, mut sub) in in_flight.drain() {
+                    // Whatever is still outstanding was never reported complete.
+                    // The drain above had a deadline, and a deadline is not a
+                    // fence: reaching it says the worker stopped waiting, not
+                    // that the device stopped. Tell each waiter its operation
+                    // did not finish, which is a statement about the logical
+                    // result, and quarantine the submission, which is a
+                    // statement about who may touch its memory and its extent.
+                    // Neither is a claim that the operation was cancelled.
+                    for (_user_data, sub) in in_flight.drain() {
                         let batch_id = sub.batch_id;
-                        // No completion ever reported this request, so the
-                        // device may still write into its buffer. Wake the
-                        // waiter, and keep the buffer for the life of the
-                        // process instead of handing a live target back to
-                        // the allocator.
-                        if let Some(buf) = sub.bounce.take() {
-                            retained_buffers.push(buf);
-                        }
+                        quarantined.push(sub.clone());
                         sub.completion.set(Err(PyRuntimeError::new_err(
-                            "io_uring worker shutting down - request cancelled",
+                            "io_uring worker shut down before this request \
+                             completed; its outcome is unknown",
                         )));
                         decrement_in_flight(
                             &in_flight_count_clone,
@@ -2301,12 +2347,21 @@ impl RawBlockDevice {
                         );
                     }
 
-                    if !retained_buffers.is_empty() {
+                    if !quarantined.is_empty() {
+                        // Deliberately never dropped. Every owner these hold, the
+                        // bounce allocation and any zero-copy target, stays valid
+                        // for the life of the process, because nothing here
+                        // established that the device had finished with them. The
+                        // slots they occupy must not go back to a live allocator
+                        // either; that is the caller's contract, not something the
+                        // worker can enforce from here.
                         eprintln!(
-                            "raw_block: retaining {} I/O buffer(s) that never reported completion",
-                            retained_buffers.len()
+                            "raw_block: quarantining {} operation(s) whose completion \
+                             was never observed; their buffers and extents are not \
+                             safe to reuse in this process",
+                            quarantined.len()
                         );
-                        std::mem::forget(retained_buffers);
+                        std::mem::forget(quarantined);
                     }
 
                     // Final notification in case any thread is waiting on in_flight_count
@@ -4015,3 +4070,59 @@ fn lmcache_rust_raw_block_io(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod short_io_action_tests {
+    use super::{short_io_action, ShortIoAction};
+
+    #[test]
+    fn a_full_transfer_is_not_short() {
+        assert_eq!(
+            short_io_action(4096, 4096, false, false),
+            ShortIoAction::Complete
+        );
+    }
+
+    #[test]
+    fn an_error_is_not_short() {
+        assert_eq!(
+            short_io_action(-5, 4096, false, false),
+            ShortIoAction::Complete
+        );
+    }
+
+    #[test]
+    fn a_short_regular_transfer_retries_its_remainder() {
+        assert_eq!(
+            short_io_action(1024, 4096, false, false),
+            ShortIoAction::Retry
+        );
+    }
+
+    #[test]
+    fn a_command_passthrough_completion_is_never_retried() {
+        assert_eq!(
+            short_io_action(1024, 4096, true, false),
+            ShortIoAction::Complete
+        );
+    }
+
+    #[test]
+    fn a_short_registered_dmabuf_transfer_ends_terminally() {
+        // The retry would have to re-express a byte offset into the
+        // registered buffer; this engine does not carry that path, so the
+        // operation must fail rather than be pushed again.
+        assert_eq!(
+            short_io_action(1024, 4096, false, true),
+            ShortIoAction::FailTerminally
+        );
+    }
+
+    #[test]
+    fn a_full_registered_dmabuf_transfer_is_unaffected() {
+        assert_eq!(
+            short_io_action(4096, 4096, false, true),
+            ShortIoAction::Complete
+        );
+    }
+}
