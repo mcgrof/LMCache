@@ -217,7 +217,6 @@ def test_an_obligation_refused_until_its_deadline_still_ends() -> None:
             time.sleep(0.01)
         assert refused.settled, "it was refused until its deadline and never ended"
 
-        settled = {item.key: item for itemin_ in () for item in ()}
         settled = {item.key: item for item in queue.poll()}
         assert settled["refused"].state == "ABANDONED"
         assert "never admitted" in settled["refused"].detail

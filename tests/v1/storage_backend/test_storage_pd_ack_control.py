@@ -421,7 +421,7 @@ def test_a_reply_about_something_else_is_not_an_answer(client):
     replies: list[str] = []
 
     def _answer_the_wrong_question() -> None:
-        context = zmq.Context.instance()
+        context: zmq.Context = zmq.Context.instance()
         rep = context.socket(zmq.REP)
         rep.setsockopt(zmq.LINGER, 0)
         rep.setsockopt(zmq.RCVTIMEO, 200)
@@ -489,7 +489,7 @@ def test_an_unintelligible_request_still_gets_an_answer(server, writer):
     listening. One malformed message would take the whole channel down.
     """
     writer.hold("request-1")
-    context = zmq.Context.instance()
+    context: zmq.Context = zmq.Context.instance()
     req = context.socket(zmq.REQ)
     req.setsockopt(zmq.LINGER, 0)
     req.setsockopt(zmq.RCVTIMEO, 3000)

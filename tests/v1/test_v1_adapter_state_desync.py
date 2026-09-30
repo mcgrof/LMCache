@@ -489,7 +489,7 @@ def test_storage_pd_read_ack_carries_the_published_request_identity() -> None:
 
     connector = _make_storage_pd_connector()
     client = Client()
-    connector._storage_pd_ack_client = client
+    connector._storage_pd_ack_client = client  # type: ignore[assignment]
     receipt = RawBlockPublicationReceipt(
         "writer-epoch", 7, 1, "digest", ack_endpoint="127.0.0.1:5999"
     )
@@ -530,7 +530,7 @@ def test_storage_pd_a_refused_obligation_is_not_recorded_as_owed() -> None:
 
     connector = _make_storage_pd_connector()
     client = RefusingClient()
-    connector._storage_pd_ack_client = client
+    connector._storage_pd_ack_client = client  # type: ignore[assignment]
     receipt = RawBlockPublicationReceipt(
         "writer-epoch", 7, 1, "digest", ack_endpoint="127.0.0.1:5999"
     )

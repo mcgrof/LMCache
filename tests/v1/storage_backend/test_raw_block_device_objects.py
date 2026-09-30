@@ -8,6 +8,7 @@ stand in for VRAM slots here: they have a device, a data pointer and a
 size, and no host bytes at all.
 """
 
+# Future
 from __future__ import annotations
 
 # Standard

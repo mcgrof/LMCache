@@ -559,7 +559,7 @@ def _ack(
         "checkpoint_seq": 7,
         "manifest_digest": "digest",
     }
-    expected_rank = int(overrides.pop("expected_tp_rank", 0))  # type: ignore[arg-type]
+    expected_rank = int(overrides.pop("expected_tp_rank", 0))  # type: ignore[call-overload]
     expected_producer = str(
         overrides.pop("expected_producer_instance_id", "producer-1")
     )
