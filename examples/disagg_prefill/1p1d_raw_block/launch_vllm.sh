@@ -54,6 +54,13 @@ printf -v extra_config \
     '{"storage_plugin.raw_block.module_path":"lmcache.v1.storage_backend.plugins.rust_raw_block_backend","storage_plugin.raw_block.class_name":"RustRawBlockBackend","storage_plugin.raw_block.required":true,%s"rust_raw_block.device_path":"%s","rust_raw_block.slot_bytes":%s,"rust_raw_block.io_engine":"io_uring","rust_raw_block.use_odirect":true,"rust_raw_block.use_uring_cmd":false,"rust_raw_block.gpu_buffer_bytes":%s,"rust_raw_block.require_dmabuf_registration":true,"rust_raw_block.publish_after_put":false,"rust_raw_block.publish_min_interval_ms":0,"rust_raw_block.meta_enable_periodic":false,"rust_raw_block.index_refresh_min_ms":1,"rust_raw_block.publication_adopt_timeout_ms":30000,"rust_raw_block.status_send_timeout_s":5}' \
     "$role_settings" "$device" "$slot_bytes" "$gpu_buffer_bytes"
 
+# Both nodes must derive the same key for the same tokens, in separate
+# processes. The builtin hash does not: it is randomised per process, and
+# PYTHONHASHSEED pins that only for processes this script starts, which is
+# not a property a shared namespace can rely on. Name a deterministic
+# algorithm instead; PYTHONHASHSEED stays for anything else that reaches
+# for the builtin.
+export LMCACHE_PRE_CACHING_HASH_ALGORITHM=${LMCACHE_PRE_CACHING_HASH_ALGORITHM:-sha256_cbor}
 export PYTHONHASHSEED=0
 export LMCACHE_CHUNK_SIZE=${LMCACHE_CHUNK_SIZE:-256}
 export LMCACHE_LOCAL_CPU=false
