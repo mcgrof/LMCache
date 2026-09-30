@@ -2249,12 +2249,13 @@ def test_raw_block_core_withholds_a_dropped_entry_when_it_cannot_say(tmp_path):
         core.close()
 
 
-def test_raw_block_core_fails_closed_on_an_unanswerable_health_probe(tmp_path):
+def test_raw_block_core_fails_closed_on_an_unanswerable_probe(tmp_path):
     """A probe that raises was asked and could not answer.
 
-    Reading the raise as health leaves the core recycling extents whose
-    outcome nothing established, and propagates the exception out of a
-    close that has already stopped its checkpoint thread.
+    Reading the raise as an idle device leaves the core publishing an index
+    and recycling extents whose outcome nothing established, and propagates
+    the exception out of a close that has already stopped its checkpoint
+    thread.
     """
     path = make_raw_block_file(tmp_path)
     config = replace(make_raw_block_core_config(path), io_engine="io_uring")
@@ -2266,7 +2267,7 @@ def test_raw_block_core_fails_closed_on_an_unanswerable_health_probe(tmp_path):
             def __getattr__(self, item):
                 return getattr(raw, item)
 
-            def is_poisoned(self):
+            def is_idle(self):
                 raise OSError("the device cannot be reached")
 
         core.set_raw_device_for_testing(_Unanswerable())
@@ -2275,6 +2276,7 @@ def test_raw_block_core_fails_closed_on_an_unanswerable_health_probe(tmp_path):
         assert core._poisoned is True
         assert outcome.quiescence is NativeQuiescence.RETAINED
         assert outcome.may_release_backing_resources is False
+        assert outcome.final_checkpoint_written is False
     finally:
         core.set_raw_device_for_testing(raw)
 
@@ -2365,6 +2367,9 @@ def test_raw_block_core_close_retains_when_it_cannot_say(tmp_path):
         class _Unknown:
             def __getattr__(self, item):
                 return getattr(raw, item)
+
+            def is_idle(self):
+                return False
 
             def is_poisoned(self):
                 return True
@@ -2483,3 +2488,78 @@ def test_raw_block_io_ledger_totals_are_exact_under_concurrency():
     assert total.requested_padded_bytes == writers * per_writer * 8
     assert total.completed_operations == writers * per_writer
     assert total.completed_padded_bytes == writers * per_writer * 8
+
+
+def test_raw_block_core_publishes_no_final_index_with_work_outstanding(tmp_path):
+    """The last index must not name extents nothing has answered for.
+
+    Close asked whether the device was *poisoned*, which is a question
+    about something that has already gone wrong. A device with commands
+    still in flight is not poisoned and is not finished either, and a
+    writer publishing on that answer makes a durable index naming extents
+    whose writes were never observed -- which the next incarnation serves
+    as a hit.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    raw = core.raw_device()
+    try:
+        key = encode_object_key(make_object_key(81))
+        assert core.put_many([key], [make_memory_obj(b"e" * 512)]).results == [True]
+
+        class _StillBusy:
+            def __getattr__(self, item):
+                return getattr(raw, item)
+
+            def is_idle(self):
+                return False
+
+        core.set_raw_device_for_testing(_StillBusy())
+        outcome = core.close()
+
+        assert outcome.quiescence is NativeQuiescence.RETAINED
+        assert outcome.final_checkpoint_written is False
+        assert outcome.final_checkpoint_is_vouched_for is False
+    finally:
+        core.set_raw_device_for_testing(raw)
+
+
+def test_raw_block_core_says_a_published_index_it_cannot_vouch_for(tmp_path):
+    """Written and vouched for are different things.
+
+    The index is published while the device still has a worker to write
+    with, because that is the only time it can be written. If the close
+    that follows then cannot prove quiescence, that index is already
+    durable and may name an unproven extent. Saying only that it was
+    written reports a clean shutdown.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    raw = core.raw_device()
+    try:
+        key = encode_object_key(make_object_key(82))
+        assert core.put_many([key], [make_memory_obj(b"f" * 512)]).results == [True]
+
+        class _RefusesAfterPublishing:
+            """Idle when asked, and unable to close afterwards."""
+
+            def __getattr__(self, item):
+                return getattr(raw, item)
+
+            def is_idle(self):
+                return True
+
+            def close(self):
+                raise RuntimeError("the worker quarantined a batch on its way out")
+
+        core.set_raw_device_for_testing(_RefusesAfterPublishing())
+        outcome = core.close()
+
+        assert outcome.final_checkpoint_written is True
+        assert outcome.quiescence is NativeQuiescence.RETAINED
+        assert outcome.final_checkpoint_is_vouched_for is False
+        assert outcome.may_release_backing_resources is False
+    finally:
+        core.set_raw_device_for_testing(raw)

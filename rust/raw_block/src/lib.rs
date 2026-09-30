@@ -4141,7 +4141,27 @@ impl RawBlockDevice {
     }
 
     /// Internal function to perform the cleanup operation.
-    fn do_close(&mut self) -> Result<(), PyErr> {
+    /// Stop the worker and wait for it, without tearing anything down.
+    ///
+    /// The worker is joined before anything is examined. Quarantining a
+    /// submission is itself what decrements the in-flight count this waits
+    /// on, so reaching zero is not evidence the device is finished -- it is
+    /// reached *by* giving up. Only after the worker has stopped is the
+    /// quarantine complete enough to ask about.
+    ///
+    /// Separated from the teardown so a caller can learn whether the device
+    /// is quiet while it still has a device to write with. A writer's final
+    /// index is the case that needs this: deciding to publish it from a
+    /// question asked before the worker stopped publishes a manifest naming
+    /// extents whose writes were never observed.
+    fn drain_worker(&mut self) {
+        // Idempotent, and it has to be: close() drains for a caller that
+        // did not ask, and the wait below is on a counter only the worker
+        // decrements. Running it a second time with the worker already
+        // joined would wait for a decrement that can never come.
+        if self.worker.is_none() {
+            return;
+        }
         if self.use_iouring {
             if let Some(shutdown) = &self.shutdown {
                 shutdown.store(true, Ordering::Relaxed);
@@ -4159,16 +4179,15 @@ impl RawBlockDevice {
                     .unwrap();
                 guard = g;
             }
+        }
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
+    }
 
-            // The worker is joined before anything is examined or torn down.
-            // Quarantining a submission is itself what decrements the count
-            // the loop above waits on, so reaching zero is not evidence the
-            // device is finished -- it is reached *by* giving up. Only after
-            // the worker has stopped is the quarantine complete enough to
-            // ask about.
-            if let Some(handle) = self.worker.take() {
-                let _ = handle.join();
-            }
+    fn do_close(&mut self) -> Result<(), PyErr> {
+        if self.use_iouring {
+            self.drain_worker();
 
             if self.outcome_is_unknown() {
                 return Err(self.retain_everything(
@@ -4209,8 +4228,8 @@ impl RawBlockDevice {
                     .store(false, Ordering::Relaxed);
                 self.fixed_buffer_map.lock().unwrap().clear();
             }
-        } else if let Some(handle) = self.worker.take() {
-            let _ = handle.join();
+        } else {
+            self.drain_worker();
         }
 
         let rc = unsafe { libc::close(self.fd) };
@@ -4265,6 +4284,23 @@ impl RawBlockDevice {
             self.do_close()?;
         }
         Ok(())
+    }
+
+    /// Whether nothing is outstanding and nothing has been quarantined.
+    ///
+    /// Answerable without stopping the worker, which is what makes it
+    /// usable by a caller that still has one more thing to write. A writer
+    /// deciding whether to publish its final index is that caller: it
+    /// cannot ask by draining, because draining is what takes away the
+    /// worker the write needs.
+    ///
+    /// This is weaker than proof of quiescence and is deliberately named
+    /// for what it is. It says nothing has been handed to the device that
+    /// the device has not answered for, as of now; a submission the worker
+    /// quarantines while shutting down is a later event, and only `close()`
+    /// reports that.
+    fn is_idle(&self) -> bool {
+        self.in_flight_count.load(Ordering::SeqCst) == 0 && !self.outcome_is_unknown()
     }
 }
 

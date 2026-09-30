@@ -395,6 +395,37 @@ class RawBlockIoLedger:
         return summed
 
 
+def device_has_nothing_outstanding(device: Any) -> bool:
+    """Whether a device has answered for everything it was handed.
+
+    This is the question a writer's final index may be published on, and it
+    is deliberately weaker than proof of quiescence. Proof requires stopping
+    the worker, and stopping the worker takes away the thing the index write
+    needs -- so a writer that drained first would hang, and one that
+    published first would be deciding on a question asked too early.
+
+    What it does establish is that nothing is in flight and nothing has been
+    quarantined as of now. A submission the worker quarantines later, while
+    shutting down, is a separate event that only the close reports; a
+    checkpoint published before it is recorded as written but not vouched
+    for.
+
+    Fails closed for the same reason the health probe does: a probe that
+    raises was asked and could not answer. A device that cannot be asked at
+    all is an older native build, which can still answer the health
+    question.
+    """
+    probe = getattr(device, "is_idle", None)
+    if probe is None:
+        return not device_says_outcome_is_unknown(device)
+    try:
+        answer = probe()
+    except Exception:
+        logger.exception("RawBlockCore could not ask the device for its state")
+        return False
+    return answer is True
+
+
 def device_says_outcome_is_unknown(device: Any) -> bool:
     """Ask a device whether it has stopped being able to say, failing closed.
 
@@ -446,6 +477,23 @@ class RawBlockCloseOutcome:
     reason: str = ""
     quarantined_slots: int = 0
     final_checkpoint_written: bool = False
+
+    @property
+    def final_checkpoint_is_vouched_for(self) -> bool:
+        """Whether the published index names only extents that were proven.
+
+        A writer publishes its last index while it still has a worker to
+        write with, and can only know at that point that everything it had
+        handed over was answered for. If the close that follows then cannot
+        prove quiescence -- because the worker quarantined something on its
+        way out -- the index is already durable and may name an extent whose
+        write was never observed. It is written and it is not vouched for,
+        and those are different things a caller has to be able to tell
+        apart.
+        """
+        return self.final_checkpoint_written and self.quiescence is (
+            NativeQuiescence.PROVEN
+        )
 
     @property
     def may_release_backing_resources(self) -> bool:
@@ -2063,12 +2111,16 @@ class RawBlockCore:
             self._meta_thread.join(timeout=5)
             self._meta_thread = None
 
-        # Sample this before touching the device: the accessor below
+        # Asked of the device this core actually has: the accessor below
         # reopens a fresh one when the reference is dropped, and a fresh
         # device knows nothing about what the old one could not establish.
+        #
+        # And answered by the device, not by the absence of a complaint:
+        # a writer about to publish its last index needs to know that
+        # everything it handed over has been answered for.
         unknown = self._poisoned
         if not unknown and self._raw is not None:
-            unknown = device_says_outcome_is_unknown(self._raw)
+            unknown = not device_has_nothing_outstanding(self._raw)
         self._poisoned = unknown
 
         checkpointed = False
@@ -2098,6 +2150,18 @@ class RawBlockCore:
                 final_checkpoint_written=checkpointed,
             )
             self._close_outcome = outcome
+            if outcome.final_checkpoint_written and not (
+                outcome.final_checkpoint_is_vouched_for
+            ):
+                logger.error(
+                    "RawBlockCore %s published a final index and then could "
+                    "not prove the device was finished (%s). That index is "
+                    "durable and may name an extent whose write was never "
+                    "observed; a later incarnation reading it will serve "
+                    "those bytes as a hit.",
+                    self.device_path,
+                    reason,
+                )
             return outcome
 
         if self._raw is None:
