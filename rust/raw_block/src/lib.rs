@@ -2348,13 +2348,17 @@ impl RawBlockDevice {
                     }
 
                     if !quarantined.is_empty() {
-                        // Deliberately never dropped. Every owner these hold, the
-                        // bounce allocation and any zero-copy target, stays valid
-                        // for the life of the process, because nothing here
-                        // established that the device had finished with them. The
-                        // slots they occupy must not go back to a live allocator
-                        // either; that is the caller's contract, not something the
-                        // worker can enforce from here.
+                        // Deliberately never dropped, so the owners a submission
+                        // does hold stay valid for the life of the process: its
+                        // bounce allocation, and the completion it would otherwise
+                        // release. That is not every owner. A zero-copy target is
+                        // a bare address here, and the Python object behind it is
+                        // held per batch elsewhere and released once the batch
+                        // count clears, which the lines above do. Quarantine
+                        // therefore protects a bounced transfer's memory and not a
+                        // registered one's, and the extents these name must not go
+                        // back to a live allocator either, which the worker cannot
+                        // enforce from here.
                         eprintln!(
                             "raw_block: quarantining {} operation(s) whose completion \
                              was never observed; their buffers and extents are not \

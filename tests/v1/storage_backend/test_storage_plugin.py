@@ -10,6 +10,7 @@ and verifies that:
 """
 
 # Standard
+from collections import OrderedDict
 from typing import Any, Callable, List, Optional, Sequence
 import asyncio
 
@@ -653,3 +654,71 @@ def test_required_storage_plugins_names_the_data_path():
     config.enable_pd = False
     config.extra_config = {"storage_plugin.extra_tier.required": True}
     assert required_storage_plugins(config) == {"extra_tier"}
+
+
+def test_shared_storage_allocates_from_the_gpu_endpoint_not_local_cpu():
+    """On the shared-storage route the data path allocates for the engine.
+
+    The review asked for this to be asserted, not inferred. A run that
+    silently allocated from a local CPU backend would be staging the payload
+    through host memory while the configuration says the GPU-resident
+    plugin carries it, and the earlier plugin-loader hole made exactly that
+    reachable.
+    """
+    # Standard
+    from unittest import mock
+
+    # First Party
+    from lmcache.v1.storage_backend.abstract_backend import (
+        AllocatorBackendInterface,
+    )
+    from lmcache.v1.storage_backend.storage_manager import StorageManager
+
+    class _Endpoint:
+        """Stands in for the raw-block backend with a GPU staging pool.
+
+        Registered as a virtual subclass so the selection's isinstance check
+        passes without reimplementing the whole allocator interface, which
+        this test does not exercise.
+        """
+
+        is_gpu_endpoint = True
+
+        def __init__(self, name: str) -> None:
+            self._name = name
+
+        def __str__(self) -> str:
+            return self._name
+
+        def __getattr__(self, item):
+            return mock.MagicMock()
+
+    AllocatorBackendInterface.register(_Endpoint)
+
+    config = create_test_config(storage_plugins=["raw_block"])
+    config.enable_pd = True
+    config.pd_role = "sender"
+    config.pd_data_path = "raw_block"
+    config.local_cpu = False
+    config.max_local_cpu_size = 0.0
+    assert config.pd_uses_shared_storage is True
+
+    manager = StorageManager.__new__(StorageManager)
+    manager.config = config
+    manager.enable_pd = config.enable_pd
+    # Both present, as a real strict run has: only the GPU endpoint may win.
+    manager.storage_backends = OrderedDict(
+        [
+            ("LocalCPUBackend", _Endpoint("LocalCPUBackend")),
+            ("raw_block", _Endpoint("raw_block")),
+        ]
+    )
+    manager.storage_backends["LocalCPUBackend"].is_gpu_endpoint = False
+
+    chosen = manager._get_allocator_backend(config)
+    assert str(chosen) == "raw_block"
+
+    # And with the transfer-channel route it is the PD backend instead.
+    config.pd_data_path = "transfer_channel"
+    manager.storage_backends["PDBackend"] = _Endpoint("PDBackend")
+    assert str(manager._get_allocator_backend(config)) == "PDBackend"
