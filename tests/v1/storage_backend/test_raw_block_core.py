@@ -1816,3 +1816,55 @@ def test_raw_block_core_planning_exception_returns_the_slot_it_reserved(tmp_path
         assert core._index[after.encoded].offset == freed_offset
     finally:
         core.close()
+
+
+def test_raw_block_core_refuses_work_once_the_native_outcome_is_unknown(tmp_path):
+    """A logical failure and an unknown outcome are different statements.
+
+    When the native engine cannot establish what the device is still doing, a
+    failed result is not proof the device has finished. The core must stop
+    handing out storage and must refuse to publish, because a receipt tells a
+    reader where to look and this core can no longer say what is there. It
+    must not merely report the request failed and carry on.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        first = encode_object_key(make_object_key(91))
+        assert core.put_many([first], [make_memory_obj(b"before")]).results == [True]
+        assert core.report_status()["is_healthy"] is True
+        assert core.report_status()["poisoned"] is False
+
+        # The engine reports it can no longer say. The core adopts that the
+        # next time it waits on a batch.
+        raw = core.raw_device()
+
+        class _Poisoned:
+            def __getattr__(self, item):
+                return getattr(raw, item)
+
+            def is_poisoned(self):
+                return True
+
+            def quarantined_batch_count(self):
+                return 1
+
+        core.set_raw_device_for_testing(_Poisoned())
+        second = encode_object_key(make_object_key(92))
+        third = encode_object_key(make_object_key(93))
+        core.put_many([second, third], [make_memory_obj(b"during")] * 2)
+
+        assert core._poisoned is True
+        assert core.report_status()["is_healthy"] is False
+        assert core.report_status()["poisoned"] is True
+
+        # No further storage is handed out, and nothing new is published.
+        after = encode_object_key(make_object_key(94))
+        assert core.put_many([after], [make_memory_obj(b"after")]).results == [False]
+        assert not core.contains_key(after.encoded)
+        with pytest.raises(RuntimeError, match="could not establish"):
+            core.publish_request([first.encoded])
+    finally:
+        core.set_raw_device_for_testing(raw)
+        core.close()

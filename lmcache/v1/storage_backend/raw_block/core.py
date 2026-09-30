@@ -395,6 +395,12 @@ class RawBlockCore:
     and lock refcounts that protect slots from deletion while in use.
     """
 
+    # Declared on the class so it exists however the core was built. Several
+    # tests construct one through __new__ without running __init__, and a
+    # guard that only the initializer installs is a guard that is sometimes
+    # absent from the very paths it protects.
+    _poisoned: bool = False
+
     def __init__(
         self,
         config: RawBlockCoreConfig,
@@ -449,6 +455,11 @@ class RawBlockCore:
         )
         self._last_publish_ts: float = 0.0
         self._buffer_registration_mode = "none"
+        # Set when the native engine could not establish what the device was
+        # doing. Separate from ``_closed``: marking the core closed would make
+        # ``close()`` return without draining or unregistering, and the point
+        # is to hold resources rather than release them.
+        self._poisoned = False
         configured_namespace = str(getattr(config, "namespace_identity", "") or "")
         self.namespace_identity = configured_namespace or _resolve_namespace_identity(
             self.device_path
@@ -1042,7 +1053,7 @@ class RawBlockCore:
 
         for i, (key, obj) in enumerate(zip(keys, objs, strict=False)):
             placement_id = per_key_placement_ids[i]
-            if self._closed:
+            if self._closed or self._poisoned:
                 break
 
             with self._lock:
@@ -1407,6 +1418,13 @@ class RawBlockCore:
         """
         if self.role != "writer":
             raise RuntimeError("only a writer core can publish a request")
+        if self._poisoned:
+            # A receipt tells a reader where to look. This core can no longer
+            # say what the device is doing with the extents it would name.
+            raise RuntimeError(
+                "raw-block core cannot publish: the native engine could not "
+                "establish what the device is still doing"
+            )
         if not encoded_keys:
             raise ValueError("request publication requires at least one key")
         with self._checkpoint_lock:
@@ -1579,7 +1597,8 @@ class RawBlockCore:
         """Return raw-block health, layout, metadata, and in-flight counters."""
         with self._lock:
             return {
-                "is_healthy": not self._closed,
+                "is_healthy": not self._closed and not self._poisoned,
+                "poisoned": self._poisoned,
                 "type": "RawBlockCore",
                 "key_namespace": self.key_namespace,
                 "device_path": self.device_path,
@@ -2235,6 +2254,22 @@ class RawBlockCore:
         """
         results, completion_errors = raw_dev.wait_iouring(batch_id)
         results = list(results)
+        # A logical failure and an unknown outcome are different statements.
+        # The engine poisons itself when it cannot say what the device is
+        # doing, and it does so before waking this wait, so asking now is not
+        # a race. Adopt that here: the core must stop handing out storage and
+        # must not let ordinary cleanup recycle anything from this batch,
+        # because a failed result is not proof the device has finished.
+        if not self._poisoned and bool(getattr(raw_dev, "is_poisoned", bool)()):
+            self._poisoned = True
+            logger.error(
+                "RawBlockCore %s batch %d: the native engine could not "
+                "establish what the device is still doing. Refusing further "
+                "work on this device and withholding %d quarantined batch(es).",
+                operation,
+                batch_id,
+                int(getattr(raw_dev, "quarantined_batch_count", int)()),
+            )
         for operation_index, error in completion_errors:
             logger.error(
                 "RawBlockCore %s batch %d operation %d failed: %s",
@@ -2434,7 +2469,7 @@ class RawBlockCore:
                 for i, (key, obj, placement_id) in enumerate(
                     zip(keys, objs, placement_ids, strict=True)
                 ):
-                    if self._closed:
+                    if self._closed or self._poisoned:
                         break
                     encoded_key = key.encoded
                     if encoded_key in self._index:

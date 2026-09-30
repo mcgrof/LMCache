@@ -194,6 +194,10 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         self._last_refresh_ts = 0.0
         self._refresh_lock = threading.Lock()
         self._warned_reader_put = False
+        # Memory objects whose references are deliberately not dropped, because
+        # the device's access to them was never shown to have ended. Held for
+        # the life of this backend so their pool slices cannot be reallocated.
+        self._quarantined_objs: list[Any] = []
         # A handoff configured through pd_data_path says the same thing as
         # the plugin-level switch, so either turns the mode on.
         self._storage_pd_mode = bool(
@@ -411,6 +415,22 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         if self.local_cpu_backend is None:
             raise RuntimeError("RustRawBlockBackend has no staging pool to load into")
         return self.local_cpu_backend.allocate(shape, dtype, fmt)
+
+    def _native_outcome_is_unknown(self) -> bool:
+        """Whether the native engine has stopped being able to say.
+
+        Once it cannot establish what the device is doing, nothing this
+        backend releases can be shown to be safe to release, so it keeps what
+        it holds rather than handing it back.
+        """
+        probe = getattr(self._raw, "is_poisoned", None)
+        if probe is None:
+            return False
+        try:
+            return bool(probe())
+        except Exception:  # pragma: no cover - a probe must not mask the path
+            logger.exception("RustRawBlockBackend: could not read native health")
+            return True
 
     def _full_chunk_size_bytes(self) -> int:
         """Bytes one full KV chunk occupies, which sizes a device slot.
@@ -965,8 +985,18 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             assert self._pd_tracker is not None
             self._pd_tracker.fail_request(req_id, exc)
         finally:
+            # Dropping the reference can return the object's pool slice to the
+            # allocator. That is only safe once the device is known to have
+            # finished with it, and a failed request is not that knowledge:
+            # the engine poisons itself when it cannot say. Keep the
+            # references in that case, so the slice stays out of the
+            # allocator's hands.
+            unknown = self._native_outcome_is_unknown()
             for key, _spec, memory_obj in pending:
-                memory_obj.ref_count_down()
+                if unknown:
+                    self._quarantined_objs.append(memory_obj)
+                else:
+                    memory_obj.ref_count_down()
                 with self._put_lock:
                     self._put_tasks.discard(key)
 
@@ -993,7 +1023,10 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                 except Exception as e:
                     logger.warning("on_complete_callback failed for key %s: %s", key, e)
         finally:
-            memory_obj.ref_count_down()
+            if self._native_outcome_is_unknown():
+                self._quarantined_objs.append(memory_obj)
+            else:
+                memory_obj.ref_count_down()
             with self._put_lock:
                 self._put_tasks.discard(key)
 
@@ -1051,8 +1084,18 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                             "on_complete_callback failed for key %s: %s", key, e
                         )
         finally:
+            # Dropping the reference can return the object's pool slice to the
+            # allocator. That is only safe once the device is known to have
+            # finished with it, and a failed request is not that knowledge:
+            # the engine poisons itself when it cannot say. Keep the
+            # references in that case, so the slice stays out of the
+            # allocator's hands.
+            unknown = self._native_outcome_is_unknown()
             for key, _spec, memory_obj in pending:
-                memory_obj.ref_count_down()
+                if unknown:
+                    self._quarantined_objs.append(memory_obj)
+                else:
+                    memory_obj.ref_count_down()
                 with self._put_lock:
                     self._put_tasks.discard(key)
 

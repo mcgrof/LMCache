@@ -20,7 +20,7 @@ use pyo3::exceptions::{
 };
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::io;
 use std::os::unix::io::AsRawFd;
@@ -225,6 +225,34 @@ fn round_up(x: usize, align: usize) -> usize {
 /// resubmit the same request indefinitely.
 fn is_retryable_regular_short_io(cqe_result: i32, len: usize, is_uring_cmd: bool) -> bool {
     cqe_result > 0 && (cqe_result as usize) < len && !is_uring_cmd
+}
+
+/// What a submit outcome means for work the ring may still be holding.
+#[derive(Debug, PartialEq, Eq)]
+enum SubmitOutcome {
+    /// The kernel took the call. Anything still in the ring is ours to flush.
+    Progressed,
+    /// Nothing was consumed and nothing was lost, so the same entries can be
+    /// delivered again once there is room.
+    Retryable,
+    /// The call failed in a way that says nothing about what the ring already
+    /// holds, so no statement can be made about the kernel's access.
+    Fatal,
+}
+
+/// Classify a submit result the same way wherever a submit is made.
+///
+/// The initial submission and the flush of entries an earlier submit left
+/// behind both face the same three outcomes, and a flush that treated a fatal
+/// error as retryable would spin while its waiters never finished.
+fn classify_submit(result: &io::Result<usize>) -> SubmitOutcome {
+    match result {
+        Ok(_) => SubmitOutcome::Progressed,
+        Err(e) => match e.raw_os_error() {
+            Some(libc::EAGAIN) | Some(libc::EINTR) => SubmitOutcome::Retryable,
+            _ => SubmitOutcome::Fatal,
+        },
+    }
 }
 
 /// What to do about a completion that moved fewer bytes than were asked for.
@@ -1320,6 +1348,20 @@ struct RawBlockDevice {
     batched_completions: Arc<Mutex<HashMap<u64, Vec<Arc<IoCompletion>>>>>,
     // Counter for generating unique batch IDs
     next_batch_id: Arc<AtomicU64>,
+    // Batches for which no statement can be made about the device's access.
+    // The worker records these before it wakes their waiter, so the waiter
+    // sees the unknown outcome rather than a plain failure and can keep the
+    // batch's owners instead of releasing them.
+    quarantined_batches: Arc<Mutex<HashSet<u64>>>,
+    // Set once any outcome has been unknown. Sticky for this incarnation:
+    // an engine that cannot say what the kernel is doing cannot serve.
+    // Deliberately separate from `closed`, because marking the device closed
+    // would make `close()` return without draining or unregistering.
+    poisoned: Arc<AtomicBool>,
+    // Owners transferred out of `batched_buffer_objs` for a quarantined
+    // batch. Never cleared: the Python objects behind them must stay alive
+    // while the device may still reach the memory they describe.
+    quarantined_owners: Arc<Mutex<Vec<Py<PyAny>>>>,
 }
 
 /// RAII guard for a raw file descriptor
@@ -1451,6 +1493,8 @@ impl RawBlockDevice {
             batched_completions_opt,
             next_batch_id_opt,
             batch_in_flight_opt,
+            quarantined_batches_opt,
+            poisoned_opt,
         ) = if use_iouring {
             let notify = UringNotify::new()
                 .map_err(|e| PyRuntimeError::new_err(format!("UringNotify init failed: {}", e)))?;
@@ -1515,6 +1559,10 @@ impl RawBlockDevice {
             let in_flight_count = Arc::new(AtomicU64::new(0));
             let in_flight_cvar = Arc::new(Condvar::new());
             let batched_buffer_objs = Arc::new(Mutex::new(HashMap::<u64, Vec<Py<PyAny>>>::new()));
+            let quarantined_batches = Arc::new(Mutex::new(HashSet::<u64>::new()));
+            let poisoned = Arc::new(AtomicBool::new(false));
+            let quarantined_batches_worker = Arc::clone(&quarantined_batches);
+            let poisoned_worker = Arc::clone(&poisoned);
             let batched_completions =
                 Arc::new(Mutex::new(HashMap::<u64, Vec<Arc<IoCompletion>>>::new()));
             let next_batch_id = Arc::new(AtomicU64::new(1));
@@ -1783,6 +1831,15 @@ impl RawBlockDevice {
                     // they outlive the worker rather than return anything to an
                     // allocator while the kernel may still act on it.
                     let mut quarantined: Vec<IoSubmission> = Vec::new();
+                    // Record a batch as unknown-outcome, and poison the device,
+                    // BEFORE its waiter is woken. The waiter reads this to
+                    // decide whether it may release the batch's owners, so the
+                    // order matters: waking first would let it release them
+                    // while the device may still reach that memory.
+                    let mark_unknown = |batch_id: u64| {
+                        poisoned_worker.store(true, Ordering::SeqCst);
+                        quarantined_batches_worker.lock().unwrap().insert(batch_id);
+                    };
                     // Set when a submit fails in a way that leaves the ring's
                     // state unknown. No new work is admitted after that: the
                     // engine cannot say what the kernel is still doing.
@@ -2072,7 +2129,43 @@ impl RawBlockDevice {
                                 }
                             };
                             ring_clone.submission_sync();
-                            resident_sqes = flushed.is_err() || ring_clone.submission_len() > 0;
+                            match classify_submit(&flushed) {
+                                SubmitOutcome::Progressed => {
+                                    resident_sqes = ring_clone.submission_len() > 0;
+                                }
+                                SubmitOutcome::Retryable => {
+                                    resident_sqes = true;
+                                }
+                                SubmitOutcome::Fatal => {
+                                    // The same outcome the initial submission
+                                    // treats as fatal. Retrying it forever left
+                                    // every waiter on every resident entry stuck,
+                                    // which is how a fatal error after a partial
+                                    // submit or a short-I/O retry used to end.
+                                    // Nothing can be said about what the kernel
+                                    // holds, so close admissions and quarantine
+                                    // everything outstanding: the flush does not
+                                    // know which entries this error touched.
+                                    admissions_closed = true;
+                                    resident_sqes = false;
+                                    for (_user_data, sub) in in_flight.drain() {
+                                        let batch_id = sub.batch_id;
+                                        sub.completion.set(Err(PyRuntimeError::new_err(format!(
+                                            "io_uring submit error flushing \
+                                                 resident work: {:?}",
+                                            flushed.as_ref().err()
+                                        ))));
+                                        quarantined.push(sub.clone());
+                                        mark_unknown(batch_id);
+                                        decrement_in_flight(
+                                            &in_flight_count_clone,
+                                            &in_flight_cvar_clone,
+                                            &batch_in_flight_clone,
+                                            batch_id,
+                                        );
+                                    }
+                                }
+                            }
                             // Yield to the kernel when the ring still will not
                             // drain, so a full ring cannot become a spin.
                             if resident_sqes && queue_clone.lock().unwrap().is_empty() {
@@ -2180,7 +2273,8 @@ impl RawBlockDevice {
                                     ring.submitter().submit()
                                 }
                             };
-                            // Handle EAGAIN (ring full) and EINTR (interrupted syscall)
+                            // Classified the same way as the resident flush.
+                            let outcome = classify_submit(&submit_result);
                             match submit_result {
                                 Ok(submitted) => {
                                     // Any remaining requests in batch that weren't submitted
@@ -2196,10 +2290,8 @@ impl RawBlockDevice {
                                     }
                                 }
                                 Err(e) => {
-                                    // Handle submission errors
-                                    let error_code = e.raw_os_error();
-                                    match error_code {
-                                        Some(libc::EAGAIN) | Some(libc::EINTR) => {
+                                    match outcome {
+                                        SubmitOutcome::Progressed | SubmitOutcome::Retryable => {
                                             // A full ring or an interrupted call
                                             // consumed nothing, so every SQE this
                                             // batch pushed is still resident and
@@ -2210,7 +2302,7 @@ impl RawBlockDevice {
                                                 resident_sqes = true;
                                             }
                                         }
-                                        _ => {
+                                        SubmitOutcome::Fatal => {
                                             // Error: fail all pending submissions in this batch.
                                             // Remove in_flight entries since these won't generate completions
                                             // This submit failed in a way that says
@@ -2233,6 +2325,7 @@ impl RawBlockDevice {
                                                     format!("io_uring submit error: {:?}", e),
                                                 )));
                                                 quarantined.push(sub.clone());
+                                                mark_unknown(batch_id);
                                                 decrement_in_flight(
                                                     &in_flight_count_clone,
                                                     &in_flight_cvar_clone,
@@ -2335,6 +2428,7 @@ impl RawBlockDevice {
                     for (_user_data, sub) in in_flight.drain() {
                         let batch_id = sub.batch_id;
                         quarantined.push(sub.clone());
+                        mark_unknown(batch_id);
                         sub.completion.set(Err(PyRuntimeError::new_err(
                             "io_uring worker shut down before this request \
                              completed; its outcome is unknown",
@@ -2348,17 +2442,15 @@ impl RawBlockDevice {
                     }
 
                     if !quarantined.is_empty() {
-                        // Deliberately never dropped, so the owners a submission
-                        // does hold stay valid for the life of the process: its
-                        // bounce allocation, and the completion it would otherwise
-                        // release. That is not every owner. A zero-copy target is
-                        // a bare address here, and the Python object behind it is
-                        // held per batch elsewhere and released once the batch
-                        // count clears, which the lines above do. Quarantine
-                        // therefore protects a bounced transfer's memory and not a
-                        // registered one's, and the extents these name must not go
-                        // back to a live allocator either, which the worker cannot
-                        // enforce from here.
+                        // Deliberately never dropped. Each submission keeps its
+                        // bounce allocation and its completion. The Python object
+                        // behind a zero-copy target is held per batch, and the
+                        // batch was marked unknown before its waiter was woken,
+                        // so the waiter transfers those owners to quarantine too
+                        // rather than releasing them. The device is poisoned for
+                        // this incarnation, so nothing further is admitted; the
+                        // extents these name are withheld by the core, which the
+                        // worker cannot reach from here.
                         eprintln!(
                             "raw_block: quarantining {} operation(s) whose completion \
                              was never observed; their buffers and extents are not \
@@ -2385,10 +2477,12 @@ impl RawBlockDevice {
                 Some(batched_completions),
                 Some(next_batch_id),
                 Some(batch_in_flight),
+                Some(quarantined_batches),
+                Some(poisoned),
             )
         } else {
             (
-                None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None,
             )
         };
 
@@ -2424,6 +2518,10 @@ impl RawBlockDevice {
             next_batch_id: next_batch_id_opt.unwrap_or_else(|| Arc::new(AtomicU64::new(1))),
             batch_in_flight: batch_in_flight_opt
                 .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new()))),
+            quarantined_batches: quarantined_batches_opt
+                .unwrap_or_else(|| Arc::new(Mutex::new(HashSet::new()))),
+            poisoned: poisoned_opt.unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+            quarantined_owners: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -3081,6 +3179,46 @@ impl RawBlockDevice {
     /// request-preparation errors instead of returning a batch ID. After a
     /// batch ID is returned, I/O completion failures are reported in both
     /// returned collections.
+    /// Release or quarantine a finished batch's Python buffer owners.
+    ///
+    /// A batch whose outcome the worker could not establish must keep them:
+    /// the device may still reach the memory they describe, and handing a
+    /// pool slice back to an allocator on the strength of a logical failure
+    /// is what this distinction exists to prevent. Logical completion is not
+    /// reusable capacity.
+    fn retire_batch_owners(&self, batch_id: u64) {
+        let unknown = self.quarantined_batches.lock().unwrap().contains(&batch_id);
+        let owners = {
+            let mut stored_objs = self.batched_buffer_objs.lock().unwrap();
+            stored_objs.remove(&batch_id)
+        };
+        if !unknown {
+            return;
+        }
+        if let Some(owners) = owners {
+            self.quarantined_owners.lock().unwrap().extend(owners);
+        }
+    }
+
+    /// Whether any outcome on this device has been unknown.
+    ///
+    /// Sticky for the life of this device: once the engine cannot say what
+    /// the kernel is doing, it cannot say it later either. Callers use this
+    /// to refuse further strict work rather than recompute or fall back.
+    fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::SeqCst)
+    }
+
+    /// How many batches are held because their outcome was never established.
+    fn quarantined_batch_count(&self) -> usize {
+        self.quarantined_batches.lock().unwrap().len()
+    }
+
+    /// How many Python buffer owners are retained for those batches.
+    fn quarantined_owner_count(&self) -> usize {
+        self.quarantined_owners.lock().unwrap().len()
+    }
+
     #[pyo3(signature = (batch_id))]
     fn wait_iouring(&self, py: Python<'_>, batch_id: u64) -> PyResult<IoUringBatchResults> {
         if !self.use_iouring {
@@ -3099,9 +3237,7 @@ impl RawBlockDevice {
                     let batch_completions = completions.remove(&batch_id);
                     drop(completions);
                     let results = collect_iouring_completion_results(batch_completions);
-                    // Clear stored buffer objects for this batch
-                    let mut stored_objs = self.batched_buffer_objs.lock().unwrap();
-                    stored_objs.remove(&batch_id);
+                    self.retire_batch_owners(batch_id);
                     return Ok(results);
                 }
             }
@@ -3125,9 +3261,8 @@ impl RawBlockDevice {
         drop(completions);
         let results = collect_iouring_completion_results(batch_completions);
 
-        // Clear stored buffer objects for this batch now that I/O is complete
-        let mut stored_objs = self.batched_buffer_objs.lock().unwrap();
-        stored_objs.remove(&batch_id);
+        // Release this batch's owners, or keep them if its outcome is unknown.
+        self.retire_batch_owners(batch_id);
 
         // Clean up per-batch tracking
         let mut batch_map = self.batch_in_flight.lock().unwrap();
@@ -4128,5 +4263,54 @@ mod short_io_action_tests {
             short_io_action(4096, 4096, false, true),
             ShortIoAction::Complete
         );
+    }
+}
+
+#[cfg(test)]
+mod classify_submit_tests {
+    use super::{classify_submit, SubmitOutcome};
+    use std::io;
+
+    #[test]
+    fn an_accepted_call_has_progressed() {
+        assert_eq!(classify_submit(&Ok(4)), SubmitOutcome::Progressed);
+    }
+
+    #[test]
+    fn accepting_nothing_still_counts_as_progress() {
+        // Ok(0) means the kernel took the call and consumed no entry. The
+        // entries are still resident and still ours; it is not an error.
+        assert_eq!(classify_submit(&Ok(0)), SubmitOutcome::Progressed);
+    }
+
+    #[test]
+    fn a_full_ring_is_retryable() {
+        let e: io::Result<usize> = Err(io::Error::from_raw_os_error(libc::EAGAIN));
+        assert_eq!(classify_submit(&e), SubmitOutcome::Retryable);
+    }
+
+    #[test]
+    fn an_interrupted_call_is_retryable() {
+        let e: io::Result<usize> = Err(io::Error::from_raw_os_error(libc::EINTR));
+        assert_eq!(classify_submit(&e), SubmitOutcome::Retryable);
+    }
+
+    #[test]
+    fn any_other_error_is_fatal() {
+        for code in [libc::EBADF, libc::EINVAL, libc::ENOMEM, libc::EIO] {
+            let e: io::Result<usize> = Err(io::Error::from_raw_os_error(code));
+            assert_eq!(
+                classify_submit(&e),
+                SubmitOutcome::Fatal,
+                "errno {code} should be fatal"
+            );
+        }
+    }
+
+    #[test]
+    fn an_error_without_an_errno_is_fatal() {
+        // Nothing is known about the ring, so the safe reading is fatal.
+        let e: io::Result<usize> = Err(io::Error::other("no errno"));
+        assert_eq!(classify_submit(&e), SubmitOutcome::Fatal);
     }
 }
