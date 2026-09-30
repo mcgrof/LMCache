@@ -2181,7 +2181,13 @@ impl RawBlockDevice {
                                     resident_sqes = ring_clone.submission_len() > 0;
                                 }
                                 SubmitOutcome::Retryable => {
-                                    resident_sqes = true;
+                                    // The call consumed nothing, so whatever
+                                    // was resident still is. Ask the ring
+                                    // rather than assuming: a retryable error
+                                    // on an already-empty ring would
+                                    // otherwise make the worker keep flushing
+                                    // nothing.
+                                    resident_sqes = ring_clone.submission_len() > 0;
                                 }
                                 SubmitOutcome::Fatal => {
                                     // The same outcome the initial submission
@@ -2311,7 +2317,6 @@ impl RawBlockDevice {
                                 }
                             }
 
-                            let built_count = built_submissions.len();
                             let submit_result = submit_ring(
                                 &ring_clone,
                                 #[cfg(feature = "fault-injection")]
@@ -2320,18 +2325,19 @@ impl RawBlockDevice {
                             // Classified the same way as the resident flush.
                             let outcome = classify_submit(&submit_result);
                             match submit_result {
-                                Ok(submitted) => {
-                                    // Any remaining requests in batch that weren't submitted
-                                    // will be retried in the next iteration of the loop
+                                Ok(_) => {
                                     // An SQE the kernel did not take is still
                                     // resident in the ring and the next submit
                                     // delivers it. Requeuing it would issue the
                                     // same I/O twice and point the resident copy
                                     // at a bounce buffer whose owner has already
                                     // been released, so ownership stays here.
-                                    if submitted < built_count {
-                                        resident_sqes = true;
-                                    }
+                                    //
+                                    // What is resident is what the ring says is
+                                    // resident. Deriving it from the returned
+                                    // count instead makes the answer depend on
+                                    // a number this worker did not observe.
+                                    resident_sqes = ring_clone.submission_len() > 0;
                                 }
                                 Err(e) => {
                                     match outcome {
@@ -2342,9 +2348,7 @@ impl RawBlockDevice {
                                             // still owned by its in_flight entry.
                                             // Reaping completions frees room and
                                             // the retry delivers the same SQEs.
-                                            if built_count > 0 {
-                                                resident_sqes = true;
-                                            }
+                                            resident_sqes = ring_clone.submission_len() > 0;
                                         }
                                         SubmitOutcome::Fatal => {
                                             // Error: fail all pending submissions in this batch.
