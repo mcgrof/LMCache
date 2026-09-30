@@ -15,6 +15,7 @@ import importlib.util
 import os
 import stat
 import sys
+import threading
 import types
 
 # Third Party
@@ -28,6 +29,10 @@ from lmcache.v1.storage_backend.raw_block import (
     RawBlockCoreConfig,
     encode_object_key,
     normalize_raw_block_placement_ids,
+)
+from lmcache.v1.storage_backend.raw_block.core import (
+    IO_PATH_IOURING_BATCHED,
+    RawBlockIoLedger,
 )
 from tests.v1.storage_backend.raw_block_test_utils import (
     RAW_BLOCK_CI_BLOCK_ALIGN,
@@ -2012,14 +2017,14 @@ def test_raw_block_core_refuses_to_read_once_the_outcome_is_unknown(tmp_path):
         core.close()
 
 
-def test_raw_block_core_keeps_its_four_byte_counts_apart(tmp_path):
-    """One number cannot answer four questions about bytes.
+def test_raw_block_core_counts_payload_apart_from_metadata(tmp_path):
+    """Slot headers and checkpoints are not cache payload.
 
-    What a caller handed over, what was already on the device and so was
-    never written again, what physical length the ring was given, and what
-    the device reported finishing are four different quantities. Reporting
-    any one of them as "bytes written" overstates or understates another,
-    and a deduplicated hit is not device traffic at all.
+    Adding them into one total produces a number that answers no question,
+    and the question it is most often asked -- did the direct path carry
+    the KV -- least of all. Every put writes a header beside its payload,
+    so a merged total is always larger than the payload by an amount that
+    depends on the header size.
     """
     path = make_raw_block_file(tmp_path)
     config = replace(make_raw_block_core_config(path), io_engine="io_uring")
@@ -2029,22 +2034,85 @@ def test_raw_block_core_keeps_its_four_byte_counts_apart(tmp_path):
         key = encode_object_key(make_object_key(71))
         assert core.put_many([key], [make_memory_obj(payload)]).results == [True]
 
-        first = core.report_status()
-        assert first["bytes_logical"] > 0
-        assert first["bytes_deduplicated"] == 0
+        status = core.report_status()
+        writes = status["payload_writes"]
+        assert writes["requested_operations"] == 1
+        assert writes["requested_logical_bytes"] == len(payload)
         # Padding to the block size means more reached the device than the
-        # caller handed over, which is exactly why these are separate.
-        assert first["bytes_submitted_padded"] >= first["bytes_logical"]
-        assert first["bytes_completed"] == first["bytes_submitted_padded"]
+        # caller handed over, which is why these are separate.
+        assert writes["requested_padded_bytes"] >= len(payload)
+        assert writes["completed_operations"] == 1
+        assert writes["completed_padded_bytes"] == writes["requested_padded_bytes"]
 
-        # The same key again is a hit. Nothing is submitted and nothing
-        # completes, and the logical total does not move either.
+        rows = status["io_by_kind_and_path"]
+        header_rows = [name for name in rows if "slot_header" in name]
+        assert header_rows, "the header this put wrote is counted somewhere"
+        for name in header_rows:
+            assert rows[name]["requested_operations"] >= 1
+        assert not any("payload" in name and "read" in name for name in rows), (
+            "nothing has been read yet"
+        )
+    finally:
+        core.close()
+
+
+def test_raw_block_core_counts_a_read_and_says_which_path_ran(tmp_path):
+    """A read that moved bytes must not leave every total at zero.
+
+    The counters covered writes only, so a load reported nothing at all --
+    which makes them useless for the one claim they exist to support: that
+    a direct path carried payload in both directions and no fallback path
+    carried any.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        payload = b"b" * 128
+        key = encode_object_key(make_object_key(72))
         assert core.put_many([key], [make_memory_obj(payload)]).results == [True]
-        second = core.report_status()
-        assert second["bytes_deduplicated"] == len(payload)
-        assert second["bytes_logical"] == first["bytes_logical"]
-        assert second["bytes_submitted_padded"] == first["bytes_submitted_padded"]
-        assert second["bytes_completed"] == first["bytes_completed"]
+        destination = make_memory_obj(b"\x00" * len(payload))
+        assert core.load_many_into([key.encoded], [destination]) == [True]
+
+        status = core.report_status()
+        reads = status["payload_reads"]
+        assert reads["requested_operations"] == 1
+        assert reads["requested_logical_bytes"] == len(payload)
+        assert reads["completed_operations"] == 1
+        assert reads["completed_padded_bytes"] > 0
+
+        # And the row names the route that actually ran, so a fallback
+        # carrying bytes is visible rather than folded into one total.
+        rows = status["io_by_kind_and_path"]
+        assert "read/payload/iouring_batched" in rows
+        assert "read/payload/sync" not in rows
+    finally:
+        core.close()
+
+
+def test_raw_block_core_does_not_call_a_deduplicated_hit_device_traffic(tmp_path):
+    """A key already on the device is not written again.
+
+    A hit moves no bytes, so nothing may be requested and nothing may
+    complete; the deduplicated total is where it is recorded, and it is
+    not an I/O quantity.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        payload = b"c" * 100
+        key = encode_object_key(make_object_key(73))
+        assert core.put_many([key], [make_memory_obj(payload)]).results == [True]
+        before = core.report_status()
+
+        assert core.put_many([key], [make_memory_obj(payload)]).results == [True]
+        after = core.report_status()
+
+        assert after["bytes_deduplicated"] == len(payload)
+        assert before["bytes_deduplicated"] == 0
+        assert after["payload_writes"] == before["payload_writes"]
+        assert after["io_by_kind_and_path"] == before["io_by_kind_and_path"]
     finally:
         core.close()
 
@@ -2109,7 +2177,9 @@ def test_raw_block_core_still_drops_an_entry_whose_header_is_not_its_own(tmp_pat
         assert core.put_many([key], [make_memory_obj(b"stale")]).results == [True]
         slot = core._offset_to_slot(int(core._index[key.encoded].offset))
 
-        def _bytes_that_are_not_ours(offsets, buffers, payload_lens, total_lens):
+        def _bytes_that_are_not_ours(
+            offsets, buffers, payload_lens, total_lens, kinds=None
+        ):
             for buf in buffers:
                 buf[:] = b"\x00" * len(buf)
             return [True] * len(offsets)
@@ -2146,7 +2216,9 @@ def test_raw_block_core_withholds_a_dropped_entry_when_it_cannot_say(tmp_path):
         assert core.put_many([key], [make_memory_obj(b"stale")]).results == [True]
         slot = core._offset_to_slot(int(core._index[key.encoded].offset))
 
-        def _bytes_that_are_not_ours(offsets, buffers, payload_lens, total_lens):
+        def _bytes_that_are_not_ours(
+            offsets, buffers, payload_lens, total_lens, kinds=None
+        ):
             for buf in buffers:
                 buf[:] = b"\x00" * len(buf)
             return [True] * len(offsets)
@@ -2336,3 +2408,78 @@ def test_raw_block_core_refuses_to_call_a_concurrent_close_a_proof(tmp_path):
             core._closed = False
             core._close_outcome = None
         core.close()
+
+
+def test_raw_block_core_counts_the_padded_write_route_it_actually_took(tmp_path):
+    """A padded O_DIRECT payload completes on a route of its own.
+
+    Its logical length differs from its physical one, which a single
+    per-entry length cannot express, so it goes one write at a time
+    instead of as a batch. That route waits inside the call and raises on
+    failure, so returning is its completion -- and counting only the
+    batched route reported zero completed bytes for writes that had
+    landed, which is most of them under O_DIRECT.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(
+        make_raw_block_core_config(path),
+        io_engine="io_uring",
+        use_odirect=True,
+    )
+    try:
+        core = RawBlockCore(config, key_namespace="object")
+    except Exception as exc:  # pragma: no cover - depends on the filesystem
+        if is_skip_safe_io_error(exc):
+            pytest.skip(f"O_DIRECT unavailable on this path: {exc}")
+        raise
+    try:
+        payload = b"d" * 100
+        key = encode_object_key(make_object_key(74))
+        assert core.put_many([key], [make_memory_obj(payload)]).results == [True]
+
+        status = core.report_status()
+        rows = status["io_by_kind_and_path"]
+        assert "write/payload/iouring_per_write" in rows, sorted(rows)
+        row = rows["write/payload/iouring_per_write"]
+        assert row["requested_operations"] == 1
+        assert row["requested_logical_bytes"] == len(payload)
+        assert row["requested_padded_bytes"] > len(payload), "the write was padded"
+        assert row["completed_operations"] == 1
+        assert row["completed_padded_bytes"] == row["requested_padded_bytes"]
+
+        writes = status["payload_writes"]
+        assert writes["completed_padded_bytes"] == row["completed_padded_bytes"]
+    finally:
+        core.close()
+
+
+def test_raw_block_io_ledger_totals_are_exact_under_concurrency():
+    """An approximate total cannot answer "was it zero".
+
+    The certification these counters exist for is that a fallback route
+    carried no payload. A lost increment under concurrent writers makes
+    the delta between two runs approximate, and an approximate zero is
+    not a zero. Every update therefore takes the lock.
+    """
+    ledger = RawBlockIoLedger()
+    writers = 8
+    per_writer = 500
+
+    def _hammer() -> None:
+        for _ in range(per_writer):
+            ledger.requested("write", IO_PATH_IOURING_BATCHED, ["payload"], [7], [8])
+            ledger.completed("write", IO_PATH_IOURING_BATCHED, ["payload"], [8], [True])
+
+    threads = [threading.Thread(target=_hammer) for _ in range(writers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+
+    total = ledger.totals(direction="write", kind="payload")
+    assert total.requested_operations == writers * per_writer
+    assert total.requested_logical_bytes == writers * per_writer * 7
+    assert total.requested_padded_bytes == writers * per_writer * 8
+    assert total.completed_operations == writers * per_writer
+    assert total.completed_padded_bytes == writers * per_writer * 8

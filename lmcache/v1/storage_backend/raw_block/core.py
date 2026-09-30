@@ -271,6 +271,130 @@ class RawBlockDerivationDescriptor:
         ]
 
 
+# What a byte moving through this engine was for. A header commits a slot
+# and a checkpoint commits an index; neither is cache payload, and adding
+# them together produces a number that answers no question -- "did the
+# direct path carry the KV" least of all.
+IO_KIND_PAYLOAD = "payload"
+IO_KIND_SLOT_HEADER = "slot_header"
+IO_KIND_CHECKPOINT = "checkpoint"
+
+# Which route actually carried it. Recorded where the route is chosen
+# rather than where it was asked for, because what an operator needs to
+# know is which path ran, not which one the configuration implies.
+IO_PATH_SYNC = "sync"
+IO_PATH_IOURING_BATCHED = "iouring_batched"
+IO_PATH_IOURING_BOUNDED = "iouring_bounded"
+IO_PATH_IOURING_PER_WRITE = "iouring_per_write"
+
+
+@dataclass
+class RawBlockIoTally:
+    """One direction, one kind and one path, counted three ways.
+
+    ``requested`` is what this engine asked the device for. ``completed``
+    is what the device reported finishing. They are kept apart because the
+    difference between them is the whole question: a submission with no
+    completion is an operation whose outcome nobody established.
+    """
+
+    requested_operations: int = 0
+    requested_logical_bytes: int = 0
+    requested_padded_bytes: int = 0
+    completed_operations: int = 0
+    completed_padded_bytes: int = 0
+
+    def as_payload(self) -> dict[str, int]:
+        return {
+            "requested_operations": self.requested_operations,
+            "requested_logical_bytes": self.requested_logical_bytes,
+            "requested_padded_bytes": self.requested_padded_bytes,
+            "completed_operations": self.completed_operations,
+            "completed_padded_bytes": self.completed_padded_bytes,
+        }
+
+
+class RawBlockIoLedger:
+    """Count what each route moved, exactly enough to subtract two runs.
+
+    Every update takes the lock. These are small integer additions on a
+    path that already performs a device I/O, and the alternative -- lost
+    concurrent increments -- makes a delta approximate, which is exactly
+    what cannot be used to certify that a fallback path carried nothing.
+    A total that is only nearly right cannot answer "was it zero".
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._tallies: dict[tuple[str, str, str], RawBlockIoTally] = {}
+
+    def _tally_locked(self, key: tuple[str, str, str]) -> RawBlockIoTally:
+        tally = self._tallies.get(key)
+        if tally is None:
+            tally = RawBlockIoTally()
+            self._tallies[key] = tally
+        return tally
+
+    def requested(
+        self,
+        direction: str,
+        path: str,
+        kinds: Sequence[str],
+        payload_lens: Sequence[int],
+        total_lens: Sequence[int],
+    ) -> None:
+        """Record operations this engine asked the device to perform."""
+        with self._lock:
+            for kind, payload_len, total_len in zip(
+                kinds, payload_lens, total_lens, strict=True
+            ):
+                tally = self._tally_locked((direction, kind, path))
+                tally.requested_operations += 1
+                tally.requested_logical_bytes += int(payload_len)
+                tally.requested_padded_bytes += int(total_len)
+
+    def completed(
+        self,
+        direction: str,
+        path: str,
+        kinds: Sequence[str],
+        total_lens: Sequence[int],
+        succeeded: Sequence[bool],
+    ) -> None:
+        """Record operations the device reported finishing."""
+        with self._lock:
+            for kind, total_len, ok in zip(kinds, total_lens, succeeded, strict=False):
+                if not ok:
+                    continue
+                tally = self._tally_locked((direction, kind, path))
+                tally.completed_operations += 1
+                tally.completed_padded_bytes += int(total_len)
+
+    def snapshot(self) -> dict[str, dict[str, int]]:
+        """Take every tally as flat rows, keyed "direction/kind/path"."""
+        with self._lock:
+            return {
+                f"{direction}/{kind}/{path}": tally.as_payload()
+                for (direction, kind, path), tally in sorted(self._tallies.items())
+            }
+
+    def totals(self, *, direction: str = "", kind: str = "") -> RawBlockIoTally:
+        """Add up the rows matching a direction and kind, or all of them."""
+        summed = RawBlockIoTally()
+        with self._lock:
+            for (row_direction, row_kind, _path), tally in self._tallies.items():
+                if direction and row_direction != direction:
+                    continue
+                if kind and row_kind != kind:
+                    continue
+                summed.requested_operations += tally.requested_operations
+                summed.requested_logical_bytes += tally.requested_logical_bytes
+                summed.requested_padded_bytes += tally.requested_padded_bytes
+                summed.completed_operations += tally.completed_operations
+                summed.completed_padded_bytes += tally.completed_padded_bytes
+        return summed
+
+
 def device_says_outcome_is_unknown(device: Any) -> bool:
     """Ask a device whether it has stopped being able to say, failing closed.
 
@@ -579,10 +703,17 @@ class RawBlockCore:
     _quarantined_slots: Optional[dict[int, None]] = None
     # Byte counters, declared here for the same reason: they are metrics, and
     # a core built without __init__ must still be able to add to them.
-    _bytes_logical: int = 0
+    # Bytes this engine never had to write because the key was already on
+    # the device. Not an I/O quantity, so it is not in the ledger.
     _bytes_deduplicated: int = 0
-    _bytes_submitted_padded: int = 0
-    _bytes_completed: int = 0
+    # The I/O ledger, declared on the class so it exists however the core
+    # was built. Several tests construct one through __new__ without
+    # running __init__, and accounting that only exists when the
+    # initializer ran is accounting missing from paths that use it. It
+    # cannot be a shared class-level instance: two cores would add into
+    # one ledger, so it is created per instance on first use.
+    _io_ledger_instance: Optional["RawBlockIoLedger"] = None
+    _io_ledger_creation_lock = threading.Lock()
     # What the first close established. Read by a repeat close, which must
     # not reach the device accessor and open one that knows nothing.
     _close_outcome: Optional["RawBlockCloseOutcome"] = None
@@ -802,10 +933,8 @@ class RawBlockCore:
         # block padding; completed is what the device reported finishing.
         # Reporting any one of these as "bytes written" overstates or
         # understates a different one.
-        self._bytes_logical = 0
         self._bytes_deduplicated = 0
-        self._bytes_submitted_padded = 0
-        self._bytes_completed = 0
+        self._io_ledger_instance = RawBlockIoLedger()
         self._free_slots_by_placement_id: dict[int, dict[int, None]] = {}
         self._slot_placement_ids: dict[int, int] = {}
         self._fdp_slot_affinity_hit_count: int = 0
@@ -1412,6 +1541,7 @@ class RawBlockCore:
             read_buffers: list[Any] = []
             read_payload_lens: list[int] = []
             read_total_lens: list[int] = []
+            read_kinds: list[str] = []
 
             for i, (encoded_key, entry) in enumerate(items):
                 if entry is None:
@@ -1459,6 +1589,7 @@ class RawBlockCore:
                     read_buffers.append(read_buffer)
                     read_payload_lens.append(read_payload_len)
                     read_total_lens.append(total_len)
+                    read_kinds.append(IO_KIND_PAYLOAD)
                 except Exception as e:
                     logger.error("RawBlockCore load failed for %s: %s", encoded_key, e)
 
@@ -1478,12 +1609,14 @@ class RawBlockCore:
                         read_buffers.append(hdr)
                         read_payload_lens.append(self.header_bytes)
                         read_total_lens.append(self.header_bytes)
+                        read_kinds.append(IO_KIND_SLOT_HEADER)
                 try:
                     io_results = self._read_buffers(
                         read_offsets,
                         read_buffers,
                         read_payload_lens,
                         read_total_lens,
+                        read_kinds,
                     )
                 except Exception as e:
                     logger.error("RawBlockCore batched load failed: %s", e)
@@ -1840,8 +1973,27 @@ class RawBlockCore:
         """
         return self._poisoned
 
+    @property
+    def _io_ledger(self) -> "RawBlockIoLedger":
+        """This core's I/O ledger, created on first use."""
+        ledger = self._io_ledger_instance
+        if ledger is None:
+            with RawBlockCore._io_ledger_creation_lock:
+                ledger = self._io_ledger_instance
+                if ledger is None:
+                    ledger = RawBlockIoLedger()
+                    self._io_ledger_instance = ledger
+        return ledger
+
     def report_status(self) -> dict:
-        """Return raw-block health, layout, metadata, and in-flight counters."""
+        """Return raw-block health, layout, metadata, and I/O accounting.
+
+        The payload rows are summed outside this core's lock because the
+        ledger has its own; taking both in one order here and the other way
+        anywhere else is how a deadlock is built.
+        """
+        payload_writes = self._io_ledger.totals(direction="write", kind=IO_KIND_PAYLOAD)
+        payload_reads = self._io_ledger.totals(direction="read", kind=IO_KIND_PAYLOAD)
         with self._lock:
             return {
                 "is_healthy": not self._closed and not self._poisoned,
@@ -1861,10 +2013,10 @@ class RawBlockCore:
                 ),
                 "free_slot_count": len(self._free_slots),
                 "quarantined_slot_count": len(self._quarantined_slots or {}),
-                "bytes_logical": self._bytes_logical,
                 "bytes_deduplicated": self._bytes_deduplicated,
-                "bytes_submitted_padded": self._bytes_submitted_padded,
-                "bytes_completed": self._bytes_completed,
+                "payload_writes": payload_writes.as_payload(),
+                "payload_reads": payload_reads.as_payload(),
+                "io_by_kind_and_path": self._io_ledger.snapshot(),
                 "next_slot": self._next_slot,
                 "max_slots": self._max_slots,
                 "metadata_seq": self._meta_seq,
@@ -2241,6 +2393,7 @@ class RawBlockCore:
         payload_lens: Sequence[int],
         total_lens: Sequence[int],
         placement_ids: Sequence[PlacementId] | None = None,
+        kinds: Sequence[str] | None = None,
     ) -> None:
         """Write buffers as chunks bounded by ``max_data_transfer_size``.
 
@@ -2262,19 +2415,31 @@ class RawBlockCore:
         chunk_buffers: list[memoryview] = []
         chunk_lens: list[int] = []
         chunk_placement_ids: list[PlacementId] = []
+        # One entry per chunk, so a completion bitmap that is per chunk can
+        # still be attributed to the logical write's kind.
+        chunk_kinds: list[str] = []
         keepalive: list[memoryview] = []
         per_write_placement_ids = normalize_raw_block_placement_ids(
             placement_ids,
             len(offsets),
             field_name="placement_ids",
         )
+        write_kinds = self._normalize_io_kinds(kinds, len(offsets))
+        self._io_ledger.requested(
+            "write",
+            IO_PATH_IOURING_BOUNDED,
+            write_kinds,
+            payload_lens,
+            total_lens,
+        )
 
-        for offset, buf, payload_len, total_len, placement_id in zip(
+        for offset, buf, payload_len, total_len, placement_id, kind in zip(
             offsets,
             buffers,
             payload_lens,
             total_lens,
             per_write_placement_ids,
+            write_kinds,
             strict=True,
         ):
             offset = int(offset)
@@ -2301,6 +2466,7 @@ class RawBlockCore:
                 chunk_buffers.append(view[cursor : cursor + chunk_len])
                 chunk_lens.append(chunk_len)
                 chunk_placement_ids.append(placement_id)
+                chunk_kinds.append(kind)
                 cursor += chunk_len
 
         if not chunk_offsets:
@@ -2317,7 +2483,13 @@ class RawBlockCore:
             len(chunk_offsets),
             "bounded io_uring write",
         )
-        self._record_completed_bytes(completed, chunk_lens)
+        self._io_ledger.completed(
+            "write",
+            IO_PATH_IOURING_BOUNDED,
+            chunk_kinds,
+            chunk_lens,
+            completed,
+        )
         if not all(completed):
             raise RuntimeError("raw-block bounded io_uring write failed")
         keepalive.clear()
@@ -2328,6 +2500,7 @@ class RawBlockCore:
         buffers: Sequence[Any],
         payload_lens: Sequence[int],
         total_lens: Sequence[int],
+        kinds: Sequence[str] | None = None,
     ) -> list[bool]:
         """Read buffers as bounded NVMe raw-command chunks.
 
@@ -2351,6 +2524,14 @@ class RawBlockCore:
         chunk_statuses: list[list[bool]] = [[] for _ in offsets]
         copy_back_targets: dict[int, tuple[memoryview, memoryview, int]] = {}
         keepalive: list[Any] = []
+        read_kinds = self._normalize_io_kinds(kinds, len(offsets))
+        self._io_ledger.requested(
+            "read",
+            IO_PATH_IOURING_BOUNDED,
+            read_kinds,
+            payload_lens,
+            total_lens,
+        )
 
         for logical_idx, (offset, buf, payload_len, total_len) in enumerate(
             zip(offsets, buffers, payload_lens, total_lens, strict=True)
@@ -2410,6 +2591,13 @@ class RawBlockCore:
         except Exception:
             return results
 
+        self._io_ledger.completed(
+            "read",
+            IO_PATH_IOURING_BOUNDED,
+            [read_kinds[idx] for idx in chunk_logical_indices],
+            chunk_lens,
+            chunk_results,
+        )
         for chunk_idx, logical_idx in enumerate(chunk_logical_indices):
             ok = chunk_idx < len(chunk_results) and bool(chunk_results[chunk_idx])
             chunk_statuses[logical_idx].append(ok)
@@ -2432,6 +2620,7 @@ class RawBlockCore:
         payload_lens: Sequence[int],
         total_lens: Sequence[int],
         placement_ids: Sequence[PlacementId] | None = None,
+        kinds: Sequence[str] | None = None,
     ) -> None:
         """Write one or more buffers through the configured Rust I/O path.
 
@@ -2453,20 +2642,22 @@ class RawBlockCore:
             len(offsets),
             field_name="placement_ids",
         )
-        # Counted here, where the physical lengths are known and before any
-        # of them can fail: submitted is what was asked of the device, which
-        # is a different quantity from what it reported finishing. These are
-        # metrics, not invariants, so they are not worth the lock -- a lost
-        # update under concurrency costs an approximate total and nothing
-        # decides anything on it.
-        self._bytes_logical += sum(int(n) for n in payload_lens)
-        self._bytes_submitted_padded += sum(int(n) for n in total_lens)
+        write_kinds = self._normalize_io_kinds(kinds, len(offsets))
 
         if self.io_engine != "io_uring":
-            for offset, buf, payload_len, total_len in zip(
-                offsets, buffers, payload_lens, total_lens, strict=True
+            # Recorded against the route that is about to run, so the row
+            # names what carried the bytes. A synchronous write returning
+            # is its completion: there is no separate reported outcome.
+            self._io_ledger.requested(
+                "write", IO_PATH_SYNC, write_kinds, payload_lens, total_lens
+            )
+            for offset, buf, payload_len, total_len, kind in zip(
+                offsets, buffers, payload_lens, total_lens, write_kinds, strict=True
             ):
                 raw_dev.pwrite_from_buffer(offset, buf, payload_len, total_len)
+                self._io_ledger.completed(
+                    "write", IO_PATH_SYNC, [kind], [total_len], [True]
+                )
             return
 
         if self.max_data_transfer_size > 0:
@@ -2476,6 +2667,7 @@ class RawBlockCore:
                 payload_lens,
                 total_lens,
                 per_write_placement_ids,
+                write_kinds,
             )
             return
 
@@ -2488,6 +2680,13 @@ class RawBlockCore:
         # write_uring, which takes both lengths and lets Rust build the aligned
         # padded transfer.
         if can_batch:
+            self._io_ledger.requested(
+                "write",
+                IO_PATH_IOURING_BATCHED,
+                write_kinds,
+                payload_lens,
+                total_lens,
+            )
             batch_id = raw_dev.batched_write(
                 [int(offset) for offset in offsets],
                 list(buffers),
@@ -2500,7 +2699,13 @@ class RawBlockCore:
                 len(offsets),
                 "io_uring write",
             )
-            self._record_completed_bytes(completed, total_lens)
+            self._io_ledger.completed(
+                "write",
+                IO_PATH_IOURING_BATCHED,
+                write_kinds,
+                total_lens,
+                completed,
+            )
             if not all(completed):
                 raise RuntimeError("raw-block io_uring write failed")
             return
@@ -2510,12 +2715,20 @@ class RawBlockCore:
         # worker's verdict. Without it a padded O_DIRECT write that the
         # worker quarantined leaves the core healthy, and the extent it rolls
         # back is handed to the very next request.
-        for offset, buf, payload_len, total_len, placement_id in zip(
+        self._io_ledger.requested(
+            "write",
+            IO_PATH_IOURING_PER_WRITE,
+            write_kinds,
+            payload_lens,
+            total_lens,
+        )
+        for offset, buf, payload_len, total_len, placement_id, kind in zip(
             offsets,
             buffers,
             payload_lens,
             total_lens,
             per_write_placement_ids,
+            write_kinds,
             strict=True,
         ):
             try:
@@ -2525,6 +2738,14 @@ class RawBlockCore:
             except BaseException:
                 self._adopt_native_poison(raw_dev, "io_uring write")
                 raise
+            # This route waits inside the call and raises on failure, so
+            # returning is the outcome. Leaving it uncounted reported zero
+            # completed bytes for a write that had landed -- and this is
+            # the route a padded O_DIRECT payload takes, which is most of
+            # them.
+            self._io_ledger.completed(
+                "write", IO_PATH_IOURING_PER_WRITE, [kind], [total_len], [True]
+            )
 
     def _read_buffers(
         self,
@@ -2532,6 +2753,7 @@ class RawBlockCore:
         buffers: Sequence[Any],
         payload_lens: Sequence[int],
         total_lens: Sequence[int],
+        kinds: Sequence[str] | None = None,
     ) -> list[bool]:
         """Read one or more buffers through the configured Rust I/O path.
 
@@ -2551,16 +2773,23 @@ class RawBlockCore:
                 reads are submitted.
         """
         raw_dev = self._rawdev()
+        read_kinds = self._normalize_io_kinds(kinds, len(offsets))
         if self.io_engine != "io_uring":
+            self._io_ledger.requested(
+                "read", IO_PATH_SYNC, read_kinds, payload_lens, total_lens
+            )
             results: list[bool] = []
-            for offset, buf, payload_len, total_len in zip(
-                offsets, buffers, payload_lens, total_lens, strict=True
+            for offset, buf, payload_len, total_len, kind in zip(
+                offsets, buffers, payload_lens, total_lens, read_kinds, strict=True
             ):
                 try:
                     raw_dev.pread_into(offset, buf, payload_len, total_len)
                     results.append(True)
                 except Exception:
                     results.append(False)
+                self._io_ledger.completed(
+                    "read", IO_PATH_SYNC, [kind], [total_len], [results[-1]]
+                )
             return results
 
         if self.max_data_transfer_size > 0:
@@ -2569,36 +2798,54 @@ class RawBlockCore:
                 buffers,
                 payload_lens,
                 total_lens,
+                read_kinds,
             )
 
+        self._io_ledger.requested(
+            "read",
+            IO_PATH_IOURING_BATCHED,
+            read_kinds,
+            payload_lens,
+            total_lens,
+        )
         batch_id = raw_dev.batched_read(
             [int(offset) for offset in offsets],
             list(buffers),
             [int(total_len) for total_len in total_lens],
         )
-        return self._wait_iouring_results(
+        results = self._wait_iouring_results(
             raw_dev,
             batch_id,
             len(offsets),
             "io_uring read",
         )
-
-    def _record_completed_bytes(
-        self,
-        completed: Sequence[bool],
-        total_lens: Sequence[int],
-    ) -> None:
-        """Add up what the engine reported finishing, not what was asked.
-
-        The success bitmap is per operation, and the caller is the only thing
-        that knows each operation's physical length, so the two are joined
-        here. Keeping this apart from the submitted total is the point: a
-        submission that was never completed is exactly the difference an
-        operator needs to see.
-        """
-        self._bytes_completed += sum(
-            int(length) for ok, length in zip(completed, total_lens, strict=False) if ok
+        self._io_ledger.completed(
+            "read",
+            IO_PATH_IOURING_BATCHED,
+            read_kinds,
+            total_lens,
+            results,
         )
+        return results
+
+    @staticmethod
+    def _normalize_io_kinds(
+        kinds: Sequence[str] | None,
+        count: int,
+    ) -> list[str]:
+        """Give every operation a kind, defaulting to payload.
+
+        A caller that does not say is writing or reading cache payload --
+        the header and checkpoint routes are the ones that have to be
+        explicit, because they are the traffic that must not be added into
+        a payload total.
+        """
+        if kinds is None:
+            return [IO_KIND_PAYLOAD] * count
+        classified = list(kinds)
+        if len(classified) != count:
+            raise ValueError("io kinds must align with the operations")
+        return classified
 
     def _require_matching_key_namespace(self, theirs: Any) -> None:
         """Refuse a device whose entries were keyed in another namespace.
@@ -2775,6 +3022,7 @@ class RawBlockCore:
                     ],
                     [hdr_total, total_len],
                     [placement_id, placement_id],
+                    [IO_KIND_SLOT_HEADER, IO_KIND_PAYLOAD],
                 )
             finally:
                 with self._lock:
@@ -2977,6 +3225,7 @@ class RawBlockCore:
         payload_lens: list[int] = []
         total_lens: list[int] = []
         write_placement_ids: list[PlacementId] = []
+        write_kinds: list[str] = []
         prepared_plan: list[tuple[int, RawBlockKeySpec, MemoryObj, int]] = []
         write_succeeded = True
         for i, key, obj, offset, placement_id in write_plan:
@@ -3013,6 +3262,7 @@ class RawBlockCore:
             payload_lens.extend((hdr_total, payload_len))
             total_lens.extend((hdr_total, total_len))
             write_placement_ids.extend((placement_id, placement_id))
+            write_kinds.extend((IO_KIND_SLOT_HEADER, IO_KIND_PAYLOAD))
             prepared_plan.append((i, key, obj, offset))
 
         if prepared_plan:
@@ -3025,6 +3275,7 @@ class RawBlockCore:
                     payload_lens,
                     total_lens,
                     write_placement_ids,
+                    write_kinds,
                 )
             except Exception as e:
                 write_succeeded = False
@@ -3101,6 +3352,7 @@ class RawBlockCore:
                     [buf],
                     [self.header_bytes],
                     [self.header_bytes],
+                    [IO_KIND_SLOT_HEADER],
                 )
             ):
                 return "unreadable", None
@@ -3271,6 +3523,7 @@ class RawBlockCore:
                     [buf],
                     [self.block_align],
                     [self.block_align],
+                    [IO_KIND_CHECKPOINT],
                 )
             ):
                 return None
@@ -3300,7 +3553,13 @@ class RawBlockCore:
         buf = bytearray(total_len)
         try:
             if not all(
-                self._read_buffers([payload_off], [buf], [payload_len], [total_len])
+                self._read_buffers(
+                    [payload_off],
+                    [buf],
+                    [payload_len],
+                    [total_len],
+                    [IO_KIND_CHECKPOINT],
+                )
             ):
                 return None
         except Exception:
@@ -3496,6 +3755,7 @@ class RawBlockCore:
             [payload_len],
             [payload_total_len],
             [placement_id],
+            [IO_KIND_CHECKPOINT],
         )
         self._write_buffers(
             [target],
@@ -3503,6 +3763,7 @@ class RawBlockCore:
             [self.block_align],
             [self.block_align],
             [placement_id],
+            [IO_KIND_CHECKPOINT],
         )
 
         with self._lock:
