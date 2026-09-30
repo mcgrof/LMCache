@@ -24,7 +24,7 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::RawFd;
 use std::slice;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1540,6 +1540,10 @@ struct RawBlockDevice {
     // batch. Never cleared: the Python objects behind them must stay alive
     // while the device may still reach the memory they describe.
     quarantined_owners: Arc<Mutex<Vec<Py<PyAny>>>>,
+    // How many owners the terminal retention has taken. It takes them by
+    // forgetting the vector, so their count has to be recorded before it
+    // becomes unreadable.
+    retained_owners: Arc<AtomicUsize>,
     #[cfg(feature = "fault-injection")]
     fault_plan: Option<Arc<FaultPlan>>,
 }
@@ -2570,6 +2574,7 @@ impl RawBlockDevice {
             quarantined_batches: quarantined_batches_opt
                 .unwrap_or_else(|| Arc::new(Mutex::new(HashSet::new()))),
             poisoned: poisoned_opt.unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+            retained_owners: Arc::new(AtomicUsize::new(0)),
             quarantined_owners: quarantined_owners_opt
                 .unwrap_or_else(|| Arc::new(Mutex::new(Vec::new()))),
             #[cfg(feature = "fault-injection")]
@@ -3270,8 +3275,23 @@ impl RawBlockDevice {
     }
 
     /// How many Python buffer owners are retained for those batches.
+    ///
+    /// Live count only: the terminal retention takes the vector, so after
+    /// a refused close this reads zero. `retained_owner_count()` is the
+    /// one that survives it, and a caller sampling after a close wants
+    /// that.
     fn quarantined_owner_count(&self) -> usize {
         self.quarantined_owners.lock().unwrap().len()
+    }
+
+    /// How many buffer owners a refused close retained, for the process.
+    ///
+    /// Recorded when the retention takes them, because it takes them by
+    /// forgetting the vector and a length read afterwards is zero. A
+    /// counter that reports nothing retained, on the one path whose whole
+    /// purpose is retaining, is worse than no counter.
+    fn retained_owner_count(&self) -> usize {
+        self.retained_owners.load(Ordering::SeqCst)
     }
 
     #[pyo3(signature = (batch_id))]
@@ -4266,6 +4286,8 @@ impl RawBlockDevice {
         let swept = drain_batch_owners(&self.batched_buffer_objs, &self.quarantined_owners, None);
         let owners = std::mem::take(&mut *self.quarantined_owners.lock().unwrap());
         let owner_count = owners.len();
+        self.retained_owners
+            .fetch_add(owner_count, Ordering::SeqCst);
         std::mem::forget(owners);
         let registered = std::mem::take(&mut *self.fixed_buffer_map.lock().unwrap());
         std::mem::forget(registered);

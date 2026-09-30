@@ -191,28 +191,122 @@ UNPOLLED_OWNER_SCENARIO = textwrap.dedent(
 )
 
 
-def test_an_unpolled_batch_keeps_its_owners_through_close(tmp_path) -> None:
-    """Nobody has to poll for the ownership rule to hold.
+def _run_scenario(scenario: str, device: Path) -> dict:
+    """Run one scenario in its own interpreter and return its report.
 
-    A batch's Python owners used to move out of reach only when a caller
-    reached wait_iouring. A caller that never polls -- which is every caller
-    whose request was abandoned, cancelled, or whose engine is shutting
-    down -- left them where the device's own destructor would free them, and
-    freeing them returns their pool slices to an allocator. The close that
-    did so had just refused, on the grounds that it could not establish what
-    the device was doing.
+    A subprocess per scenario, because one interpreter cannot hold two
+    builds of one native module and the rest of the suite imports the
+    ordinary one.
     """
-    device = tmp_path / "dev.bin"
-    with open(device, "wb") as handle:
-        handle.truncate(64 * 1024 * 1024)
     result = subprocess.run(
-        [sys.executable, "-c", UNPOLLED_OWNER_SCENARIO, FAULT_EXT, str(device)],
+        [sys.executable, "-c", scenario, FAULT_EXT, str(device)],
         capture_output=True,
         text=True,
         timeout=180,
     )
     assert result.returncode == 0, result.stderr[-2000:]
-    report = json.loads(result.stdout.strip().splitlines()[-1])
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+UNSWEPT_HEALTHY_OWNER_SCENARIO = textwrap.dedent(
+    """
+    import gc, json, sys, time, weakref
+    sys.path.insert(0, sys.argv[1])
+    from lmcache_rust_raw_block_io import RawBlockDevice
+
+    dev = RawBlockDevice(
+        sys.argv[2], writable=True, use_iouring=True, use_odirect=False,
+        alignment=4096, iouring_queue_depth=8,
+    )
+
+    class Payload(bytearray):
+        pass
+
+    # A batch that completes normally and that nobody polls. Nothing marks
+    # it unknown, so the only thing that can take its owners out of reach
+    # is the terminal sweep.
+    healthy = Payload(b"h" * 4096)
+    healthy_alive = weakref.ref(healthy)
+    dev.batched_write([0], [healthy], [4096], [None])
+    # Wait for it to land before anything goes wrong. An entry still in
+    # flight when the fatal submit happens is failed by that path instead,
+    # which is a different rule being tested; the assertion on the owner
+    # count below fails loudly if this wait was not enough.
+    deadline = time.monotonic() + 10
+    while not dev.is_idle() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    # A second batch whose submit is fatal. That poisons the engine and
+    # makes the close refuse -- for a reason that has nothing to do with
+    # the first batch.
+    doomed = Payload(b"d" * 4096)
+    base = dev.submit_call_count()
+    dev.inject_submit_faults([(base, "fatal:5")])
+    dev.batched_write([4096], [doomed], [4096], [None])
+    deadline = time.monotonic() + 10
+    while not dev.is_poisoned() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    report = {
+        "poisoned": dev.is_poisoned(),
+        # Nothing marked the healthy batch, so before the close only the
+        # doomed one's owner has been moved.
+        "owners_before_close": dev.quarantined_owner_count(),
+    }
+    del healthy
+    del doomed
+    gc.collect()
+    try:
+        dev.close()
+        report["close"] = "returned"
+    except BaseException as exc:
+        report["close"] = type(exc).__name__
+    report["retained_after_close"] = dev.retained_owner_count()
+    del dev
+    gc.collect()
+    report["healthy_alive_after_drop"] = healthy_alive() is not None
+    print(json.dumps(report))
+    """
+)
+
+
+def test_a_refused_close_sweeps_every_batch_nobody_polled(tmp_path) -> None:
+    """The sweep is not only for the batches that were marked.
+
+    A batch can complete normally and never be polled, and then a close
+    can refuse for an unrelated reason -- another batch's fatal submit, or
+    a registration that would not come back. The registration the engine
+    is retaining covers whatever memory it named, including that batch's
+    buffers, so the terminal retention takes every batch rather than only
+    the ones something had already objected to.
+    """
+    device = tmp_path / "dev.bin"
+    with open(device, "wb") as handle:
+        handle.truncate(64 * 1024 * 1024)
+    report = _run_scenario(UNSWEPT_HEALTHY_OWNER_SCENARIO, device)
+    assert report["poisoned"] is True
+    assert report["close"] == "RuntimeError"
+    # One marked, one not. The sweep is the only thing that can reach the
+    # second, and the owner surviving the drop is what proves it did.
+    assert report["owners_before_close"] == 1, report
+    assert report["retained_after_close"] == 2, report
+    assert report["healthy_alive_after_drop"] is True
+
+
+def test_an_unpolled_batch_keeps_its_owners_through_close(tmp_path) -> None:
+    """Nobody has to poll for the ownership rule to hold.
+
+    A caller whose request was abandoned or cancelled, or whose engine is
+    shutting down, never reaches wait_iouring. If a batch's owners moved out
+    of reach only there, those callers leave them where the device's own
+    destructor frees them -- returning their pool slices to an allocator on
+    behalf of a close that has just refused, on the grounds that it could
+    not establish what the device was doing.
+    """
+    device = tmp_path / "dev.bin"
+    with open(device, "wb") as handle:
+        handle.truncate(64 * 1024 * 1024)
+    report = _run_scenario(UNPOLLED_OWNER_SCENARIO, device)
 
     assert report["poisoned"] is True
     assert report["quarantined_batches"] == 1

@@ -290,11 +290,13 @@ def test_a_proven_close_does_release_what_it_holds(backend):
 
 
 def test_closing_twice_does_not_release_twice(backend):
-    """A second close used to reopen the device to ask if it was healthy.
+    """A second close must not reach the device accessor.
 
-    The accessor builds a device when the core has none, so the question
-    itself created a new writable handle on the same path -- and then the
-    allocator was closed again. Measured as constructions=2, close_calls=2.
+    That accessor builds a device when the core has none, so asking a
+    closed core about its device's health opens a new writable handle on
+    the same path -- and then releases the allocator a second time. Two
+    constructions and two allocator closes, for a call that should do
+    nothing.
     """
     allocator = backend._gpu_allocator
     backend.close()
