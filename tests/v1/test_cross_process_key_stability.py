@@ -12,6 +12,7 @@ is the only way a per-process seed shows up.
 from __future__ import annotations
 
 # Standard
+import builtins
 import hashlib
 import os
 import subprocess
@@ -56,7 +57,14 @@ PROBE = textwrap.dedent(
     elif isinstance(witness, int):
         witness = format(witness & ((1 << 256) - 1), "x")
     print("WITNESS " + str(witness))
-    print("ROOT " + repr(getattr(database, "prefix_hash", None)))
+    # The chain root is the module's NONE_HASH, set at construction from the
+    # serving engine's own value. A "prefix_hash" attribute on the database
+    # is not it: reporting that reported nothing about the derivation every
+    # key in this namespace actually starts from.
+    # First Party
+    from lmcache.v1 import token_database as token_database_module
+
+    print("ROOT " + repr(token_database_module.NONE_HASH))
     print("|".join(str(key) for _, _, key in database.process_tokens(tokens)))
     """
 )
@@ -73,8 +81,15 @@ def _vllm_state() -> tuple[bool, str]:
     try:
         # Third Party
         import vllm  # noqa: F401
-    except ModuleNotFoundError:
-        return False, "not installed"
+    except ModuleNotFoundError as exc:
+        # Only vllm itself being absent is an absence. When vllm is installed
+        # and something it imports is not, the name that failed is that other
+        # module -- and reading every ModuleNotFoundError as "not installed"
+        # skips precisely the broken environment this contract exists to
+        # catch.
+        if exc.name == "vllm":
+            return False, "not installed"
+        return False, f"installed but unusable: missing {exc.name}"
     except Exception as exc:  # pragma: no cover - environment-specific
         return False, f"installed but unusable: {type(exc).__name__}: {exc}"
     return True, "usable"
@@ -170,6 +185,12 @@ def test_the_named_algorithm_is_the_one_actually_used():
     effective, _, extras = _probe("sha256_cbor", "0")
     witness = extras.get("WITNESS", "")
     expected = _expected_cbor_sha256()
+    # The chain root every key in a namespace starts from. Recorded because a
+    # matching hash function with a different root derives different keys.
+    assert "ROOT" in extras, extras
+    assert extras["ROOT"] not in ("", "None"), (
+        f"the probe could not report the effective chain root: {extras!r}"
+    )
     assert witness == expected, (
         f"sha256_cbor resolved to {effective!r}, which does not compute the "
         f"CBOR SHA-256 this contract names: it produced {witness!r} where "
@@ -200,3 +221,43 @@ def test_the_hash_seed_changes_the_keys_whichever_algorithm_is_named():
             "environment; the seed no longer has to match across nodes"
         )
     assert seeded != other
+
+
+@pytest.mark.parametrize(
+    ("failing_module", "expected"),
+    [
+        ("vllm", "not installed"),
+        ("vllm.thing", "installed but unusable"),
+        ("some_dependency", "installed but unusable"),
+    ],
+    ids=["absent", "broken-submodule", "broken-dependency"],
+)
+def test_a_broken_engine_install_is_not_read_as_an_absent_one(
+    monkeypatch: pytest.MonkeyPatch, failing_module: str, expected: str
+) -> None:
+    """An absence is a skip; a broken install is this environment's defect.
+
+    Reading every ``ModuleNotFoundError`` as "not installed" skips exactly the
+    case this contract exists to catch, where a deployment believes it
+    selected a documented hash function and is silently getting the
+    interpreter's.
+
+    The real ``_vllm_state`` is called with the import made to fail, rather
+    than the rule restated here: a test that reimplements the decision passes
+    whatever the decision does.
+    """
+    real_import = builtins.__import__
+
+    def failing_import(name, *args, **kwargs):
+        if name == "vllm":
+            raise ModuleNotFoundError(
+                f"No module named {failing_module!r}", name=failing_module
+            )
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", failing_import)
+    monkeypatch.delitem(sys.modules, "vllm", raising=False)
+
+    available, why = _vllm_state()
+    assert available is False
+    assert why.startswith(expected), why
