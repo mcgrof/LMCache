@@ -2810,8 +2810,19 @@ class RawBlockCore:
         payload_len = int.from_bytes(hdr[16:24], "little", signed=False)
         return slot_identity, payload_len
 
-    def _read_slot_header(self, offset: int) -> Optional[tuple[int, int]]:
-        """Read and decode the slot header at a raw-device offset."""
+    def _read_slot_header(
+        self, offset: int
+    ) -> tuple[str, Optional[tuple[int, int]]]:
+        """Read one slot header, saying which of three things happened.
+
+        ``"decoded"`` with the identity and length; ``"invalid"`` when bytes
+        arrived and are not one of ours; ``"unreadable"`` when the read did
+        not complete.
+
+        The third is not the same statement as the second, and collapsing
+        them is what let an I/O outcome nobody could establish look like
+        ordinary stale metadata -- which is recycled.
+        """
         buf = bytearray(self.header_bytes)
         try:
             with self._lock:
@@ -2824,10 +2835,13 @@ class RawBlockCore:
                     [self.header_bytes],
                 )
             ):
-                return None
-            return self._decode_slot_header(buf)
+                return "unreadable", None
+            decoded = self._decode_slot_header(buf)
+            if decoded is None:
+                return "invalid", None
+            return "decoded", decoded
         except Exception:
-            return None
+            return "unreadable", None
         finally:
             with self._lock:
                 self._inflight_io_count -= 1
@@ -3462,11 +3476,20 @@ class RawBlockCore:
     def _validate_loaded_entries(self) -> None:
         """Drop recovered entries whose slot headers do not match metadata."""
         to_drop: list[str] = []
+        unreadable: Optional[str] = None
         with self._lock:
             items = list(self._index.items())
 
         for encoded_key, entry in items:
-            slot_hdr = self._read_slot_header(int(entry.offset))
+            state, slot_hdr = self._read_slot_header(int(entry.offset))
+            if state == "unreadable":
+                # Not evidence this entry is stale -- evidence that the
+                # device did not answer. Dropping it and recycling its slot
+                # would be a decision made on no information, so validation
+                # stops and every entry it has not judged is kept. The same
+                # condition applies to all of them.
+                unreadable = encoded_key
+                break
             if slot_hdr is None:
                 to_drop.append(encoded_key)
                 continue
@@ -3485,6 +3508,15 @@ class RawBlockCore:
             if int(payload_len) != int(entry.size):
                 to_drop.append(encoded_key)
 
+        if unreadable is not None:
+            logger.error(
+                "RawBlockCore could not read the slot header for key %s; "
+                "stopping validation and keeping every entry it had not "
+                "judged. An unreadable header says the device did not "
+                "answer, not that the entry is stale.",
+                unreadable,
+            )
+
         if not to_drop:
             return
 
@@ -3493,7 +3525,10 @@ class RawBlockCore:
                 removed_entry = self._index.pop(encoded_key, None)
                 self._lock_refcnt.pop(encoded_key, None)
                 if removed_entry is not None:
-                    self._append_free_slot_locked(
+                    # A header that arrived and is not ours is a known
+                    # outcome, so ordinary recycling applies -- unless this
+                    # core has stopped being able to say, which this decides.
+                    self._release_submitted_slot_locked(
                         self._offset_to_slot(int(removed_entry.offset))
                     )
             self._meta_dirty_total += 1

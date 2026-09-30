@@ -2046,3 +2046,91 @@ def test_raw_block_core_keeps_its_four_byte_counts_apart(tmp_path):
         assert second["bytes_completed"] == first["bytes_completed"]
     finally:
         core.close()
+
+
+def test_raw_block_core_keeps_an_entry_whose_header_it_could_not_read(tmp_path):
+    """An unreadable header is not evidence that an entry is stale.
+
+    Header validation drops entries whose slot no longer names them and
+    recycles their extents. A read that did not complete says nothing about
+    the entry, so dropping it and handing its slot back would be a decision
+    made on no information -- and the slot may be one the device is still
+    writing.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        key = encode_object_key(make_object_key(61))
+        assert core.put_many([key], [make_memory_obj(b"kept")]).results == [True]
+        free_before = set(core._free_slots)
+
+        # The device stops answering, which is what an unknown read looks
+        # like from here.
+        core._read_buffers = lambda *args, **kwargs: [False]
+        core._validate_loaded_entries()
+
+        assert core.contains_key(key.encoded), "the entry was dropped on no evidence"
+        assert set(core._free_slots) == free_before
+        assert not (core._quarantined_slots or {})
+    finally:
+        core.close()
+
+
+def test_raw_block_core_still_drops_an_entry_whose_header_is_not_its_own(tmp_path):
+    """A header that arrived and does not name this key is a known outcome.
+
+    That is the case validation exists for, and it must keep working: the
+    entry goes and its extent is recyclable, because nothing is in flight.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        key = encode_object_key(make_object_key(62))
+        assert core.put_many([key], [make_memory_obj(b"stale")]).results == [True]
+        slot = core._offset_to_slot(int(core._index[key.encoded].offset))
+
+        def _bytes_that_are_not_ours(offsets, buffers, payload_lens, total_lens):
+            for buf in buffers:
+                buf[:] = b"\x00" * len(buf)
+            return [True] * len(offsets)
+
+        core._read_buffers = _bytes_that_are_not_ours
+        core._validate_loaded_entries()
+
+        assert not core.contains_key(key.encoded)
+        assert slot in core._free_slots
+        assert not (core._quarantined_slots or {})
+    finally:
+        core.close()
+
+
+def test_raw_block_core_withholds_a_dropped_entry_when_it_cannot_say(tmp_path):
+    """Even a known-bad header does not authorize recycling once poisoned.
+
+    The header says this entry is stale; poison says this engine cannot
+    establish what the device is doing with that extent. The second governs.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        key = encode_object_key(make_object_key(63))
+        assert core.put_many([key], [make_memory_obj(b"stale")]).results == [True]
+        slot = core._offset_to_slot(int(core._index[key.encoded].offset))
+
+        def _bytes_that_are_not_ours(offsets, buffers, payload_lens, total_lens):
+            for buf in buffers:
+                buf[:] = b"\x00" * len(buf)
+            return [True] * len(offsets)
+
+        core._read_buffers = _bytes_that_are_not_ours
+        core._poisoned = True
+        core._validate_loaded_entries()
+
+        assert not core.contains_key(key.encoded)
+        assert slot not in core._free_slots
+        assert slot in (core._quarantined_slots or {})
+    finally:
+        core.close()
