@@ -504,3 +504,53 @@ async def test_endpoint_releases_its_permit_once_on_the_successful_path(
     assert list(proxy.app.state.storage_pd_active) == []
     assert semaphore.held == 0
     assert semaphore.releases == 1, "the permit was released more than once"
+
+
+def test_a_budget_of_one_token_is_refused_rather_than_forwarded() -> None:
+    """A handoff spends one token on the prefiller, so one is not enough.
+
+    Forwarding it gave the decoder a budget of zero, which the engine
+    rejects, so the request failed further away from the cause.
+    """
+    with pytest.raises(ValueError, match="at least 2 tokens"):
+        proxy.take_prefill_budget({"max_tokens": 1})
+    with pytest.raises(ValueError, match="at least 2 tokens"):
+        proxy.take_prefill_budget({"max_completion_tokens": 1})
+
+
+def test_a_request_with_no_budget_at_all_is_refused_by_name() -> None:
+    with pytest.raises(ValueError, match="needs max_tokens"):
+        proxy.take_prefill_budget({"prompt": [1, 2, 3]})
+
+
+def test_the_chat_spelling_of_the_budget_is_accepted() -> None:
+    """A chat request may carry only max_completion_tokens.
+
+    Reading max_tokens unconditionally raised KeyError and returned 500.
+    """
+    req = {"max_completion_tokens": 8}
+    assert proxy.take_prefill_budget(req) == 8
+    # The prefiller is given exactly one token whichever spelling arrived.
+    assert req["max_tokens"] == 1
+
+
+def test_a_producer_with_no_first_token_does_not_corrupt_the_prompt() -> None:
+    """A missing id is not appended.
+
+    The prompt is what the decoder continues from, so appending None makes
+    it unparseable rather than merely one token shorter.
+    """
+    req = {"prompt": [1, 2, 3]}
+    assert proxy.adopt_prefill_first_token(req, {"kv_transfer_params": {}}) is None
+    assert req["prompt"] == [1, 2, 3]
+    assert proxy.adopt_prefill_first_token(req, {}) is None
+    assert req["prompt"] == [1, 2, 3]
+
+
+def test_a_producer_first_token_is_carried_into_the_prompt() -> None:
+    req = {"prompt": [1, 2, 3]}
+    first = proxy.adopt_prefill_first_token(
+        req, {"kv_transfer_params": {"first_tok": 77}}
+    )
+    assert first == 77
+    assert req["prompt"] == [1, 2, 3, 77]

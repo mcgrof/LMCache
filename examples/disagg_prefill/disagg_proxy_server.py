@@ -514,6 +514,51 @@ storage_pd_ack_endpoints: dict[str, str] = {}
 storage_pd_ack_sockets: dict[str, Any] = {}
 
 
+def take_prefill_budget(req_data: dict) -> int:
+    """Read the caller's token budget and give the prefiller one token.
+
+    A handoff spends one token on the prefiller, so a request asking for a
+    single token leaves the decoder none, which the engine rejects. Refuse it
+    here, naming the reason, rather than forwarding a request that cannot be
+    served. The chat spelling is accepted too: a request carrying only
+    ``max_completion_tokens`` used to raise a KeyError and return 500.
+    """
+    budget = req_data.get("max_tokens")
+    if budget is None:
+        budget = req_data.get("max_completion_tokens")
+    if budget is None:
+        raise ValueError(
+            "a prefill/decode handoff needs max_tokens (or "
+            "max_completion_tokens) so the decoder's budget can be computed"
+        )
+    budget = int(budget)
+    if budget < 2:
+        raise ValueError(
+            "a prefill/decode handoff spends one token on the prefiller, so "
+            f"the budget must be at least 2 tokens; got {budget}"
+        )
+    req_data["max_tokens"] = 1
+    return budget
+
+
+def adopt_prefill_first_token(req_data: dict, prefill_output: dict) -> Optional[int]:
+    """Carry the prefiller's one token into the decoder's prompt.
+
+    Returns the token id, or None when the producer reported none. A missing
+    id is not appended: the prompt is what the decoder continues from, and
+    appending None makes it unparseable rather than merely shorter.
+    """
+    first_tok_id = (prefill_output.get("kv_transfer_params") or {}).get("first_tok")
+    if first_tok_id is None:
+        logger.warning(
+            "Prefiller returned no first token id; the decoder continues from "
+            "the original prompt and the comparison has no producer token"
+        )
+        return None
+    req_data["prompt"].append(first_tok_id)
+    return int(first_tok_id)
+
+
 def relay_storage_pd_read_ack(ack: StoragePDReadAck) -> None:
     """Forward one acknowledgement to the producer that is owed it.
 
@@ -773,9 +818,8 @@ async def handle_completions(request: Request):
         )
         tokenize_output = tokenize_output.json()
 
-        org_max_tokens = req_data["max_tokens"]
+        org_max_tokens = take_prefill_budget(req_data)
         req_data["prompt"] = tokenize_output["tokens"]
-        req_data["max_tokens"] = 1
 
         # Acquire ceil(L/chunk_size) PD buffer slots before prefill.
         slots = math.ceil(len(tokenize_output["tokens"]) / global_args.chunk_size)
@@ -820,8 +864,7 @@ async def handle_completions(request: Request):
         stats_calculator.add(et - st)
 
         req_data["max_tokens"] = org_max_tokens - 1
-        first_tok_id = prefill_output["kv_transfer_params"]["first_tok"]
-        req_data["prompt"].append(first_tok_id)
+        first_tok_id = adopt_prefill_first_token(req_data, prefill_output)
         req_data.pop("kv_transfer_params")
         req_data["stream"] = True
         if stream_options is not None:
@@ -933,9 +976,8 @@ async def handle_chat_completions(request: Request):
         )
         tokenize_output = tokenize_output.json()
 
-        org_max_tokens = req_data["max_tokens"]
+        org_max_tokens = take_prefill_budget(req_data)
         req_data["prompt"] = tokenize_output["tokens"]
-        req_data["max_tokens"] = 1
 
         org_max_completion_tokens = None
         if "max_completion_tokens" in req_data:
@@ -990,8 +1032,7 @@ async def handle_chat_completions(request: Request):
             req_data["max_completion_tokens"] = org_max_completion_tokens - 1
 
         # Add the first token from prefill to the tokenized messages for decode
-        first_tok_id = prefill_output["kv_transfer_params"]["first_tok"]
-        req_data["prompt"].append(first_tok_id)
+        first_tok_id = adopt_prefill_first_token(req_data, prefill_output)
 
         req_data.pop("kv_transfer_params")
         req_data["stream"] = True
@@ -1103,6 +1144,15 @@ async def handle_chat_completions(request: Request):
                                         },
                                         "logprobs": completion_data["choices"][0].get(
                                             "logprobs"
+                                        ),
+                                        # Carried, not dropped. Without this
+                                        # the chat lane reports exactly one
+                                        # token id -- the synthetic first
+                                        # one -- however long the answer is,
+                                        # which reads as id-capable while
+                                        # comparing nothing.
+                                        "token_ids": completion_data["choices"][0].get(
+                                            "token_ids"
                                         ),
                                         "finish_reason": completion_data["choices"][
                                             0

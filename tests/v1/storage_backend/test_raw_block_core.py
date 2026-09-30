@@ -2009,3 +2009,40 @@ def test_raw_block_core_refuses_to_read_once_the_outcome_is_unknown(tmp_path):
     finally:
         core.set_raw_device_for_testing(raw)
         core.close()
+
+
+def test_raw_block_core_keeps_its_four_byte_counts_apart(tmp_path):
+    """One number cannot answer four questions about bytes.
+
+    What a caller handed over, what was already on the device and so was
+    never written again, what physical length the ring was given, and what
+    the device reported finishing are four different quantities. Reporting
+    any one of them as "bytes written" overstates or understates another,
+    and a deduplicated hit is not device traffic at all.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        payload = b"a" * 100
+        key = encode_object_key(make_object_key(71))
+        assert core.put_many([key], [make_memory_obj(payload)]).results == [True]
+
+        first = core.report_status()
+        assert first["bytes_logical"] > 0
+        assert first["bytes_deduplicated"] == 0
+        # Padding to the block size means more reached the device than the
+        # caller handed over, which is exactly why these are separate.
+        assert first["bytes_submitted_padded"] >= first["bytes_logical"]
+        assert first["bytes_completed"] == first["bytes_submitted_padded"]
+
+        # The same key again is a hit. Nothing is submitted and nothing
+        # completes, and the logical total does not move either.
+        assert core.put_many([key], [make_memory_obj(payload)]).results == [True]
+        second = core.report_status()
+        assert second["bytes_deduplicated"] == len(payload)
+        assert second["bytes_logical"] == first["bytes_logical"]
+        assert second["bytes_submitted_padded"] == first["bytes_submitted_padded"]
+        assert second["bytes_completed"] == first["bytes_completed"]
+    finally:
+        core.close()

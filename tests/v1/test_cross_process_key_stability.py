@@ -12,6 +12,7 @@ is the only way a per-process seed shows up.
 from __future__ import annotations
 
 # Standard
+import hashlib
 import os
 import subprocess
 import sys
@@ -43,28 +44,80 @@ PROBE = textwrap.dedent(
     tokens = torch.tensor(list(range(300)), dtype=torch.long)
     effective = getattr(database.hash_func, "__name__", repr(database.hash_func))
     print("EFFECTIVE " + effective)
+    print("MODULE " + getattr(database.hash_func, "__module__", "?"))
+    # A name proves nothing: report what the function computes for a fixed
+    # input so the caller can check it against the encoding it asked for
+    # rather than against a substring. Normalized to hex because the
+    # documented functions return a digest as bytes while the interpreter's
+    # returns an int, and the caller is comparing values.
+    witness = database.hash_func((None, (1, 2, 3)))
+    if isinstance(witness, bytes):
+        witness = witness.hex()
+    elif isinstance(witness, int):
+        witness = format(witness & ((1 << 256) - 1), "x")
+    print("WITNESS " + str(witness))
+    print("ROOT " + repr(getattr(database, "prefix_hash", None)))
     print("|".join(str(key) for _, _, key in database.process_tokens(tokens)))
     """
 )
 
 
-def _vllm_is_available() -> bool:
-    """Whether the hash functions this contract names can be resolved."""
+def _vllm_state() -> tuple[bool, str]:
+    """Whether the engine these algorithms resolve through is usable.
+
+    A genuinely absent engine and a broken installed one are different
+    situations and must not both become a skip: the second is a defect in
+    this environment, and skipping it hides exactly the case where a
+    deployment believes it selected a documented function.
+    """
     try:
         # Third Party
         import vllm  # noqa: F401
-    except Exception:
-        return False
-    return True
+    except ModuleNotFoundError:
+        return False, "not installed"
+    except Exception as exc:  # pragma: no cover - environment-specific
+        return False, f"installed but unusable: {type(exc).__name__}: {exc}"
+    return True, "usable"
 
 
-def _probe(algorithm: str, hash_seed: str) -> tuple[str, str]:
+def _require_vllm() -> None:
+    available, why = _vllm_state()
+    if available:
+        return
+    if why == "not installed":
+        pytest.skip(
+            "the named algorithms resolve through the serving engine, which "
+            "is not installed here; both fall back and the comparison is "
+            "vacuous"
+        )
+    pytest.fail(f"the serving engine cannot be imported in this environment: {why}")
+
+
+def _expected_cbor_sha256() -> str:
+    """What sha256_cbor must compute for the probe's fixed input.
+
+    Derived here from the encoding the contract names -- CBOR of the parent
+    and token tuple, then SHA-256 -- so that the assertion compares a value
+    rather than a function name. Any function that merely has "sha256" in
+    its name fails this.
+    """
+    # Third Party
+    import cbor2
+
+    return hashlib.sha256(cbor2.dumps((None, (1, 2, 3)))).hexdigest()
+
+
+def _probe(algorithm: str, hash_seed: str) -> tuple[str, str, dict[str, str]]:
     """Return the effective hash function and the keys, from a fresh process.
 
     Where the named functions can be resolved at all, a probe failure is a
     real failure: converting every error to a skip would hide exactly the
     misconfiguration this contract exists to catch. Only the absence of the
-    serving engine is a skip.
+    serving engine is a skip, and an engine that is installed but broken is
+    neither -- it is this environment's defect.
+
+    Returns the function's name, the keys, and the labelled facts the probe
+    reported about what it actually computed.
     """
     env = dict(os.environ)
     env["PYTHONHASHSEED"] = hash_seed
@@ -77,16 +130,20 @@ def _probe(algorithm: str, hash_seed: str) -> tuple[str, str]:
     )
     if result.returncode != 0:
         detail = result.stderr.strip()[-400:]
-        if not _vllm_is_available():
+        available, why = _vllm_state()
+        if not available and why == "not installed":
             pytest.skip(f"serving engine not installed: {detail}")
         raise AssertionError(f"key probe failed for {algorithm}: {detail}")
     lines = result.stdout.strip().splitlines()
-    effective = next(
-        line.split(" ", 1)[1] for line in lines if line.startswith("EFFECTIVE ")
-    )
+    extras = {
+        label: line.split(" ", 1)[1]
+        for label in ("EFFECTIVE", "MODULE", "WITNESS", "ROOT")
+        for line in lines
+        if line.startswith(label + " ")
+    }
     keys = lines[-1]
     assert "CacheEngineKey" in keys, keys
-    return effective, keys
+    return extras.get("EFFECTIVE", ""), keys, extras
 
 
 def _keys(algorithm: str, hash_seed: str) -> str:
@@ -109,16 +166,16 @@ def test_the_named_algorithm_is_the_one_actually_used():
     a documented function while getting the interpreter's would satisfy
     every other check here.
     """
-    if not _vllm_is_available():
-        pytest.skip(
-            "the named algorithms resolve through the serving engine, which is "
-            "not installed here; both fall back and the comparison is vacuous"
-        )
-    effective, _ = _probe("sha256_cbor", "0")
-    assert "sha256" in effective.lower(), (
-        f"sha256_cbor resolved to {effective!r}, which is the fallback"
+    _require_vllm()
+    effective, _, extras = _probe("sha256_cbor", "0")
+    witness = extras.get("WITNESS", "")
+    expected = _expected_cbor_sha256()
+    assert witness == expected, (
+        f"sha256_cbor resolved to {effective!r}, which does not compute the "
+        f"CBOR SHA-256 this contract names: it produced {witness!r} where "
+        f"that encoding gives {expected!r}"
     )
-    builtin_effective, _ = _probe("builtin", "0")
+    builtin_effective, _, _ = _probe("builtin", "0")
     assert effective != builtin_effective, (
         "the named algorithm and the builtin resolve to the same function, "
         "so naming it has no effect in this environment"

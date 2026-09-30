@@ -408,6 +408,12 @@ class RawBlockCore:
     # default keeps it readable on a core built without __init__; the first
     # quarantine replaces it with an instance dict.
     _quarantined_slots: Optional[dict[int, None]] = None
+    # Byte counters, declared here for the same reason: they are metrics, and
+    # a core built without __init__ must still be able to add to them.
+    _bytes_logical: int = 0
+    _bytes_deduplicated: int = 0
+    _bytes_submitted_padded: int = 0
+    _bytes_completed: int = 0
 
     def __init__(
         self,
@@ -611,6 +617,17 @@ class RawBlockCore:
         self._next_slot: int = 0
         self._free_slots: dict[int, None] = {}
         self._quarantined_slots = {}
+        # Four different questions, kept apart because one number cannot
+        # answer them. Logical is what callers handed over; deduplicated is
+        # what was already on the device and so was never written again;
+        # submitted is the physical length given to the ring, which includes
+        # block padding; completed is what the device reported finishing.
+        # Reporting any one of these as "bytes written" overstates or
+        # understates a different one.
+        self._bytes_logical = 0
+        self._bytes_deduplicated = 0
+        self._bytes_submitted_padded = 0
+        self._bytes_completed = 0
         self._free_slots_by_placement_id: dict[int, dict[int, None]] = {}
         self._slot_placement_ids: dict[int, int] = {}
         self._fdp_slot_affinity_hit_count: int = 0
@@ -1077,6 +1094,10 @@ class RawBlockCore:
 
             with self._lock:
                 if key.encoded in self._index:
+                    # Already here: a hit, not a write. Counting these as
+                    # bytes stored would report device traffic that never
+                    # happened.
+                    self._bytes_deduplicated += int(self._index[key.encoded].size)
                     results[i] = True
                     continue
                 if key.encoded in self._inflight:
@@ -1656,6 +1677,10 @@ class RawBlockCore:
                 ),
                 "free_slot_count": len(self._free_slots),
                 "quarantined_slot_count": len(self._quarantined_slots or {}),
+                "bytes_logical": self._bytes_logical,
+                "bytes_deduplicated": self._bytes_deduplicated,
+                "bytes_submitted_padded": self._bytes_submitted_padded,
+                "bytes_completed": self._bytes_completed,
                 "next_slot": self._next_slot,
                 "max_slots": self._max_slots,
                 "metadata_seq": self._meta_seq,
@@ -2066,14 +2091,14 @@ class RawBlockCore:
             chunk_lens,
             chunk_placement_ids,
         )
-        if not all(
-            self._wait_iouring_results(
-                raw_dev,
-                batch_id,
-                len(chunk_offsets),
-                "bounded io_uring write",
-            )
-        ):
+        completed = self._wait_iouring_results(
+            raw_dev,
+            batch_id,
+            len(chunk_offsets),
+            "bounded io_uring write",
+        )
+        self._record_completed_bytes(completed, chunk_lens)
+        if not all(completed):
             raise RuntimeError("raw-block bounded io_uring write failed")
         keepalive.clear()
 
@@ -2208,6 +2233,14 @@ class RawBlockCore:
             len(offsets),
             field_name="placement_ids",
         )
+        # Counted here, where the physical lengths are known and before any
+        # of them can fail: submitted is what was asked of the device, which
+        # is a different quantity from what it reported finishing. These are
+        # metrics, not invariants, so they are not worth the lock -- a lost
+        # update under concurrency costs an approximate total and nothing
+        # decides anything on it.
+        self._bytes_logical += sum(int(n) for n in payload_lens)
+        self._bytes_submitted_padded += sum(int(n) for n in total_lens)
 
         if self.io_engine != "io_uring":
             for offset, buf, payload_len, total_len in zip(
@@ -2241,14 +2274,14 @@ class RawBlockCore:
                 [int(total_len) for total_len in total_lens],
                 per_write_placement_ids,
             )
-            if not all(
-                self._wait_iouring_results(
-                    raw_dev,
-                    batch_id,
-                    len(offsets),
-                    "io_uring write",
-                )
-            ):
+            completed = self._wait_iouring_results(
+                raw_dev,
+                batch_id,
+                len(offsets),
+                "io_uring write",
+            )
+            self._record_completed_bytes(completed, total_lens)
+            if not all(completed):
                 raise RuntimeError("raw-block io_uring write failed")
             return
 
@@ -2328,6 +2361,25 @@ class RawBlockCore:
             batch_id,
             len(offsets),
             "io_uring read",
+        )
+
+    def _record_completed_bytes(
+        self,
+        completed: Sequence[bool],
+        total_lens: Sequence[int],
+    ) -> None:
+        """Add up what the engine reported finishing, not what was asked.
+
+        The success bitmap is per operation, and the caller is the only thing
+        that knows each operation's physical length, so the two are joined
+        here. Keeping this apart from the submitted total is the point: a
+        submission that was never completed is exactly the difference an
+        operator needs to see.
+        """
+        self._bytes_completed += sum(
+            int(length)
+            for ok, length in zip(completed, total_lens, strict=False)
+            if ok
         )
 
     def _adopt_native_poison(
@@ -2586,6 +2638,9 @@ class RawBlockCore:
                         break
                     encoded_key = key.encoded
                     if encoded_key in self._index:
+                        self._bytes_deduplicated += int(
+                            self._index[encoded_key].size
+                        )
                         results[i] = True
                         continue
                     if encoded_key in planned_keys:
