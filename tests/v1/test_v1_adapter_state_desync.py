@@ -133,7 +133,8 @@ def _make_storage_pd_connector() -> LMCacheConnectorV1Impl:
     connector._storage_pd_failures = {}
     connector._storage_pd_terminal_states = {}
     connector._storage_pd_receipts = {}
-    connector._storage_pd_status_queued = set()
+    connector._storage_pd_obligations = {}
+    connector._storage_pd_ack_outbox = OrderedDict()
     connector._storage_pd_acks_sent = OrderedDict()
     connector._storage_pd_status_sender = None
     connector._storage_pd_notify_queue = None
@@ -168,6 +169,33 @@ def _close_notification_queues() -> Iterator[None]:
         _OPEN_QUEUES.pop().close()
 
 
+class _SenderAdapter:
+    """Present a test sender the way the queue now calls one.
+
+    The queue bounds each attempt by what is left of an obligation's deadline
+    and closes the sender it owns, so it passes a timeout to both. Absorbing
+    that here keeps every test's sender about sending, and keeps a dropped
+    keyword from looking like an unreachable peer -- which is how it first
+    presented.
+    """
+
+    def __init__(self, sender: Any) -> None:
+        self._sender = sender
+        self.closed_with: list[Any] = []
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._sender, item)
+
+    def send(self, message: Any, *, timeout_s: Any = None) -> None:
+        self._sender.send(message)
+
+    def close(self, timeout_s: Any = None) -> None:
+        self.closed_with.append(timeout_s)
+        inner = getattr(self._sender, "close", None)
+        if callable(inner):
+            inner()
+
+
 def _attach_notification_queue(
     connector: LMCacheConnectorV1Impl,
     sender: Any,
@@ -176,6 +204,7 @@ def _attach_notification_queue(
     """Give the connector the real delivery queue over a test sender."""
     kwargs.setdefault("retry_interval_s", 0.001)
     kwargs.setdefault("deadline_s", SETTLE_TIMEOUT_S)
+    sender = _SenderAdapter(sender)
     queue = StoragePDNotificationQueue(
         sender,
         on_unreported=connector._log_storage_pd_delivery,
@@ -499,7 +528,7 @@ def test_storage_pd_releasing_a_request_clears_its_state() -> None:
     assert connector._storage_pd_store_futures == {}
     assert connector._storage_pd_wire_req_ids == {}
     assert connector._storage_pd_receipts == {}
-    assert connector._storage_pd_status_queued == set()
+    assert connector._storage_pd_obligations == {}
     assert connector._storage_pd_engine_finished == set()
     assert connector._storage_pd_failures == {}
     assert connector._storage_pd_terminal_states == {}
@@ -614,7 +643,7 @@ def test_storage_pd_defers_an_announcement_the_queue_cannot_take() -> None:
     assert sending.wait(SETTLE_TIMEOUT_S)
     # One is in the sender and one is queued behind it; the third was
     # refused, so it is not recorded as queued and will be offered again.
-    assert len(connector._storage_pd_status_queued) == 2
+    assert len(connector._storage_pd_obligations) == 3
     assert len(connector._storage_pd_engine_finished) == 3
 
     release_peer.set()

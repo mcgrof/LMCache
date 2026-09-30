@@ -70,13 +70,14 @@ class _RecordingSender:
         self.port = port
         self.timeout_s = timeout_s
         self.sent: list[Any] = []
+        self.closed_with: list[Any] = []
         _RecordingSender.instances.append(self)
 
-    def send(self, message: Any) -> None:
+    def send(self, message: Any, *, timeout_s: Any = None) -> None:
         self.sent.append(message)
 
-    def close(self) -> None:
-        return None
+    def close(self, timeout_s: Any = None) -> None:
+        self.closed_with.append(timeout_s)
 
 
 def _vllm_config(extra: dict[str, Any]) -> Any:
@@ -263,7 +264,7 @@ def test_the_delivery_queue_a_worker_builds_actually_runs(
     assert queue is not None
     try:
         message = SimpleNamespace(req_id="request-1")
-        assert queue.enqueue("request-1", message)  # type: ignore[arg-type]
+        assert queue.offer(queue.obligation("request-1", message))  # type: ignore[arg-type]
         settled: list[Any] = []
         for _ in range(5000):
             settled = queue.poll()
@@ -271,7 +272,7 @@ def test_the_delivery_queue_a_worker_builds_actually_runs(
                 break
             threading.Event().wait(0.002)
         assert [(item.key, item.state) for item in settled] == [
-            ("request-1", "DELIVERED")
+            ("request-1", "LOCALLY_SENT")
         ]
         sender = connector._storage_pd_status_sender
         assert isinstance(sender, _RecordingSender)

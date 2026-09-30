@@ -3,7 +3,7 @@
 from collections import defaultdict
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 import argparse
 import asyncio
 import itertools
@@ -432,15 +432,15 @@ async def zmq_pull_server():
                 continue
 
             if isinstance(msg, StoragePDStatus):
+                if msg.ack_endpoint:
+                    storage_pd_ack_endpoints[msg.producer_instance_id] = (
+                        msg.ack_endpoint
+                    )
                 record_storage_pd_status(msg)
                 continue
 
             if isinstance(msg, StoragePDReadAck):
-                logger.debug(
-                    "Storage P/D read ACK for req %s rank %d.",
-                    msg.req_id,
-                    msg.tp_rank,
-                )
+                relay_storage_pd_read_ack(msg)
                 continue
 
             if not isinstance(msg, ProxyNotif):
@@ -504,6 +504,57 @@ def round_robin_pick_clients() -> tuple[ClientInfo, ClientInfo, ClientInfo]:
     prefill_client = round_robin_pick_client(app.state.prefill_clients, idx)
     decode_client = round_robin_pick_client(app.state.decode_clients, idx)
     return tokenization_client, prefill_client, decode_client
+
+
+# Where each producer said it listens for acknowledgements, learned from the
+# READY statuses it sends. A producer that advertises nothing gets no relay,
+# and its extents stay leased -- which is the producer's own statement about
+# itself, not something to guess around.
+storage_pd_ack_endpoints: dict[str, str] = {}
+storage_pd_ack_sockets: dict[str, Any] = {}
+
+
+def relay_storage_pd_read_ack(ack: StoragePDReadAck) -> None:
+    """Forward one acknowledgement to the producer that is owed it.
+
+    The proxy owns the READY barrier; it does not own the lease and does not
+    decide that an extent is reclaimable. Relaying is all it does here, and
+    the producer re-validates everything before releasing anything.
+    """
+    endpoint = storage_pd_ack_endpoints.get(ack.producer_instance_id)
+    if not endpoint:
+        logger.warning(
+            "Storage P/D read ACK for req %s names producer %s, which "
+            "advertised no acknowledgement endpoint; its extents stay leased",
+            ack.req_id,
+            ack.producer_instance_id,
+        )
+        return
+    socket = storage_pd_ack_sockets.get(endpoint)
+    if socket is None:
+        socket = zmq_ctx.socket(zmq.PUSH)
+        socket.setsockopt(zmq.LINGER, 0)
+        # Do not queue for a producer that is not there: a relay that cannot
+        # be made now is better reported than held.
+        socket.setsockopt(zmq.IMMEDIATE, 1)
+        socket.setsockopt(zmq.SNDTIMEO, 1000)
+        socket.connect(f"tcp://{endpoint}")
+        storage_pd_ack_sockets[endpoint] = socket
+    try:
+        socket.send(msgspec.msgpack.encode(ack), flags=zmq.NOBLOCK)
+    except zmq.ZMQError as exc:
+        # The consumer keeps the obligation and offers it again, so a failed
+        # relay costs a retry rather than the acknowledgement.
+        logger.warning(
+            "Storage P/D could not relay the read ACK for req %s to %s: %s",
+            ack.req_id,
+            endpoint,
+            exc,
+        )
+        return
+    logger.debug(
+        "Storage P/D relayed the read ACK for req %s to %s", ack.req_id, endpoint
+    )
 
 
 def record_storage_pd_status(msg: StoragePDStatus) -> str:
