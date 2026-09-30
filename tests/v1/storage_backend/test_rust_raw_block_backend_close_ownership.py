@@ -373,3 +373,64 @@ def test_a_cancelled_put_keeps_its_buffer_until_the_thread_lets_go(
     assert memory_obj.get_ref_count() == 0
     with backend._put_lock:
         assert backend._pending_put_owners == []
+
+
+def test_a_control_handler_that_did_not_stop_blocks_every_release(backend):
+    """Releasing a hold reaches the core, so the handler stops before it.
+
+    A timed join that returns is not proof the handler stopped touching the
+    core: the thread may have been descheduled inside it. The server says
+    which happened, and an unconfirmed stop means nothing after it can be
+    released on evidence -- the core is being destroyed under something
+    that may still be using it.
+    """
+    allocator = backend._gpu_allocator
+    tracker = _RecordingTracker()
+    backend._pd_tracker = tracker
+
+    class _NeverConfirms:
+        def __init__(self) -> None:
+            self.close_calls = 0
+            self.endpoint = "127.0.0.1:1"
+
+        def close(self, timeout_s: float = 5.0) -> bool:
+            self.close_calls += 1
+            return False
+
+    server = _NeverConfirms()
+    backend._ack_receiver = server
+
+    before = len(plugin._RETAINED_AFTER_UNKNOWN_OUTCOME)
+    backend.close()
+
+    assert server.close_calls == 1
+    assert allocator.close_calls == 0
+    assert tracker.release_leases is False
+    assert len(_retained_now(before)) == 1
+
+
+def test_a_control_handler_that_stopped_does_not_block_release(backend):
+    """The refusal above has to be the server's answer, not a stuck default."""
+    allocator = backend._gpu_allocator
+    tracker = _RecordingTracker()
+    backend._pd_tracker = tracker
+
+    class _Confirms:
+        def __init__(self) -> None:
+            self.close_calls = 0
+            self.endpoint = "127.0.0.1:1"
+
+        def close(self, timeout_s: float = 5.0) -> bool:
+            self.close_calls += 1
+            return True
+
+    server = _Confirms()
+    backend._ack_receiver = server
+
+    before = len(plugin._RETAINED_AFTER_UNKNOWN_OUTCOME)
+    backend.close()
+
+    assert server.close_calls == 1
+    assert allocator.close_calls == 1
+    assert tracker.release_leases is True
+    assert _retained_now(before) == []

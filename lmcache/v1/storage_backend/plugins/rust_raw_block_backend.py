@@ -1686,6 +1686,16 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             return
         self._closed_once = True
 
+        # The control handler reaches the core -- releasing a hold unlocks
+        # keys through it -- so it stops first. A timed join that returns is
+        # not proof a handler stopped touching the core, and the server says
+        # which happened; an unconfirmed stop means the core is destroyed
+        # under something that may still be using it, so nothing after this
+        # can be released on evidence.
+        control_quiesced = True
+        if self._ack_receiver is not None:
+            control_quiesced = self._ack_receiver.close()
+
         # Everything below either releases a resource the device may still be
         # using or asks a question that could reopen the device, so the state
         # is sampled once, first. A deadline is not a fence: leaving that loop
@@ -1697,6 +1707,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             pending > 0
             or retained_batches > 0
             or bool(self._quarantined_objs)
+            or not control_quiesced
             or self._outcome_is_unknown()
         )
 
@@ -1720,8 +1731,6 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             # tracker keeps them unless this engine never published any.
             self._pd_tracker.close(release_leases=not unknown)
 
-        if self._ack_receiver is not None:
-            self._ack_receiver.close()
         if self._gpu_allocator is None:
             return
         if unknown:
