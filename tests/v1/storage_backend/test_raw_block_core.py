@@ -2134,3 +2134,75 @@ def test_raw_block_core_withholds_a_dropped_entry_when_it_cannot_say(tmp_path):
         assert slot in (core._quarantined_slots or {})
     finally:
         core.close()
+
+
+def test_raw_block_core_fails_closed_on_an_unanswerable_health_probe(tmp_path):
+    """A probe that raises was asked and could not answer.
+
+    Reading the raise as health leaves the core recycling extents whose
+    outcome nothing established, and propagates the exception out of a
+    close that has already stopped its checkpoint thread.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    raw = core.raw_device()
+    try:
+
+        class _Unanswerable:
+            def __getattr__(self, item):
+                return getattr(raw, item)
+
+            def is_poisoned(self):
+                raise OSError("the device cannot be reached")
+
+        core.set_raw_device_for_testing(_Unanswerable())
+        core.close()
+
+        assert core._poisoned is True
+    finally:
+        core.set_raw_device_for_testing(raw)
+
+
+def test_raw_block_core_adopts_an_unanswerable_probe_after_a_failed_write(tmp_path):
+    """The write path asks the same question in the same conditions.
+
+    A per-write failure rolls its extent back, and whether that extent may
+    be handed out again is what the probe decides. A raise there left the
+    core healthy and the extent immediately re-allocatable.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+
+        class _Unanswerable:
+            def is_poisoned(self):
+                raise OSError("the device cannot be reached")
+
+        assert core._adopt_native_poison(_Unanswerable(), "io_uring write") is True
+        assert core._poisoned is True
+    finally:
+        core.close()
+
+
+def test_raw_block_core_does_not_read_a_non_bool_as_an_unknown_outcome(tmp_path):
+    """A device that answers something else has not said it cannot say.
+
+    Failing closed on anything but a clear yes would withhold every extent
+    behind every stand-in object, which is a way to pass this rule without
+    ever exercising it.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+
+        class _Chatty:
+            def is_poisoned(self):
+                return "no"
+
+        assert core._adopt_native_poison(_Chatty(), "io_uring write") is False
+        assert core._poisoned is False
+    finally:
+        core.close()

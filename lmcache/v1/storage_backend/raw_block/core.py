@@ -270,6 +270,32 @@ class RawBlockDerivationDescriptor:
         ]
 
 
+def device_says_outcome_is_unknown(device: Any) -> bool:
+    """Ask a device whether it has stopped being able to say, failing closed.
+
+    A probe that raises was asked and could not answer, which is exactly the
+    condition to treat as unknown. Reading the raise as health is worse than
+    not asking: the caller then recycles on the strength of a question that
+    was never answered. A probe that returns something other than a bool is
+    an object that does not answer this question, and reading that as unknown
+    would quarantine on nothing.
+
+    A device with no such probe cannot report the condition at all, so the
+    absence is not an unanswered question and reads as healthy. That is a
+    real gap against an older native build, which is why the core keeps its
+    own flag once it has adopted one.
+    """
+    probe = getattr(device, "is_poisoned", None)
+    if probe is None:
+        return False
+    try:
+        answer = probe()
+    except Exception:
+        logger.exception("RawBlockCore could not read device health")
+        return True
+    return answer is True
+
+
 class IncompatibleKeyDerivation(RuntimeError):
     """A namespace's keys were derived in a way this engine cannot reproduce."""
 
@@ -1837,7 +1863,7 @@ class RawBlockCore:
         # device knows nothing about what the old one could not establish.
         unknown = self._poisoned
         if not unknown and self._raw is not None:
-            unknown = getattr(self._raw, "is_poisoned", bool)() is True
+            unknown = device_says_outcome_is_unknown(self._raw)
         self._poisoned = unknown
 
         if self.role == "writer" and not unknown:
@@ -2495,9 +2521,7 @@ class RawBlockCore:
         operator needs to see.
         """
         self._bytes_completed += sum(
-            int(length)
-            for ok, length in zip(completed, total_lens, strict=False)
-            if ok
+            int(length) for ok, length in zip(completed, total_lens, strict=False) if ok
         )
 
     def _require_matching_key_namespace(self, theirs: Any) -> None:
@@ -2578,7 +2602,7 @@ class RawBlockCore:
         """
         if self._poisoned:
             return True
-        if not bool(getattr(raw_dev, "is_poisoned", bool)()):
+        if not device_says_outcome_is_unknown(raw_dev):
             return False
         self._poisoned = True
         logger.error(
@@ -2810,9 +2834,7 @@ class RawBlockCore:
                         break
                     encoded_key = key.encoded
                     if encoded_key in self._index:
-                        self._bytes_deduplicated += int(
-                            self._index[encoded_key].size
-                        )
+                        self._bytes_deduplicated += int(self._index[encoded_key].size)
                         results[i] = True
                         continue
                     if encoded_key in planned_keys:
@@ -2982,9 +3004,7 @@ class RawBlockCore:
         payload_len = int.from_bytes(hdr[16:24], "little", signed=False)
         return slot_identity, payload_len
 
-    def _read_slot_header(
-        self, offset: int
-    ) -> tuple[str, Optional[tuple[int, int]]]:
+    def _read_slot_header(self, offset: int) -> tuple[str, Optional[tuple[int, int]]]:
         """Read one slot header, saying which of three things happened.
 
         ``"decoded"`` with the identity and length; ``"invalid"`` when bytes
