@@ -15,9 +15,7 @@
 //!   submission/completion loop. All alignment checks are performed before
 //!   enqueuing; violations result in an immediate Python `ValueError`.
 
-use pyo3::exceptions::{
-    PyMemoryError, PyOSError, PyRuntimeError, PyValueError,
-};
+use pyo3::exceptions::{PyMemoryError, PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 use std::collections::{HashMap, HashSet};
@@ -1932,13 +1930,12 @@ impl RawBlockDevice {
                     // rather than on the batch counter, so setting the
                     // completion first reads to it as "failed, and nothing
                     // is otherwise wrong".
-                    let fail_unknown = |sub: &IoSubmission,
-                                        quarantined: &mut Vec<IoSubmission>,
-                                        err: PyErr| {
-                        quarantined.push(sub.clone());
-                        mark_unknown(sub.batch_id);
-                        sub.completion.set(Err(err));
-                    };
+                    let fail_unknown =
+                        |sub: &IoSubmission, quarantined: &mut Vec<IoSubmission>, err: PyErr| {
+                            quarantined.push(sub.clone());
+                            mark_unknown(sub.batch_id);
+                            sub.completion.set(Err(err));
+                        };
                     // Set when a submit fails in a way that leaves the ring's
                     // state unknown. No new work is admitted after that: the
                     // engine cannot say what the kernel is still doing.
@@ -3625,14 +3622,15 @@ impl RawBlockDevice {
         };
 
         self.retire_batch_owners(batch_id);
-        if self.quarantined_batches.lock().unwrap().contains(&batch_id) {
-            // Releasing the export calls PyBuffer_Release, which lets the
-            // caller's buffer be reused. The device may still be reading it,
-            // so the export is leaked instead: the memory stays pinned for
-            // this engine's lifetime, which is the price of not being able
-            // to say when the write finished.
-            std::mem::forget(view);
-        } else {
+        // Releasing the export calls PyBuffer_Release, which lets the
+        // caller's buffer be reused. The device may still be reading a
+        // quarantined batch's buffer, so its export is never released: the
+        // memory stays pinned for this engine's lifetime, which is the
+        // price of not being able to say when the write finished. BufRef
+        // has no Drop impl -- release() is an explicit call -- so
+        // withholding that call is the whole of the retention.
+        let withheld = self.quarantined_batches.lock().unwrap().contains(&batch_id);
+        if !withheld {
             view.release();
         }
         res?;
@@ -4254,8 +4252,7 @@ impl RawBlockDevice {
 
     /// Whether this device has stopped being able to say what it is doing.
     fn outcome_is_unknown(&self) -> bool {
-        self.poisoned.load(Ordering::SeqCst)
-            || !self.quarantined_batches.lock().unwrap().is_empty()
+        self.poisoned.load(Ordering::SeqCst) || !self.quarantined_batches.lock().unwrap().is_empty()
     }
 
     /// Keep every resource an unproven outcome may still be reaching.
