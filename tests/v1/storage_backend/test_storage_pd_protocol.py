@@ -132,3 +132,35 @@ def test_decoder_adoption_retries_without_the_continuation_token() -> None:
 
     assert engine.adopt_storage_publication([1, 2, 3, 4], receipt) == 3
     assert backend.keys == [hash((1, 2, 3, 4)), hash((1, 2, 3))]
+
+
+def test_sender_close_does_not_claim_a_socket_owner_it_abandoned() -> None:
+    """Abandoning an executor is not the same as it having finished.
+
+    A socket stuck in the transport outlasts the shutdown budget, and close
+    gives up on it rather than blocking. The thread is then still alive and
+    still holding the socket, so the caller has to be told -- otherwise it
+    destroys what that thread is using next.
+    """
+    # Standard
+    import threading
+
+    sender = StoragePDStatusSender("127.0.0.1", 1, timeout_s=1.0)
+    stuck = threading.Event()
+    try:
+
+        def _never_finishes() -> None:
+            assert stuck.wait(30.0)
+
+        sender._close_socket = _never_finishes  # type: ignore[method-assign]
+        assert sender.close(timeout_s=0.1) is False
+    finally:
+        stuck.set()
+
+
+def test_sender_close_reports_a_clean_stop_when_there_is_one() -> None:
+    """The refusal above is an observation, not a stuck answer."""
+    sender = StoragePDStatusSender("127.0.0.1", 1, timeout_s=1.0)
+    assert sender.close(timeout_s=5.0) is True
+    # A second close has nothing left to establish and says so.
+    assert sender.close(timeout_s=5.0) is True

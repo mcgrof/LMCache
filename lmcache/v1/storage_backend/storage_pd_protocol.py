@@ -210,16 +210,24 @@ class StoragePDStatusSender:
                 f"storage P/D status send timed out for {self._proxy_url}"
             ) from exc
 
-    def close(self, timeout_s: float | None = None) -> None:
+    def close(self, timeout_s: float | None = None) -> bool:
         """Close the socket on its owner thread and stop the worker.
 
         ``timeout_s`` bounds the wait. Without it this blocks for as long as
         a stuck socket takes, which is why the notification queue owns this
         call and passes what is left of its own shutdown budget.
+
+        Returns whether the socket's owner thread confirmed it had finished.
+        Returning inside the budget is not that confirmation: a stuck socket
+        makes this abandon the worker, which is then still alive and still
+        holding the socket. A caller that treats the return as proof of
+        termination is making a claim about a thread nobody observed
+        stopping -- and on this path that thread is what reaches the
+        transport.
         """
         with self._lock:
             if self._closed:
-                return
+                return True
             self._closed = True
             close_future = self._executor.submit(self._close_socket)
         try:
@@ -231,8 +239,9 @@ class StoragePDStatusSender:
                 self._proxy_url,
             )
             self._executor.shutdown(wait=False, cancel_futures=True)
-            return
+            return False
         self._executor.shutdown(wait=True, cancel_futures=False)
+        return True
 
     def _send(self, status: StoragePDMsg, attempt_s: float) -> None:
         if self._socket is None:
@@ -270,6 +279,15 @@ class StoragePDDelivery(NamedTuple):
     key: str
     state: Literal["LOCALLY_SENT", "ABANDONED"]
     detail: str = ""
+
+    # Which of the two a caller sees for an attempt that finishes after its
+    # obligation expired is decided by whichever settlement ran first, and
+    # both are true statements about different things: the socket did accept
+    # the message, and the obligation was not announced within its
+    # deadline. An attempt that wins the race reports LOCALLY_SENT even
+    # though the deadline has passed, because that is what was observed.
+    # Nothing here reorders them into a single story, and neither state is
+    # evidence that a peer acted.
 
 
 class StoragePDObligation:
@@ -403,18 +421,36 @@ class StoragePDNotificationQueue:
         keeps whatever it would have announced, and may offer the *same*
         object again later. It must not build a new one, which would restart
         a deadline that has already been running.
+
+        An obligation refused until its deadline settles here rather than
+        being refused forever. The deadline belongs to the obligation, not
+        to an attempt, so it has to be reachable by one that was never
+        admitted at all -- otherwise a permanently saturated queue leaves
+        the caller re-offering something with no end, and no record that it
+        was never announced.
         """
+        unreported: StoragePDDelivery | None = None
         with self._cond:
             if self._stopping or obligation.settled:
                 return False
-            if obligation.key in self._in_flight:
+            if obligation.expired(time.monotonic()):
+                unreported = self._settle_locked(
+                    obligation,
+                    "ABANDONED",
+                    "never admitted before its deadline",
+                )
+            elif obligation.key in self._in_flight:
                 return False
-            if len(self._pending) >= self._capacity:
+            elif len(self._pending) >= self._capacity:
                 return False
-            self._in_flight.add(obligation.key)
-            self._pending.append(obligation)
-            self._cond.notify()
-        return True
+            else:
+                self._in_flight.add(obligation.key)
+                self._pending.append(obligation)
+                self._cond.notify()
+                return True
+        if unreported is not None:
+            self._report_unreported(unreported)
+        return False
 
     def poll(self) -> list[StoragePDDelivery]:
         """Take every outcome settled since the last call. Never blocks."""
@@ -428,20 +464,32 @@ class StoragePDNotificationQueue:
         with self._cond:
             return len(self._in_flight)
 
-    def close(self, timeout_s: float = 5.0) -> None:
+    def close(self, timeout_s: float = 5.0) -> bool:
         """Stop, within one budget shared with the sender it owns.
 
         The attempt in progress gets what is left of the budget to finish.
         Whatever is still owed then settles as abandoned, and is marked
         settled so that a send returning afterwards reports nothing.
+
+        Returns whether both this queue's worker and the sender's socket
+        owner confirmed they had finished. Returning at all does not: a
+        stuck socket is abandoned rather than waited on, and its thread is
+        then still alive and still holding the transport. A caller that
+        needs to destroy something those threads touch has to read this.
         """
         with self._cond:
             if self._stopping:
-                return
+                return True
             self._stopping = True
             self._cond.notify_all()
         budget_ends = time.monotonic() + max(0.0, timeout_s)
         self._worker.join(timeout=max(0.0, budget_ends - time.monotonic()))
+        worker_stopped = not self._worker.is_alive()
+        if not worker_stopped:
+            logger.error(
+                "storage P/D notification worker did not stop within its "
+                "shutdown budget; it may still be attempting a send"
+            )
         unreported: list[StoragePDDelivery] = []
         with self._cond:
             owed = list(self._pending)
@@ -459,7 +507,10 @@ class StoragePDNotificationQueue:
             self._in_flight.clear()
         for delivery in unreported:
             self._report_unreported(delivery)
-        self._sender.close(timeout_s=max(0.0, budget_ends - time.monotonic()))
+        sender_stopped = self._sender.close(
+            timeout_s=max(0.0, budget_ends - time.monotonic())
+        )
+        return worker_stopped and sender_stopped
 
     def _report_unreported(self, delivery: StoragePDDelivery) -> None:
         if self._on_unreported is not None:

@@ -21,6 +21,7 @@ import pytest
 from lmcache.v1.storage_backend.storage_pd_protocol import (
     StoragePDDelivery,
     StoragePDNotificationQueue,
+    StoragePDObligation,
     StoragePDStatus,
     StoragePDStatusSender,
 )
@@ -45,6 +46,7 @@ class _RecordingSender:
         self._fail_first = fail_first
         self._fail_always = fail_always
         self._gate = gate
+        self.stops_cleanly = True
         self._lock = threading.Lock()
 
     def send(self, message: StoragePDStatus, *, timeout_s: float | None = None) -> None:
@@ -59,8 +61,9 @@ class _RecordingSender:
         with self._lock:
             self.sent.append(message)
 
-    def close(self, timeout_s: float | None = None) -> None:
+    def close(self, timeout_s: float | None = None) -> bool:
         self.closed_with.append(timeout_s)
+        return self.stops_cleanly
 
 
 class _Clock:
@@ -155,11 +158,18 @@ def test_an_unavailable_proxy_is_abandoned_at_the_deadline() -> None:
 
 
 def test_an_obligation_with_no_lifetime_is_abandoned_unattempted() -> None:
-    """A deadline of zero is a refusal, not a single free attempt."""
+    """A deadline of zero is a refusal, not a single free attempt.
+
+    It is also not admitted: offering reports that nothing was taken on,
+    and the obligation settles on the spot. The deadline belongs to the
+    obligation rather than to an attempt, so whether it can be reached must
+    not depend on there having been room.
+    """
     sender = _RecordingSender()
     queue = _queue(sender, deadline_s=0.0)
     try:
-        assert queue.offer(queue.obligation("request", _status("request")))
+        assert queue.offer(queue.obligation("request", _status("request"))) is False
+        assert queue.pending_count() == 0
         settled = _settle(queue)
         assert [(item.key, item.state) for item in settled] == [
             ("request", "ABANDONED")
@@ -167,6 +177,52 @@ def test_an_obligation_with_no_lifetime_is_abandoned_unattempted() -> None:
         assert "deadline" in settled[0].detail
         assert sender.attempts == 0
     finally:
+        queue.close()
+
+
+def test_an_obligation_refused_until_its_deadline_still_ends() -> None:
+    """A full queue must not leave a caller re-offering something forever.
+
+    The obligation was never admitted, so no worker will ever settle it.
+    Reaching its own deadline while being refused is the only end it has,
+    and it has to produce the same record as any other abandonment.
+    """
+    gate = threading.Event()
+    sender = _RecordingSender(gate=gate)
+    queue = _queue(sender, capacity=1, retry_interval_s=0.0)
+    far = time.monotonic() + 3600.0
+    try:
+        # One obligation occupies the worker and one fills the queue, both
+        # with deadlines far enough away that neither of them is what ends.
+        held = StoragePDObligation("held", _status("held"), report=True, deadline=far)
+        assert queue.offer(held)
+        while sender.attempts == 0:
+            time.sleep(0.002)
+        filler = StoragePDObligation(
+            "filler", _status("filler"), report=True, deadline=far
+        )
+        assert queue.offer(filler)
+
+        refused = StoragePDObligation(
+            "refused",
+            _status("refused"),
+            report=True,
+            deadline=time.monotonic() + 0.2,
+        )
+        assert queue.offer(refused) is False, "the queue has no room"
+
+        deadline = time.monotonic() + SETTLE_TIMEOUT_S
+        while not refused.settled and time.monotonic() < deadline:
+            assert queue.offer(refused) is False
+            time.sleep(0.01)
+        assert refused.settled, "it was refused until its deadline and never ended"
+
+        settled = {item.key: item for itemin_ in () for item in ()}
+        settled = {item.key: item for item in queue.poll()}
+        assert settled["refused"].state == "ABANDONED"
+        assert "never admitted" in settled["refused"].detail
+    finally:
+        gate.set()
         queue.close()
 
 
@@ -356,8 +412,11 @@ def test_an_unreported_obligation_goes_to_the_callback_instead() -> None:
     sender = _RecordingSender(fail_always=True)
     queue = _queue(sender, deadline_s=0.0, on_unreported=seen.append)
     try:
-        assert queue.offer(
-            queue.obligation("ack:request", _status("request"), report=False)
+        assert (
+            queue.offer(
+                queue.obligation("ack:request", _status("request"), report=False)
+            )
+            is False
         )
         deadline = time.monotonic() + SETTLE_TIMEOUT_S
         while not seen and time.monotonic() < deadline:
@@ -401,3 +460,48 @@ def test_an_unreported_obligation_abandoned_at_shutdown_reaches_the_callback() -
 def test_an_unusable_policy_is_refused_at_construction(kwargs: Any) -> None:
     with pytest.raises(ValueError):
         _queue(_RecordingSender(), **kwargs)
+
+
+def test_close_does_not_call_an_abandoned_worker_stopped() -> None:
+    """A budget running out is not a thread stopping.
+
+    A send stuck in the transport outlives the shutdown budget, and close
+    abandons it rather than waiting. That thread is still alive and still
+    holding the socket, so reporting success here would let a caller
+    destroy what it is using.
+    """
+    gate = threading.Event()
+    sender = _RecordingSender(gate=gate)
+    queue = _queue(sender, capacity=2)
+    try:
+        assert queue.offer(queue.obligation("held", _status("held")))
+        while sender.attempts == 0:
+            time.sleep(0.002)
+
+        assert queue.close(timeout_s=0.1) is False
+    finally:
+        gate.set()
+
+
+def test_close_reports_a_clean_stop_when_there_is_one() -> None:
+    """The refusal above has to be an observation, not a stuck answer."""
+    sender = _RecordingSender()
+    queue = _queue(sender, capacity=2)
+    assert queue.offer(queue.obligation("request", _status("request")))
+    _settle(queue)
+    assert queue.close(timeout_s=5.0) is True
+
+
+def test_close_carries_the_senders_own_answer() -> None:
+    """The sender owns the socket, so its answer is part of this one.
+
+    A queue worker that stopped says nothing about the thread holding the
+    transport, and that thread is the one still touching a socket a caller
+    may be about to destroy.
+    """
+    sender = _RecordingSender()
+    sender.stops_cleanly = False
+    queue = _queue(sender, capacity=2)
+    assert queue.offer(queue.obligation("request", _status("request")))
+    _settle(queue)
+    assert queue.close(timeout_s=5.0) is False
