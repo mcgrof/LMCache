@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Drive the worker's submit-failure transitions with a deterministic plan.
 
-The fatal and partial-submit paths cannot be reached on a working device:
-nothing makes a healthy ring refuse a submission. The engine therefore carries
-a nondefault ``fault-injection`` feature whose plan replaces what one submit
-call reports, before the ring is consulted -- so the worker runs its ordinary
-code against an outcome it cannot otherwise be given, and no completion is
-ever synthesised for a request the kernel owns.
+The submit-failure paths cannot be reached on a working device: nothing makes
+a healthy ring refuse a submission. The engine therefore carries a nondefault
+``fault-injection`` feature whose plan replaces what one submit call reports,
+before the ring is consulted -- so the worker runs its ordinary code against
+an outcome it cannot otherwise be given, and no completion is ever synthesised
+for a request the kernel owns.
+
+Substituting before the ring is also what the plan cannot say: with no entry
+offered to the kernel, the only take count that is true is zero. A partial
+take has to come from the submission queue actually filling up.
 
 The seam is off in a serving build, so these run against a separately built
 artifact named by ``LMCACHE_RAW_BLOCK_FAULT_EXT``. The two artifacts are kept
@@ -239,7 +243,7 @@ def test_a_submit_that_takes_nothing_keeps_the_entries_resident(tmp_path) -> Non
     Nothing may be quarantined for it, because nothing was handed over -- and
     treating it as fatal would poison an engine that is fine.
     """
-    report = _run(tmp_path, "nothing_taken")
+    report = _run(tmp_path, "reports_zero_taken")
     assert report.get("results") == [True], report
     assert report["poisoned"] is False
     assert report["quarantined_batches"] == 0
@@ -256,9 +260,17 @@ def test_a_retryable_submit_error_is_retried_not_quarantined(
     assert report["quarantined_batches"] == 0
 
 
-def test_a_partial_submit_completes_what_was_taken(tmp_path) -> None:
-    """Some taken, some resident: the resident half is flushed, not abandoned."""
-    report = _run(tmp_path, "partially_taken:0")
-    assert report.get("results") == [True], report
+def test_the_seam_refuses_to_state_a_partial_take(tmp_path) -> None:
+    """A count it cannot make true is refused, not accepted and ignored.
+
+    The substitution runs before the ring, so no entry was offered and any
+    non-zero count would describe entries that never moved. A seam that
+    accepted it would report a partial submit while reproducing the zero
+    case -- a test passing against a state the engine was never in.
+    """
+    report = _run(tmp_path, "partially_taken:1")
+    assert report.get("raised", "").startswith("ValueError"), report
+    assert "before the ring" in report["raised"]
+    assert "reports_zero_taken" in report["raised"]
     assert report["poisoned"] is False
     assert report["quarantined_batches"] == 0

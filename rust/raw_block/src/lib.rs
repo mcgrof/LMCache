@@ -358,10 +358,13 @@ fn drain_batch_owners<T>(
 #[cfg(feature = "fault-injection")]
 #[derive(Clone, Copy, Debug)]
 enum SubmitFault {
-    /// Nothing was taken, so every entry stays resident.
-    NothingTaken,
-    /// Fewer entries were taken than were pushed.
-    PartiallyTaken(usize),
+    /// The call reports taking nothing, and nothing was taken.
+    ///
+    /// This is the only count the seam can state truthfully. Substituting
+    /// before the ring means no entry was ever offered, so every entry is
+    /// still resident and still the worker's -- which is exactly what a
+    /// real submit returning zero leaves behind.
+    ReportsZeroTaken,
     /// Retryable: the ring is unchanged and the work is still ours.
     Retryable(i32),
     /// Fatal: what the kernel took is unknowable from here.
@@ -401,8 +404,7 @@ fn submit_ring(
             // they were, so the worker's own bookkeeping is what is under
             // test and the kernel is never told anything.
             return match fault {
-                SubmitFault::NothingTaken => Ok(0),
-                SubmitFault::PartiallyTaken(taken) => Ok(taken),
+                SubmitFault::ReportsZeroTaken => Ok(0),
                 SubmitFault::Retryable(errno) | SubmitFault::Fatal(errno) => {
                     Err(io::Error::from_raw_os_error(errno))
                 }
@@ -3335,14 +3337,16 @@ impl RawBlockDevice {
 
     /// Make one submit call report the named outcome instead of the kernel's.
     ///
-    /// `faults` maps a submit-call ordinal to one of `nothing_taken`,
-    /// `partially_taken:<n>`, `retryable:<errno>` or `fatal:<errno>`. Keying
-    /// on the ordinal is what makes a plan reproducible: a test names the
-    /// third submit and gets the third submit, however fast the run is.
+    /// `faults` maps a submit-call ordinal to one of `reports_zero_taken`,
+    /// `retryable:<errno>` or `fatal:<errno>`. Keying on the ordinal is what
+    /// makes a plan reproducible: a test names the third submit and gets the
+    /// third submit, however fast the run is.
     ///
     /// The substitution happens before the ring, so the entries stay exactly
     /// where they were and the kernel is told nothing. No completion is ever
-    /// synthesised for a request the kernel owns.
+    /// synthesised for a request the kernel owns. That is also why there is
+    /// no way to state a non-zero partial take here -- see the refusal
+    /// below.
     #[cfg(feature = "fault-injection")]
     fn inject_submit_faults(&self, faults: Vec<(u64, String)>) -> PyResult<()> {
         let plan = self
@@ -3351,13 +3355,17 @@ impl RawBlockDevice {
             .ok_or_else(|| PyRuntimeError::new_err("device has no fault plan"))?;
         let mut submits = plan.submits.lock().unwrap();
         for (ordinal, spec) in faults {
-            let fault = if spec == "nothing_taken" {
-                SubmitFault::NothingTaken
-            } else if let Some(n) = spec.strip_prefix("partially_taken:") {
-                SubmitFault::PartiallyTaken(
-                    n.parse()
-                        .map_err(|_| PyValueError::new_err(format!("bad count in {spec}")))?,
-                )
+            let fault = if spec == "reports_zero_taken" {
+                SubmitFault::ReportsZeroTaken
+            } else if spec.starts_with("partially_taken") {
+                return Err(PyValueError::new_err(
+                    "partially_taken cannot be expressed by this seam: the \
+                     substitution happens before the ring, so no entry was \
+                     offered to the kernel and any non-zero count would be \
+                     a claim about entries that never moved. Use \
+                     reports_zero_taken for the resident case; a genuine \
+                     partial take comes from filling the submission queue.",
+                ));
             } else if let Some(n) = spec.strip_prefix("retryable:") {
                 SubmitFault::Retryable(
                     n.parse()
