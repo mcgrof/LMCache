@@ -379,7 +379,13 @@ app.state.bound_clients = {}
 
 # Keep finished reqs
 app.state.finished_reqs = defaultdict(int)
-app.state.storage_pd_statuses = defaultdict(dict)
+# Requests currently waiting for a storage P/D barrier. A status is only
+# admitted while its request is registered here, so traffic that arrives for
+# a request already finished, already failed, or never seen cannot bring its
+# state back into existence. These are plain dicts for that reason: a
+# defaultdict would create an entry for whatever key was read.
+app.state.storage_pd_active = {}
+app.state.storage_pd_statuses = {}
 app.state.storage_pd_failures = {}
 
 pd_buffer_semaphore: Optional[WeightedSemaphore] = None
@@ -426,35 +432,7 @@ async def zmq_pull_server():
                 continue
 
             if isinstance(msg, StoragePDStatus):
-                req_id = msg.req_id
-                if msg.state != "READY":
-                    app.state.storage_pd_failures[req_id] = msg
-                    logger.error(
-                        "Storage P/D producer failed req %s rank %d at %s: %s",
-                        req_id,
-                        msg.tp_rank,
-                        msg.error_stage,
-                        msg.error_text,
-                    )
-                    continue
-                previous = app.state.storage_pd_statuses[req_id].get(msg.tp_rank)
-                if previous is not None and previous != msg:
-                    app.state.storage_pd_failures[req_id] = StoragePDStatus(
-                        req_id=req_id,
-                        producer_instance_id=msg.producer_instance_id,
-                        tp_rank=msg.tp_rank,
-                        state="FAILED",
-                        error_stage="PROXY_BARRIER",
-                        error_text="conflicting READY statuses for one TP rank",
-                    )
-                    continue
-                app.state.storage_pd_statuses[req_id][msg.tp_rank] = msg
-                logger.debug(
-                    "Storage P/D req %s rank %d published checkpoint %d.",
-                    req_id,
-                    msg.tp_rank,
-                    msg.checkpoint_seq,
-                )
+                record_storage_pd_status(msg)
                 continue
 
             if isinstance(msg, StoragePDReadAck):
@@ -528,39 +506,122 @@ def round_robin_pick_clients() -> tuple[ClientInfo, ClientInfo, ClientInfo]:
     return tokenization_client, prefill_client, decode_client
 
 
+def record_storage_pd_status(msg: StoragePDStatus) -> str:
+    """Take one producer status into the barrier's state, or refuse it.
+
+    Returns what was done, for the caller's log and for tests: ``ignored``
+    for a request that is not waiting on a barrier, ``failed`` for a
+    terminal status, ``conflict`` for a second, different READY from a rank
+    that already reported, and ``recorded`` otherwise.
+    """
+    req_id = msg.req_id
+    if not _pd_request_is_active(req_id):
+        # Late, duplicate or unknown: the request has already reached a
+        # terminal state or was never registered. Recording it would
+        # recreate state a barrier just cleared, and nothing would ever
+        # clear it again.
+        logger.debug(
+            "Storage P/D ignoring %s for inactive req %s rank %d",
+            msg.state,
+            req_id,
+            msg.tp_rank,
+        )
+        return "ignored"
+    if msg.state != "READY":
+        app.state.storage_pd_failures[req_id] = msg
+        logger.error(
+            "Storage P/D producer failed req %s rank %d at %s: %s",
+            req_id,
+            msg.tp_rank,
+            msg.error_stage,
+            msg.error_text,
+        )
+        return "failed"
+    ranks = app.state.storage_pd_statuses.setdefault(req_id, {})
+    previous = ranks.get(msg.tp_rank)
+    if previous is not None and previous != msg:
+        app.state.storage_pd_failures[req_id] = StoragePDStatus(
+            req_id=req_id,
+            producer_instance_id=msg.producer_instance_id,
+            tp_rank=msg.tp_rank,
+            state="FAILED",
+            error_stage="PROXY_BARRIER",
+            error_text="conflicting READY statuses for one TP rank",
+        )
+        return "conflict"
+    ranks[msg.tp_rank] = msg
+    logger.debug(
+        "Storage P/D req %s rank %d published checkpoint %d.",
+        req_id,
+        msg.tp_rank,
+        msg.checkpoint_seq,
+    )
+    return "recorded"
+
+
+def _register_pd_request(req_id: str) -> None:
+    """Admit statuses for this request from now until it is cleared.
+
+    Registration happens before the prefiller is contacted, because a
+    producer can report READY before its HTTP response comes back.
+    """
+    app.state.storage_pd_active[req_id] = time.monotonic()
+    app.state.storage_pd_statuses.setdefault(req_id, {})
+
+
+def _pd_request_is_active(req_id: str) -> bool:
+    """Whether this request is still waiting for its barrier."""
+    return req_id in app.state.storage_pd_active
+
+
 def _clear_pd_request_state(req_id: str) -> None:
+    app.state.storage_pd_active.pop(req_id, None)
     app.state.storage_pd_failures.pop(req_id, None)
     app.state.storage_pd_statuses.pop(req_id, None)
     app.state.finished_reqs.pop(req_id, None)
+
+
+def _handoff_deadline() -> float:
+    """One absolute deadline for a whole handoff, fixed when it starts.
+
+    Every wait in the handoff is measured against this instant rather than
+    given its own fresh allowance, so no stage can extend the budget by
+    starting its clock late or by retrying.
+    """
+    return time.monotonic() + float(global_args.storage_pd_ready_timeout_s)
 
 
 async def prefill_within_handoff_budget(
     client: httpx.AsyncClient,
     req_data: dict,
     req_id: str,
-) -> tuple[httpx.Response, float]:
-    """Post to the prefiller under the handoff budget; return what is left.
+    deadline: float,
+) -> httpx.Response:
+    """Post to the prefiller, bounded by the handoff's absolute deadline.
 
     The prefill clients carry no timeout of their own, so a prefiller that
-    stops answering holds the request open for as long as it likes. The
-    wait for READY that follows only starts its clock once this returns,
-    which leaves the part of the handoff most likely to stall as the part
-    nothing bounds. Spend one budget across both.
+    stops answering would hold the request open for as long as it likes,
+    and the wait for READY that follows only starts its clock once this
+    returns. Both stages share the one deadline.
     """
-    budget = float(global_args.storage_pd_ready_timeout_s)
-    started = time.monotonic()
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        _clear_pd_request_state(req_id)
+        raise TimeoutError(
+            f"storage P/D request {req_id} exhausted its handoff budget "
+            "before the prefiller was contacted"
+        )
     try:
-        response = await asyncio.wait_for(
+        return await asyncio.wait_for(
             send_request_to_service(client, "/v1/completions", req_data),
-            timeout=budget,
+            timeout=remaining,
         )
     except (asyncio.TimeoutError, TimeoutError) as exc:
         _clear_pd_request_state(req_id)
         raise TimeoutError(
-            f"storage P/D request {req_id} timed out after {budget:g}s "
+            f"storage P/D request {req_id} timed out after {remaining:g}s "
             f"waiting for the prefiller to answer"
         ) from exc
-    return response, budget - (time.monotonic() - started)
 
 
 async def wait_decode_kv_ready(
@@ -568,11 +629,25 @@ async def wait_decode_kv_ready(
     num_tp_rank: int,
     *,
     storage_pd: bool,
-    timeout_s: float,
+    deadline: float,
 ):
-    deadline = time.monotonic() + timeout_s
+    """Wait for every expected rank to report READY, or for the deadline.
+
+    The deadline is absolute and shared with the prefill call, so a barrier
+    that is handed an already exhausted budget fails rather than succeeding
+    on statuses that arrived too late to be useful.
+    """
     expected_ranks = set(range(num_tp_rank))
     while True:
+        if storage_pd and time.monotonic() >= deadline:
+            missing_ranks = expected_ranks - set(
+                app.state.storage_pd_statuses.get(req_id, {})
+            )
+            _clear_pd_request_state(req_id)
+            raise TimeoutError(
+                f"storage P/D request {req_id} timed out waiting for TP ranks "
+                f"{sorted(missing_ranks)}"
+            )
         failure = app.state.storage_pd_failures.get(req_id)
         if failure is not None:
             _clear_pd_request_state(req_id)
@@ -599,13 +674,6 @@ async def wait_decode_kv_ready(
             _clear_pd_request_state(req_id)
             logger.debug("Prefill node signaled kv ready for req %s", req_id)
             return []
-        if storage_pd and time.monotonic() >= deadline:
-            missing_ranks = expected_ranks - set(statuses)
-            _clear_pd_request_state(req_id)
-            raise TimeoutError(
-                f"storage P/D request {req_id} timed out waiting for TP ranks "
-                f"{sorted(missing_ranks)}"
-            )
         await asyncio.sleep(0.001)
 
 
@@ -680,16 +748,19 @@ async def handle_completions(request: Request):
         req_data["stream"] = False
         stream_options = req_data.pop("stream_options", None)
 
-        # Send request to prefill service, ignore the response
+        # Fix the whole handoff's deadline before anything waits, and admit
+        # this request's statuses from here: a producer can report READY
+        # before its HTTP response comes back.
+        handoff_deadline = _handoff_deadline()
         if global_args.storage_pd:
-            prefill_response, ready_budget = await prefill_within_handoff_budget(
-                prefill_client.client, req_data, req_id
+            _register_pd_request(req_id)
+            prefill_response = await prefill_within_handoff_budget(
+                prefill_client.client, req_data, req_id, handoff_deadline
             )
         else:
             prefill_response = await send_request_to_service(
                 prefill_client.client, "/v1/completions", req_data
             )
-            ready_budget = float(global_args.storage_pd_ready_timeout_s)
         prefill_output = prefill_response
 
         prefill_output = prefill_output.json()
@@ -709,7 +780,7 @@ async def handle_completions(request: Request):
                 req_id,
                 num_tp_rank,
                 storage_pd=global_args.storage_pd,
-                timeout_s=ready_budget,
+                deadline=handoff_deadline,
             )
             if statuses:
                 req_data["kv_transfer_params"] = {
@@ -719,6 +790,10 @@ async def handle_completions(request: Request):
                     ],
                 }
         finally:
+            # The barrier clears its own state on every path it returns
+            # through, but a cancelled or failed request never reaches it.
+            if global_args.storage_pd:
+                _clear_pd_request_state(req_id)
             if pd_buffer_semaphore is not None:
                 acquired = False
                 await pd_buffer_semaphore.release(slots)
@@ -819,16 +894,19 @@ async def handle_chat_completions(request: Request):
         req_data["stream"] = False
         stream_options = req_data.pop("stream_options", None)
 
-        # Send request to prefill service, get the response
+        # Fix the whole handoff's deadline before anything waits, and admit
+        # this request's statuses from here: a producer can report READY
+        # before its HTTP response comes back.
+        handoff_deadline = _handoff_deadline()
         if global_args.storage_pd:
-            prefill_response, ready_budget = await prefill_within_handoff_budget(
-                prefill_client.client, req_data, req_id
+            _register_pd_request(req_id)
+            prefill_response = await prefill_within_handoff_budget(
+                prefill_client.client, req_data, req_id, handoff_deadline
             )
         else:
             prefill_response = await send_request_to_service(
                 prefill_client.client, "/v1/completions", req_data
             )
-            ready_budget = float(global_args.storage_pd_ready_timeout_s)
         prefill_output = prefill_response
 
         prefill_output = prefill_output.json()
@@ -853,7 +931,7 @@ async def handle_chat_completions(request: Request):
                 req_id,
                 num_tp_rank,
                 storage_pd=global_args.storage_pd,
-                timeout_s=ready_budget,
+                deadline=handoff_deadline,
             )
             if statuses:
                 req_data["kv_transfer_params"] = {
@@ -863,6 +941,10 @@ async def handle_chat_completions(request: Request):
                     ],
                 }
         finally:
+            # The barrier clears its own state on every path it returns
+            # through, but a cancelled or failed request never reaches it.
+            if global_args.storage_pd:
+                _clear_pd_request_state(req_id)
             if pd_buffer_semaphore is not None:
                 acquired = False
                 await pd_buffer_semaphore.release(slots)
