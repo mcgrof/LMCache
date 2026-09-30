@@ -506,16 +506,37 @@ async def test_endpoint_releases_its_permit_once_on_the_successful_path(
     assert semaphore.releases == 1, "the permit was released more than once"
 
 
-def test_a_budget_of_one_token_is_refused_rather_than_forwarded() -> None:
-    """A handoff spends one token on the prefiller, so one is not enough.
+def test_a_one_token_request_is_served_rather_than_refused() -> None:
+    """One token is a whole answer, and the prefiller produces it.
 
-    Forwarding it gave the decoder a budget of zero, which the engine
-    rejects, so the request failed further away from the cause.
+    Refusing the request was a clearer error than forwarding a zero-token
+    decode, but it was still a refusal of something servable. The budget is
+    accepted and the decode is skipped instead.
     """
-    with pytest.raises(ValueError, match="at least 2 tokens"):
-        proxy.take_prefill_budget({"max_tokens": 1})
-    with pytest.raises(ValueError, match="at least 2 tokens"):
-        proxy.take_prefill_budget({"max_completion_tokens": 1})
+    for spelling in ("max_tokens", "max_completion_tokens"):
+        req = {spelling: 1}
+        assert proxy.take_prefill_budget(req) == 1
+        assert req["max_tokens"] == 1
+        assert proxy.producer_answer_is_complete(1, {}) is True
+
+
+def test_a_budget_below_one_token_is_refused() -> None:
+    with pytest.raises(ValueError, match="at least one token"):
+        proxy.take_prefill_budget({"max_tokens": 0})
+
+
+def test_a_producer_that_stopped_needs_no_decode() -> None:
+    """A terminal producer token ends the answer whatever the budget was.
+
+    Asking the decoder to continue past a stop would generate tokens the
+    engine had already decided not to.
+    """
+    stopped = {"choices": [{"finish_reason": "stop"}]}
+    ran_out = {"choices": [{"finish_reason": "length"}]}
+    unfinished = {"choices": [{"finish_reason": None}]}
+    assert proxy.producer_answer_is_complete(32, stopped) is True
+    assert proxy.producer_answer_is_complete(32, ran_out) is False
+    assert proxy.producer_answer_is_complete(32, unfinished) is False
 
 
 def test_a_request_with_no_budget_at_all_is_refused_by_name() -> None:
@@ -534,17 +555,59 @@ def test_the_chat_spelling_of_the_budget_is_accepted() -> None:
     assert req["max_tokens"] == 1
 
 
-def test_a_producer_with_no_first_token_does_not_corrupt_the_prompt() -> None:
-    """A missing id is not appended.
+@pytest.mark.parametrize(
+    "prefill_output",
+    [
+        {"kv_transfer_params": {}},
+        {},
+        {"kv_transfer_params": {"first_tok": None}},
+        {"kv_transfer_params": {"first_tok": "7"}},
+        {"kv_transfer_params": {"first_tok": True}},
+    ],
+    ids=["absent-key", "no-params", "null", "string", "bool"],
+)
+def test_an_unusable_producer_token_fails_before_decode(prefill_output) -> None:
+    """Continuing without it is a different answer, not a shorter one.
 
-    The prompt is what the decoder continues from, so appending None makes
-    it unparseable rather than merely one token shorter.
+    The budget has already been spent on a token the decoder is not given, so
+    it continues from the wrong prompt and emits a sequence nothing
+    generated. Merely declining to append left exactly that.
     """
     req = {"prompt": [1, 2, 3]}
-    assert proxy.adopt_prefill_first_token(req, {"kv_transfer_params": {}}) is None
+    with pytest.raises(ValueError, match="no usable first token"):
+        proxy.adopt_prefill_first_token(req, prefill_output)
     assert req["prompt"] == [1, 2, 3]
-    assert proxy.adopt_prefill_first_token(req, {}) is None
-    assert req["prompt"] == [1, 2, 3]
+
+
+def test_the_producer_head_chunk_carries_its_id_and_probabilities() -> None:
+    """A head chunk without a probability record cannot be compared.
+
+    The oracle reports one probability per generated token; a head chunk that
+    reports none makes the two lists different lengths, which reads as a
+    mismatch on a run where nothing mismatched.
+    """
+    prefill_output = {
+        "id": "cmpl-1",
+        "created": 1,
+        "model": "m",
+        "choices": [
+            {
+                "text": "A",
+                "logprobs": {"tokens": ["A"], "token_logprobs": [-0.5]},
+                "finish_reason": "stop",
+                "stop_reason": None,
+            }
+        ],
+    }
+    ongoing = proxy.producer_head_chunk(prefill_output, 7, final=False)
+    choice = ongoing["choices"][0]
+    assert choice["token_ids"] == [7]
+    assert choice["logprobs"]["token_logprobs"] == [-0.5]
+    # Not final: the decoder is still to speak, so this chunk ends nothing.
+    assert choice["finish_reason"] is None
+
+    final = proxy.producer_head_chunk(prefill_output, 7, final=True)
+    assert final["choices"][0]["finish_reason"] == "stop"
 
 
 def test_a_producer_first_token_is_carried_into_the_prompt() -> None:

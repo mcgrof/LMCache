@@ -532,31 +532,78 @@ def take_prefill_budget(req_data: dict) -> int:
             "max_completion_tokens) so the decoder's budget can be computed"
         )
     budget = int(budget)
-    if budget < 2:
+    if budget < 1:
         raise ValueError(
-            "a prefill/decode handoff spends one token on the prefiller, so "
-            f"the budget must be at least 2 tokens; got {budget}"
+            f"a generation budget must be at least one token; got {budget}"
         )
     req_data["max_tokens"] = 1
     return budget
 
 
-def adopt_prefill_first_token(req_data: dict, prefill_output: dict) -> Optional[int]:
+def adopt_prefill_first_token(req_data: dict, prefill_output: dict) -> int:
     """Carry the prefiller's one token into the decoder's prompt.
 
-    Returns the token id, or None when the producer reported none. A missing
-    id is not appended: the prompt is what the decoder continues from, and
-    appending None makes it unparseable rather than merely shorter.
+    Raises when the producer reported no usable id. Continuing without it is
+    not a lesser answer, it is a different one: the budget has already been
+    spent on a token the decoder is not given, so the decoder continues from
+    the wrong prompt and emits a sequence that was never generated.
     """
     first_tok_id = (prefill_output.get("kv_transfer_params") or {}).get("first_tok")
-    if first_tok_id is None:
-        logger.warning(
-            "Prefiller returned no first token id; the decoder continues from "
-            "the original prompt and the comparison has no producer token"
+    if not isinstance(first_tok_id, int) or isinstance(first_tok_id, bool):
+        raise ValueError(
+            "prefiller reported no usable first token id "
+            f"({first_tok_id!r}); the decoder cannot continue from a prompt "
+            "missing the token the budget was spent on"
         )
-        return None
     req_data["prompt"].append(first_tok_id)
-    return int(first_tok_id)
+    return first_tok_id
+
+
+def producer_head_chunk(
+    prefill_output: dict,
+    first_tok_id: int,
+    *,
+    final: bool,
+) -> dict:
+    """Render the prefiller's one token as a completion chunk.
+
+    Carries the id and the probability record beside the text. A client
+    comparing generated tokens cannot recover an id from text without
+    retokenizing, which is a different operation and can disagree; and a
+    probability list that omits this token cannot be compared against one
+    that includes it.
+    """
+    choice = (prefill_output.get("choices") or [{}])[0]
+    return {
+        "id": prefill_output["id"],
+        "object": "text_completion",
+        "created": prefill_output["created"],
+        "model": prefill_output["model"],
+        "choices": [
+            {
+                "index": 0,
+                "text": choice.get("text", ""),
+                "token_ids": [first_tok_id],
+                "logprobs": choice.get("logprobs"),
+                "finish_reason": choice.get("finish_reason") if final else None,
+                "stop_reason": choice.get("stop_reason") if final else None,
+            }
+        ],
+        "usage": None,
+    }
+
+
+def producer_answer_is_complete(budget: int, prefill_output: dict) -> bool:
+    """Whether the prefiller's single token is the whole answer.
+
+    Two ways that happens: the caller asked for one token, or the producer
+    stopped of its own accord. Either way the decoder has nothing to
+    generate, and asking it for zero tokens is a request the engine refuses.
+    """
+    if budget <= 1:
+        return True
+    finish = (prefill_output.get("choices") or [{}])[0].get("finish_reason")
+    return finish not in (None, "", "length")
 
 
 def relay_storage_pd_read_ack(ack: StoragePDReadAck) -> None:
@@ -863,8 +910,10 @@ async def handle_completions(request: Request):
         et = time.time()
         stats_calculator.add(et - st)
 
-        req_data["max_tokens"] = org_max_tokens - 1
+        producer_only = producer_answer_is_complete(org_max_tokens, prefill_output)
         first_tok_id = adopt_prefill_first_token(req_data, prefill_output)
+        if not producer_only:
+            req_data["max_tokens"] = org_max_tokens - 1
         req_data.pop("kv_transfer_params")
         req_data["stream"] = True
         if stream_options is not None:
@@ -895,34 +944,27 @@ async def handle_completions(request: Request):
 
         # Stream response from decode service
         async def generate_stream():
-            head_chunk = {
-                "id": prefill_output["id"],
-                "object": "text_completion",
-                "created": prefill_output["created"],
-                "model": prefill_output["model"],
-                "choices": [
-                    {
-                        "index": 0,
-                        "text": prefill_output["choices"][0]["text"],
-                        # The prefiller already decided this token and
-                        # reported its integer id. Carry the id, not only the
-                        # text it renders to: a client comparing generated
-                        # tokens cannot recover an id from text without
-                        # retokenizing, which is a different operation and can
-                        # disagree.
-                        "token_ids": (
-                            [first_tok_id] if first_tok_id is not None else None
-                        ),
-                        "logprobs": None,
-                        "finish_reason": None,
-                        "stop_reason": None,
-                    }
-                ],
-                "usage": None,
-            }
             yield (
-                "data: " + json.dumps(head_chunk, separators=(",", ":")) + "\n\n"
+                "data: "
+                + json.dumps(
+                    producer_head_chunk(
+                        prefill_output, first_tok_id, final=producer_only
+                    ),
+                    separators=(",", ":"),
+                )
+                + "\n\n"
             ).encode()
+
+            if producer_only:
+                # The answer is one token: either that is all the caller
+                # asked for, or the producer stopped. The decoder has nothing
+                # to generate, and asking it for zero tokens is a request the
+                # engine refuses. The publication stands and no reader will
+                # claim it, which is the writer's to resolve -- nothing here
+                # fabricates a restore acknowledgement for a read that did
+                # not happen.
+                yield b"data: [DONE]\n\n"
+                return
 
             async for chunk in stream_service_response(
                 decode_client.client, "/v1/completions", req_data
@@ -1027,9 +1069,11 @@ async def handle_chat_completions(request: Request):
         et = time.time()
         stats_calculator.add(et - st)
 
-        req_data["max_tokens"] = org_max_tokens - 1
-        if org_max_completion_tokens is not None:
-            req_data["max_completion_tokens"] = org_max_completion_tokens - 1
+        producer_only = producer_answer_is_complete(org_max_tokens, prefill_output)
+        if not producer_only:
+            req_data["max_tokens"] = org_max_tokens - 1
+            if org_max_completion_tokens is not None:
+                req_data["max_completion_tokens"] = org_max_completion_tokens - 1
 
         # Add the first token from prefill to the tokenized messages for decode
         first_tok_id = adopt_prefill_first_token(req_data, prefill_output)
@@ -1062,6 +1106,8 @@ async def handle_chat_completions(request: Request):
                 acquired = False
                 await pd_buffer_semaphore.release(slots)
 
+        producer_choice = (prefill_output.get("choices") or [{}])[0]
+
         # Stream response from decode service
         async def generate_stream():
             initial_chunk = {
@@ -1090,24 +1136,35 @@ async def handle_chat_completions(request: Request):
                 "choices": [
                     {
                         "index": 0,
-                        "delta": {"content": prefill_output["choices"][0]["text"]},
+                        "delta": {"content": producer_choice.get("text", "")},
                         # The prefiller already decided this token and
-                        # reported its integer id. Carry the id, not only the
-                        # text it renders to: a client comparing generated
-                        # tokens cannot recover an id from text without
-                        # retokenizing, which is a different operation and can
-                        # disagree.
-                        "token_ids": (
-                            [first_tok_id] if first_tok_id is not None else None
+                        # reported its integer id. Carry the id and the
+                        # probability record, not only the text they render
+                        # to: a client comparing generated tokens cannot
+                        # recover an id from text without retokenizing, and a
+                        # probability list missing this token cannot be
+                        # compared against one that includes it.
+                        "token_ids": [first_tok_id],
+                        "logprobs": producer_choice.get("logprobs"),
+                        "finish_reason": (
+                            producer_choice.get("finish_reason")
+                            if producer_only
+                            else None
                         ),
-                        "logprobs": None,
-                        "finish_reason": None,
                     }
                 ],
             }
             yield (
                 "data: " + json.dumps(head_chunk, separators=(",", ":")) + "\n\n"
             ).encode()
+
+            if producer_only:
+                # One token is the whole answer, so there is nothing to
+                # decode and a zero-token request would be refused. The
+                # publication stands unread, which is the writer's to
+                # resolve; nothing here fabricates a restore acknowledgement.
+                yield b"data: [DONE]\n\n"
+                return
 
             # Stream and convert completion format chunks to chat completion format
             async for chunk in stream_service_response(
