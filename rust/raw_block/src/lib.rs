@@ -245,6 +245,79 @@ enum SubmitOutcome {
 /// The initial submission and the flush of entries an earlier submit left
 /// behind both face the same three outcomes, and a flush that treated a fatal
 /// error as retryable would spin while its waiters never finished.
+/// A submit outcome a test asks the worker to see instead of the kernel's.
+///
+/// Reaching the fatal and partial-submit transitions otherwise needs a device
+/// that fails on demand. This replaces what one submit call reports, before
+/// the ring is consulted, so the worker runs its ordinary code against an
+/// outcome it cannot otherwise be given. No completion is ever synthesised:
+/// a request the kernel owns is never claimed to have finished.
+#[cfg(feature = "fault-injection")]
+#[derive(Clone, Copy, Debug)]
+enum SubmitFault {
+    /// Nothing was taken, so every entry stays resident.
+    NothingTaken,
+    /// Fewer entries were taken than were pushed.
+    PartiallyTaken(usize),
+    /// Retryable: the ring is unchanged and the work is still ours.
+    Retryable(i32),
+    /// Fatal: what the kernel took is unknowable from here.
+    Fatal(i32),
+}
+
+/// Faults keyed by which submit call they apply to.
+///
+/// Keying on the call ordinal rather than on time is what makes a plan
+/// reproducible: a test names the third submit, and gets the third submit,
+/// however fast or slow the run is.
+#[cfg(feature = "fault-injection")]
+#[derive(Default)]
+struct FaultPlan {
+    submits: Mutex<HashMap<u64, SubmitFault>>,
+    submit_calls: AtomicU64,
+}
+
+#[cfg(feature = "fault-injection")]
+impl FaultPlan {
+    /// Take the fault for this submit call, if the plan names one.
+    fn take_submit_fault(&self) -> Option<SubmitFault> {
+        let ordinal = self.submit_calls.fetch_add(1, Ordering::SeqCst);
+        self.submits.lock().unwrap().remove(&ordinal)
+    }
+}
+
+/// Submit the ring, or report what a plan says this call reports.
+fn submit_ring(
+    ring: &IoUringWrapper,
+    #[cfg(feature = "fault-injection")] plan: &Option<Arc<FaultPlan>>,
+) -> io::Result<usize> {
+    #[cfg(feature = "fault-injection")]
+    if let Some(plan) = plan {
+        if let Some(fault) = plan.take_submit_fault() {
+            // Deliberately before the ring: the entries stay exactly where
+            // they were, so the worker's own bookkeeping is what is under
+            // test and the kernel is never told anything.
+            return match fault {
+                SubmitFault::NothingTaken => Ok(0),
+                SubmitFault::PartiallyTaken(taken) => Ok(taken),
+                SubmitFault::Retryable(errno) | SubmitFault::Fatal(errno) => {
+                    Err(io::Error::from_raw_os_error(errno))
+                }
+            };
+        }
+    }
+    match ring {
+        IoUringWrapper::Standard(ring) => {
+            let ring = ring.lock().unwrap();
+            ring.submitter().submit()
+        }
+        IoUringWrapper::Big(ring) => {
+            let ring = ring.lock().unwrap();
+            ring.submitter().submit()
+        }
+    }
+}
+
 fn classify_submit(result: &io::Result<usize>) -> SubmitOutcome {
     match result {
         Ok(_) => SubmitOutcome::Progressed,
@@ -1362,6 +1435,8 @@ struct RawBlockDevice {
     // batch. Never cleared: the Python objects behind them must stay alive
     // while the device may still reach the memory they describe.
     quarantined_owners: Arc<Mutex<Vec<Py<PyAny>>>>,
+    #[cfg(feature = "fault-injection")]
+    fault_plan: Option<Arc<FaultPlan>>,
 }
 
 /// RAII guard for a raw file descriptor
@@ -1481,6 +1556,11 @@ impl RawBlockDevice {
             fd_size_bytes(fd)?
         };
 
+        // Created before the branch so that the worker closure and the
+        // struct can share one plan without threading it through the tuple.
+        #[cfg(feature = "fault-injection")]
+        let fault_plan: Option<Arc<FaultPlan>> = Some(Arc::new(FaultPlan::default()));
+
         let (
             ring_opt,
             queue_opt,
@@ -1563,6 +1643,8 @@ impl RawBlockDevice {
             let poisoned = Arc::new(AtomicBool::new(false));
             let quarantined_batches_worker = Arc::clone(&quarantined_batches);
             let poisoned_worker = Arc::clone(&poisoned);
+            #[cfg(feature = "fault-injection")]
+            let fault_plan_worker = fault_plan.clone();
             let batched_completions =
                 Arc::new(Mutex::new(HashMap::<u64, Vec<Arc<IoCompletion>>>::new()));
             let next_batch_id = Arc::new(AtomicU64::new(1));
@@ -2135,16 +2217,11 @@ impl RawBlockDevice {
                         // looking for new work, so their waiters are not
                         // blocked on entries that sit in the ring untouched.
                         if resident_sqes {
-                            let flushed = match &ring_clone {
-                                IoUringWrapper::Standard(ring) => {
-                                    let ring = ring.lock().unwrap();
-                                    ring.submitter().submit()
-                                }
-                                IoUringWrapper::Big(ring) => {
-                                    let ring = ring.lock().unwrap();
-                                    ring.submitter().submit()
-                                }
-                            };
+                            let flushed = submit_ring(
+                                &ring_clone,
+                                #[cfg(feature = "fault-injection")]
+                                &fault_plan_worker,
+                            );
                             ring_clone.submission_sync();
                             match classify_submit(&flushed) {
                                 SubmitOutcome::Progressed => {
@@ -2282,16 +2359,11 @@ impl RawBlockDevice {
                             }
 
                             let built_count = built_submissions.len();
-                            let submit_result = match &ring_clone {
-                                IoUringWrapper::Standard(ring) => {
-                                    let ring = ring.lock().unwrap();
-                                    ring.submitter().submit()
-                                }
-                                IoUringWrapper::Big(ring) => {
-                                    let ring = ring.lock().unwrap();
-                                    ring.submitter().submit()
-                                }
-                            };
+                            let submit_result = submit_ring(
+                                &ring_clone,
+                                #[cfg(feature = "fault-injection")]
+                                &fault_plan_worker,
+                            );
                             // Classified the same way as the resident flush.
                             let outcome = classify_submit(&submit_result);
                             match submit_result {
@@ -2392,16 +2464,11 @@ impl RawBlockDevice {
                         // Deliver any SQE still resident so it can complete or
                         // report an error instead of waiting for a submit that
                         // the shutdown path would never make.
-                        let _ = match &ring_clone {
-                            IoUringWrapper::Standard(ring) => {
-                                let ring = ring.lock().unwrap();
-                                ring.submitter().submit()
-                            }
-                            IoUringWrapper::Big(ring) => {
-                                let ring = ring.lock().unwrap();
-                                ring.submitter().submit()
-                            }
-                        };
+                        let _ = submit_ring(
+                            &ring_clone,
+                            #[cfg(feature = "fault-injection")]
+                            &fault_plan_worker,
+                        );
                         let completions: Vec<(u64, i32)> = match &ring_clone {
                             IoUringWrapper::Standard(ring) => {
                                 let mut ring = ring.lock().unwrap();
@@ -2546,6 +2613,8 @@ impl RawBlockDevice {
                 .unwrap_or_else(|| Arc::new(Mutex::new(HashSet::new()))),
             poisoned: poisoned_opt.unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
             quarantined_owners: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(feature = "fault-injection")]
+            fault_plan,
         })
     }
 
@@ -3298,6 +3367,68 @@ impl RawBlockDevice {
     /// Synchronous read using io_uring.
     ///
     /// Deprecated: use ``batched_read()`` followed by ``wait_iouring()`` instead.
+    /// Whether this build carries the test-only fault seam.
+    ///
+    /// A serving build answers false. A test asks before installing a plan so
+    /// that it fails with a clear reason rather than silently measuring
+    /// nothing on an ordinary artifact.
+    #[staticmethod]
+    fn has_fault_injection() -> bool {
+        cfg!(feature = "fault-injection")
+    }
+
+    /// Make one submit call report the named outcome instead of the kernel's.
+    ///
+    /// `faults` maps a submit-call ordinal to one of `nothing_taken`,
+    /// `partially_taken:<n>`, `retryable:<errno>` or `fatal:<errno>`. Keying
+    /// on the ordinal is what makes a plan reproducible: a test names the
+    /// third submit and gets the third submit, however fast the run is.
+    ///
+    /// The substitution happens before the ring, so the entries stay exactly
+    /// where they were and the kernel is told nothing. No completion is ever
+    /// synthesised for a request the kernel owns.
+    #[cfg(feature = "fault-injection")]
+    fn inject_submit_faults(&self, faults: Vec<(u64, String)>) -> PyResult<()> {
+        let plan = self
+            .fault_plan
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("device has no fault plan"))?;
+        let mut submits = plan.submits.lock().unwrap();
+        for (ordinal, spec) in faults {
+            let fault = if spec == "nothing_taken" {
+                SubmitFault::NothingTaken
+            } else if let Some(n) = spec.strip_prefix("partially_taken:") {
+                SubmitFault::PartiallyTaken(
+                    n.parse()
+                        .map_err(|_| PyValueError::new_err(format!("bad count in {spec}")))?,
+                )
+            } else if let Some(n) = spec.strip_prefix("retryable:") {
+                SubmitFault::Retryable(
+                    n.parse()
+                        .map_err(|_| PyValueError::new_err(format!("bad errno in {spec}")))?,
+                )
+            } else if let Some(n) = spec.strip_prefix("fatal:") {
+                SubmitFault::Fatal(
+                    n.parse()
+                        .map_err(|_| PyValueError::new_err(format!("bad errno in {spec}")))?,
+                )
+            } else {
+                return Err(PyValueError::new_err(format!("unknown fault {spec}")));
+            };
+            submits.insert(ordinal, fault);
+        }
+        Ok(())
+    }
+
+    /// How many submit calls the worker has made, for a test to key a plan on.
+    #[cfg(feature = "fault-injection")]
+    fn submit_call_count(&self) -> u64 {
+        self.fault_plan
+            .as_ref()
+            .map(|plan| plan.submit_calls.load(Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
     /// Refused: a synchronous read owns nothing it could retain.
     ///
     /// This path registered no owner for its destination and could not carry
