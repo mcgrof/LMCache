@@ -142,6 +142,12 @@ def _make_connector(
         get_extra_config_value=lambda key, default: default
     )
     connector._request_trackers = {}
+    # Built without running __init__, so every attribute the code under
+    # test reads has to be set here. request_finished consults the storage
+    # handoff mode to decide whether to defer freeing the source blocks;
+    # this connector is a scheduler outside that mode.
+    connector._storage_pd_mode = False
+    connector._storage_pd_raw_role = "writer"
     return connector
 
 
