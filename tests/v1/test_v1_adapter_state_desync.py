@@ -22,9 +22,12 @@ locks in that behavior by feeding ``wait_for_save`` a request whose
 # Standard
 from collections import OrderedDict
 from concurrent.futures import Future
+from contextlib import contextmanager
 from types import SimpleNamespace
+from typing import Any, Iterator
 import logging
 import threading
+import time
 
 # Third Party
 from vllm.v1.request import RequestStatus
@@ -46,6 +49,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
 )
 from lmcache.v1.storage_backend.raw_block import RawBlockPublicationReceipt
 from lmcache.v1.storage_backend.storage_pd_protocol import (
+    StoragePDNotificationQueue,
     StoragePDReadAck,
     StoragePDStatus,
 )
@@ -129,9 +133,10 @@ def _make_storage_pd_connector() -> LMCacheConnectorV1Impl:
     connector._storage_pd_failures = {}
     connector._storage_pd_terminal_states = {}
     connector._storage_pd_receipts = {}
-    connector._storage_pd_status_sent = set()
+    connector._storage_pd_status_queued = set()
     connector._storage_pd_acks_sent = OrderedDict()
     connector._storage_pd_status_sender = None
+    connector._storage_pd_notify_queue = None
     connector._storage_pd_notify_required = False
     # get_finished consults the role: a scheduler never completes a storage
     # handoff. This fixture stands in for a worker.
@@ -148,6 +153,81 @@ def _make_storage_pd_connector() -> LMCacheConnectorV1Impl:
         get_extra_config_value=lambda _key, default: default
     )
     return connector
+
+
+_OPEN_QUEUES: list[StoragePDNotificationQueue] = []
+
+SETTLE_TIMEOUT_S = 10.0
+
+
+@pytest.fixture(autouse=True)
+def _close_notification_queues() -> Iterator[None]:
+    """Stop any delivery worker a test started, however the test ended."""
+    yield
+    while _OPEN_QUEUES:
+        _OPEN_QUEUES.pop().close()
+
+
+def _attach_notification_queue(
+    connector: LMCacheConnectorV1Impl,
+    sender: Any,
+    **kwargs: Any,
+) -> StoragePDNotificationQueue:
+    """Give the connector the real delivery queue over a test sender."""
+    kwargs.setdefault("retry_interval_s", 0.001)
+    kwargs.setdefault("deadline_s", SETTLE_TIMEOUT_S)
+    queue = StoragePDNotificationQueue(
+        sender,
+        on_unreported=connector._log_storage_pd_delivery,
+        **kwargs,
+    )
+    _OPEN_QUEUES.append(queue)
+    connector._storage_pd_status_sender = sender
+    connector._storage_pd_notify_queue = queue
+    return queue
+
+
+@contextmanager
+def _captured_adapter_logs(level: int) -> Iterator[list[logging.LogRecord]]:
+    """Collect the adapter's own records, whatever pytest can see.
+
+    ``init_logger`` sets ``propagate = False``, so these never reach
+    ``caplog``. Attaching a handler to the named logger is what the
+    desynced-save regression below does too, and for the same reason.
+    """
+    records: list[logging.LogRecord] = []
+
+    class _ListHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _ListHandler(level=level)
+    adapter_logger = logging.getLogger("lmcache.integration.vllm.vllm_v1_adapter")
+    original_level = adapter_logger.level
+    adapter_logger.setLevel(level)
+    adapter_logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        adapter_logger.removeHandler(handler)
+        adapter_logger.setLevel(original_level)
+
+
+def _finish_until_released(
+    connector: LMCacheConnectorV1Impl,
+    finished_req_ids: set[str] | None = None,
+) -> set[str]:
+    """Step ``get_finished`` until it releases something, as vLLM does.
+
+    Delivery no longer happens inside the call that decides a status, so a
+    request is released on a later step rather than the one that queued it.
+    """
+    released, _ = connector.get_finished(finished_req_ids or set())
+    deadline = time.monotonic() + SETTLE_TIMEOUT_S
+    while not released and time.monotonic() < deadline:
+        time.sleep(0.002)
+        released, _ = connector.get_finished(set())
+    return released
 
 
 def test_storage_pd_reader_does_not_run_writer_completion() -> None:
@@ -201,7 +281,7 @@ def test_storage_pd_get_finished_waits_for_store_publication() -> None:
 
     connector = _make_storage_pd_connector()
     sender = Sender()
-    connector._storage_pd_status_sender = sender  # type: ignore[assignment]
+    _attach_notification_queue(connector, sender)
     completion: Future[list[RawBlockPublicationReceipt]] = Future()
     connector._storage_pd_store_futures["request-1"] = completion
 
@@ -209,7 +289,7 @@ def test_storage_pd_get_finished_waits_for_store_publication() -> None:
     assert sender.statuses == []
     receipt = RawBlockPublicationReceipt("writer", 1, 1, "digest")
     completion.set_result([receipt])
-    assert connector.get_finished(set()) == ({"request-1"}, None)
+    assert _finish_until_released(connector) == {"request-1"}
     assert [status.manifest_digest for status in sender.statuses] == ["digest"]
     assert connector.get_finished({"request-1"}) == (set(), None)
 
@@ -235,84 +315,94 @@ def test_storage_pd_get_finished_keeps_wire_and_vllm_request_ids_distinct() -> N
         lmcache_engine=SimpleNamespace(storage_manager=storage_manager)
     )
     sender = Sender()
-    connector._storage_pd_status_sender = sender  # type: ignore[assignment]
+    _attach_notification_queue(connector, sender)
     connector._storage_pd_wire_req_ids["cmpl-internal-0"] = "proxy-uuid"
     completion: Future[list[RawBlockPublicationReceipt]] = Future()
     completion.set_result([RawBlockPublicationReceipt("writer", 1, 1, "digest")])
     connector._storage_pd_store_futures["cmpl-internal-0"] = completion
 
-    assert connector.get_finished({"cmpl-internal-0"}) == (
-        {"cmpl-internal-0"},
-        None,
-    )
+    assert _finish_until_released(connector, {"cmpl-internal-0"}) == {"cmpl-internal-0"}
     assert storage_manager.finished == ["proxy-uuid"]
     assert [status.req_id for status in sender.statuses] == ["proxy-uuid"]
 
 
-def test_storage_pd_get_finished_resends_ready_after_a_failed_send() -> None:
+def test_storage_pd_a_failed_send_does_not_become_a_failed_publication() -> None:
     """A send that fails must not turn a durable publication into a failure.
 
     The publication already happened and its receipt is recorded, so the
     only thing left is telling the peer. Reporting FAILED instead would
     send the consumer looking elsewhere for an object that is on the
-    device and correct.
+    device and correct. Retrying is the delivery queue's job now, and the
+    request is held until it either lands or is given up on.
     """
 
     class FlakySender:
         def __init__(self) -> None:
             self.statuses: list[StoragePDStatus] = []
-            self.fail_next = True
+            self.attempts = 0
 
         def send(self, status: StoragePDStatus) -> None:
-            if self.fail_next:
-                self.fail_next = False
+            self.attempts += 1
+            if self.attempts == 1:
                 raise OSError("peer not reachable")
             self.statuses.append(status)
 
     connector = _make_storage_pd_connector()
     sender = FlakySender()
-    connector._storage_pd_status_sender = sender  # type: ignore[assignment]
+    _attach_notification_queue(connector, sender)
     receipt = RawBlockPublicationReceipt("writer", 1, 1, "digest")
     completion: Future[list[RawBlockPublicationReceipt]] = Future()
     completion.set_result([receipt])
     connector._storage_pd_store_futures["request-1"] = completion
 
-    assert connector.get_finished({"request-1"}) == (set(), None)
-    assert sender.statuses == []
-
-    assert connector.get_finished(set()) == ({"request-1"}, None)
+    assert _finish_until_released(connector, {"request-1"}) == {"request-1"}
+    assert sender.attempts >= 2
     assert [status.state for status in sender.statuses] == ["READY"]
     assert connector._storage_pd_failures == {}
     assert "request-1" not in connector._storage_pd_aborted
 
 
-def test_storage_pd_get_finished_sends_status_without_holding_the_state_lock() -> None:
+def test_storage_pd_get_finished_does_not_wait_for_the_peer() -> None:
     """A peer that stops reading must not be able to freeze the connector.
 
-    The status socket can block for as long as the consumer likes, so the
-    send has to happen with the state lock released; otherwise every
-    other user of this connector waits on an unrelated peer.
+    The status socket can block for as long as the consumer likes. The
+    engine step therefore hands the status over and returns; it neither
+    waits for the peer nor holds the connector's state lock while the
+    send is in flight, or every other user of this connector would queue
+    behind an unrelated consumer.
     """
-    observed: list[bool] = []
+    release_peer = threading.Event()
+    sending = threading.Event()
+    lock_free_during_send: list[bool] = []
 
-    class LockProbingSender:
+    class BlockedSender:
         def __init__(self, connector: LMCacheConnectorV1Impl) -> None:
             self._connector = connector
 
         def send(self, status: StoragePDStatus) -> None:
             acquired = self._connector._storage_pd_lock.acquire(blocking=False)
-            observed.append(acquired)
+            lock_free_during_send.append(acquired)
             if acquired:
                 self._connector._storage_pd_lock.release()
+            sending.set()
+            assert release_peer.wait(SETTLE_TIMEOUT_S)
 
     connector = _make_storage_pd_connector()
-    connector._storage_pd_status_sender = LockProbingSender(connector)  # type: ignore[assignment]
+    _attach_notification_queue(connector, BlockedSender(connector))
     completion: Future[list[RawBlockPublicationReceipt]] = Future()
     completion.set_result([RawBlockPublicationReceipt("writer", 1, 1, "digest")])
     connector._storage_pd_store_futures["request-1"] = completion
 
-    assert connector.get_finished({"request-1"}) == ({"request-1"}, None)
-    assert observed == [True], "the state lock was held across the status send"
+    assert connector.get_finished({"request-1"}) == (set(), None)
+    assert sending.wait(SETTLE_TIMEOUT_S)
+    # The peer is still inside the send and the step already returned.
+    assert connector.get_finished(set()) == (set(), None)
+    assert lock_free_during_send == [True], (
+        "the state lock was held across the status send"
+    )
+
+    release_peer.set()
+    assert _finish_until_released(connector) == {"request-1"}
 
 
 def test_storage_pd_get_finished_refuses_to_release_without_a_consumer() -> None:
@@ -364,11 +454,14 @@ def test_storage_pd_read_ack_carries_the_published_request_identity() -> None:
 
     connector = _make_storage_pd_connector()
     sender = Sender()
-    connector._storage_pd_status_sender = sender  # type: ignore[assignment]
+    _attach_notification_queue(connector, sender)
     receipt = RawBlockPublicationReceipt("writer-epoch", 7, 1, "digest")
     status = StoragePDStatus.ready("proxy-uuid", 0, receipt)
 
     connector._ack_storage_pd_restore("cmpl-internal-0", status)
+    deadline = time.monotonic() + SETTLE_TIMEOUT_S
+    while not sender.acks and time.monotonic() < deadline:
+        time.sleep(0.002)
 
     assert [ack.req_id for ack in sender.acks] == ["proxy-uuid"]
     ack = sender.acks[0]
@@ -395,18 +488,18 @@ def test_storage_pd_releasing_a_request_clears_its_state() -> None:
         def send(self, status) -> None:
             return None
 
-    connector._storage_pd_status_sender = Sender()  # type: ignore[assignment]
+    _attach_notification_queue(connector, Sender())
     connector._storage_pd_wire_req_ids["request-1"] = "proxy-uuid"
     completion: Future[list[RawBlockPublicationReceipt]] = Future()
     completion.set_result([RawBlockPublicationReceipt("writer", 1, 1, "digest")])
     connector._storage_pd_store_futures["request-1"] = completion
 
-    assert connector.get_finished({"request-1"}) == ({"request-1"}, None)
+    assert _finish_until_released(connector, {"request-1"}) == {"request-1"}
 
     assert connector._storage_pd_store_futures == {}
     assert connector._storage_pd_wire_req_ids == {}
     assert connector._storage_pd_receipts == {}
-    assert connector._storage_pd_status_sent == set()
+    assert connector._storage_pd_status_queued == set()
     assert connector._storage_pd_engine_finished == set()
     assert connector._storage_pd_failures == {}
     assert connector._storage_pd_terminal_states == {}
@@ -426,7 +519,7 @@ def test_storage_pd_forgets_the_oldest_finished_requests() -> None:
         def send(self, status) -> None:
             return None
 
-    connector._storage_pd_status_sender = Sender()  # type: ignore[assignment]
+    _attach_notification_queue(connector, Sender())
     original = vllm_v1_adapter.STORAGE_PD_REQUEST_HISTORY
     vllm_v1_adapter.STORAGE_PD_REQUEST_HISTORY = 3
     try:
@@ -437,7 +530,7 @@ def test_storage_pd_forgets_the_oldest_finished_requests() -> None:
                 [RawBlockPublicationReceipt("writer", 1, 1, "digest")]
             )
             connector._storage_pd_store_futures[req_id] = completion
-            assert connector.get_finished({req_id}) == ({req_id}, None)
+            assert _finish_until_released(connector, {req_id}) == {req_id}
         assert list(connector._storage_pd_returned) == [
             f"request-{i}" for i in range(5, 8)
         ]
@@ -455,16 +548,83 @@ def test_storage_pd_get_finished_reports_failure_but_releases_source_blocks() ->
 
     connector = _make_storage_pd_connector()
     sender = Sender()
-    connector._storage_pd_status_sender = sender  # type: ignore[assignment]
+    _attach_notification_queue(connector, sender)
     completion: Future[list[RawBlockPublicationReceipt]] = Future()
     connector._storage_pd_store_futures["request-failed"] = completion
     completion.set_exception(OSError("write failed"))
 
-    assert connector.get_finished({"request-failed"}) == ({"request-failed"}, None)
+    assert _finish_until_released(connector, {"request-failed"}) == {"request-failed"}
     assert [(s.state, s.error_text) for s in sender.statuses] == [
         ("FAILED", "write failed")
     ]
     assert connector.get_finished({"request-failed"}) == (set(), None)
+
+
+def test_storage_pd_releases_a_request_it_could_not_announce() -> None:
+    """Giving up on delivery still has to be a decision, and a loud one.
+
+    The bytes are durable and the publication stands; what failed is
+    telling anyone. Holding the engine's request open would not change
+    that, so it is released -- and the loss is recorded, because it
+    authorizes no extent reuse: the writer's lease is released on an
+    acknowledgement this request will now never receive.
+    """
+
+    class DeadSender:
+        def send(self, status: StoragePDStatus) -> None:
+            raise ConnectionRefusedError("proxy is gone")
+
+    connector = _make_storage_pd_connector()
+    _attach_notification_queue(connector, DeadSender(), deadline_s=0.0)
+    completion: Future[list[RawBlockPublicationReceipt]] = Future()
+    completion.set_result([RawBlockPublicationReceipt("writer", 1, 1, "digest")])
+    connector._storage_pd_store_futures["request-1"] = completion
+
+    with _captured_adapter_logs(logging.ERROR) as records:
+        assert _finish_until_released(connector, {"request-1"}) == {"request-1"}
+
+    assert any(
+        "gave up announcing request" in record.getMessage()
+        and "request-1" in record.getMessage()
+        for record in records
+    ), "giving up on a durable publication was not reported"
+
+
+def test_storage_pd_defers_an_announcement_the_queue_cannot_take() -> None:
+    """A full queue postpones a request; it does not lose or release it."""
+    release_peer = threading.Event()
+    sending = threading.Event()
+
+    class BlockedSender:
+        def send(self, status: StoragePDStatus) -> None:
+            sending.set()
+            assert release_peer.wait(SETTLE_TIMEOUT_S)
+
+    connector = _make_storage_pd_connector()
+    _attach_notification_queue(connector, BlockedSender(), capacity=1)
+    for req_id in ("request-1", "request-2", "request-3"):
+        completion: Future[list[RawBlockPublicationReceipt]] = Future()
+        completion.set_result([RawBlockPublicationReceipt("writer", 1, 1, "digest")])
+        connector._storage_pd_store_futures[req_id] = completion
+
+    assert connector.get_finished({"request-1", "request-2", "request-3"}) == (
+        set(),
+        None,
+    )
+    assert sending.wait(SETTLE_TIMEOUT_S)
+    # One is in the sender and one is queued behind it; the third was
+    # refused, so it is not recorded as queued and will be offered again.
+    assert len(connector._storage_pd_status_queued) == 2
+    assert len(connector._storage_pd_engine_finished) == 3
+
+    release_peer.set()
+    released: set[str] = set()
+    deadline = time.monotonic() + SETTLE_TIMEOUT_S
+    while len(released) < 3 and time.monotonic() < deadline:
+        step, _ = connector.get_finished(set())
+        released |= step
+        time.sleep(0.002)
+    assert released == {"request-1", "request-2", "request-3"}
 
 
 def test_wait_for_save_skips_desynced_request_and_keeps_engine_alive() -> None:

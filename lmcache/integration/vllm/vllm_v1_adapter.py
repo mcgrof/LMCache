@@ -52,6 +52,8 @@ from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.manager import LMCacheManager
 from lmcache.v1.storage_backend.raw_block import RawBlockPublicationReceipt
 from lmcache.v1.storage_backend.storage_pd_protocol import (
+    StoragePDDelivery,
+    StoragePDNotificationQueue,
     StoragePDReadAck,
     StoragePDState,
     StoragePDStatus,
@@ -590,11 +592,12 @@ class LMCacheConnectorV1Impl:
         self._storage_pd_failures: dict[str, str] = {}
         self._storage_pd_terminal_states: dict[str, StoragePDState] = {}
         self._storage_pd_receipts: dict[str, RawBlockPublicationReceipt] = {}
-        self._storage_pd_status_sent: set[str] = set()
+        self._storage_pd_status_queued: set[str] = set()
         self._storage_pd_acks_sent: OrderedDict[str, None] = OrderedDict()
         self._storage_pd_lock = threading.Lock()
         self._storage_pd_tp_rank = 0
         self._storage_pd_status_sender: Optional[StoragePDStatusSender] = None
+        self._storage_pd_notify_queue: Optional[StoragePDNotificationQueue] = None
         # Whether a consumer is waiting to be told about this producer's
         # publications. It does not depend on which role this instance
         # plays, so an instance that completes requests without a sender
@@ -1050,30 +1053,55 @@ class LMCacheConnectorV1Impl:
         ``req_id`` names the request inside this engine and is only used to
         avoid acknowledging it twice. What goes on the wire is the identity
         the producer published, which the adopted status carries.
+
+        The acknowledgement is queued, not sent: this runs on the restore
+        path, where waiting for a producer that may have exited would stall
+        the load. A saturated queue therefore drops this acknowledgement,
+        which nothing here retries -- the writer's lease timeout is the
+        backstop for a lost one, and no reuse is authorized without it.
         """
         if req_id in self._storage_pd_acks_sent:
             return
-        if self._storage_pd_status_sender is not None:
-            self._storage_pd_status_sender.send(
-                StoragePDReadAck(
-                    # The producer knows this request by the identity it
-                    # published and checked READY against, not by the name
-                    # this engine happens to give it. The two differ, and an
-                    # acknowledgement carrying the local name matches nothing
-                    # on the side that has to act on it.
-                    req_id=status.req_id,
-                    producer_instance_id=status.producer_instance_id,
-                    consumer_instance_id=f"pid:{os.getpid()}",
-                    tp_rank=self._storage_pd_tp_rank,
-                    writer_epoch=status.writer_epoch,
-                    checkpoint_seq=status.checkpoint_seq,
-                    manifest_digest=status.manifest_digest,
-                )
+        if self._storage_pd_notify_queue is not None:
+            ack = StoragePDReadAck(
+                # The producer knows this request by the identity it
+                # published and checked READY against, not by the name
+                # this engine happens to give it. The two differ, and an
+                # acknowledgement carrying the local name matches nothing
+                # on the side that has to act on it.
+                req_id=status.req_id,
+                producer_instance_id=status.producer_instance_id,
+                consumer_instance_id=f"pid:{os.getpid()}",
+                tp_rank=self._storage_pd_tp_rank,
+                writer_epoch=status.writer_epoch,
+                checkpoint_seq=status.checkpoint_seq,
+                manifest_digest=status.manifest_digest,
             )
+            # Keyed apart from a producer status so a reader and a writer
+            # sharing one connector cannot displace each other's message.
+            if not self._storage_pd_notify_queue.enqueue(
+                f"ack:{req_id}", ack, report=False
+            ):
+                logger.error(
+                    "Raw-block storage P/D dropped the read acknowledgement "
+                    "for request %s: notification queue is full",
+                    req_id,
+                )
+                return
         self._storage_pd_acks_sent.pop(req_id, None)
         self._storage_pd_acks_sent[req_id] = None
         while len(self._storage_pd_acks_sent) > STORAGE_PD_REQUEST_HISTORY:
             self._storage_pd_acks_sent.popitem(last=False)
+
+    @staticmethod
+    def _log_storage_pd_delivery(delivery: "StoragePDDelivery") -> None:
+        """Report the fate of a message whose sender has no polling point."""
+        if delivery.state == "ABANDONED":
+            logger.error(
+                "Raw-block storage P/D gave up sending %s: %s",
+                delivery.key,
+                delivery.detail,
+            )
 
     def record_failed_blocks(
         self,
@@ -1599,6 +1627,24 @@ class LMCacheConnectorV1Impl:
                     )
                 ),
             )
+        if self._storage_pd_status_sender is not None:
+            # A status is only worth what the consumer eventually hears, but
+            # the engine step is the wrong place to wait for it. The queue
+            # owns delivery from here: the completion path hands it a decided
+            # status and asks later what became of it.
+            self._storage_pd_notify_queue = StoragePDNotificationQueue(
+                self._storage_pd_status_sender,
+                capacity=int(
+                    extra_config.get("rust_raw_block.status_queue_capacity", 1024)
+                ),
+                retry_interval_s=float(
+                    extra_config.get("rust_raw_block.status_retry_interval_s", 0.5)
+                ),
+                deadline_s=float(
+                    extra_config.get("rust_raw_block.status_deadline_s", 60.0)
+                ),
+                on_unreported=self._log_storage_pd_delivery,
+            )
         if self._storage_pd_notify_required and self._storage_pd_status_sender is None:
             # A worker that owes a consumer a status and has no way to send
             # one cannot serve this configuration. Say so now, rather than on
@@ -1626,7 +1672,7 @@ class LMCacheConnectorV1Impl:
         self._storage_pd_failures.pop(req_id, None)
         self._storage_pd_terminal_states.pop(req_id, None)
         self._storage_pd_receipts.pop(req_id, None)
-        self._storage_pd_status_sent.discard(req_id)
+        self._storage_pd_status_queued.discard(req_id)
         self._storage_pd_returned.pop(req_id, None)
         self._storage_pd_returned[req_id] = None
         while len(self._storage_pd_returned) > STORAGE_PD_REQUEST_HISTORY:
@@ -1707,7 +1753,7 @@ class LMCacheConnectorV1Impl:
                         )
                     self._storage_pd_store_futures.pop(req_id, None)
 
-                if req_id not in self._storage_pd_status_sent:
+                if req_id not in self._storage_pd_status_queued:
                     wire_req_id = self._storage_pd_wire_req_ids.get(req_id, req_id)
                     if req_id in self._storage_pd_aborted:
                         status = StoragePDStatus(
@@ -1731,19 +1777,17 @@ class LMCacheConnectorV1Impl:
                             self._storage_pd_tp_rank,
                             receipt,
                         )
-                    # Hand the status to the send below rather than reach the
-                    # peer from here: a consumer that has stopped reading can
-                    # block this socket for as long as it likes, and every
+                    # Hand the status to the queue below rather than reach
+                    # the peer from here: a consumer that has stopped reading
+                    # can block this socket for as long as it likes, and every
                     # other user of this state would wait behind it.
                     pending_sends.append((req_id, status))
-                    continue
+                # A request already handed to the queue is not yet announced.
+                # Releasing it here would tell the engine the handoff is done
+                # while the consumer has heard nothing; only a settled
+                # delivery below may do that.
 
-                releasable.add(req_id)
-                self._storage_pd_engine_finished.discard(req_id)
-            for req_id in releasable:
-                self._storage_pd_retire_locked(req_id)
-
-        if pending_sends and self._storage_pd_status_sender is None:
+        if pending_sends and self._storage_pd_notify_queue is None:
             # Releasing these would tell the engine the handoff is done
             # while the consumer is still waiting to hear that anything
             # was published. Nothing here can reach it, so say so instead
@@ -1755,25 +1799,45 @@ class LMCacheConnectorV1Impl:
                     "or pd_skip_proxy_notification=true to run without a "
                     "consumer"
                 )
-
-        sent: list[str] = []
-        for req_id, status in pending_sends:
-            try:
-                if self._storage_pd_status_sender is not None:
-                    self._storage_pd_status_sender.send(status)
-                sent.append(req_id)
-            except BaseException as exc:
-                logger.error(
-                    "Raw-block storage P/D status send failed for request %s: %s",
-                    req_id,
-                    exc,
-                )
-
-        if sent:
+            # Configured to run without a consumer: there is nobody to tell,
+            # so the request is done as soon as its bytes are durable.
             with self._storage_pd_lock:
-                for req_id in sent:
+                for req_id, _ in pending_sends:
                     releasable.add(req_id)
                     self._storage_pd_retire_locked(req_id)
+            return releasable, None
+
+        queue = self._storage_pd_notify_queue
+        if queue is not None:
+            for req_id, status in pending_sends:
+                if queue.enqueue(req_id, status):
+                    with self._storage_pd_lock:
+                        self._storage_pd_status_queued.add(req_id)
+                else:
+                    # Saturated. The status stays this connector's to send,
+                    # so the request is not marked queued and is offered
+                    # again on the next step once the queue drains.
+                    logger.warning(
+                        "Raw-block storage P/D notification queue is full; "
+                        "request %s will be announced on a later step",
+                        req_id,
+                    )
+            for delivery in queue.poll():
+                if delivery.state == "ABANDONED":
+                    # The bytes are durable and the publication stands; what
+                    # failed is telling anyone. Holding the engine's request
+                    # open would not change that, so it is released and the
+                    # loss is recorded. It authorizes no extent reuse: that
+                    # is the writer's lease, released on an acknowledgement
+                    # this request will now never receive.
+                    logger.error(
+                        "Raw-block storage P/D gave up announcing request %s: %s",
+                        delivery.key,
+                        delivery.detail,
+                    )
+                with self._storage_pd_lock:
+                    releasable.add(delivery.key)
+                    self._storage_pd_retire_locked(delivery.key)
         return releasable, None
 
     def _record_storage_pd_failure(self, req_id: str, error: str) -> None:
@@ -1795,6 +1859,10 @@ class LMCacheConnectorV1Impl:
         try:
             self._manager.stop_services()
         finally:
+            # Order matters: the queue's worker is the only thing still
+            # using the socket, so it stops first.
+            if self._storage_pd_notify_queue is not None:
+                self._storage_pd_notify_queue.close()
             if self._storage_pd_status_sender is not None:
                 self._storage_pd_status_sender.close()
 

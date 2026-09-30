@@ -5,11 +5,13 @@
 from __future__ import annotations
 
 # Standard
-from collections.abc import Mapping
+from collections import deque
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from typing import Literal
+from typing import Literal, NamedTuple
 import threading
+import time
 
 # Third Party
 import msgspec
@@ -196,3 +198,197 @@ class StoragePDStatusSender:
         if self._socket is not None:
             self._socket.close(linger=1000)
             self._socket = None
+
+
+class StoragePDDelivery(NamedTuple):
+    """The outcome of trying to hand one message to the proxy."""
+
+    key: str
+    state: Literal["DELIVERED", "ABANDONED"]
+    detail: str = ""
+
+
+class _PendingSend(NamedTuple):
+    """One accepted message and the moment it stops being worth retrying."""
+
+    key: str
+    message: StoragePDMsg
+    deadline: float
+
+
+class StoragePDNotificationQueue:
+    """Deliver terminal statuses without making the caller wait for a peer.
+
+    Whether a request is READY or FAILED is settled before a message reaches
+    this queue and is never revised here. What this tracks is the separate
+    question of whether that decision has been *delivered*, which has its own
+    capacity, its own retries and its own deadline. A caller enqueues and
+    polls; it never blocks on the consumer.
+
+    Delivery is ordered and one worker owns it, so an unreachable proxy paces
+    every message queued behind it. That is the case the capacity bound and
+    the deadline exist for: the queue fills, further enqueues are refused
+    while the caller still holds the resources they would have announced, and
+    each accepted message eventually settles one way or the other rather than
+    being retried forever.
+    """
+
+    def __init__(
+        self,
+        sender: StoragePDStatusSender,
+        *,
+        capacity: int = 1024,
+        retry_interval_s: float = 0.5,
+        deadline_s: float = 60.0,
+        on_unreported: Callable[[StoragePDDelivery], None] | None = None,
+    ) -> None:
+        if capacity <= 0:
+            raise ValueError("storage P/D notification capacity must be positive")
+        if retry_interval_s < 0:
+            raise ValueError("storage P/D retry interval must not be negative")
+        if deadline_s < 0:
+            raise ValueError("storage P/D delivery deadline must not be negative")
+        self._sender = sender
+        self._capacity = capacity
+        self._retry_interval_s = retry_interval_s
+        self._deadline_s = deadline_s
+        self._on_unreported = on_unreported
+        self._cond = threading.Condition()
+        self._pending: deque[_PendingSend] = deque()
+        self._in_flight: set[str] = set()
+        self._unreported: set[str] = set()
+        self._settled: list[StoragePDDelivery] = []
+        self._stopping = False
+        self._worker = threading.Thread(
+            target=self._run,
+            name="storage-pd-notify",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def enqueue(
+        self,
+        key: str,
+        message: StoragePDMsg,
+        *,
+        report: bool = True,
+    ) -> bool:
+        """Accept one message for delivery under ``key``.
+
+        Returns False when the queue is closed, is full, or already holds an
+        undelivered message for ``key``. A refusal takes nothing over: the
+        caller still owns whatever the message would have announced, and can
+        offer it again once :meth:`poll` has freed room.
+
+        With ``report`` false the outcome is not retained for :meth:`poll`
+        and is handed to ``on_unreported`` instead. That is for a caller with
+        no polling point of its own, which would otherwise leave outcomes
+        accumulating here for the life of the process.
+        """
+        with self._cond:
+            if self._stopping:
+                return False
+            if key in self._in_flight:
+                return False
+            if len(self._pending) >= self._capacity:
+                return False
+            self._in_flight.add(key)
+            if not report:
+                self._unreported.add(key)
+            self._pending.append(
+                _PendingSend(
+                    key=key,
+                    message=message,
+                    deadline=time.monotonic() + self._deadline_s,
+                )
+            )
+            self._cond.notify()
+        return True
+
+    def poll(self) -> list[StoragePDDelivery]:
+        """Take every delivery settled since the last call. Never blocks."""
+        with self._cond:
+            settled = self._settled
+            self._settled = []
+        return settled
+
+    def pending_count(self) -> int:
+        """Count messages accepted and not yet settled."""
+        with self._cond:
+            return len(self._in_flight)
+
+    def close(self, timeout_s: float = 5.0) -> None:
+        """Stop accepting, let the attempt in progress finish, settle the rest.
+
+        Everything still accepted settles as abandoned, so a caller polling
+        after shutdown gets a definite answer for every message it handed
+        over instead of having some simply disappear.
+        """
+        with self._cond:
+            if self._stopping:
+                return
+            self._stopping = True
+            self._cond.notify_all()
+        self._worker.join(timeout=timeout_s)
+        unreported: list[StoragePDDelivery] = []
+        with self._cond:
+            self._pending.clear()
+            for key in sorted(self._in_flight):
+                dropped = self._settle_locked(
+                    StoragePDDelivery(
+                        key=key,
+                        state="ABANDONED",
+                        detail="storage P/D notification queue shut down",
+                    )
+                )
+                if dropped is not None:
+                    unreported.append(dropped)
+            self._in_flight.clear()
+        for delivery in unreported:
+            if self._on_unreported is not None:
+                self._on_unreported(delivery)
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                while not self._pending and not self._stopping:
+                    self._cond.wait()
+                if self._stopping:
+                    # Leave the item queued: close() settles whatever is
+                    # still accepted, and popping it here would lose it.
+                    return
+                item = self._pending.popleft()
+            failure = ""
+            try:
+                self._sender.send(item.message)
+            except BaseException as exc:  # noqa: BLE001 - reported, not raised
+                failure = f"{type(exc).__name__}: {exc}"
+            unreported: StoragePDDelivery | None = None
+            with self._cond:
+                if not failure:
+                    unreported = self._settle_locked(
+                        StoragePDDelivery(key=item.key, state="DELIVERED")
+                    )
+                elif time.monotonic() >= item.deadline:
+                    unreported = self._settle_locked(
+                        StoragePDDelivery(
+                            key=item.key,
+                            state="ABANDONED",
+                            detail=failure,
+                        )
+                    )
+                else:
+                    self._pending.append(item)
+                    if not self._stopping and self._retry_interval_s:
+                        self._cond.wait(self._retry_interval_s)
+            if unreported is not None and self._on_unreported is not None:
+                self._on_unreported(unreported)
+
+    def _settle_locked(self, delivery: StoragePDDelivery) -> StoragePDDelivery | None:
+        """Retire one key, returning the delivery only if nobody polls it."""
+        self._in_flight.discard(delivery.key)
+        if delivery.key in self._unreported:
+            self._unreported.discard(delivery.key)
+            return delivery
+        self._settled.append(delivery)
+        return None
