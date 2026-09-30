@@ -385,6 +385,10 @@ class RawBlockPublicationReceipt:
     namespace_identity: str = ""
     total_logical_bytes: int = 0
     total_padded_bytes: int = 0
+    # Where the writer that produced this listens for the acknowledgement
+    # that releases its extents. Empty means it is not listening, so a
+    # consumer cannot release anything by replying.
+    ack_endpoint: str = ""
 
 
 class RawBlockCore:
@@ -400,6 +404,10 @@ class RawBlockCore:
     # guard that only the initializer installs is a guard that is sometimes
     # absent from the very paths it protects.
     _poisoned: bool = False
+    # Slots withheld because the device may still be writing them. A class
+    # default keeps it readable on a core built without __init__; the first
+    # quarantine replaces it with an instance dict.
+    _quarantined_slots: Optional[dict[int, None]] = None
 
     def __init__(
         self,
@@ -602,6 +610,7 @@ class RawBlockCore:
 
         self._next_slot: int = 0
         self._free_slots: dict[int, None] = {}
+        self._quarantined_slots = {}
         self._free_slots_by_placement_id: dict[int, dict[int, None]] = {}
         self._slot_placement_ids: dict[int, int] = {}
         self._fdp_slot_affinity_hit_count: int = 0
@@ -731,6 +740,16 @@ class RawBlockCore:
 
     def _rawdev(self):
         """Return the lazily opened Rust raw-block device binding."""
+        if self._raw is None and self._poisoned:
+            # Opening a fresh device here would answer every question about
+            # quiescence with a confident "nothing outstanding", which is
+            # exactly wrong after this core stopped being able to say. Being
+            # merely closed is not the same thing and keeps its old
+            # behaviour.
+            raise RuntimeError(
+                f"raw-block device {self.device_path} could not establish "
+                "what it was doing; it will not be reopened"
+            )
         if self._raw is None:
             try:
                 # Third Party
@@ -1102,7 +1121,7 @@ class RawBlockCore:
                     results[i] = False
                     continue
                 if inflight.canceled or not success:
-                    self._append_free_slot_locked(
+                    self._release_submitted_slot_locked(
                         self._offset_to_slot(int(inflight.offset))
                     )
                     self._meta_dirty_total += 1
@@ -1173,6 +1192,12 @@ class RawBlockCore:
             raise ValueError("encoded_keys and objs must be non-empty")
         if len(encoded_keys) != len(objs):
             raise ValueError("encoded_keys and objs must have the same length")
+        if self._poisoned:
+            # Both write paths refuse here; a read has the same problem. It
+            # would hand the device fresh destination buffers on an engine
+            # that has already stopped being able to say when it is finished
+            # with the ones it has.
+            return [False] * len(encoded_keys)
 
         with self._lock:
             items = [
@@ -1354,7 +1379,7 @@ class RawBlockCore:
                     inflight.canceled = True
                 self._lock_refcnt.pop(encoded_key, None)
                 if removed_entry is not None:
-                    self._append_free_slot_locked(
+                    self._release_submitted_slot_locked(
                         self._offset_to_slot(int(removed_entry.offset))
                     )
                     self._meta_dirty_total += 1
@@ -1373,7 +1398,14 @@ class RawBlockCore:
             usable_capacity = self._max_slots * self.slot_bytes
             if usable_capacity <= 0:
                 return (-1.0, -1.0)
-            used_slots = len(self._index) + len(self._inflight)
+            # A withheld extent is occupied, not free. Leaving it out of
+            # both terms would report capacity this engine will never hand
+            # out again as available.
+            used_slots = (
+                len(self._index)
+                + len(self._inflight)
+                + len(self._quarantined_slots or {})
+            )
             usage = (used_slots * self.slot_bytes) / usable_capacity
             return (usage, usage)
 
@@ -1593,6 +1625,16 @@ class RawBlockCore:
         """
         return self._apply_loaded_state(data)
 
+    def is_poisoned(self) -> bool:
+        """Whether this core has stopped being able to say what the device did.
+
+        Sticky for the life of the engine. Callers use it to decide whether a
+        resource may be handed back or has to be withheld; it is read without
+        the lock on purpose, because a caller that sees a stale False will be
+        refused by the guarded path it goes on to take.
+        """
+        return self._poisoned
+
     def report_status(self) -> dict:
         """Return raw-block health, layout, metadata, and in-flight counters."""
         with self._lock:
@@ -1613,6 +1655,7 @@ class RawBlockCore:
                     1 for refcnt in self._lock_refcnt.values() if refcnt > 0
                 ),
                 "free_slot_count": len(self._free_slots),
+                "quarantined_slot_count": len(self._quarantined_slots or {}),
                 "next_slot": self._next_slot,
                 "max_slots": self._max_slots,
                 "metadata_seq": self._meta_seq,
@@ -1646,21 +1689,60 @@ class RawBlockCore:
             self._meta_thread.join(timeout=5)
             self._meta_thread = None
 
-        if self.role == "writer":
+        # Sample this before touching the device: the accessor below
+        # reopens a fresh one when the reference is dropped, and a fresh
+        # device knows nothing about what the old one could not establish.
+        unknown = self._poisoned
+        if not unknown and self._raw is not None:
+            unknown = getattr(self._raw, "is_poisoned", bool)() is True
+        self._poisoned = unknown
+
+        if self.role == "writer" and not unknown:
+            # A writer that cannot say what the device holds must not
+            # publish an index naming it. publish_request already refuses
+            # while running, and shutdown is not an exemption.
             try:
                 self._checkpoint_once(force=True)
             except Exception as e:
                 logger.warning("RawBlockCore final checkpoint failed: %s", e)
+        elif self.role == "writer":
+            logger.error(
+                "RawBlockCore %s: skipping the final checkpoint because this "
+                "writer cannot establish what the device holds. The last "
+                "published index stands; these extents are not advertised.",
+                self.device_path,
+            )
 
-        if self._raw is not None:
-            try:
-                self._raw.close()
-            except Exception as e:
-                logger.warning(
-                    "Failed to close raw block device %s: %s", self.device_path, e
-                )
-            finally:
-                self._raw = None
+        if self._raw is None:
+            return
+        if unknown:
+            # Dropping this reference runs the native destructor, which frees
+            # the very owners the engine retained. Keep it bound: the handle,
+            # its registration and the buffers behind it stay alive for the
+            # life of the process, which is the price of not knowing when the
+            # device finished.
+            logger.error(
+                "RawBlockCore %s: retaining the native device, its buffer "
+                "registration and %d withheld extent(s) because an outcome "
+                "could not be established.",
+                self.device_path,
+                len(self._quarantined_slots or {}),
+            )
+            return
+        try:
+            self._raw.close()
+        except Exception as e:
+            # The native close refuses when it cannot prove quiescence. That
+            # is a report, not noise: keep the reference and stay unhealthy.
+            self._poisoned = True
+            logger.error(
+                "Failed to close raw block device %s: %s. Retaining the "
+                "native device and everything it holds.",
+                self.device_path,
+                e,
+            )
+            return
+        self._raw = None
 
     def _cleanup_after_init_failure(self) -> None:
         """Close resources that may have been opened before init failed."""
@@ -2170,6 +2252,11 @@ class RawBlockCore:
                 raise RuntimeError("raw-block io_uring write failed")
             return
 
+        # The per-write path returns its own completion error and never
+        # reaches wait_iouring, so this is the only place it can adopt the
+        # worker's verdict. Without it a padded O_DIRECT write that the
+        # worker quarantined leaves the core healthy, and the extent it rolls
+        # back is handed to the very next request.
         for offset, buf, payload_len, total_len, placement_id in zip(
             offsets,
             buffers,
@@ -2178,9 +2265,13 @@ class RawBlockCore:
             per_write_placement_ids,
             strict=True,
         ):
-            raw_dev.write_uring(
-                int(offset), buf, int(payload_len), int(total_len), placement_id
-            )
+            try:
+                raw_dev.write_uring(
+                    int(offset), buf, int(payload_len), int(total_len), placement_id
+                )
+            except BaseException:
+                self._adopt_native_poison(raw_dev, "io_uring write")
+                raise
 
     def _read_buffers(
         self,
@@ -2239,6 +2330,43 @@ class RawBlockCore:
             "io_uring read",
         )
 
+    def _adopt_native_poison(
+        self,
+        raw_dev: Any,
+        operation: str,
+        batch_id: Optional[int] = None,
+    ) -> bool:
+        """Take on the worker's verdict that it cannot say what happened.
+
+        A logical failure and an unknown outcome are different statements.
+        The engine poisons itself when it cannot say what the device is
+        doing, and it does so before signalling any completion, so asking
+        after one is not a race. Adopting it here is what makes the core stop
+        handing out storage and stop letting ordinary cleanup recycle an
+        extent, because a failed result is not proof the device has finished.
+
+        Every path that waits on the worker has to ask, not only the batched
+        one: a caller that never asks leaves the core healthy while the
+        worker has already given up, and an extent it rolls back becomes
+        immediately re-allocatable.
+
+        Returns whether the core is poisoned once this call is done.
+        """
+        if self._poisoned:
+            return True
+        if not bool(getattr(raw_dev, "is_poisoned", bool)()):
+            return False
+        self._poisoned = True
+        logger.error(
+            "RawBlockCore %s%s: the native engine could not establish what "
+            "the device is still doing. Refusing further work on this device "
+            "and withholding %d quarantined batch(es).",
+            operation,
+            f" batch {batch_id}" if batch_id is not None else "",
+            int(getattr(raw_dev, "quarantined_batch_count", int)()),
+        )
+        return True
+
     def _wait_iouring_results(
         self,
         raw_dev: Any,
@@ -2254,22 +2382,7 @@ class RawBlockCore:
         """
         results, completion_errors = raw_dev.wait_iouring(batch_id)
         results = list(results)
-        # A logical failure and an unknown outcome are different statements.
-        # The engine poisons itself when it cannot say what the device is
-        # doing, and it does so before waking this wait, so asking now is not
-        # a race. Adopt that here: the core must stop handing out storage and
-        # must not let ordinary cleanup recycle anything from this batch,
-        # because a failed result is not proof the device has finished.
-        if not self._poisoned and bool(getattr(raw_dev, "is_poisoned", bool)()):
-            self._poisoned = True
-            logger.error(
-                "RawBlockCore %s batch %d: the native engine could not "
-                "establish what the device is still doing. Refusing further "
-                "work on this device and withholding %d quarantined batch(es).",
-                operation,
-                batch_id,
-                int(getattr(raw_dev, "quarantined_batch_count", int)()),
-            )
+        self._adopt_native_poison(raw_dev, operation, batch_id)
         for operation_index, error in completion_errors:
             logger.error(
                 "RawBlockCore %s batch %d operation %d failed: %s",
@@ -2604,7 +2717,7 @@ class RawBlockCore:
                 if inflight is None:
                     continue
                 if not write_succeeded or inflight.canceled:
-                    self._append_free_slot_locked(
+                    self._release_submitted_slot_locked(
                         self._offset_to_slot(int(inflight.offset))
                     )
                     self._meta_dirty_total += 1
@@ -2736,6 +2849,38 @@ class RawBlockCore:
         placement_id = self._slot_placement_ids.get(slot)
         if placement_id is not None:
             self._free_slots_by_placement_id.setdefault(placement_id, {})[slot] = None
+
+    def _release_submitted_slot_locked(self, slot: int) -> None:
+        """Give back a slot the device was already told to write.
+
+        Whether that is safe is exactly the question poison answers. A
+        logical failure is not a DMA fence: if the worker could not
+        establish what happened, a later request handed this slot would be
+        given storage an earlier write may still be landing in.
+
+        Only use this where the extent reached the submission ring. A slot
+        reserved and then abandoned before submission was never the device's
+        and goes straight back to the free list.
+        """
+        if self._poisoned:
+            self._quarantine_slot_locked(slot)
+            return
+        self._append_free_slot_locked(slot)
+
+    def _quarantine_slot_locked(self, slot: int) -> None:
+        """Withhold a slot from allocation for this engine's lifetime.
+
+        Nothing takes a slot out of quarantine. Reuse needs proof that the
+        device is done with it, which this engine cannot obtain once its
+        worker has reported an outcome it could not determine.
+        """
+        if self._quarantined_slots is None:
+            self._quarantined_slots = {}
+        if slot in self._quarantined_slots:
+            return
+        self._quarantined_slots[slot] = None
+        self._free_slots.pop(slot, None)
+        self._remove_slot_from_affinity_pool_locked(slot)
 
     def _remove_slot_from_affinity_pool_locked(self, slot: int) -> None:
         """Remove an allocated slot from its PID-specific free-slot pool."""
@@ -3195,8 +3340,14 @@ class RawBlockCore:
             # Rebuild from committed entries instead of trusting checkpoint
             # free_slots. A crash-time checkpoint can otherwise preserve a slot
             # reserved by an uncommitted in-flight write as neither used nor free.
+            # Quarantined slots are in neither set and must stay withheld: the
+            # index no longer names them, so a plain rebuild would hand back
+            # exactly the extents whose outcome is unknown.
+            quarantined = self._quarantined_slots or {}
             self._free_slots = {
-                slot: None for slot in range(self._next_slot) if slot not in used_slots
+                slot: None
+                for slot in range(self._next_slot)
+                if slot not in used_slots and slot not in quarantined
             }
 
             self._meta_dirty_total = 0

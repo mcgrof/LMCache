@@ -1868,3 +1868,144 @@ def test_raw_block_core_refuses_work_once_the_native_outcome_is_unknown(tmp_path
     finally:
         core.set_raw_device_for_testing(raw)
         core.close()
+
+
+def test_raw_block_core_withholds_extents_whose_outcome_is_unknown(tmp_path):
+    """An extent released after an unprovable write must leave the free list.
+
+    A logical failure is not a DMA fence. If the worker could not establish
+    what the device did, an extent rolled back here and handed to the next
+    request would give that request storage an earlier write may still be
+    landing in -- and the header would then name one key over another key's
+    bytes, which validates clean because the header is the later, successful
+    writer's.
+
+    The assertion that matters is the allocator's, not the admission gate's:
+    a slot has to be out of the allocator's reach rather than merely shadowed
+    by a guard that some other path might not consult.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    raw = core.raw_device()
+    try:
+        first = encode_object_key(make_object_key(81))
+        assert core.put_many([first], [make_memory_obj(b"before")]).results == [True]
+        free_before = set(core._free_slots)
+        next_slot_before = core._next_slot
+
+        class _Unknown:
+            """A worker that has given up, and whose writes now fail."""
+
+            def __getattr__(self, item):
+                return getattr(raw, item)
+
+            def is_poisoned(self):
+                return True
+
+            def quarantined_batch_count(self):
+                return 1
+
+            def wait_iouring(self, batch_id):
+                results, errors = raw.wait_iouring(batch_id)
+                return [False] * len(results), errors
+
+        core.set_raw_device_for_testing(_Unknown())
+        second = encode_object_key(make_object_key(82))
+        third = encode_object_key(make_object_key(83))
+        assert core.put_many(
+            [second, third], [make_memory_obj(b"during")] * 2
+        ).results == [False, False]
+
+        # The rollback did not put either extent back where it could be
+        # handed out again.
+        assert set(core._free_slots) == free_before
+        withheld = set(core._quarantined_slots or {})
+        assert withheld == {next_slot_before, next_slot_before + 1}
+        status = core.report_status()
+        assert status["quarantined_slot_count"] == 2
+        assert status["poisoned"] is True
+
+        # The allocator itself cannot reach them. This is the statement the
+        # admission guard cannot make: a caller that reached the allocator by
+        # some other route still does not get a withheld extent.
+        with core._lock:
+            handed_out = {
+                core._offset_to_slot(core._allocate_slot_locked(None)) for _ in range(4)
+            }
+        assert not (handed_out & withheld)
+    finally:
+        core.set_raw_device_for_testing(raw)
+        core.close()
+
+
+def test_raw_block_core_adopts_an_unknown_outcome_from_a_single_write(tmp_path):
+    """The per-write path must adopt the verdict too, not only the batch.
+
+    An O_DIRECT payload whose logical length is not a multiple of the block
+    size cannot be expressed as one batched length, so it goes through the
+    per-write path, which returns its own completion error and never waits on
+    a batch. That was the only route by which the core stayed healthy while
+    its worker had already given up -- and a healthy core rolls the extent
+    straight back into the free list, where the very next request gets it.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    raw = core.raw_device()
+    try:
+
+        class _UnknownSingleWrite:
+            def __getattr__(self, item):
+                return getattr(raw, item)
+
+            def is_poisoned(self):
+                return True
+
+            def quarantined_batch_count(self):
+                return 1
+
+            def write_uring(self, *args, **kwargs):
+                raise RuntimeError("io_uring submit error: outcome unknown")
+
+        core.set_raw_device_for_testing(_UnknownSingleWrite())
+        # A padded write -- payload shorter than the physical transfer -- is
+        # what cannot be expressed as one batched length, and is therefore
+        # what takes the per-write route.
+        with pytest.raises(RuntimeError, match="outcome unknown"):
+            core._write_buffers(
+                [core._data_base_offset],
+                [bytearray(4096)],
+                [len(b"unprovable")],
+                [4096],
+            )
+
+        assert core._poisoned is True
+        assert core.report_status()["poisoned"] is True
+
+        # And an extent released after it is withheld rather than freed.
+        with core._lock:
+            core._release_submitted_slot_locked(0)
+        assert set(core._quarantined_slots or {}) == {0}
+        assert 0 not in core._free_slots
+    finally:
+        core.set_raw_device_for_testing(raw)
+        core.close()
+
+
+def test_raw_block_core_refuses_to_read_once_the_outcome_is_unknown(tmp_path):
+    """A read hands the device fresh destinations, which is the same problem."""
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    raw = core.raw_device()
+    try:
+        key = encode_object_key(make_object_key(85))
+        assert core.put_many([key], [make_memory_obj(b"readable")]).results == [True]
+
+        core._poisoned = True
+        target = make_memory_obj(b"\x00" * len(b"readable"))
+        assert core.load_many_into([key.encoded], [target]) == [False]
+    finally:
+        core.set_raw_device_for_testing(raw)
+        core.close()
