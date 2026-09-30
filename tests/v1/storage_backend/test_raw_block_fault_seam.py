@@ -141,6 +141,84 @@ def test_the_artifact_under_test_is_not_the_serving_one() -> None:
     print(f"serving build sha256={serving_digest}")
 
 
+UNPOLLED_OWNER_SCENARIO = textwrap.dedent(
+    """
+    import gc, json, sys, time, weakref
+    sys.path.insert(0, sys.argv[1])
+    from lmcache_rust_raw_block_io import RawBlockDevice
+
+    dev = RawBlockDevice(
+        sys.argv[2], writable=True, use_iouring=True, use_odirect=False,
+        alignment=4096, iouring_queue_depth=8,
+    )
+
+    class Payload(bytearray):
+        pass
+
+    payload = Payload(b"x" * 4096)
+    alive = weakref.ref(payload)
+
+    base = dev.submit_call_count()
+    dev.inject_submit_faults([(base, "fatal:5")])
+    dev.batched_write([0], [payload], [4096], [None])
+    # Deliberately no wait_iouring: this is the caller that never polls.
+    deadline = time.monotonic() + 10
+    while not dev.is_poisoned() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    report = {
+        "poisoned": dev.is_poisoned(),
+        "quarantined_batches": dev.quarantined_batch_count(),
+        "owners_without_polling": dev.quarantined_owner_count(),
+    }
+    del payload
+    gc.collect()
+    report["alive_after_our_reference_went"] = alive() is not None
+    try:
+        dev.close()
+        report["close"] = "returned"
+    except BaseException as exc:
+        report["close"] = type(exc).__name__
+    del dev
+    gc.collect()
+    report["alive_after_close_and_drop"] = alive() is not None
+    print(json.dumps(report))
+    """
+)
+
+
+def test_an_unpolled_batch_keeps_its_owners_through_close(tmp_path) -> None:
+    """Nobody has to poll for the ownership rule to hold.
+
+    A batch's Python owners used to move out of reach only when a caller
+    reached wait_iouring. A caller that never polls -- which is every caller
+    whose request was abandoned, cancelled, or whose engine is shutting
+    down -- left them where the device's own destructor would free them, and
+    freeing them returns their pool slices to an allocator. The close that
+    did so had just refused, on the grounds that it could not establish what
+    the device was doing.
+    """
+    device = tmp_path / "dev.bin"
+    with open(device, "wb") as handle:
+        handle.truncate(64 * 1024 * 1024)
+    result = subprocess.run(
+        [sys.executable, "-c", UNPOLLED_OWNER_SCENARIO, FAULT_EXT, str(device)],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    report = json.loads(result.stdout.strip().splitlines()[-1])
+
+    assert report["poisoned"] is True
+    assert report["quarantined_batches"] == 1
+    # Moved when the worker learned, not when somebody asked.
+    assert report["owners_without_polling"] == 1
+    assert report["alive_after_our_reference_went"] is True
+    assert report["close"] == "RuntimeError"
+    assert report["alive_after_close_and_drop"] is True
+
+
 def test_a_fatal_submit_poisons_the_engine_and_keeps_the_batch(tmp_path) -> None:
     """A submit that fails fatally leaves what the kernel took unknowable.
 

@@ -243,6 +243,34 @@ enum SubmitOutcome {
 /// The initial submission and the flush of entries an earlier submit left
 /// behind both face the same three outcomes, and a flush that treated a fatal
 /// error as retryable would spin while its waiters never finished.
+/// Move batch owners somewhere no allocator can reach them.
+///
+/// `batch_id: None` takes every outstanding batch. Moving handles between
+/// Rust collections performs no reference-count operation, so this needs no
+/// GIL and is safe to call from the worker thread.
+///
+/// The two locks are taken and released in sequence, never nested: the
+/// worker holds neither when it calls this, and nesting them would be the
+/// only ordering hazard here.
+fn drain_batch_owners<T>(
+    batched: &Mutex<HashMap<u64, Vec<T>>>,
+    quarantined: &Mutex<Vec<T>>,
+    batch_id: Option<u64>,
+) -> usize {
+    let taken: Vec<T> = {
+        let mut batched = batched.lock().unwrap();
+        match batch_id {
+            Some(id) => batched.remove(&id).unwrap_or_default(),
+            None => batched.drain().flat_map(|(_id, owners)| owners).collect(),
+        }
+    };
+    let moved = taken.len();
+    if moved > 0 {
+        quarantined.lock().unwrap().extend(taken);
+    }
+    moved
+}
+
 /// A submit outcome a test asks the worker to see instead of the kernel's.
 ///
 /// Reaching the fatal and partial-submit transitions otherwise needs a device
@@ -1573,6 +1601,7 @@ impl RawBlockDevice {
             batch_in_flight_opt,
             quarantined_batches_opt,
             poisoned_opt,
+            quarantined_owners_opt,
         ) = if use_iouring {
             let notify = UringNotify::new()
                 .map_err(|e| PyRuntimeError::new_err(format!("UringNotify init failed: {}", e)))?;
@@ -1637,6 +1666,9 @@ impl RawBlockDevice {
             let in_flight_count = Arc::new(AtomicU64::new(0));
             let in_flight_cvar = Arc::new(Condvar::new());
             let batched_buffer_objs = Arc::new(Mutex::new(HashMap::<u64, Vec<Py<PyAny>>>::new()));
+            let quarantined_owners = Arc::new(Mutex::new(Vec::<Py<PyAny>>::new()));
+            let batched_buffer_objs_worker = Arc::clone(&batched_buffer_objs);
+            let quarantined_owners_worker = Arc::clone(&quarantined_owners);
             let quarantined_batches = Arc::new(Mutex::new(HashSet::<u64>::new()));
             let poisoned = Arc::new(AtomicBool::new(false));
             let quarantined_batches_worker = Arc::clone(&quarantined_batches);
@@ -1916,9 +1948,23 @@ impl RawBlockDevice {
                     // decide whether it may release the batch's owners, so the
                     // order matters: waking first would let it release them
                     // while the device may still reach that memory.
+                    // Record a batch as unknown-outcome, poison the device,
+                    // and take the batch's Python owners out of reach --
+                    // here, when the worker learns, rather than whenever
+                    // somebody happens to ask. A caller that never polls is
+                    // the case that made the difference: owners sat in
+                    // `batched_buffer_objs` until `wait_iouring` moved them,
+                    // so a close after an unknown outcome dropped them and
+                    // returned their pool slices to an allocator while the
+                    // device may still have been writing.
                     let mark_unknown = |batch_id: u64| {
                         poisoned_worker.store(true, Ordering::SeqCst);
                         quarantined_batches_worker.lock().unwrap().insert(batch_id);
+                        drain_batch_owners(
+                            &batched_buffer_objs_worker,
+                            &quarantined_owners_worker,
+                            Some(batch_id),
+                        );
                     };
                     // The whole unknown-outcome sequence, in the only order
                     // that is safe, so no site has to remember it: put the
@@ -2567,10 +2613,11 @@ impl RawBlockDevice {
                 Some(batch_in_flight),
                 Some(quarantined_batches),
                 Some(poisoned),
+                Some(quarantined_owners),
             )
         } else {
             (
-                None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
             )
         };
 
@@ -2609,7 +2656,8 @@ impl RawBlockDevice {
             quarantined_batches: quarantined_batches_opt
                 .unwrap_or_else(|| Arc::new(Mutex::new(HashSet::new()))),
             poisoned: poisoned_opt.unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
-            quarantined_owners: Arc::new(Mutex::new(Vec::new())),
+            quarantined_owners: quarantined_owners_opt
+                .unwrap_or_else(|| Arc::new(Mutex::new(Vec::new()))),
             #[cfg(feature = "fault-injection")]
             fault_plan,
         })
@@ -3277,17 +3325,20 @@ impl RawBlockDevice {
     /// is what this distinction exists to prevent. Logical completion is not
     /// reusable capacity.
     fn retire_batch_owners(&self, batch_id: u64) {
-        let unknown = self.quarantined_batches.lock().unwrap().contains(&batch_id);
-        let owners = {
-            let mut stored_objs = self.batched_buffer_objs.lock().unwrap();
-            stored_objs.remove(&batch_id)
-        };
-        if !unknown {
+        // The worker already moved this batch's owners if it marked the
+        // batch unknown, so that case is a no-op here rather than a second
+        // transfer. This is still the only release for a healthy batch, and
+        // for one the worker never saw.
+        if self.quarantined_batches.lock().unwrap().contains(&batch_id) {
+            drain_batch_owners(
+                &self.batched_buffer_objs,
+                &self.quarantined_owners,
+                Some(batch_id),
+            );
             return;
         }
-        if let Some(owners) = owners {
-            self.quarantined_owners.lock().unwrap().extend(owners);
-        }
+        let mut stored_objs = self.batched_buffer_objs.lock().unwrap();
+        stored_objs.remove(&batch_id);
     }
 
     /// Whether any outcome on this device has been unknown.
@@ -4268,6 +4319,12 @@ impl RawBlockDevice {
     /// saying it is closed would invite a caller to conclude its resources
     /// were released.
     fn retain_everything(&mut self, reason: &str) -> PyErr {
+        // Everything still held by a batch, not only batches somebody
+        // marked. A registration that failed to unregister covers whatever
+        // memory it named, and a caller that never polled left its owners
+        // where only this sweep will find them. Over-retaining a
+        // proven-complete unpolled batch is the deliberate side to err on.
+        let swept = drain_batch_owners(&self.batched_buffer_objs, &self.quarantined_owners, None);
         let owners = std::mem::take(&mut *self.quarantined_owners.lock().unwrap());
         let owner_count = owners.len();
         std::mem::forget(owners);
@@ -4277,8 +4334,8 @@ impl RawBlockDevice {
             std::mem::forget(ring);
         }
         PyRuntimeError::new_err(format!(
-            "{reason} (retained {owner_count} buffer owner(s), \
-             {batches} quarantined batch(es))",
+            "{reason} (retained {owner_count} buffer owner(s), {swept} of them \
+             from batches nobody polled, {batches} quarantined batch(es))",
             batches = self.quarantined_batches.lock().unwrap().len(),
         ))
     }
@@ -4361,6 +4418,43 @@ mod short_io_action_tests {
             short_io_action(4096, 4096, false, true),
             ShortIoAction::Complete
         );
+    }
+}
+
+#[cfg(test)]
+mod drain_batch_owners_tests {
+    use super::drain_batch_owners;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    #[test]
+    fn one_batch_moves_and_a_second_call_moves_nothing() {
+        let batched = Mutex::new(HashMap::from([(7u64, vec!["a", "b"])]));
+        let quarantined = Mutex::new(Vec::new());
+        assert_eq!(drain_batch_owners(&batched, &quarantined, Some(7)), 2);
+        assert_eq!(quarantined.lock().unwrap().len(), 2);
+        // Idempotent: the worker moves a batch when it learns the outcome,
+        // and a later poll must not try to move it again.
+        assert_eq!(drain_batch_owners(&batched, &quarantined, Some(7)), 0);
+        assert_eq!(quarantined.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn an_unknown_batch_id_moves_nothing() {
+        let batched = Mutex::new(HashMap::from([(7u64, vec!["a"])]));
+        let quarantined = Mutex::new(Vec::new());
+        assert_eq!(drain_batch_owners(&batched, &quarantined, Some(8)), 0);
+        assert!(quarantined.lock().unwrap().is_empty());
+        assert_eq!(batched.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sweeping_takes_every_batch_including_unpolled_ones() {
+        let batched = Mutex::new(HashMap::from([(1u64, vec!["a"]), (2u64, vec!["b", "c"])]));
+        let quarantined = Mutex::new(vec!["already"]);
+        assert_eq!(drain_batch_owners(&batched, &quarantined, None), 3);
+        assert!(batched.lock().unwrap().is_empty());
+        assert_eq!(quarantined.lock().unwrap().len(), 4);
     }
 }
 
