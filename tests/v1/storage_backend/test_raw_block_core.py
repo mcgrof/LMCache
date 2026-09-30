@@ -2066,14 +2066,31 @@ def test_raw_block_core_keeps_an_entry_whose_header_it_could_not_read(tmp_path):
         assert core.put_many([key], [make_memory_obj(b"kept")]).results == [True]
         free_before = set(core._free_slots)
 
+        slot = core._offset_to_slot(int(core._index[key.encoded].offset))
+
         # The device stops answering, which is what an unknown read looks
         # like from here.
+        real_read_buffers = core._read_buffers
         core._read_buffers = lambda *args, **kwargs: [False]
         core._validate_loaded_entries()
 
         assert core.contains_key(key.encoded), "the entry was dropped on no evidence"
         assert set(core._free_slots) == free_before
         assert not (core._quarantined_slots or {})
+
+        # A free list is bookkeeping; what the allocator hands out is the
+        # property. Ask it for every extent it has and this one is not
+        # among them.
+        withheld = core._slot_to_offset(slot)
+        core._read_buffers = real_read_buffers
+        handed_out = set()
+        for seq in range(core._max_slots + 4):
+            later = encode_object_key(make_object_key(900 + seq))
+            if core.put_many([later], [make_memory_obj(b"later")]).results != [True]:
+                break
+            handed_out.add(int(core._index[later.encoded].offset))
+        assert handed_out, "the device refused every later write, proving nothing"
+        assert withheld not in handed_out
     finally:
         core.close()
 
@@ -2097,12 +2114,20 @@ def test_raw_block_core_still_drops_an_entry_whose_header_is_not_its_own(tmp_pat
                 buf[:] = b"\x00" * len(buf)
             return [True] * len(offsets)
 
+        real_read_buffers = core._read_buffers
         core._read_buffers = _bytes_that_are_not_ours
         core._validate_loaded_entries()
 
         assert not core.contains_key(key.encoded)
         assert slot in core._free_slots
         assert not (core._quarantined_slots or {})
+
+        # And recyclable means reused: the next request is given this extent
+        # rather than merely told the slot is free.
+        core._read_buffers = real_read_buffers
+        later = encode_object_key(make_object_key(920))
+        assert core.put_many([later], [make_memory_obj(b"later")]).results == [True]
+        assert int(core._index[later.encoded].offset) == core._slot_to_offset(slot)
     finally:
         core.close()
 
@@ -2126,6 +2151,7 @@ def test_raw_block_core_withholds_a_dropped_entry_when_it_cannot_say(tmp_path):
                 buf[:] = b"\x00" * len(buf)
             return [True] * len(offsets)
 
+        real_read_buffers = core._read_buffers
         core._read_buffers = _bytes_that_are_not_ours
         core._poisoned = True
         core._validate_loaded_entries()
@@ -2133,6 +2159,20 @@ def test_raw_block_core_withholds_a_dropped_entry_when_it_cannot_say(tmp_path):
         assert not core.contains_key(key.encoded)
         assert slot not in core._free_slots
         assert slot in (core._quarantined_slots or {})
+
+        # Running cleanup again is the obvious way the extent comes back:
+        # the entry is gone from the index now, so a second pass sees a
+        # quarantined slot with no owner and could read that as free.
+        core._read_buffers = real_read_buffers
+        core._validate_loaded_entries()
+        assert slot not in core._free_slots
+        assert slot in (core._quarantined_slots or {})
+
+        # Allocation pressure cannot probe this one: a poisoned core refuses
+        # every write, so there is no request to hand the extent to. That
+        # refusal is asserted where it belongs, in the put-admission tests.
+        later = encode_object_key(make_object_key(921))
+        assert core.put_many([later], [make_memory_obj(b"later")]).results == [False]
     finally:
         core.close()
 
