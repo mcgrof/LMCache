@@ -36,10 +36,14 @@ from lmcache.v1.storage_backend.raw_block import (
     round_up,
     validate_raw_block_io_options,
 )
+from lmcache.v1.storage_backend.storage_pd_ack import (
+    ACK_REJECTED,
+    ACK_UNRESOLVED,
+    StoragePDAckRequest,
+    StoragePDAckServer,
+)
 from lmcache.v1.storage_backend.storage_pd_protocol import (
     STORAGE_PD_INCARNATION,
-    StoragePDAckReceiver,
-    StoragePDReadAck,
 )
 
 if TYPE_CHECKING:
@@ -341,7 +345,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         # A writer that cannot hear an acknowledgement holds every extent it
         # ever publishes for its own lifetime, so the listener is built
         # beside the tracker that owns those leases.
-        self._ack_receiver: Optional[StoragePDAckReceiver] = None
+        self._ack_receiver: Optional[StoragePDAckServer] = None
         self._ack_tp_rank = int(getattr(metadata, "worker_id", 0) or 0)
         # Names one producer/consumer group's run. Both ends carry it, so a
         # restart of the whole group is a new session and a restart of the
@@ -1204,17 +1208,33 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
 
     def _build_ack_receiver(
         self, extra: Mapping[str, Any]
-    ) -> Optional[StoragePDAckReceiver]:
-        """Listen for read acknowledgements, or say what that costs.
+    ) -> Optional[StoragePDAckServer]:
+        """Answer read acknowledgements, or say what not answering costs.
 
         A port of zero means the operator has not configured one. That is
-        allowed -- a deployment may genuinely not want the reverse channel --
-        but it is stated rather than assumed, because the consequence is that
-        no extent this writer publishes is ever reclaimed.
+        allowed for a diagnostic run, and it is stated rather than assumed,
+        because the consequence is that no extent this writer publishes is
+        ever reclaimed. Where reuse is required it is an initialization
+        error instead: a writer that cannot be acknowledged cannot recycle,
+        and discovering that from a slow leak is worse than not starting.
+
+        The bind address and the advertised address are separate. A
+        wildcard says where to listen and is not an address a consumer can
+        reply to.
         """
         host = str(extra.get("rust_raw_block.ack_listen_host", "0.0.0.0") or "")
+        advertise = str(extra.get("rust_raw_block.ack_advertise_host", "") or "") or (
+            "127.0.0.1" if host in ("0.0.0.0", "::", "*") else host
+        )
         base_port = int(extra.get("rust_raw_block.ack_listen_port", 0) or 0)
+        reuse_required = bool(extra.get("rust_raw_block.require_extent_reuse", False))
         if base_port <= 0:
+            if reuse_required:
+                raise ValueError(
+                    "raw-block storage P/D requires extent reuse, so it "
+                    "needs an acknowledgement port: set "
+                    "rust_raw_block.ack_listen_port"
+                )
             logger.warning(
                 "Raw-block storage P/D has no acknowledgement listener "
                 "(rust_raw_block.ack_listen_port is unset). Published "
@@ -1225,12 +1245,15 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         # contend for a single listener.
         port = base_port + self._ack_tp_rank
         try:
-            receiver = StoragePDAckReceiver(
-                self._apply_read_ack,
-                host=host,
+            server = StoragePDAckServer(
+                self._answer_read_ack,
+                bind_host=host,
                 port=port,
+                advertise_host=advertise,
             )
         except Exception:
+            if reuse_required:
+                raise
             logger.exception(
                 "Raw-block storage P/D could not listen for acknowledgements "
                 "on %s:%d; published extents will stay leased",
@@ -1239,22 +1262,29 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             )
             return None
         logger.info(
-            "Raw-block storage P/D listening for read acknowledgements on %s",
-            receiver.endpoint,
+            "Raw-block storage P/D answers read acknowledgements on %s (bound on %s)",
+            server.endpoint,
+            server.bind_endpoint,
         )
-        return receiver
+        return server
 
-    def _apply_read_ack(self, ack: StoragePDReadAck) -> ReadAckOutcome:
-        """Hand one acknowledgement to the tracker that owns the hold.
+    def _answer_read_ack(self, request: StoragePDAckRequest) -> tuple[str, str]:
+        """Apply one acknowledgement and say what happened.
 
-        Everything in ``ack`` came off a network. The tracker re-checks it
-        against what this writer actually published and releases nothing it
-        cannot match, so this only routes. The outcome is returned because
-        it is what the consumer is told, and a consumer retires its
-        obligation on that answer.
+        Everything in the request came off a network. The tracker re-checks
+        it against what this writer actually published and releases nothing
+        it cannot match, so this routes and reports. The answer is what the
+        consumer retires its obligation on, which is why it is produced
+        after the release rather than alongside it.
         """
         if self._pd_tracker is None:
-            return ReadAckOutcome.REJECTED
+            return ACK_REJECTED, "this engine holds no leases"
+        ack = request.ack
+        if self._pd_session_id and request.session_id != self._pd_session_id:
+            return (
+                ACK_REJECTED,
+                "the acknowledgement names another producer/consumer session",
+            )
         outcome = self._pd_tracker.apply_read_ack(
             ReadAckIdentity(
                 req_id=ack.req_id,
@@ -1267,12 +1297,14 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             ),
             expected_producer_instance_id=STORAGE_PD_INCARNATION,
             expected_tp_rank=self._ack_tp_rank,
-            session_id=self._pd_session_id,
+            session_id=request.session_id,
         )
         logger.debug(
             "Raw-block storage P/D read ack for %s: %s", ack.req_id, outcome.value
         )
-        return outcome
+        if outcome is ReadAckOutcome.UNRESOLVED:
+            return ACK_UNRESOLVED, "this writer could not establish the outcome"
+        return outcome.value, ""
 
     def ack_endpoint(self) -> str:
         """Where a consumer should send this writer's acknowledgements."""

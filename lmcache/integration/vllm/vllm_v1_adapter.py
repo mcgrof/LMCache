@@ -51,6 +51,7 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.manager import LMCacheManager
 from lmcache.v1.storage_backend.raw_block import RawBlockPublicationReceipt
+from lmcache.v1.storage_backend.storage_pd_ack import StoragePDAckClient
 from lmcache.v1.storage_backend.storage_pd_protocol import (
     STORAGE_PD_INCARNATION,
     StoragePDDelivery,
@@ -600,13 +601,13 @@ class LMCacheConnectorV1Impl:
         # once and survives a queue that has no room for it yet.
         self._storage_pd_obligations: dict[str, StoragePDObligation] = {}
         self._storage_pd_acks_sent: OrderedDict[str, None] = OrderedDict()
-        # Acknowledgements this consumer owes a producer, kept until the
-        # queue takes them. Independent of the decoder request's own
-        # lifetime: the request is long gone by the time a saturated queue
-        # has room.
-        self._storage_pd_ack_outbox: OrderedDict[str, StoragePDObligation] = (
-            OrderedDict()
-        )
+        # Acknowledgements this consumer owes producers, each owed until
+        # its writer answers. Owned by the client's own worker rather than
+        # by the restore that created it: the request is long gone before a
+        # writer that was unreachable comes back, and tying retries to the
+        # next restore makes a lost acknowledgement wait for traffic that
+        # may never arrive.
+        self._storage_pd_ack_client: Optional[StoragePDAckClient] = None
         self._storage_pd_lock = threading.Lock()
         self._storage_pd_tp_rank = 0
         self._storage_pd_status_sender: Optional[StoragePDStatusSender] = None
@@ -1061,82 +1062,55 @@ class LMCacheConnectorV1Impl:
         req_id: str,
         status: StoragePDStatus,
     ) -> None:
-        """Report that the advertised bytes reached this rank's GPU cache.
+        """Ask the producer to release the extents this rank has finished with.
 
         ``req_id`` names the request inside this engine and is only used to
-        avoid acknowledging it twice. What goes on the wire is the identity
-        the producer published, which the adopted status carries.
+        avoid taking on the same obligation twice. What goes on the wire is
+        the identity the producer published, which the adopted status
+        carries: the producer knows this request by the name it checked
+        READY against, and an acknowledgement carrying the local name
+        matches nothing on the side that has to act on it.
 
-        The acknowledgement is queued, not sent: this runs on the restore
-        path, where waiting for a producer that may have exited would stall
-        the load. Saturation keeps the obligation rather than dropping it,
-        so the same acknowledgement is offered again without needing
-        another restore.
+        The asking is handed to a background owner rather than done here.
+        This runs on the restore path, where waiting for a producer that
+        may not be listening yet would stall the load -- and the producer's
+        answer, not this send, is what discharges the obligation.
         """
         if req_id in self._storage_pd_acks_sent:
             return
-        if self._storage_pd_notify_queue is not None:
-            ack: StoragePDReadAck = StoragePDReadAck(
-                # The producer knows this request by the identity it
-                # published and checked READY against, not by the name
-                # this engine happens to give it. The two differ, and an
-                # acknowledgement carrying the local name matches nothing
-                # on the side that has to act on it.
-                req_id=status.req_id,
-                producer_instance_id=status.producer_instance_id,
-                consumer_instance_id=STORAGE_PD_INCARNATION,
-                tp_rank=self._storage_pd_tp_rank,
-                writer_epoch=status.writer_epoch,
-                checkpoint_seq=status.checkpoint_seq,
-                manifest_digest=status.manifest_digest,
+        client = self._storage_pd_ack_client
+        if client is None:
+            logger.error(
+                "Raw-block storage P/D restored request %s with no way to "
+                "acknowledge it; the producer's extents stay held",
+                req_id,
             )
-            # Keyed apart from a producer status so a reader and a writer
-            # sharing one connector cannot displace each other's message.
-            # The obligation is created and kept here, so saturation costs a
-            # later attempt rather than the acknowledgement itself, and the
-            # retry does not need another restore to happen.
-            obligation = self._storage_pd_notify_queue.obligation(
-                f"ack:{req_id}", ack, report=False
-            )
-            self._storage_pd_ack_outbox[req_id] = obligation
+            return
+        ack = StoragePDReadAck(
+            req_id=status.req_id,
+            producer_instance_id=status.producer_instance_id,
+            consumer_instance_id=STORAGE_PD_INCARNATION,
+            tp_rank=self._storage_pd_tp_rank,
+            writer_epoch=status.writer_epoch,
+            checkpoint_seq=status.checkpoint_seq,
+            manifest_digest=status.manifest_digest,
+        )
+        obligation = client.owe(
+            ack,
+            endpoint=status.ack_endpoint,
+            session_id=self._storage_pd_session_id,
+            deadline_s=self._storage_pd_ack_deadline_s,
+        )
+        if obligation is None:
+            # Refused: either the producer advertised nowhere to reply or
+            # this consumer already owes as many acknowledgements as it is
+            # allowed to. Neither is recorded as sent, so a later restore
+            # of the same request tries again.
+            return
         self._storage_pd_acks_sent.pop(req_id, None)
         self._storage_pd_acks_sent[req_id] = None
         while len(self._storage_pd_acks_sent) > STORAGE_PD_REQUEST_HISTORY:
             self._storage_pd_acks_sent.popitem(last=False)
-        self._drain_storage_pd_ack_outbox()
-
-    def _drain_storage_pd_ack_outbox(self) -> None:
-        """Offer every acknowledgement still owed, oldest first.
-
-        Called from the restore path, which is the only regular event a
-        reader has. An obligation the queue refuses stays here with the
-        deadline it was created under, so the next restore retries it; the
-        outbox is what makes a lost acknowledgement this engine's problem
-        rather than something that silently evaporated.
-        """
-        queue = self._storage_pd_notify_queue
-        if queue is None:
-            return
-        owed = list(self._storage_pd_ack_outbox.items())
-        for req_id, obligation in owed:
-            if obligation.settled:
-                self._storage_pd_ack_outbox.pop(req_id, None)
-                continue
-            queue.offer(obligation)
-        if len(self._storage_pd_ack_outbox) > STORAGE_PD_REQUEST_HISTORY:
-            # A reader that cannot reach its producer at all must not grow
-            # without bound either. The oldest are dropped, loudly: their
-            # extents stay protected on the writer, which is the safe
-            # direction, and the writer's own accounting is what surfaces
-            # them.
-            while len(self._storage_pd_ack_outbox) > STORAGE_PD_REQUEST_HISTORY:
-                dropped, _ = self._storage_pd_ack_outbox.popitem(last=False)
-                logger.error(
-                    "Raw-block storage P/D gave up acknowledging request "
-                    "%s: %d acknowledgements are already owed and unsent",
-                    dropped,
-                    STORAGE_PD_REQUEST_HISTORY,
-                )
 
     @staticmethod
     def _log_storage_pd_delivery(delivery: "StoragePDDelivery") -> None:
@@ -1700,6 +1674,30 @@ class LMCacheConnectorV1Impl:
                 "pd_skip_proxy_notification=true to run without a consumer"
             )
 
+        # A reader owes every producer it restores from an acknowledgement,
+        # and asks the producer directly: the answer that releases an extent
+        # can only come from the engine holding it, so a relay in between
+        # would add a hop that cannot answer the question.
+        self._storage_pd_session_id = str(
+            extra_config.get("rust_raw_block.pd_session_id", "")
+            or os.environ.get("LMCACHE_STORAGE_PD_SESSION", "")
+        )
+        self._storage_pd_ack_deadline_s = float(
+            extra_config.get("rust_raw_block.ack_deadline_s", 600.0)
+        )
+        if self._storage_pd_raw_role == "reader":
+            self._storage_pd_ack_client = StoragePDAckClient(
+                attempt_timeout_ms=int(
+                    extra_config.get("rust_raw_block.ack_attempt_timeout_ms", 2000)
+                ),
+                retry_interval_s=float(
+                    extra_config.get("rust_raw_block.ack_retry_interval_s", 1.0)
+                ),
+                max_live_obligations=int(
+                    extra_config.get("rust_raw_block.ack_max_owed", 1024)
+                ),
+            )
+
     def _storage_pd_retire_locked(self, req_id: str) -> None:
         """Drop a finished request's state, keeping only that it finished.
 
@@ -1914,6 +1912,11 @@ class LMCacheConnectorV1Impl:
                 self._storage_pd_notify_queue.close()
             elif self._storage_pd_status_sender is not None:
                 self._storage_pd_status_sender.close()
+            if self._storage_pd_ack_client is not None:
+                # Unsettled obligations settle as unresolved here, because
+                # that is what they are: nothing heard a producer say
+                # anything about them, and the extents stay held.
+                self._storage_pd_ack_client.close()
 
     ###################
     # Scheduler side APIs

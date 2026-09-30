@@ -50,7 +50,6 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
 from lmcache.v1.storage_backend.raw_block import RawBlockPublicationReceipt
 from lmcache.v1.storage_backend.storage_pd_protocol import (
     StoragePDNotificationQueue,
-    StoragePDReadAck,
     StoragePDStatus,
 )
 
@@ -134,8 +133,10 @@ def _make_storage_pd_connector() -> LMCacheConnectorV1Impl:
     connector._storage_pd_terminal_states = {}
     connector._storage_pd_receipts = {}
     connector._storage_pd_obligations = {}
-    connector._storage_pd_ack_outbox = OrderedDict()
     connector._storage_pd_acks_sent = OrderedDict()
+    connector._storage_pd_ack_client = None
+    connector._storage_pd_session_id = "session-1"
+    connector._storage_pd_ack_deadline_s = 10.0
     connector._storage_pd_status_sender = None
     connector._storage_pd_notify_queue = None
     connector._storage_pd_notify_required = False
@@ -472,36 +473,74 @@ def test_storage_pd_read_ack_carries_the_published_request_identity() -> None:
     READY is checked against the published identity, so the
     acknowledgement has to use it too, or the producer cannot match it to
     anything and the extents it is holding stay held.
+
+    It must also go to the endpoint the producer advertised. That is the
+    only party that can release the hold, so the acknowledgement is asked
+    of it directly and its answer is what discharges the obligation.
     """
 
-    class Sender:
+    class Client:
         def __init__(self) -> None:
-            self.acks: list[StoragePDReadAck] = []
+            self.owed: list[tuple] = []
 
-        def send(self, message) -> None:
-            self.acks.append(message)
+        def owe(self, ack, *, endpoint, session_id, deadline_s):
+            self.owed.append((ack, endpoint, session_id, deadline_s))
+            return object()
 
     connector = _make_storage_pd_connector()
-    sender = Sender()
-    _attach_notification_queue(connector, sender)
-    receipt = RawBlockPublicationReceipt("writer-epoch", 7, 1, "digest")
+    client = Client()
+    connector._storage_pd_ack_client = client
+    receipt = RawBlockPublicationReceipt(
+        "writer-epoch", 7, 1, "digest", ack_endpoint="127.0.0.1:5999"
+    )
     status = StoragePDStatus.ready("proxy-uuid", 0, receipt)
 
     connector._ack_storage_pd_restore("cmpl-internal-0", status)
-    deadline = time.monotonic() + SETTLE_TIMEOUT_S
-    while not sender.acks and time.monotonic() < deadline:
-        time.sleep(0.002)
 
-    assert [ack.req_id for ack in sender.acks] == ["proxy-uuid"]
-    ack = sender.acks[0]
+    assert len(client.owed) == 1
+    ack, endpoint, session_id, deadline_s = client.owed[0]
+    assert ack.req_id == "proxy-uuid"
     assert ack.writer_epoch == "writer-epoch"
     assert ack.checkpoint_seq == 7
     assert ack.manifest_digest == "digest"
     assert ack.tp_rank == connector._storage_pd_tp_rank
+    assert endpoint == "127.0.0.1:5999"
+    assert session_id == "session-1"
+    assert deadline_s == 10.0
 
-    # The local name still governs sending it only once.
+    # The local name still governs taking it on only once.
     connector._ack_storage_pd_restore("cmpl-internal-0", status)
-    assert len(sender.acks) == 1
+    assert len(client.owed) == 1
+
+
+def test_storage_pd_a_refused_obligation_is_not_recorded_as_owed() -> None:
+    """A consumer that could not take one on has not acknowledged anything.
+
+    Recording it as sent would make the next restore of the same request
+    skip it, so the hold would never be asked about again.
+    """
+
+    class RefusingClient:
+        def __init__(self) -> None:
+            self.asked = 0
+
+        def owe(self, ack, *, endpoint, session_id, deadline_s):
+            self.asked += 1
+            return None
+
+    connector = _make_storage_pd_connector()
+    client = RefusingClient()
+    connector._storage_pd_ack_client = client
+    receipt = RawBlockPublicationReceipt(
+        "writer-epoch", 7, 1, "digest", ack_endpoint="127.0.0.1:5999"
+    )
+    status = StoragePDStatus.ready("proxy-uuid", 0, receipt)
+
+    connector._ack_storage_pd_restore("cmpl-internal-0", status)
+    assert "cmpl-internal-0" not in connector._storage_pd_acks_sent
+
+    connector._ack_storage_pd_restore("cmpl-internal-0", status)
+    assert client.asked == 2
 
 
 def test_storage_pd_releasing_a_request_clears_its_state() -> None:

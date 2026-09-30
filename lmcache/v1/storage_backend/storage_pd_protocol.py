@@ -112,7 +112,11 @@ class StoragePDReadAck(msgspec.Struct, tag=True):
     manifest_digest: str
 
 
-StoragePDMsg = StoragePDStatus | StoragePDReadAck
+# What travels to the proxy. The acknowledgement does not: it goes straight
+# from the consumer to the writer that holds the extents, because a relay's
+# word about one is not the reader's word and the writer is the only party
+# that can act on it.
+StoragePDMsg = StoragePDStatus
 
 
 def order_storage_pd_ready_statuses(
@@ -250,86 +254,6 @@ class StoragePDStatusSender:
         if self._socket is not None:
             self._socket.close(linger=1000)
             self._socket = None
-
-
-class StoragePDAckReceiver:
-    """Listen for the acknowledgements that release a writer's leases.
-
-    A writer holds an extent until the consumer that was told about it says
-    it has the bytes. Nothing else can decide that, so a writer with no way
-    to hear an acknowledgement holds every extent it ever published for its
-    own lifetime. This is that way.
-
-    One thread owns the socket. Each message is handed to ``handler``, which
-    is expected to validate it against a live lease and to be safe to call
-    with a duplicate, a stale message or an outright forgery: what arrives
-    here came off a network and is not trusted for anything but its shape.
-    """
-
-    def __init__(
-        self,
-        handler: Callable[[StoragePDReadAck], None],
-        *,
-        host: str,
-        port: int,
-    ) -> None:
-        if not host:
-            raise ValueError("storage P/D acknowledgements need a listen host")
-        if port <= 0:
-            raise ValueError("storage P/D acknowledgements need a listen port")
-        self._handler = handler
-        self.endpoint = f"{host}:{port}"
-        context = get_zmq_context(use_asyncio=False)
-        self._socket = get_zmq_socket(
-            context,
-            self.endpoint,
-            "tcp",
-            zmq.PULL,
-            "bind",
-        )
-        self._socket.setsockopt(zmq.RCVTIMEO, 200)
-        self._stopping = False
-        self._thread = threading.Thread(
-            target=self._run,
-            name="storage-pd-ack",
-            daemon=True,
-        )
-        self._thread.start()
-
-    def close(self, timeout_s: float = 5.0) -> None:
-        self._stopping = True
-        self._thread.join(timeout=timeout_s)
-        self._socket.close(linger=0)
-
-    def _run(self) -> None:
-        while not self._stopping:
-            try:
-                raw = self._socket.recv()
-            except zmq.Again:
-                continue
-            except zmq.ZMQError:
-                if self._stopping:
-                    return
-                logger.exception("storage P/D acknowledgement socket failed")
-                return
-            try:
-                message = msgspec.msgpack.decode(raw, type=StoragePDMsg)
-            except Exception:
-                logger.warning("storage P/D acknowledgement was undecodable")
-                continue
-            if not isinstance(message, StoragePDReadAck):
-                logger.warning(
-                    "storage P/D acknowledgement socket got a %s",
-                    type(message).__name__,
-                )
-                continue
-            try:
-                self._handler(message)
-            except Exception:
-                logger.exception(
-                    "storage P/D acknowledgement for %s was not applied",
-                    message.req_id,
-                )
 
 
 class StoragePDDelivery(NamedTuple):

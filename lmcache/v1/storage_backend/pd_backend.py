@@ -33,7 +33,6 @@ from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.rpc_utils import get_zmq_context, get_zmq_socket
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
 from lmcache.v1.storage_backend.storage_pd_protocol import (
-    StoragePDReadAck,
     StoragePDStatus,
 )
 from lmcache.v1.transfer_channel import CreateTransferChannel
@@ -92,7 +91,6 @@ PDMsg = Union[
     CacheQueryRequest,
     CacheQueryResponse,
     StoragePDStatus,
-    StoragePDReadAck,
 ]
 
 
