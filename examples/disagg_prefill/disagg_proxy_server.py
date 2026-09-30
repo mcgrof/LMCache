@@ -769,7 +769,8 @@ async def handle_completions(request: Request):
         stats_calculator.add(et - st)
 
         req_data["max_tokens"] = org_max_tokens - 1
-        req_data["prompt"].append(prefill_output["kv_transfer_params"]["first_tok"])
+        first_tok_id = prefill_output["kv_transfer_params"]["first_tok"]
+        req_data["prompt"].append(first_tok_id)
         req_data.pop("kv_transfer_params")
         req_data["stream"] = True
         if stream_options is not None:
@@ -809,6 +810,15 @@ async def handle_completions(request: Request):
                     {
                         "index": 0,
                         "text": prefill_output["choices"][0]["text"],
+                        # The prefiller already decided this token and
+                        # reported its integer id. Carry the id, not only the
+                        # text it renders to: a client comparing generated
+                        # tokens cannot recover an id from text without
+                        # retokenizing, which is a different operation and can
+                        # disagree.
+                        "token_ids": (
+                            [first_tok_id] if first_tok_id is not None else None
+                        ),
                         "logprobs": None,
                         "finish_reason": None,
                         "stop_reason": None,
@@ -929,7 +939,8 @@ async def handle_chat_completions(request: Request):
             req_data["max_completion_tokens"] = org_max_completion_tokens - 1
 
         # Add the first token from prefill to the tokenized messages for decode
-        req_data["prompt"].append(prefill_output["kv_transfer_params"]["first_tok"])
+        first_tok_id = prefill_output["kv_transfer_params"]["first_tok"]
+        req_data["prompt"].append(first_tok_id)
 
         req_data.pop("kv_transfer_params")
         req_data["stream"] = True
@@ -988,6 +999,15 @@ async def handle_chat_completions(request: Request):
                     {
                         "index": 0,
                         "delta": {"content": prefill_output["choices"][0]["text"]},
+                        # The prefiller already decided this token and
+                        # reported its integer id. Carry the id, not only the
+                        # text it renders to: a client comparing generated
+                        # tokens cannot recover an id from text without
+                        # retokenizing, which is a different operation and can
+                        # disagree.
+                        "token_ids": (
+                            [first_tok_id] if first_tok_id is not None else None
+                        ),
                         "logprobs": None,
                         "finish_reason": None,
                     }
