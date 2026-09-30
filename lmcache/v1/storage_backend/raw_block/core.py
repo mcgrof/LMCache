@@ -2470,7 +2470,14 @@ class RawBlockCore:
                 for encoded_key in planned_keys:
                     inflight = self._inflight.pop(encoded_key, None)
                     if inflight is not None:
-                        self._append_free_slot_locked(inflight.offset)
+                        # The free list is keyed by slot index; an in-flight
+                        # record carries the slot's byte offset. Passing the
+                        # offset loses the slot for the life of the process:
+                        # the range check drops it silently, and with other
+                        # geometry it would name an unrelated slot.
+                        self._append_free_slot_locked(
+                            self._offset_to_slot(int(inflight.offset))
+                        )
             raise
 
         if not write_plan:

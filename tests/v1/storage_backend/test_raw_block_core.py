@@ -1758,3 +1758,61 @@ def test_raw_block_core_batch_with_one_unsupported_object(
         ]
     finally:
         core.close()
+
+
+def test_raw_block_core_planning_exception_returns_the_slot_it_reserved(tmp_path):
+    """An ordinary planning failure must give back the slots it took.
+
+    Planning reserves a slot per key as it walks a batch, and records each
+    reservation by its byte offset. The free list is keyed by slot index. The
+    catch-all unwind passed the offset straight through, so the range check
+    dropped it and the slot was lost for the life of the process; with other
+    geometry the same value would have named an unrelated slot.
+
+    The unsupported-format cases never reach this path: they are refused per
+    key and planning continues. This drives the exception that unwinds the
+    whole batch after a reservation has already been made.
+    """
+    # First Party
+    from lmcache.v1.storage_backend.raw_block import core as core_module
+
+    path = make_raw_block_file(tmp_path)
+    # The catch-all unwind only exists on the batched io_uring path, which
+    # put_many selects for more than one key. The default POSIX config stores
+    # each key independently and never reaches it.
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        first = encode_object_key(make_object_key(71))
+        second = encode_object_key(make_object_key(72))
+        payload = make_memory_obj(b"planning-unwind")
+
+        real_len = core_module._logical_payload_len
+        calls = {"n": 0}
+
+        def raise_on_second(obj):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("injected planning failure")
+            return real_len(obj)
+
+        core_module._logical_payload_len = raise_on_second
+        try:
+            with pytest.raises(RuntimeError, match="injected planning failure"):
+                core.put_many([first, second], [payload, payload])
+        finally:
+            core_module._logical_payload_len = real_len
+
+        # The reservation is gone and its slot is back on the free list.
+        assert not core.exists_inflight(first.encoded)
+        assert not core.exists_inflight(second.encoded)
+        assert core._free_slots, "the reserved slot was lost, not freed"
+        freed_slot = next(iter(core._free_slots))
+        freed_offset = core._data_base_offset + freed_slot * core.slot_bytes
+
+        # And it is genuinely reusable: the next put lands in it.
+        after = encode_object_key(make_object_key(73))
+        assert core.put_many([after], [make_memory_obj(b"reused")]).results == [True]
+        assert core._index[after.encoded].offset == freed_offset
+    finally:
+        core.close()
