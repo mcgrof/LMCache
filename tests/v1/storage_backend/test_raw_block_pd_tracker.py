@@ -811,3 +811,59 @@ def test_tracker_says_it_cannot_tell_once_a_tombstone_is_gone() -> None:
     finally:
         core.allow_publish.set()
         tracker.close()
+
+
+def test_tracker_stops_admitting_before_its_hold_bound_is_exceeded() -> None:
+    """Deduplicated requests grow holds without consuming any device slot.
+
+    A hold is released only by an acknowledgement, so a consumer that stops
+    acknowledging grows this state indefinitely -- and because two requests
+    naming the same extent each hold a reference, a finite device does not
+    bound it and neither does a bounded request history. Publication stops
+    instead.
+    """
+    core = _FakeCore()
+    tracker = RawBlockPDRequestTracker(core, max_live_leases=2)  # type: ignore[arg-type]
+    try:
+        for index in range(2):
+            req_id = f"request-{index}"
+            terminal = tracker.register_batch(
+                req_id,
+                ["shared-key"],
+                expected_chunks=1,
+                is_last_batch=True,
+            )
+            tracker.complete_batch(req_id, ["shared-key"])
+            core.allow_publish.set()
+            terminal.result(timeout=1)
+        assert tracker.live_lease_count() == 2
+        # Two requests, one key: two independent holds, so the extent is
+        # protected until both are acknowledged.
+        assert core.leased == ["shared-key", "shared-key"]
+
+        with pytest.raises(RuntimeError, match="refusing to publish"):
+            tracker.register_batch(
+                "one-too-many",
+                ["shared-key"],
+                expected_chunks=1,
+                is_last_batch=True,
+            )
+
+        # Acknowledging one frees exactly one hold, and admission resumes.
+        assert (
+            _ack(tracker, req_id="request-0", consumer_instance_id="consumer-1")
+            is ReadAckOutcome.APPLIED
+        )
+        assert core.leased == ["shared-key"]
+        assert tracker.live_lease_count() == 1
+        terminal = tracker.register_batch(
+            "one-too-many",
+            ["shared-key"],
+            expected_chunks=1,
+            is_last_batch=True,
+        )
+        tracker.complete_batch("one-too-many", ["shared-key"])
+        terminal.result(timeout=1)
+    finally:
+        core.allow_publish.set()
+        tracker.close()

@@ -42,6 +42,15 @@ class _RequestState:
 # means an identifier reused after this many requests is treated as new.
 _FINISHED_HISTORY = 4096
 
+# How many holds this writer will keep at once. A hold is released only by
+# an acknowledgement, so a consumer that stops acknowledging grows this
+# without bound -- and deduplicated requests grow it without consuming any
+# additional device slot, so neither a finite device nor a bounded request
+# history bounds it. Admission stops here instead. It is sized to the
+# tombstone history so that a retry of anything still admissible can still
+# be distinguished from a message about a hold this writer never had.
+_MAX_LIVE_LEASES = _FINISHED_HISTORY
+
 
 class ReadAckOutcome(enum.Enum):
     """What a writer did about one acknowledgement.
@@ -102,8 +111,16 @@ class _Lease:
 class RawBlockPDRequestTracker:
     """Turn raw-block batch completions into one publication receipt."""
 
-    def __init__(self, core: RawBlockCore) -> None:
+    def __init__(
+        self,
+        core: RawBlockCore,
+        *,
+        max_live_leases: int = _MAX_LIVE_LEASES,
+    ) -> None:
+        if max_live_leases <= 0:
+            raise ValueError("a raw-block P/D tracker needs a live-lease bound")
         self._core = core
+        self._max_live_leases = max_live_leases
         self._lock = threading.Lock()
         self._requests: dict[str, _RequestState] = {}
         self._finished: OrderedDict[str, Future[RawBlockPublicationReceipt]] = (
@@ -162,6 +179,21 @@ class RawBlockPDRequestTracker:
         with self._lock:
             if self._closed:
                 raise RuntimeError("raw-block P/D request tracker is closed")
+            if (
+                req_id not in self._requests
+                and len(self._leases) + len(self._requests) >= self._max_live_leases
+            ):
+                # Refusing is the point. Publishing anyway would add a hold
+                # nobody is going to release, and evicting an older one to
+                # make room would hand a live extent to a later request --
+                # so the writer stops admitting and says why.
+                raise RuntimeError(
+                    "raw-block P/D already holds "
+                    f"{len(self._leases)} unacknowledged lease(s) and "
+                    f"{len(self._requests)} in-flight request(s), at its "
+                    f"bound of {self._max_live_leases}; refusing to publish "
+                    f"{req_id} rather than abandon one of them"
+                )
             if req_id in self._finished:
                 raise RuntimeError(
                     f"request {req_id} has already finished and cannot be "
