@@ -335,3 +335,66 @@ def test_publication_refuses_an_identity_another_node_cannot_resolve(tmp_path):
             writer.publish_request([key.encoded])
     finally:
         writer.close()
+
+
+@requires_rust_raw_block_io
+@pytest.mark.skipif(sys.platform != "linux", reason="raw-block is Linux only")
+def test_publication_does_not_reuse_a_generation_that_moved_the_key(tmp_path):
+    """A receipt must name where a key is now, not where it used to be.
+
+    A key can be published at one extent, deleted, and written again
+    somewhere else. The earlier checkpoint still advertises the extent it
+    had then, and the key is still a member of that generation, so a
+    publication that decides by membership alone hands back a receipt
+    pointing at storage the writer has since given to another key. The
+    holds the request takes protect the new extent, not the advertised one.
+    """
+    path = make_raw_block_file(tmp_path)
+    writer = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    reader = RawBlockCore(_reader_config(path), key_namespace="object")
+    try:
+        first = encode_object_key(make_object_key(81))
+        second = encode_object_key(make_object_key(82))
+
+        assert writer.put_many([first], [make_memory_obj(b"A" * 1024)]).results == [
+            True
+        ]
+        old_receipt = writer.publish_request([first.encoded])
+        old_offset = writer._index[first.encoded].offset
+
+        # Drop the key, let another one take its slot, then store it again so
+        # it lands somewhere else.
+        assert writer.delete_many([first.encoded]) == [True]
+        assert writer.put_many([second], [make_memory_obj(b"B" * 1024)]).results == [
+            True
+        ]
+        assert writer._index[second.encoded].offset == old_offset
+        assert writer.put_many([first], [make_memory_obj(b"C" * 1024)]).results == [
+            True
+        ]
+        new_offset = writer._index[first.encoded].offset
+        assert new_offset != old_offset
+
+        new_receipt = writer.publish_request([first.encoded])
+
+        # A fresh generation, not the one that described the old extent.
+        assert new_receipt.checkpoint_seq > old_receipt.checkpoint_seq
+
+        # And a reader following the new receipt reads the key's current bytes,
+        # not whatever now lives at the extent the old receipt advertised.
+        assert reader.refresh_until_publication(
+            new_receipt,
+            [first.encoded],
+            timeout_ms=1_000,
+            refresh_interval_ms=1,
+        )
+        loaded = make_empty_memory_obj(1024)
+        assert reader.load_many_into([first.encoded], [loaded]) == [True]
+        assert memory_obj_bytes(loaded) == b"C" * 1024
+
+        # The fully deduplicated case still yields a current generation.
+        repeat = writer.publish_request([first.encoded])
+        assert repeat.checkpoint_seq > new_receipt.checkpoint_seq
+    finally:
+        reader.close()
+        writer.close()

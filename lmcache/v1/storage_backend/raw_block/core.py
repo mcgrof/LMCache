@@ -1418,15 +1418,29 @@ class RawBlockCore:
                 is None
             ):
                 raise RuntimeError("request publication contains an uncommitted key")
-            needs_checkpoint = (
-                self._published_writer_epoch != self._writer_epoch
-                or not set(encoded_keys).issubset(self._published_keys)
-            )
-            if needs_checkpoint:
-                if not self._checkpoint_once_locked(force=True, rewrite_clean=True):
-                    raise RuntimeError("failed to publish the request checkpoint")
-                if not set(encoded_keys).issubset(self._published_keys):
-                    raise RuntimeError("published checkpoint is missing request keys")
+            # Write a fresh generation for every request rather than reuse one
+            # that already names these keys. Membership does not mean the
+            # mapping is the same: a key can be published at one extent,
+            # deleted, and written again somewhere else, and the earlier
+            # checkpoint still advertises the extent it had then. A reader
+            # adopting that receipt would be sent to storage the writer has
+            # since given to something else, and the holds this request takes
+            # protect where the key is now, not where the old checkpoint says
+            # it was.
+            #
+            # The cost falls only on a request whose keys were all already
+            # published, since any new key forced a checkpoint anyway. The
+            # cheaper alternative is to record the extent each key occupied
+            # when it was published and reuse the generation only while every
+            # requested key still sits where it did, which is a physical
+            # identity check and deliberately not part of the content digest.
+            # That needs keeping the extra map correct at every site that
+            # republishes, and a single missed site restores this bug
+            # silently, so it is not what this milestone does.
+            if not self._checkpoint_once_locked(force=True, rewrite_clean=True):
+                raise RuntimeError("failed to publish the request checkpoint")
+            if not set(encoded_keys).issubset(self._published_keys):
+                raise RuntimeError("published checkpoint is missing request keys")
             digest = self._published_manifest_digest(encoded_keys)
             if digest is None:
                 raise RuntimeError(
