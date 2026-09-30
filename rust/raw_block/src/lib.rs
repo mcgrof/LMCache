@@ -16,7 +16,7 @@
 //!   enqueuing; violations result in an immediate Python `ValueError`.
 
 use pyo3::exceptions::{
-    PyDeprecationWarning, PyMemoryError, PyOSError, PyRuntimeError, PyValueError,
+    PyMemoryError, PyOSError, PyRuntimeError, PyValueError,
 };
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
@@ -1840,6 +1840,23 @@ impl RawBlockDevice {
                         poisoned_worker.store(true, Ordering::SeqCst);
                         quarantined_batches_worker.lock().unwrap().insert(batch_id);
                     };
+                    // The whole unknown-outcome sequence, in the only order
+                    // that is safe, so no site has to remember it: put the
+                    // submission's owners out of reach, record the batch as
+                    // unknown and poison the device, and only then tell
+                    // anyone. A waiter reads the poison flag to decide
+                    // whether it may release what it holds, and a
+                    // synchronous caller waits on the completion directly
+                    // rather than on the batch counter, so setting the
+                    // completion first reads to it as "failed, and nothing
+                    // is otherwise wrong".
+                    let fail_unknown = |sub: &IoSubmission,
+                                        quarantined: &mut Vec<IoSubmission>,
+                                        err: PyErr| {
+                        quarantined.push(sub.clone());
+                        mark_unknown(sub.batch_id);
+                        sub.completion.set(Err(err));
+                    };
                     // Set when a submit fails in a way that leaves the ring's
                     // state unknown. No new work is admitted after that: the
                     // engine cannot say what the kernel is still doing.
@@ -2150,13 +2167,15 @@ impl RawBlockDevice {
                                     resident_sqes = false;
                                     for (_user_data, sub) in in_flight.drain() {
                                         let batch_id = sub.batch_id;
-                                        sub.completion.set(Err(PyRuntimeError::new_err(format!(
-                                            "io_uring submit error flushing \
+                                        fail_unknown(
+                                            &sub,
+                                            &mut quarantined,
+                                            PyRuntimeError::new_err(format!(
+                                                "io_uring submit error flushing \
                                                  resident work: {:?}",
-                                            flushed.as_ref().err()
-                                        ))));
-                                        quarantined.push(sub.clone());
-                                        mark_unknown(batch_id);
+                                                flushed.as_ref().err()
+                                            )),
+                                        );
                                         decrement_in_flight(
                                             &in_flight_count_clone,
                                             &in_flight_cvar_clone,
@@ -2321,11 +2340,14 @@ impl RawBlockDevice {
                                             }
                                             for sub in built_submissions.iter_mut() {
                                                 let batch_id = sub.batch_id;
-                                                sub.completion.set(Err(PyRuntimeError::new_err(
-                                                    format!("io_uring submit error: {:?}", e),
-                                                )));
-                                                quarantined.push(sub.clone());
-                                                mark_unknown(batch_id);
+                                                fail_unknown(
+                                                    sub,
+                                                    &mut quarantined,
+                                                    PyRuntimeError::new_err(format!(
+                                                        "io_uring submit error: {:?}",
+                                                        e
+                                                    )),
+                                                );
                                                 decrement_in_flight(
                                                     &in_flight_count_clone,
                                                     &in_flight_cvar_clone,
@@ -2427,12 +2449,14 @@ impl RawBlockDevice {
                     // Neither is a claim that the operation was cancelled.
                     for (_user_data, sub) in in_flight.drain() {
                         let batch_id = sub.batch_id;
-                        quarantined.push(sub.clone());
-                        mark_unknown(batch_id);
-                        sub.completion.set(Err(PyRuntimeError::new_err(
-                            "io_uring worker shut down before this request \
-                             completed; its outcome is unknown",
-                        )));
+                        fail_unknown(
+                            &sub,
+                            &mut quarantined,
+                            PyRuntimeError::new_err(
+                                "io_uring worker shut down before this request \
+                                 completed; its outcome is unknown",
+                            ),
+                        );
                         decrement_in_flight(
                             &in_flight_count_clone,
                             &in_flight_cvar_clone,
@@ -3274,168 +3298,27 @@ impl RawBlockDevice {
     /// Synchronous read using io_uring.
     ///
     /// Deprecated: use ``batched_read()`` followed by ``wait_iouring()`` instead.
+    /// Refused: a synchronous read owns nothing it could retain.
+    ///
+    /// This path registered no owner for its destination and could not carry
+    /// one through an unknown outcome, so on a device whose worker has given
+    /// up it handed the buffer back while a read may still have been landing
+    /// in it. `batched_read()` followed by `wait_iouring()` owns its
+    /// destinations and withholds them; use those.
     #[pyo3(signature = (offset, data, payload_len, total_len = None))]
     fn read_uring(
         &self,
-        py: Python<'_>,
         offset: u64,
         data: &Bound<'_, PyAny>,
         payload_len: usize,
         total_len: Option<usize>,
     ) -> PyResult<()> {
-        PyErr::warn(
-            py,
-            &py.get_type::<PyDeprecationWarning>(),
-            c"RawBlockDevice.read_uring() is deprecated; \
-              use batched_read() followed by wait_iouring() instead.",
-            1,
-        )?;
-
-        if !self.use_iouring {
-            return Err(PyRuntimeError::new_err("io_uring not enabled"));
-        }
-        if self.closed.load(Ordering::Relaxed) {
-            return Err(PyRuntimeError::new_err("device is closed"));
-        }
-
-        let view = get_buffer(py, data, true)?;
-        if view.readonly {
-            view.release();
-            return Err(PyValueError::new_err("output buffer is readonly"));
-        }
-        let ptr = view.ptr;
-        if ptr.is_null() {
-            view.release();
-            return Err(PyValueError::new_err("null buffer pointer"));
-        }
-
-        let cap = view.len;
-        let total_len = total_len.unwrap_or(payload_len);
-        if cap < payload_len {
-            view.release();
-            return Err(PyValueError::new_err(format!(
-                "output buffer too small: cap={cap} need={payload_len}"
-            )));
-        }
-        if total_len < payload_len {
-            view.release();
-            return Err(PyValueError::new_err("total_len must be >= payload_len"));
-        }
-
-        let align = self.alignment;
-        if self.use_odirect {
-            #[allow(clippy::manual_is_multiple_of)]
-            if (offset as usize) % align != 0 {
-                view.release();
-                return Err(PyValueError::new_err("O_DIRECT requires aligned offset"));
-            }
-            #[allow(clippy::manual_is_multiple_of)]
-            if total_len % align != 0 {
-                view.release();
-                return Err(PyValueError::new_err("O_DIRECT requires aligned total_len"));
-            }
-        }
-
-        // O_DIRECT and NVMe io_uring_cmd both require a page-aligned ptr for
-        // multi-page transfers (kernel / PRP list entries).
-        let needs_align = self.use_odirect || self.use_uring_cmd;
-        let ptr_aligned = if needs_align {
-            (ptr as usize).is_multiple_of(align)
-        } else {
-            true
-        };
-
-        // Fixed buffers are pre-registered with io_uring, enabling true zero-copy I/O
-        let use_fixed = self.fixed_buffers_registered.load(Ordering::Relaxed);
-        let (fixed_idx, fixed_dmabuf) = if use_fixed && ptr_aligned {
-            let map = self.fixed_buffer_map.lock().unwrap();
-            fixed_buffer_for_range(&map, ptr as usize, total_len)
-        } else {
-            (None, None)
-        };
-        if !view.host_accessible && fixed_dmabuf.is_none() {
-            view.release();
-            return Err(PyValueError::new_err(
-                "pointer-only buffer is not fully covered by a dma-buf registration",
-            ));
-        }
-
-        // Use bounce buffer if:
-        // Buffer is not aligned (O_DIRECT or io_uring_cmd PRP requirement)
-        // Buffer capacity is less than total_len
-        let use_bounce = !ptr_aligned || cap < total_len;
-        // A dma-buf registered buffer may be device memory the CPU cannot
-        // touch: it is never bounced.  Misalignment or a short buffer is an
-        // error for it, not a copy.
-        if fixed_dmabuf.is_some() && use_bounce {
-            view.release();
-            return Err(PyValueError::new_err(
-                "dma-buf registered buffer must be aligned and at least total_len bytes",
-            ));
-        }
-
-        let res = if !use_bounce {
-            self.in_flight_count.fetch_add(1, Ordering::Relaxed);
-            let comp = Arc::new(IoCompletion::new());
-            let sub = IoSubmission {
-                fd: self.fd,
-                offset,
-                len: total_len,
-                ptr_addr: ptr as usize,
-                is_write: false,
-                completion: comp.clone(),
-                fixed_buffer_idx: fixed_idx,
-                fixed_dmabuf,
-                bounce: None,
-                original_ptr: None,
-                payload_len: None,
-                batch_id: 0,
-                nvme_cmd_data: self._build_nvme_cmd_data(0, 0)?,
-            };
-            {
-                let q = self.queue.as_ref().expect("queue must exist");
-                let mut q = q.lock().unwrap();
-                q.push(sub);
-            }
-            if let Some(batch_ready) = &self.batch_ready {
-                batch_ready.signal_producer();
-            }
-            py.allow_threads(move || comp.wait())
-        } else {
-            let bounce = AlignedBuf::new(total_len, align)?;
-            let bounce_arc = std::sync::Arc::new(bounce);
-            let bounce_ptr = bounce_arc.as_mut_ptr();
-            self.in_flight_count.fetch_add(1, Ordering::Relaxed);
-            let comp = Arc::new(IoCompletion::new());
-            let sub = IoSubmission {
-                fd: self.fd,
-                offset,
-                len: total_len,
-                ptr_addr: bounce_ptr as usize,
-                is_write: false,
-                completion: comp.clone(),
-                fixed_buffer_idx: None,
-                fixed_dmabuf: None,
-                bounce: Some(bounce_arc),
-                original_ptr: Some(ptr as usize),
-                payload_len: Some(payload_len),
-                batch_id: 0,
-                nvme_cmd_data: self._build_nvme_cmd_data(0, 0)?,
-            };
-            {
-                let q = self.queue.as_ref().expect("queue must exist");
-                let mut q = q.lock().unwrap();
-                q.push(sub);
-            }
-            if let Some(batch_ready) = &self.batch_ready {
-                batch_ready.signal_producer();
-            }
-            py.allow_threads(move || comp.wait())
-        };
-
-        view.release();
-        res?;
-        Ok(())
+        let _ = (offset, data, payload_len, total_len);
+        Err(PyRuntimeError::new_err(
+            "RawBlockDevice.read_uring() is not supported; use \
+             batched_read() followed by wait_iouring(), which retains its \
+             destination buffers when an outcome cannot be established",
+        ))
     }
 
     /// Synchronous write using io_uring.
@@ -3474,6 +3357,19 @@ impl RawBlockDevice {
         if total_len < payload_len {
             view.release();
             return Err(PyValueError::new_err("total_len must be >= payload_len"));
+        }
+
+        // A real batch id, not the 0 sentinel: the id is what the worker
+        // records when it cannot establish an outcome, and what decides
+        // below whether this buffer may be handed back. With 0 the
+        // quarantine machinery does not apply to this submission at all.
+        let batch_id = self.next_batch_id.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut stored_objs = self.batched_buffer_objs.lock().unwrap();
+            stored_objs
+                .entry(batch_id)
+                .or_default()
+                .push(data.clone().unbind());
         }
 
         let align = self.alignment;
@@ -3543,7 +3439,7 @@ impl RawBlockDevice {
                 bounce: None,
                 original_ptr: None,
                 payload_len: None,
-                batch_id: 0,
+                batch_id,
                 nvme_cmd_data: self._build_nvme_cmd_data(
                     if placement_id_u16.is_some() { 0x2 } else { 0x0 },
                     placement_id_u16.unwrap_or(0),
@@ -3580,7 +3476,7 @@ impl RawBlockDevice {
                 bounce: Some(bounce_arc),
                 original_ptr: None,
                 payload_len: Some(payload_len),
-                batch_id: 0,
+                batch_id,
                 nvme_cmd_data: self._build_nvme_cmd_data(
                     if placement_id_u16.is_some() { 0x2 } else { 0x0 },
                     placement_id_u16.unwrap_or(0),
@@ -3597,7 +3493,17 @@ impl RawBlockDevice {
             py.allow_threads(move || comp.wait())
         };
 
-        view.release();
+        self.retire_batch_owners(batch_id);
+        if self.quarantined_batches.lock().unwrap().contains(&batch_id) {
+            // Releasing the export calls PyBuffer_Release, which lets the
+            // caller's buffer be reused. The device may still be reading it,
+            // so the export is leaked instead: the memory stays pinned for
+            // this engine's lifetime, which is the price of not being able
+            // to say when the write finished.
+            std::mem::forget(view);
+        } else {
+            view.release();
+        }
         res?;
         Ok(())
     }
@@ -4154,26 +4060,56 @@ impl RawBlockDevice {
                 guard = g;
             }
 
+            // The worker is joined before anything is examined or torn down.
+            // Quarantining a submission is itself what decrements the count
+            // the loop above waits on, so reaching zero is not evidence the
+            // device is finished -- it is reached *by* giving up. Only after
+            // the worker has stopped is the quarantine complete enough to
+            // ask about.
+            if let Some(handle) = self.worker.take() {
+                let _ = handle.join();
+            }
+
+            if self.outcome_is_unknown() {
+                return Err(self.retain_everything(
+                    "io_uring engine could not establish what the device is \
+                     still doing; its buffer registration, exported buffers \
+                     and device descriptor are retained rather than torn \
+                     down, and this device is not reusable",
+                ));
+            }
+
             if self.fixed_buffers_registered.load(Ordering::Relaxed) {
-                if let Some(ring) = &self.ring {
-                    let _ = match ring {
-                        IoUringWrapper::Standard(ring) => {
-                            let ring = ring.lock().unwrap();
-                            ring.submitter().unregister_buffers()
-                        }
-                        IoUringWrapper::Big(ring) => {
-                            let ring = ring.lock().unwrap();
-                            ring.submitter().unregister_buffers()
-                        }
-                    };
+                let unregistered = match &self.ring {
+                    Some(IoUringWrapper::Standard(ring)) => {
+                        let ring = ring.lock().unwrap();
+                        ring.submitter().unregister_buffers()
+                    }
+                    Some(IoUringWrapper::Big(ring)) => {
+                        let ring = ring.lock().unwrap();
+                        ring.submitter().unregister_buffers()
+                    }
+                    None => Ok(()),
+                };
+                if let Err(e) = unregistered {
+                    // The kernel still holds a registration this process was
+                    // about to forget. Forgetting it is what would let the
+                    // memory behind it be reused, so this is the same
+                    // situation as an unknown completion and is treated as
+                    // one.
+                    self.poisoned.store(true, Ordering::SeqCst);
+                    return Err(self.retain_everything(&format!(
+                        "io_uring buffer unregister failed ({e}); the \
+                         registration the kernel still holds is retained \
+                         rather than forgotten, and this device is not \
+                         reusable"
+                    )));
                 }
                 self.fixed_buffers_registered
                     .store(false, Ordering::Relaxed);
                 self.fixed_buffer_map.lock().unwrap().clear();
             }
-        }
-
-        if let Some(handle) = self.worker.take() {
+        } else if let Some(handle) = self.worker.take() {
             let _ = handle.join();
         }
 
@@ -4183,6 +4119,40 @@ impl RawBlockDevice {
         }
         self.closed.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Whether this device has stopped being able to say what it is doing.
+    fn outcome_is_unknown(&self) -> bool {
+        self.poisoned.load(Ordering::SeqCst)
+            || !self.quarantined_batches.lock().unwrap().is_empty()
+    }
+
+    /// Keep every resource an unproven outcome may still be reaching.
+    ///
+    /// The ring, its registration and the device descriptor stay open,
+    /// because closing them is what releases the kernel's attachments to
+    /// memory a command may still be landing in. The retained Python owners
+    /// are leaked deliberately, for the same reason the worker leaks its
+    /// quarantined submissions: their pool slices must not go back to an
+    /// allocator that would hand them to the next request.
+    ///
+    /// `closed` is deliberately left false. This device is finished, but
+    /// saying it is closed would invite a caller to conclude its resources
+    /// were released.
+    fn retain_everything(&mut self, reason: &str) -> PyErr {
+        let owners = std::mem::take(&mut *self.quarantined_owners.lock().unwrap());
+        let owner_count = owners.len();
+        std::mem::forget(owners);
+        let registered = std::mem::take(&mut *self.fixed_buffer_map.lock().unwrap());
+        std::mem::forget(registered);
+        if let Some(ring) = self.ring.take() {
+            std::mem::forget(ring);
+        }
+        PyRuntimeError::new_err(format!(
+            "{reason} (retained {owner_count} buffer owner(s), \
+             {batches} quarantined batch(es))",
+            batches = self.quarantined_batches.lock().unwrap().len(),
+        ))
     }
 
     fn close(&mut self) -> PyResult<()> {
