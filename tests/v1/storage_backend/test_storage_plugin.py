@@ -568,3 +568,88 @@ def test_the_plugin_named_as_the_pd_data_path_is_required(standalone_async_loop)
             loop=standalone_async_loop,
             dst_device="cpu",
         )
+
+
+def test_empty_extra_config_is_refused_when_a_plugin_is_required(
+    standalone_async_loop,
+):
+    """An unconfigurable data path must stop startup, not warn.
+
+    The loader returned early when extra_config was empty, before it looked
+    at whether any plugin was required. On the shared-storage route that
+    left the engine with no backend carrying the payload: with capacity to
+    spare it would fall through to a local CPU allocator, and with none it
+    failed later for an unrelated-looking reason.
+    """
+    config = create_test_config(storage_plugins=["raw_block"])
+    config.extra_config = {}
+    config.enable_pd = True
+    config.pd_role = "sender"
+    config.pd_data_path = "raw_block"
+    config.local_cpu = False
+    config.max_local_cpu_size = 0.0
+
+    with pytest.raises(ValueError, match="extra_config is empty"):
+        CreateStorageBackends(
+            config=config,
+            metadata=create_test_metadata(),
+            loop=standalone_async_loop,
+            dst_device="cpu",
+        )
+
+
+def test_a_data_path_absent_from_storage_plugins_is_refused(standalone_async_loop):
+    """Naming a data path that is not enabled cannot silently do nothing."""
+    config = create_test_config(
+        extra_config=MOCK_BACKEND_EXTRA_CONFIG,
+        storage_plugins=["mock_backend"],
+    )
+    config.enable_pd = True
+    config.pd_role = "sender"
+    config.pd_data_path = "raw_block"
+    config.local_cpu = False
+    config.max_local_cpu_size = 0.0
+
+    with pytest.raises(ValueError, match="not\nlisted in storage_plugins|not listed"):
+        CreateStorageBackends(
+            config=config,
+            metadata=create_test_metadata(),
+            loop=standalone_async_loop,
+            dst_device="cpu",
+        )
+
+
+def test_empty_extra_config_still_only_warns_for_an_optional_plugin(
+    standalone_async_loop,
+):
+    """A cache tier that cannot be configured is still only a warning."""
+    config = create_test_config(storage_plugins=["mock_backend"])
+    config.extra_config = {}
+
+    backends = CreateStorageBackends(
+        config=config,
+        metadata=create_test_metadata(),
+        loop=standalone_async_loop,
+        dst_device="cpu",
+    )
+    assert "mock_backend" not in backends
+    for backend in backends.values():
+        backend.close()
+
+
+def test_required_storage_plugins_names_the_data_path():
+    """The data path is required whether or not it says so itself."""
+    # First Party
+    from lmcache.v1.storage_backend import required_storage_plugins
+
+    config = create_test_config(storage_plugins=["raw_block", "extra_tier"])
+    config.extra_config = {"storage_plugin.extra_tier.required": False}
+    config.enable_pd = True
+    config.pd_role = "sender"
+    config.pd_data_path = "raw_block"
+    assert required_storage_plugins(config) == {"raw_block"}
+
+    # Without the handoff, only an explicit declaration makes one required.
+    config.enable_pd = False
+    config.extra_config = {"storage_plugin.extra_tier.required": True}
+    assert required_storage_plugins(config) == {"extra_tier"}

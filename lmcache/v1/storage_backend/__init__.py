@@ -37,6 +37,24 @@ def is_cuda_worker(metadata: LMCacheMetadata) -> bool:
     return metadata.role != "scheduler" and torch_dev.is_available()
 
 
+def required_storage_plugins(config: LMCacheEngineConfig) -> set[str]:
+    """Return the plugins this deployment cannot serve without.
+
+    A plugin is required when the deployment says so, and when it is named
+    as the data path of a prefill/decode handoff, because then it is the
+    thing carrying the key-value data rather than a tier in front of it.
+    """
+    extra = config.extra_config or {}
+    required = {
+        name
+        for name in (config.storage_plugins or [])
+        if bool(extra.get(f"storage_plugin.{name}.required", False))
+    }
+    if getattr(config, "pd_uses_shared_storage", False) and config.pd_data_path:
+        required.add(str(config.pd_data_path))
+    return required
+
+
 def storage_plugin_launcher(
     config: LMCacheEngineConfig,
     metadata: LMCacheMetadata,
@@ -53,25 +71,41 @@ def storage_plugin_launcher(
     """
     # Get the list of allowed external backends if configured
     storage_plugins = set(config.storage_plugins) if config.storage_plugins else set()
-    if storage_plugins and not config.extra_config:
-        logger.warning(
-            "storage_plugins=%s is set but extra_config is empty; "
-            "plugin settings must be provided under extra_config, e.g. "
-            "extra_config.storage_plugin.<name>.module_path/class_name",
-            sorted(storage_plugins),
-        )
-        return
+
+    # A plugin that only adds a cache tier can be skipped when it cannot be
+    # built: the engine is slower without it but still correct. A plugin that
+    # carries the payload cannot, because serving without it means serving
+    # without the data. Work out which are which before the early returns
+    # below, because an empty extra_config leaves a required plugin just as
+    # unbuildable as a broken one, and returning quietly there let the engine
+    # continue to a local CPU allocator on the shared-storage route.
+    required_plugins = required_storage_plugins(config)
+
     if not config.extra_config:
+        if required_plugins:
+            raise ValueError(
+                "storage plugins "
+                f"{sorted(required_plugins)} are required but extra_config is "
+                "empty, so their module_path and class_name cannot be read"
+            )
+        if storage_plugins:
+            logger.warning(
+                "storage_plugins=%s is set but extra_config is empty; "
+                "plugin settings must be provided under extra_config, e.g. "
+                "extra_config.storage_plugin.<name>.module_path/class_name",
+                sorted(storage_plugins),
+            )
         return
 
+    missing_required = required_plugins - storage_plugins
+    if missing_required:
+        raise ValueError(
+            f"storage plugins {sorted(missing_required)} are required but not "
+            "listed in storage_plugins, so nothing would carry the payload"
+        )
+
     for storage_plugin in storage_plugins:
-        # A plugin that only adds a cache tier can be skipped when it fails to
-        # build: the engine is slower without it but still correct. A plugin
-        # that carries the payload cannot, because serving without it means
-        # serving without the data. The deployment says which it is.
-        required = bool(
-            config.extra_config.get(f"storage_plugin.{storage_plugin}.required", False)
-        ) or (config.pd_uses_shared_storage and storage_plugin == config.pd_data_path)
+        required = storage_plugin in required_plugins
         try:
             module_path = config.extra_config.get(
                 f"storage_plugin.{storage_plugin}.module_path"

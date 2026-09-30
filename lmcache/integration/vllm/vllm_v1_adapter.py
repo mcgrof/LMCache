@@ -606,30 +606,7 @@ class LMCacheConnectorV1Impl:
             and not bool(config.pd_skip_proxy_notification)
         )
         if self._storage_pd_mode and role != KVConnectorRole.SCHEDULER:
-            engine_metadata = getattr(self.lmcache_engine, "metadata", None)
-            self._storage_pd_tp_rank = int(
-                getattr(engine_metadata, "worker_id", os.environ.get("LOCAL_RANK", 0))
-            )
-            skip_notification = bool(config.pd_skip_proxy_notification)
-            if (
-                self._storage_pd_raw_role in ("writer", "reader")
-                and not skip_notification
-            ):
-                if config.pd_proxy_host is None or config.pd_proxy_port is None:
-                    raise ValueError(
-                        "raw-block storage P/D requires pd_proxy_host and "
-                        "pd_proxy_port, or pd_skip_proxy_notification=true"
-                    )
-                self._storage_pd_status_sender = StoragePDStatusSender(
-                    config.pd_proxy_host,
-                    config.pd_proxy_port,
-                    timeout_s=float(
-                        extra_config.get(
-                            "rust_raw_block.status_send_timeout_s",
-                            5.0,
-                        )
-                    ),
-                )
+            self._init_storage_pd_notification(config, extra_config)
 
         # Role-specific initialization
         if role == KVConnectorRole.SCHEDULER:
@@ -1594,6 +1571,44 @@ class LMCacheConnectorV1Impl:
         )
 
     @_lmcache_nvtx_annotate
+    def _init_storage_pd_notification(self, config, extra_config: dict) -> None:
+        """Build this worker's status sender, or refuse the configuration.
+
+        Only a worker reaches this. The scheduler builds no sender by design
+        and completes no handoff, so requiring one there would reject a
+        configuration that is correct.
+        """
+        engine_metadata = getattr(self.lmcache_engine, "metadata", None)
+        self._storage_pd_tp_rank = int(
+            getattr(engine_metadata, "worker_id", os.environ.get("LOCAL_RANK", 0))
+        )
+        skip_notification = bool(config.pd_skip_proxy_notification)
+        if self._storage_pd_raw_role in ("writer", "reader") and not skip_notification:
+            if config.pd_proxy_host is None or config.pd_proxy_port is None:
+                raise ValueError(
+                    "raw-block storage P/D requires pd_proxy_host and "
+                    "pd_proxy_port, or pd_skip_proxy_notification=true"
+                )
+            self._storage_pd_status_sender = StoragePDStatusSender(
+                config.pd_proxy_host,
+                config.pd_proxy_port,
+                timeout_s=float(
+                    extra_config.get(
+                        "rust_raw_block.status_send_timeout_s",
+                        5.0,
+                    )
+                ),
+            )
+        if self._storage_pd_notify_required and self._storage_pd_status_sender is None:
+            # A worker that owes a consumer a status and has no way to send
+            # one cannot serve this configuration. Say so now, rather than on
+            # the first request that finishes.
+            raise ValueError(
+                "raw-block storage P/D requires a status sender on a worker: "
+                "set pd_proxy_host and pd_proxy_port, or "
+                "pd_skip_proxy_notification=true to run without a consumer"
+            )
+
     def _storage_pd_retire_locked(self, req_id: str) -> None:
         """Drop a finished request's state, keeping only that it finished.
 
@@ -1620,7 +1635,15 @@ class LMCacheConnectorV1Impl:
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
-        if not self._storage_pd_mode or self._storage_pd_raw_role != "writer":
+        if (
+            not self._storage_pd_mode
+            or self._storage_pd_raw_role != "writer"
+            or self._role == KVConnectorRole.SCHEDULER
+        ):
+            # The scheduler builds no status sender by design, so it must not
+            # run the writer's completion path either: doing so would either
+            # demand a sender it should not have or record deliveries that
+            # never happened.
             return None, None
 
         releasable: set[str] = set()

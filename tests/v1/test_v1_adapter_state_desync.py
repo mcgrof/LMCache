@@ -33,6 +33,11 @@ import torch
 
 pytest.importorskip("vllm")
 
+# Third Party
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorRole,
+)
+
 # First Party
 from lmcache.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorMetadata,
@@ -128,6 +133,9 @@ def _make_storage_pd_connector() -> LMCacheConnectorV1Impl:
     connector._storage_pd_acks_sent = OrderedDict()
     connector._storage_pd_status_sender = None
     connector._storage_pd_notify_required = False
+    # get_finished consults the role: a scheduler never completes a storage
+    # handoff. This fixture stands in for a worker.
+    connector._role = KVConnectorRole.WORKER
     connector._storage_pd_tp_rank = 0
     connector._storage_pd_lock = threading.Lock()
     connector._manager = SimpleNamespace(  # type: ignore[assignment]
@@ -514,3 +522,56 @@ def test_wait_for_save_skips_desynced_request_and_keeps_engine_alive() -> None:
     finally:
         adapter_logger.removeHandler(handler)
         adapter_logger.setLevel(original_level)
+
+
+def test_storage_pd_worker_without_notification_config_fails_at_init() -> None:
+    """A worker that owes statuses and cannot send them must not start.
+
+    Refusing on the first completed request instead lets the engine come up,
+    answer its health check and serve, which looks exactly like a healthy
+    start. This drives the real setup the constructor runs, not a
+    reimplementation of its decision.
+    """
+    connector = _make_storage_pd_connector()
+    connector._storage_pd_notify_required = True
+    connector._storage_pd_raw_role = "writer"
+    connector._storage_pd_status_sender = None
+
+    # A writer that must notify, with no proxy to notify.
+    config = SimpleNamespace(
+        pd_skip_proxy_notification=False,
+        pd_proxy_host=None,
+        pd_proxy_port=None,
+    )
+    with pytest.raises(ValueError, match="pd_proxy_host"):
+        connector._init_storage_pd_notification(config, {})
+
+    # Notification deliberately turned off: no sender is needed, and the
+    # requirement is not in force either.
+    connector._storage_pd_notify_required = False
+    connector._init_storage_pd_notification(
+        SimpleNamespace(
+            pd_skip_proxy_notification=True,
+            pd_proxy_host=None,
+            pd_proxy_port=None,
+        ),
+        {},
+    )
+    assert connector._storage_pd_status_sender is None
+
+
+def test_storage_pd_scheduler_does_not_complete_a_handoff() -> None:
+    """The scheduler builds no sender by design, so it must not complete.
+
+    Running the writer's completion path there would either demand a sender
+    it should not have or record deliveries that never happened.
+    """
+    connector = _make_storage_pd_connector()
+    connector._role = KVConnectorRole.SCHEDULER
+    completion: Future[list[RawBlockPublicationReceipt]] = Future()
+    completion.set_result([RawBlockPublicationReceipt("writer", 1, 1, "digest")])
+    connector._storage_pd_store_futures["request-1"] = completion
+
+    assert connector.get_finished({"request-1"}) == (None, None)
+    # Nothing was released and nothing was retired.
+    assert "request-1" in connector._storage_pd_store_futures
