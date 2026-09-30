@@ -72,6 +72,83 @@ impl IoUringWrapper {
             }
         }
     }
+
+    /// Push one 128-byte passthrough SQE onto this ring.
+    ///
+    /// Only the big-entry ring can carry one: a 64-byte SQE has no room for
+    /// the NVMe command, so a standard ring refuses rather than truncating.
+    fn push_cmd(&self, sqe: &Entry128) -> Result<(), PyErr> {
+        match self {
+            IoUringWrapper::Big(ring) => {
+                let mut ring = ring.lock().unwrap();
+                let pushed = unsafe { ring.submission().push(sqe) };
+                pushed.map_err(|_| PyRuntimeError::new_err("submission queue full"))
+            }
+            IoUringWrapper::Standard(_) => Err(PyRuntimeError::new_err(
+                "io_uring_cmd requires big entries (kernel 5.19+)",
+            )),
+        }
+    }
+
+    /// Push one ordinary read or write SQE onto this ring.
+    ///
+    /// A big-entry ring takes the same operation widened to 128 bytes; the
+    /// trailing space is unused for anything but a passthrough command.
+    fn push_regular(&self, sqe: &SqueueEntry) -> Result<(), PyErr> {
+        match self {
+            IoUringWrapper::Big(ring) => {
+                let widened: Entry128 = sqe.clone().into();
+                let mut ring = ring.lock().unwrap();
+                let pushed = unsafe { ring.submission().push(&widened) };
+                pushed.map_err(|_| PyRuntimeError::new_err("submission queue full"))
+            }
+            IoUringWrapper::Standard(ring) => {
+                let mut ring = ring.lock().unwrap();
+                let pushed = unsafe { ring.submission().push(sqe) };
+                pushed.map_err(|_| PyRuntimeError::new_err("submission queue full"))
+            }
+        }
+    }
+
+    /// Take every completion the kernel has posted on this ring.
+    ///
+    /// The two ring types carry different CQE types that agree on the only
+    /// two fields the worker reads, so they are normalised here and the
+    /// worker has one completion path instead of one per ring type.
+    ///
+    /// This is a `match` rather than a chain of `if let`, so that a ring
+    /// variant added later fails to compile here. An unmatched variant
+    /// would return no completions for a request the kernel still owns,
+    /// which presents as a hang rather than as an error.
+    fn take_completions(&self) -> Vec<RingCompletion> {
+        match self {
+            IoUringWrapper::Standard(ring) => ring
+                .lock()
+                .unwrap()
+                .completion()
+                .map(|cqe| RingCompletion {
+                    user_data: cqe.user_data(),
+                    result: cqe.result(),
+                })
+                .collect(),
+            IoUringWrapper::Big(ring) => ring
+                .lock()
+                .unwrap()
+                .completion()
+                .map(|cqe| RingCompletion {
+                    user_data: cqe.user_data(),
+                    result: cqe.result(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// One completion, with the ring type it came from erased.
+#[derive(Clone, Copy)]
+struct RingCompletion {
+    user_data: u64,
+    result: i32,
 }
 
 // NVMe identify namespace data structure
@@ -1835,23 +1912,7 @@ impl RawBlockDevice {
                     }
 
                     let sqe128 = uring_cmd.build().user_data(user_data);
-
-                    // Push the big SQE entry (128 bytes)
-                    match ring {
-                        IoUringWrapper::Big(ring) => {
-                            let mut ring = ring.lock().unwrap();
-                            unsafe {
-                                ring.submission().push(&sqe128).map_err(|_| {
-                                    PyRuntimeError::new_err("submission queue full")
-                                })?;
-                            }
-                        }
-                        IoUringWrapper::Standard(_) => {
-                            return Err(PyRuntimeError::new_err(
-                                "io_uring_cmd requires big entries (kernel 5.19+)",
-                            ));
-                        }
-                    }
+                    ring.push_cmd(&sqe128)?;
                 } else {
                     // Regular read/write operations
                     // A dma-buf registered buffer has no user address in the
@@ -1886,26 +1947,7 @@ impl RawBlockDevice {
                             .build()
                     };
                     let sqe = sqe.user_data(user_data);
-                    // Convert to appropriate entry type based on ring type
-                    match ring {
-                        IoUringWrapper::Big(ring) => {
-                            let mut ring = ring.lock().unwrap();
-                            let sqe128: Entry128 = sqe.into();
-                            unsafe {
-                                ring.submission().push(&sqe128).map_err(|_| {
-                                    PyRuntimeError::new_err("submission queue full")
-                                })?;
-                            }
-                        }
-                        IoUringWrapper::Standard(ring) => {
-                            let mut ring = ring.lock().unwrap();
-                            unsafe {
-                                ring.submission().push(&sqe).map_err(|_| {
-                                    PyRuntimeError::new_err("submission queue full")
-                                })?;
-                            }
-                        }
-                    }
+                    ring.push_regular(&sqe)?;
                 }
                 Ok(())
             }
@@ -1995,250 +2037,116 @@ impl RawBlockDevice {
                         //   - Decrement the in_flight_count atomic
                         //   - Wake up any threads waiting for all I/O to complete
                         {
-                            // Process completions for standard ring
-                            if let IoUringWrapper::Standard(ring) = &ring_clone {
-                                let completions: Vec<_> = {
-                                    let mut ring = ring.lock().unwrap();
-                                    ring.completion().collect()
-                                };
-                                for cqe in completions {
-                                    let user_data = cqe.user_data();
-                                    if let Some(mut sub) = in_flight.remove(&user_data) {
-                                        let batch_id = sub.batch_id;
-                                        let cqe_result = cqe.result();
+                            for cqe in ring_clone.take_completions() {
+                                let user_data = cqe.user_data;
+                                if let Some(mut sub) = in_flight.remove(&user_data) {
+                                    let batch_id = sub.batch_id;
+                                    let cqe_result = cqe.result;
 
-                                        // Decide a short completion before pushing
-                                        // anything. io_uring_cmd is never retried, and
-                                        // a registered dma-buf transfer ends here.
-                                        let short_action = short_io_action(
-                                            cqe_result,
-                                            sub.len,
-                                            sub.nvme_cmd_data.is_some(),
-                                            sub.fixed_dmabuf.is_some(),
-                                        );
-                                        if short_action == ShortIoAction::FailTerminally {
-                                            let result = handle_completion_result(
-                                                &mut sub,
-                                                -libc::EIO,
-                                                false,
-                                            );
-                                            sub.completion.set(result);
-                                            decrement_in_flight(
-                                                &in_flight_count_clone,
-                                                &in_flight_cvar_clone,
-                                                &batch_in_flight_clone,
-                                                batch_id,
-                                            );
-                                            continue;
-                                        }
-                                        if short_action == ShortIoAction::Retry {
-                                            let bytes_transferred = cqe_result as usize;
-                                            // Update offset and length for resubmission
-                                            sub.offset += bytes_transferred as u64;
-                                            sub.len -= bytes_transferred;
-                                            // Update buffer pointer for writes and direct reads
-                                            if sub.is_write || sub.bounce.is_none() {
-                                                sub.ptr_addr += bytes_transferred;
-                                            }
-                                            // For read with bounce buffer, copy partial data back
-                                            if !sub.is_write {
-                                                if let (
-                                                    Some(bounce),
-                                                    Some(orig_ptr),
-                                                    Some(payload_len),
-                                                ) = (
-                                                    sub.bounce.as_ref(),
-                                                    sub.original_ptr,
-                                                    sub.payload_len,
-                                                ) {
-                                                    copy_from_bounce_buffer(
-                                                        bounce,
-                                                        orig_ptr,
-                                                        bytes_transferred.min(payload_len),
-                                                    );
-                                                    sub.original_ptr =
-                                                        Some(orig_ptr + bytes_transferred);
-                                                    sub.payload_len = Some(
-                                                        payload_len
-                                                            .saturating_sub(bytes_transferred),
-                                                    );
-                                                }
-                                            }
-                                            // Re-insert into in_flight with updated values
-                                            // Don't decrement in_flight_count since we're resubmitting
-                                            in_flight.insert(user_data, sub.clone());
-                                            // Push the remainder and account for it the
-                                            // way an initial submission is accounted
-                                            // for: the entry stays owned and the ring
-                                            // is marked as holding work, which the top
-                                            // of the loop flushes. Deciding here from
-                                            // one submit call cannot distinguish an
-                                            // error from a zero return or a partial
-                                            // acceptance, and treating any of those as
-                                            // "nothing was queued" reports the
-                                            // operation finished while the kernel may
-                                            // still act on it.
-                                            match build_and_submit_sqe(&ring_clone, &sub, user_data)
-                                            {
-                                                Ok(()) => {
-                                                    resident_sqes = true;
-                                                }
-                                                Err(_) => {
-                                                    // The ring never took it, so no
-                                                    // completion can arrive for it.
-                                                    in_flight.remove(&user_data);
-                                                    let result = handle_completion_result(
-                                                        &mut sub,
-                                                        -libc::EIO,
-                                                        false,
-                                                    );
-                                                    sub.completion.set(result);
-                                                    decrement_in_flight(
-                                                        &in_flight_count_clone,
-                                                        &in_flight_cvar_clone,
-                                                        &batch_in_flight_clone,
-                                                        batch_id,
-                                                    );
-                                                }
-                                            }
-                                            continue;
-                                        }
-
-                                        // Handle completion result
+                                    // Decide a short completion before pushing
+                                    // anything. io_uring_cmd is never retried, and
+                                    // a registered dma-buf transfer ends here.
+                                    let short_action = short_io_action(
+                                        cqe_result,
+                                        sub.len,
+                                        sub.nvme_cmd_data.is_some(),
+                                        sub.fixed_dmabuf.is_some(),
+                                    );
+                                    if short_action == ShortIoAction::FailTerminally {
                                         let result =
-                                            handle_completion_result(&mut sub, cqe_result, false);
+                                            handle_completion_result(&mut sub, -libc::EIO, false);
                                         sub.completion.set(result);
-
-                                        // Decrement in-flight counts and notify
                                         decrement_in_flight(
                                             &in_flight_count_clone,
                                             &in_flight_cvar_clone,
                                             &batch_in_flight_clone,
                                             batch_id,
                                         );
+                                        continue;
                                     }
-                                }
-                            } else if let IoUringWrapper::Big(ring) = &ring_clone {
-                                let completions: Vec<_> = {
-                                    let mut ring = ring.lock().unwrap();
-                                    ring.completion().collect()
-                                };
-                                for cqe in completions {
-                                    let user_data = cqe.user_data();
-                                    if let Some(mut sub) = in_flight.remove(&user_data) {
-                                        let batch_id = sub.batch_id;
-                                        let cqe_result = cqe.result();
-
-                                        // Decide a short completion before pushing
-                                        // anything. io_uring_cmd is never retried, and
-                                        // a registered dma-buf transfer ends here.
-                                        let short_action = short_io_action(
-                                            cqe_result,
-                                            sub.len,
-                                            sub.nvme_cmd_data.is_some(),
-                                            sub.fixed_dmabuf.is_some(),
-                                        );
-                                        if short_action == ShortIoAction::FailTerminally {
-                                            let result = handle_completion_result(
-                                                &mut sub,
-                                                -libc::EIO,
-                                                false,
-                                            );
-                                            sub.completion.set(result);
-                                            decrement_in_flight(
-                                                &in_flight_count_clone,
-                                                &in_flight_cvar_clone,
-                                                &batch_in_flight_clone,
-                                                batch_id,
-                                            );
-                                            continue;
+                                    if short_action == ShortIoAction::Retry {
+                                        let bytes_transferred = cqe_result as usize;
+                                        // Update offset and length for resubmission
+                                        sub.offset += bytes_transferred as u64;
+                                        sub.len -= bytes_transferred;
+                                        // Update buffer pointer for writes and direct reads
+                                        if sub.is_write || sub.bounce.is_none() {
+                                            sub.ptr_addr += bytes_transferred;
                                         }
-                                        if short_action == ShortIoAction::Retry {
-                                            let bytes_transferred = cqe_result as usize;
-                                            // Update offset and length for resubmission
-                                            sub.offset += bytes_transferred as u64;
-                                            sub.len -= bytes_transferred;
-                                            // Update buffer pointer for writes and direct reads
-                                            if sub.is_write || sub.bounce.is_none() {
-                                                sub.ptr_addr += bytes_transferred;
+                                        // For read with bounce buffer, copy partial data back
+                                        if !sub.is_write {
+                                            if let (
+                                                Some(bounce),
+                                                Some(orig_ptr),
+                                                Some(payload_len),
+                                            ) = (
+                                                sub.bounce.as_ref(),
+                                                sub.original_ptr,
+                                                sub.payload_len,
+                                            ) {
+                                                copy_from_bounce_buffer(
+                                                    bounce,
+                                                    orig_ptr,
+                                                    bytes_transferred.min(payload_len),
+                                                );
+                                                sub.original_ptr =
+                                                    Some(orig_ptr + bytes_transferred);
+                                                sub.payload_len = Some(
+                                                    payload_len.saturating_sub(bytes_transferred),
+                                                );
                                             }
-                                            // For read with bounce buffer, copy partial data back
-                                            if !sub.is_write {
-                                                if let (
-                                                    Some(bounce),
-                                                    Some(orig_ptr),
-                                                    Some(payload_len),
-                                                ) = (
-                                                    sub.bounce.as_ref(),
-                                                    sub.original_ptr,
-                                                    sub.payload_len,
-                                                ) {
-                                                    copy_from_bounce_buffer(
-                                                        bounce,
-                                                        orig_ptr,
-                                                        bytes_transferred.min(payload_len),
-                                                    );
-                                                    sub.original_ptr =
-                                                        Some(orig_ptr + bytes_transferred);
-                                                    sub.payload_len = Some(
-                                                        payload_len
-                                                            .saturating_sub(bytes_transferred),
-                                                    );
-                                                }
-                                            }
-                                            // Re-insert into in_flight with updated values
-                                            // Don't decrement in_flight_count since we're resubmitting
-                                            in_flight.insert(user_data, sub.clone());
-                                            // Push the remainder and account for it the
-                                            // way an initial submission is accounted
-                                            // for: the entry stays owned and the ring
-                                            // is marked as holding work, which the top
-                                            // of the loop flushes. Deciding here from
-                                            // one submit call cannot distinguish an
-                                            // error from a zero return or a partial
-                                            // acceptance, and treating any of those as
-                                            // "nothing was queued" reports the
-                                            // operation finished while the kernel may
-                                            // still act on it.
-                                            match build_and_submit_sqe(&ring_clone, &sub, user_data)
-                                            {
-                                                Ok(()) => {
-                                                    resident_sqes = true;
-                                                }
-                                                Err(_) => {
-                                                    // The ring never took it, so no
-                                                    // completion can arrive for it.
-                                                    in_flight.remove(&user_data);
-                                                    let result = handle_completion_result(
-                                                        &mut sub,
-                                                        -libc::EIO,
-                                                        false,
-                                                    );
-                                                    sub.completion.set(result);
-                                                    decrement_in_flight(
-                                                        &in_flight_count_clone,
-                                                        &in_flight_cvar_clone,
-                                                        &batch_in_flight_clone,
-                                                        batch_id,
-                                                    );
-                                                }
-                                            }
-                                            continue;
                                         }
-
-                                        // Handle completion result
-                                        let result =
-                                            handle_completion_result(&mut sub, cqe_result, false);
-                                        sub.completion.set(result);
-
-                                        // Decrement in-flight counts and notify
-                                        decrement_in_flight(
-                                            &in_flight_count_clone,
-                                            &in_flight_cvar_clone,
-                                            &batch_in_flight_clone,
-                                            batch_id,
-                                        );
+                                        // Re-insert into in_flight with updated values
+                                        // Don't decrement in_flight_count since we're resubmitting
+                                        in_flight.insert(user_data, sub.clone());
+                                        // Push the remainder and account for it the
+                                        // way an initial submission is accounted
+                                        // for: the entry stays owned and the ring
+                                        // is marked as holding work, which the top
+                                        // of the loop flushes. Deciding here from
+                                        // one submit call cannot distinguish an
+                                        // error from a zero return or a partial
+                                        // acceptance, and treating any of those as
+                                        // "nothing was queued" reports the
+                                        // operation finished while the kernel may
+                                        // still act on it.
+                                        match build_and_submit_sqe(&ring_clone, &sub, user_data) {
+                                            Ok(()) => {
+                                                resident_sqes = true;
+                                            }
+                                            Err(_) => {
+                                                // The ring never took it, so no
+                                                // completion can arrive for it.
+                                                in_flight.remove(&user_data);
+                                                let result = handle_completion_result(
+                                                    &mut sub,
+                                                    -libc::EIO,
+                                                    false,
+                                                );
+                                                sub.completion.set(result);
+                                                decrement_in_flight(
+                                                    &in_flight_count_clone,
+                                                    &in_flight_cvar_clone,
+                                                    &batch_in_flight_clone,
+                                                    batch_id,
+                                                );
+                                            }
+                                        }
+                                        continue;
                                     }
+
+                                    // Handle completion result
+                                    let result =
+                                        handle_completion_result(&mut sub, cqe_result, false);
+                                    sub.completion.set(result);
+
+                                    // Decrement in-flight counts and notify
+                                    decrement_in_flight(
+                                        &in_flight_count_clone,
+                                        &in_flight_cvar_clone,
+                                        &batch_in_flight_clone,
+                                        batch_id,
+                                    );
                                 }
                             }
                             ring_clone.submission_sync();
