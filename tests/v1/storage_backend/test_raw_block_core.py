@@ -23,6 +23,7 @@ import pytest
 # First Party
 from lmcache.v1.memory_management import MemoryObj, TensorMemoryObj
 from lmcache.v1.storage_backend.raw_block import (
+    NativeQuiescence,
     RawBlockCore,
     RawBlockCoreConfig,
     encode_object_key,
@@ -2157,9 +2158,11 @@ def test_raw_block_core_fails_closed_on_an_unanswerable_health_probe(tmp_path):
                 raise OSError("the device cannot be reached")
 
         core.set_raw_device_for_testing(_Unanswerable())
-        core.close()
+        outcome = core.close()
 
         assert core._poisoned is True
+        assert outcome.quiescence is NativeQuiescence.RETAINED
+        assert outcome.may_release_backing_resources is False
     finally:
         core.set_raw_device_for_testing(raw)
 
@@ -2205,4 +2208,91 @@ def test_raw_block_core_does_not_read_a_non_bool_as_an_unknown_outcome(tmp_path)
         assert core._adopt_native_poison(_Chatty(), "io_uring write") is False
         assert core._poisoned is False
     finally:
+        core.close()
+
+
+def test_raw_block_core_close_reports_what_it_established(tmp_path):
+    """A caller's next decisions cannot be made from a return of None.
+
+    Whether the memory behind this device is free, and whether anything a
+    reader may still be reading can be released, are different questions
+    with different answers. Close has to say which it proved.
+    """
+    path = make_raw_block_file(tmp_path)
+    core = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    key = encode_object_key(make_object_key(51))
+    assert core.put_many([key], [make_memory_obj(b"value")]).results == [True]
+
+    outcome = core.close()
+    assert outcome.quiescence is NativeQuiescence.PROVEN
+    assert outcome.poisoned is False
+    assert outcome.may_release_backing_resources is True
+
+    # A repeat close reports the first result rather than inventing a fresh
+    # proof, and must not reach the accessor that would open a new device.
+    again = core.close()
+    assert again.quiescence in (
+        NativeQuiescence.PROVEN,
+        NativeQuiescence.NOT_ATTEMPTED,
+    )
+    assert core._raw is None
+
+
+def test_raw_block_core_close_retains_when_it_cannot_say(tmp_path):
+    """A close that cannot prove quiescence authorizes nothing.
+
+    It also keeps the native handle bound: dropping it runs the destructor,
+    which frees the very owners the engine retained.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    raw = core.raw_device()
+    try:
+
+        class _Unknown:
+            def __getattr__(self, item):
+                return getattr(raw, item)
+
+            def is_poisoned(self):
+                return True
+
+            def quarantined_batch_count(self):
+                return 1
+
+        core.set_raw_device_for_testing(_Unknown())
+        outcome = core.close()
+
+        assert outcome.quiescence is NativeQuiescence.RETAINED
+        assert outcome.poisoned is True
+        assert outcome.may_release_backing_resources is False
+        # No index was published naming extents it cannot vouch for.
+        assert outcome.final_checkpoint_written is False
+        assert core._raw is not None
+    finally:
+        core.set_raw_device_for_testing(raw)
+
+
+def test_raw_block_core_refuses_to_call_a_concurrent_close_a_proof(tmp_path):
+    """A second caller arriving mid-close has established nothing itself.
+
+    The first caller set the flag and is still draining, so there is no
+    recorded result to report yet. Answering "closed" would let the second
+    caller release the arena while the first is still inside the device.
+    """
+    path = make_raw_block_file(tmp_path)
+    core = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    try:
+        with core._lock:
+            core._closed = True
+
+        outcome = core.close()
+
+        assert outcome.quiescence is NativeQuiescence.NOT_ATTEMPTED
+        assert outcome.may_release_backing_resources is False
+        assert core._raw is not None
+    finally:
+        with core._lock:
+            core._closed = False
+            core._close_outcome = None
         core.close()

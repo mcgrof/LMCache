@@ -83,6 +83,7 @@ def _probe_says_unknown(probe: Optional[Callable[[], Any]], what: str) -> bool:
         )
     return False
 
+
 _DEFAULT_META_MAGIC = b"LMCIDX01"
 _DEFAULT_META_VERSION = 1
 
@@ -348,6 +349,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         # Batches whose I/O thread is still running after the task awaiting
         # it went away. Their buffers are nobody's to release until it ends.
         self._pending_put_owners: list[list[MemoryObj]] = []
+        self._closed_once = False
         self._pin_lock = threading.Lock()
         self._pinned_keys: set[str] = set()
 
@@ -1249,9 +1251,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             manifest_digest=ack.manifest_digest,
             expected_tp_rank=self._ack_tp_rank,
         )
-        logger.debug(
-            "Raw-block storage P/D read ack for %s: %s", ack.req_id, outcome
-        )
+        logger.debug("Raw-block storage P/D read ack for %s: %s", ack.req_id, outcome)
 
     def ack_endpoint(self) -> str:
         """Where a consumer should send this writer's acknowledgements."""
@@ -1623,9 +1623,19 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                 break
             time.sleep(0.01)
 
+        if self._closed_once:
+            # Running the rest again is not a repeat of a no-op. The core has
+            # no device handle by then, and asking it about the device's
+            # health goes through an accessor that opens a new writable one
+            # on the same path -- which then gets closed along with a second
+            # release of the allocator.
+            logger.warning("Raw-block backend close was already run")
+            return
+        self._closed_once = True
+
         # Everything below either releases a resource the device may still be
-        # using or asks a question that reopens the device, so the state is
-        # sampled once, first. A deadline is not a fence: leaving that loop
+        # using or asks a question that could reopen the device, so the state
+        # is sampled once, first. A deadline is not a fence: leaving that loop
         # with work still counted says the wait gave up, not that the device
         # did.
         with self._put_lock:
@@ -1637,15 +1647,25 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             or self._outcome_is_unknown()
         )
 
-        if self._pd_tracker is not None:
-            # Releasing a lease lets its extent go back to the free list.
-            self._pd_tracker.close(release_leases=not unknown)
+        # The local close comes first, because its result is what says
+        # whether the memory behind this device is free. Asking afterwards is
+        # asking a device that no longer exists.
         try:
-            self._core.close()
+            outcome = self._core.close()
         except Exception as e:
-            # The core refuses to close when it cannot prove quiescence.
             unknown = True
-            logger.error("Raw-block core close was refused: %s", e)
+            outcome = None
+            logger.error("Raw-block core close raised: %s", e)
+        if outcome is not None and not outcome.may_release_backing_resources:
+            unknown = True
+
+        if self._pd_tracker is not None:
+            # Two different decisions, and only the first is ours to make
+            # here: local quiescence says the memory is free, and says
+            # nothing about a reader elsewhere still holding a lease. A
+            # healthy close is not release authority over a lease, so the
+            # tracker keeps them unless this engine never published any.
+            self._pd_tracker.close(release_leases=not unknown)
 
         if self._ack_receiver is not None:
             self._ack_receiver.close()
@@ -1657,8 +1677,18 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             # still be landing in it, so the allocator, its exports and the
             # withheld buffers are kept for the life of the process -- and
             # kept referenced here, so no finalizer reaches close() either.
+            # One owner for the whole graph, the core included: the native
+            # engine is retaining owners of its own, and dropping the core
+            # runs the destructor that frees them. Two retentions that cannot
+            # see each other are one retention.
             _RETAINED_AFTER_UNKNOWN_OUTCOME.append(
-                (self._gpu_allocator, self._quarantined_objs, self._pending_put_owners)
+                (
+                    self._core,
+                    self._gpu_allocator,
+                    self._quarantined_objs,
+                    self._pending_put_owners,
+                    self._pd_tracker,
+                )
             )
             logger.error(
                 "Raw-block backend retaining its GPU allocator, %d exported "

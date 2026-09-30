@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 import ctypes
+import enum
 import hashlib
 import json
 import os
@@ -296,6 +297,42 @@ def device_says_outcome_is_unknown(device: Any) -> bool:
     return answer is True
 
 
+class NativeQuiescence(enum.Enum):
+    """What a close established about the device it was closing.
+
+    ``PROVEN`` is the only one that authorizes releasing anything the device
+    was given: the worker stopped, its registration was withdrawn and the
+    descriptor was closed. ``RETAINED`` covers every way that failed --
+    refused, poisoned, or a wait that gave up -- because they differ in what
+    to report, not in what may be released. ``NOT_ATTEMPTED`` exists so that
+    a second caller cannot read a repeat close as a fresh proof.
+    """
+
+    PROVEN = "proven"
+    RETAINED = "retained"
+    NOT_ATTEMPTED = "not_attempted"
+
+
+@dataclass(frozen=True)
+class RawBlockCloseOutcome:
+    """The result of closing one core, and what it permits."""
+
+    quiescence: NativeQuiescence
+    poisoned: bool
+    reason: str = ""
+    quarantined_slots: int = 0
+    final_checkpoint_written: bool = False
+
+    @property
+    def may_release_backing_resources(self) -> bool:
+        """Whether the memory and descriptors behind this device are free.
+
+        Local quiescence only. It says nothing about a reader elsewhere still
+        holding a lease, which is a separate decision with a separate owner.
+        """
+        return self.quiescence is NativeQuiescence.PROVEN and not self.poisoned
+
+
 class IncompatibleKeyDerivation(RuntimeError):
     """A namespace's keys were derived in a way this engine cannot reproduce."""
 
@@ -546,6 +583,9 @@ class RawBlockCore:
     _bytes_deduplicated: int = 0
     _bytes_submitted_padded: int = 0
     _bytes_completed: int = 0
+    # What the first close established. Read by a repeat close, which must
+    # not reach the device accessor and open one that knows nothing.
+    _close_outcome: Optional["RawBlockCloseOutcome"] = None
 
     def __init__(
         self,
@@ -1846,11 +1886,24 @@ class RawBlockCore:
                 ),
             }
 
-    def close(self) -> None:
-        """Stop checkpointing, write a final checkpoint, and close the device."""
+    def close(self) -> RawBlockCloseOutcome:
+        """Stop checkpointing, write a final checkpoint, and close the device.
+
+        Returns what was established, because the caller's next decisions --
+        whether to free the memory behind this device, whether to release
+        what a reader may still be reading -- cannot be made from a return
+        of None. A repeated close reports the first result rather than
+        inventing a fresh one: it must not reach the device accessor, which
+        opens a new device that knows nothing about the old one.
+        """
         with self._lock:
             if self._closed:
-                return
+                return self._close_outcome or RawBlockCloseOutcome(
+                    quiescence=NativeQuiescence.NOT_ATTEMPTED,
+                    poisoned=self._poisoned,
+                    reason="a close was already in progress or complete",
+                    quarantined_slots=len(self._quarantined_slots or {}),
+                )
             self._closed = True
 
         self._meta_stop_evt.set()
@@ -1866,12 +1919,14 @@ class RawBlockCore:
             unknown = device_says_outcome_is_unknown(self._raw)
         self._poisoned = unknown
 
+        checkpointed = False
         if self.role == "writer" and not unknown:
             # A writer that cannot say what the device holds must not
             # publish an index naming it. publish_request already refuses
             # while running, and shutdown is not an exemption.
             try:
                 self._checkpoint_once(force=True)
+                checkpointed = True
             except Exception as e:
                 logger.warning("RawBlockCore final checkpoint failed: %s", e)
         elif self.role == "writer":
@@ -1882,8 +1937,22 @@ class RawBlockCore:
                 self.device_path,
             )
 
+        def settle(quiescence: NativeQuiescence, reason: str) -> RawBlockCloseOutcome:
+            outcome = RawBlockCloseOutcome(
+                quiescence=quiescence,
+                poisoned=self._poisoned,
+                reason=reason,
+                quarantined_slots=len(self._quarantined_slots or {}),
+                final_checkpoint_written=checkpointed,
+            )
+            self._close_outcome = outcome
+            return outcome
+
         if self._raw is None:
-            return
+            return settle(
+                NativeQuiescence.NOT_ATTEMPTED,
+                "no native device was open",
+            )
         if unknown:
             # Dropping this reference runs the native destructor, which frees
             # the very owners the engine retained. Keep it bound: the handle,
@@ -1897,7 +1966,10 @@ class RawBlockCore:
                 self.device_path,
                 len(self._quarantined_slots or {}),
             )
-            return
+            return settle(
+                NativeQuiescence.RETAINED,
+                "the engine could not establish what the device was doing",
+            )
         try:
             self._raw.close()
         except Exception as e:
@@ -1910,8 +1982,12 @@ class RawBlockCore:
                 self.device_path,
                 e,
             )
-            return
+            return settle(
+                NativeQuiescence.RETAINED,
+                f"the native close was refused: {e}",
+            )
         self._raw = None
+        return settle(NativeQuiescence.PROVEN, "the native engine closed")
 
     def _cleanup_after_init_failure(self) -> None:
         """Close resources that may have been opened before init failed."""
