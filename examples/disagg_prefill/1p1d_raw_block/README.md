@@ -14,9 +14,42 @@ still works, where `enable_pd` stays off and the plugin settings carry
 everything; `launch_vllm.sh` uses the newer one and honours
 `LMCACHE_PD_DATA_PATH` if you want the other.
 
-This proof retains every published extent until the writer exits. That prevents
-reuse during a decoder read, but it also means the namespace must not wrap and
-long-running service use is unsupported. ACK-driven reclamation is future work.
+## What releases a published extent, and what a restart means
+
+The writer locks every extent it publishes and releases it only when the
+decoder that was told about it says the bytes reached GPU memory. That
+acknowledgement goes straight from the decoder to the address the writer
+advertises in its READY status, as a bounded request whose reply the writer
+sends only after the release has actually happened. The proxy carries the READY
+barrier and nothing else: whether a hold is gone is a fact about the engine
+holding it, and no relay can state it.
+
+Two consequences are worth stating before a long run.
+
+A decoder that cannot reach its writer keeps asking, in the background, with no
+further request needed. Its obligations have one absolute deadline each, and
+reaching that deadline is reported as unresolved -- never as a release. The
+writer therefore keeps those extents, and it stops accepting new publications
+once its unacknowledged holds reach their bound rather than abandoning one to
+make room. A run that ends with `refusing to publish` in the writer's log is a
+run whose decoder stopped acknowledging; the namespace is intact and the holds
+are still held.
+
+Restarting is a whole-group operation. `LMCACHE_STORAGE_PD_SESSION` names one
+producer/consumer pair's run and both nodes must carry the same value. The
+writer binds the first decoder incarnation that acknowledges under a session
+and refuses any other incarnation for it, because a decoder that came back
+alone cannot have performed the reads it would be claiming -- its extents may
+still be being read by nothing at all, or the writer's index may name bytes the
+new process never received. So: to restart, stop both nodes, change the session
+value, and start both. Bringing the decoder back by itself is refused, loudly,
+and the writer keeps its holds.
+
+This is deliberately not crash recovery. Nothing here reconstructs which
+extents an exited decoder had finished with, and nothing persists a hold across
+a writer restart: a writer that exits leaves its locks only in memory, and the
+next writer rebuilds its free list from the committed index. Durable holds and
+recovery after an unplanned exit are separate work and are not attempted.
 
 ## Safety and prerequisites
 
@@ -63,12 +96,23 @@ From this directory, start the proxy first:
   --storage-pd --storage-pd-ready-timeout-s 30
 ```
 
-Then launch the reader before the writer on separate GPUs:
+Then launch the reader before the writer on separate GPUs, with the same
+session value on both:
 
 ```bash
+export LMCACHE_STORAGE_PD_SESSION=$(date +%Y%m%d-%H%M%S)
 DECODER_DEVICE_ID=1 ./launch_vllm.sh reader MODEL
 PREFILLER_DEVICE_ID=0 ./launch_vllm.sh writer MODEL
 ```
+
+The launcher refuses to start without that value rather than inventing one per
+process, which would make every pair a mismatched session. The writer answers
+acknowledgements on `LMCACHE_RAW_ACK_PORT` (7600 by default), bound on
+`LMCACHE_RAW_ACK_BIND_HOST` and advertised as `LMCACHE_RAW_ACK_ADVERTISE_HOST`;
+the two are separate because a wildcard bind is not an address a decoder can
+reply to. Extent reuse is required in this configuration, so a port that cannot
+be bound stops startup instead of producing a writer that silently never
+reclaims.
 
 The launcher disables vLLM prefix caching, preserves the first-token
 continuation contract, saves the final partial chunk, and requires strict

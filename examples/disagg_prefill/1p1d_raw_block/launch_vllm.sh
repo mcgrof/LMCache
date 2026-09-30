@@ -10,6 +10,28 @@ device=${LMCACHE_RAW_DEVICE:?"set LMCACHE_RAW_DEVICE to a dedicated by-id path"}
 gpu_buffer_bytes=${LMCACHE_GPU_BUFFER_BYTES:-4294967296}
 # One slot must hold a full KV chunk plus its header; size it for the model.
 slot_bytes=${LMCACHE_RAW_SLOT_BYTES:-9437184}
+# Where the writer answers the acknowledgements that release its extents,
+# and the address it tells the reader to use. A wildcard is a bind, not an
+# address, so the two are separate; loopback is enough for one host.
+ack_port=${LMCACHE_RAW_ACK_PORT:-7600}
+ack_bind_host=${LMCACHE_RAW_ACK_BIND_HOST:-127.0.0.1}
+ack_advertise_host=${LMCACHE_RAW_ACK_ADVERTISE_HOST:-127.0.0.1}
+
+# Names this producer/consumer pair's run, and both nodes carry it. The
+# writer binds the first consumer incarnation that acknowledges under a
+# session and refuses any other one for it, so a consumer restarted on its
+# own cannot release holds for reads it never made. Restarting the whole
+# group is a new session and rebinds, which is why this defaults to a value
+# that changes per launch and has to be set explicitly -- to the same value
+# on both nodes -- for a pair started separately.
+if [ -z "${LMCACHE_STORAGE_PD_SESSION:-}" ]; then
+    echo "LMCACHE_STORAGE_PD_SESSION is unset." >&2
+    echo "Set it to the same value on the writer and the reader; changing" >&2
+    echo "it is how a whole-group restart is distinguished from a reader" >&2
+    echo "that came back alone." >&2
+    exit 1
+fi
+export LMCACHE_STORAGE_PD_SESSION
 
 "$script_dir/verify_raw_device.sh" "$device"
 
@@ -51,8 +73,9 @@ else
 fi
 
 printf -v extra_config \
-    '{"storage_plugin.raw_block.module_path":"lmcache.v1.storage_backend.plugins.rust_raw_block_backend","storage_plugin.raw_block.class_name":"RustRawBlockBackend","storage_plugin.raw_block.required":true,%s"rust_raw_block.device_path":"%s","rust_raw_block.slot_bytes":%s,"rust_raw_block.io_engine":"io_uring","rust_raw_block.use_odirect":true,"rust_raw_block.use_uring_cmd":false,"rust_raw_block.gpu_buffer_bytes":%s,"rust_raw_block.require_dmabuf_registration":true,"rust_raw_block.publish_after_put":false,"rust_raw_block.publish_min_interval_ms":0,"rust_raw_block.meta_enable_periodic":false,"rust_raw_block.index_refresh_min_ms":1,"rust_raw_block.publication_adopt_timeout_ms":30000,"rust_raw_block.status_send_timeout_s":5}' \
-    "$role_settings" "$device" "$slot_bytes" "$gpu_buffer_bytes"
+    '{"storage_plugin.raw_block.module_path":"lmcache.v1.storage_backend.plugins.rust_raw_block_backend","storage_plugin.raw_block.class_name":"RustRawBlockBackend","storage_plugin.raw_block.required":true,%s"rust_raw_block.device_path":"%s","rust_raw_block.slot_bytes":%s,"rust_raw_block.io_engine":"io_uring","rust_raw_block.use_odirect":true,"rust_raw_block.use_uring_cmd":false,"rust_raw_block.gpu_buffer_bytes":%s,"rust_raw_block.require_dmabuf_registration":true,"rust_raw_block.publish_after_put":false,"rust_raw_block.publish_min_interval_ms":0,"rust_raw_block.meta_enable_periodic":false,"rust_raw_block.index_refresh_min_ms":1,"rust_raw_block.publication_adopt_timeout_ms":30000,"rust_raw_block.status_send_timeout_s":5,"rust_raw_block.ack_listen_port":%s,"rust_raw_block.ack_listen_host":"%s","rust_raw_block.ack_advertise_host":"%s","rust_raw_block.require_extent_reuse":true}' \
+    "$role_settings" "$device" "$slot_bytes" "$gpu_buffer_bytes" \
+    "$ack_port" "$ack_bind_host" "$ack_advertise_host"
 
 # Both nodes must derive the same key for the same tokens, in separate
 # processes. Two things decide that, and both have to match.
