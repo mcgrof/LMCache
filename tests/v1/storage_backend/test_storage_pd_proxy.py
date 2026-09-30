@@ -348,3 +348,159 @@ def test_a_conflicting_second_ready_for_one_rank_fails_the_request() -> None:
     assert proxy.record_storage_pd_status(first) == "recorded"
     assert proxy.record_storage_pd_status(first) == "recorded"
     assert "request" not in proxy.app.state.storage_pd_failures
+
+
+class _CountingSemaphore:
+    """Records every acquire and release so exactly-once can be asserted."""
+
+    def __init__(self) -> None:
+        self.held = 0
+        self.acquires = 0
+        self.releases = 0
+
+    async def acquire(self, slots: int) -> None:
+        self.held += slots
+        self.acquires += 1
+
+    async def release(self, slots: int) -> None:
+        self.held -= slots
+        self.releases += 1
+
+
+def _endpoint_env(monkeypatch, prefill_outcome, *, tokens=(1, 2, 3)):
+    """Point the real endpoint at stubs, and hand back the semaphore.
+
+    Only transport and client selection are replaced. The endpoint's own
+    control flow, its request registration and its cleanup are the code
+    under test.
+    """
+    # Standard
+    from types import SimpleNamespace
+
+    semaphore = _CountingSemaphore()
+    client = SimpleNamespace(
+        client=None, host="localhost", init_port=[1], alloc_port=[2]
+    )
+
+    async def send_request_to_service(_client, endpoint, _data):
+        if endpoint == "/tokenize":
+            return SimpleNamespace(json=lambda: {"tokens": list(tokens)})
+        if isinstance(prefill_outcome, BaseException):
+            raise prefill_outcome
+        return SimpleNamespace(json=lambda: prefill_outcome)
+
+    monkeypatch.setattr(proxy, "pd_buffer_semaphore", semaphore)
+    monkeypatch.setattr(proxy, "send_request_to_service", send_request_to_service)
+    monkeypatch.setattr(
+        proxy, "pick_up_clients", lambda _request: (client, client, client)
+    )
+    # global_args only exists once the server's main() has run, so it has to
+    # be created here rather than replaced.
+    monkeypatch.setattr(
+        proxy,
+        "global_args",
+        SimpleNamespace(
+            storage_pd=True, storage_pd_ready_timeout_s=1.0, chunk_size=256
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(proxy, "stats_calculator", SimpleNamespace(add=lambda _v: None))
+    return semaphore
+
+
+def _fake_request(prompt="hello", max_tokens=32):
+    # Standard
+    from types import SimpleNamespace
+
+    async def json():
+        return {"prompt": prompt, "max_tokens": max_tokens}
+
+    return SimpleNamespace(json=json)
+
+
+@pytest.mark.asyncio
+async def test_endpoint_releases_its_request_when_prefill_fails(monkeypatch) -> None:
+    """A failure before the barrier must not leave the request registered.
+
+    The endpoint registers the request before contacting the prefiller,
+    because a producer can report ready first. Cleanup used to sit around the
+    barrier alone, so a request that never reached it stayed registered for
+    the life of the proxy, and its status map with it.
+    """
+    semaphore = _endpoint_env(monkeypatch, RuntimeError("prefill HTTP failure"))
+
+    with pytest.raises(RuntimeError, match="prefill HTTP failure"):
+        await proxy.handle_completions(_fake_request())
+
+    assert list(proxy.app.state.storage_pd_active) == []
+    assert list(proxy.app.state.storage_pd_statuses) == []
+    assert semaphore.held == 0
+    assert semaphore.releases == 1
+
+
+@pytest.mark.asyncio
+async def test_endpoint_releases_its_request_when_cancelled(monkeypatch) -> None:
+    """Cancellation is not an Exception, so the handler never saw it.
+
+    That left both the registration and an acquired buffer permit behind,
+    which is the worse of the two leaks: the permit bounds concurrency, so
+    losing them throttles the proxy until it restarts.
+    """
+    # Standard
+    import asyncio
+
+    semaphore = _endpoint_env(monkeypatch, asyncio.CancelledError())
+
+    with pytest.raises(asyncio.CancelledError):
+        await proxy.handle_completions(_fake_request())
+
+    assert list(proxy.app.state.storage_pd_active) == []
+    assert list(proxy.app.state.storage_pd_statuses) == []
+    assert semaphore.held == 0
+    assert semaphore.releases == 1
+
+
+@pytest.mark.asyncio
+async def test_endpoint_releases_its_permit_once_on_the_successful_path(
+    monkeypatch,
+) -> None:
+    """The successful path must release exactly once, not twice.
+
+    The barrier releases the permit when it completes, and the outer scope
+    releases anything still held. Both running would return a permit the
+    proxy never took.
+    """
+    receipt = RawBlockPublicationReceipt("writer", 1, 1, "digest")
+    prefill_response = {
+        "id": "cmpl-1",
+        "created": 0,
+        "model": "probe-model",
+        "kv_transfer_params": {"first_tok": 7},
+    }
+    semaphore = _endpoint_env(monkeypatch, prefill_response)
+
+    async def stream(_client, _endpoint, _data):
+        for chunk in (b"data: {}\n\n",):
+            yield chunk
+
+    monkeypatch.setattr(proxy, "stream_service_response", stream)
+
+    # The barrier is satisfied as soon as the expected rank reports.
+    real_wait = proxy.wait_decode_kv_ready
+
+    async def wait(req_id, num_tp_rank, *, storage_pd, deadline):
+        proxy.app.state.storage_pd_statuses.setdefault(req_id, {})[0] = (
+            StoragePDStatus.ready(req_id, 0, receipt)
+        )
+        return await real_wait(
+            req_id, num_tp_rank, storage_pd=storage_pd, deadline=deadline
+        )
+
+    monkeypatch.setattr(proxy, "wait_decode_kv_ready", wait)
+
+    response = await proxy.handle_completions(_fake_request())
+    assert response is not None
+
+    assert list(proxy.app.state.storage_pd_active) == []
+    assert semaphore.held == 0
+    assert semaphore.releases == 1, "the permit was released more than once"

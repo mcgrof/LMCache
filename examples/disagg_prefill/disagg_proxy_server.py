@@ -828,8 +828,6 @@ async def handle_completions(request: Request):
         return StreamingResponse(generate_stream(), media_type="application/json")
 
     except Exception as e:
-        if pd_buffer_semaphore is not None and acquired:
-            await pd_buffer_semaphore.release(slots)
         # Standard
         import sys
         import traceback
@@ -839,6 +837,18 @@ async def handle_completions(request: Request):
         print(e)
         print("".join(traceback.format_exception(*exc_info)))
         raise
+    finally:
+        # One ownership scope for the whole request: registration, prefill,
+        # parsing and the barrier. The barrier clears its own state and
+        # releases the permit on every path it returns through, but a request
+        # that fails or is cancelled before reaching it never got there, and
+        # cancellation is not an Exception so the handler above never saw it.
+        # Both actions are idempotent, so this runs exactly once either way.
+        if global_args.storage_pd:
+            _clear_pd_request_state(req_id)
+        if pd_buffer_semaphore is not None and acquired:
+            acquired = False
+            await pd_buffer_semaphore.release(slots)
 
 
 @app.post("/v1/chat/completions")
@@ -1045,8 +1055,6 @@ async def handle_chat_completions(request: Request):
         return StreamingResponse(generate_stream(), media_type="application/json")
 
     except Exception as e:
-        if pd_buffer_semaphore is not None and acquired:
-            await pd_buffer_semaphore.release(slots)
         # Standard
         import sys
         import traceback
@@ -1058,6 +1066,18 @@ async def handle_chat_completions(request: Request):
         print(e)
         print("".join(traceback.format_exception(*exc_info)))
         raise
+    finally:
+        # One ownership scope for the whole request: registration, prefill,
+        # parsing and the barrier. The barrier clears its own state and
+        # releases the permit on every path it returns through, but a request
+        # that fails or is cancelled before reaching it never got there, and
+        # cancellation is not an Exception so the handler above never saw it.
+        # Both actions are idempotent, so this runs exactly once either way.
+        if global_args.storage_pd:
+            _clear_pd_request_state(req_id)
+        if pd_buffer_semaphore is not None and acquired:
+            acquired = False
+            await pd_buffer_semaphore.release(slots)
 
 
 if __name__ == "__main__":
