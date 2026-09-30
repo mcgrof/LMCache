@@ -23,6 +23,7 @@ class _FakeCore:
         self.allow_publish = Event()
         self.published: list[list[str]] = []
         self.leased: list[str] = []
+        self.unlock_calls = 0
 
     def publish_request(self, encoded_keys: list[str]) -> RawBlockPublicationReceipt:
         self.publish_started.set()
@@ -47,6 +48,7 @@ class _FakeCore:
         return [object() for _ in encoded_keys]
 
     def unlock_many(self, encoded_keys: list[str]) -> None:
+        self.unlock_calls += 1
         for encoded_key in encoded_keys:
             self.leased.remove(encoded_key)
 
@@ -508,3 +510,118 @@ def test_raw_block_role_follows_the_pd_role_when_storage_is_the_data_path():
     )
     # Without the switch the plugin default stands.
     assert _resolve_role(_RoleConfig(shared=False, pd_role=None), {}) == "writer"
+
+
+def _published_lease(core: _FakeCore, tracker: RawBlockPDRequestTracker) -> None:
+    """Drive one request to a published lease."""
+    terminal = tracker.register_batch(
+        "request-1",
+        ["key-1"],
+        expected_chunks=1,
+        is_last_batch=True,
+    )
+    tracker.complete_batch("request-1", ["key-1"])
+    core.allow_publish.set()
+    terminal.result(timeout=1)
+
+
+def _ack(
+    tracker: RawBlockPDRequestTracker,
+    **overrides: object,
+) -> str:
+    fields: dict[str, object] = {
+        "req_id": "request-1",
+        "consumer_instance_id": "consumer-1",
+        "tp_rank": 0,
+        "writer_epoch": "writer-1",
+        "checkpoint_seq": 7,
+        "manifest_digest": "digest",
+        "expected_tp_rank": 0,
+    }
+    fields.update(overrides)
+    return tracker.apply_read_ack(**fields)  # type: ignore[arg-type]
+
+
+def test_tracker_releases_an_extent_on_a_matching_acknowledgement() -> None:
+    """Nothing but an acknowledgement the writer can vouch for frees a lease."""
+    core = _FakeCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    try:
+        _published_lease(core, tracker)
+        assert core.leased == ["key-1"]
+        assert tracker.live_lease_count() == 1
+
+        assert _ack(tracker) == "released"
+        assert core.leased == []
+        assert tracker.live_lease_count() == 0
+    finally:
+        core.allow_publish.set()
+        tracker.close()
+
+
+def test_tracker_releases_nothing_twice_for_a_duplicate_acknowledgement() -> None:
+    """A lost confirmation is safe to retry, so a duplicate must be inert.
+
+    The consumer that never heard back sends the same acknowledgement again.
+    Releasing a second reference would free an extent a later request may
+    already own.
+    """
+    core = _FakeCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    try:
+        _published_lease(core, tracker)
+        assert _ack(tracker) == "released"
+        assert _ack(tracker) == "already_released"
+        assert _ack(tracker) == "already_released"
+        assert core.unlock_calls == 1
+    finally:
+        core.allow_publish.set()
+        tracker.close()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"writer_epoch": "writer-0"},
+        {"checkpoint_seq": 6},
+        {"manifest_digest": "someone-elses-digest"},
+        {"tp_rank": 1},
+        {"req_id": "request-2"},
+    ],
+    ids=["stale-epoch", "stale-seq", "wrong-digest", "wrong-rank", "unknown-request"],
+)
+def test_tracker_rejects_an_acknowledgement_it_cannot_match(
+    overrides: dict[str, object],
+) -> None:
+    """Every field is checked by the writer, because it holds the lease.
+
+    A stale acknowledgement naming a previous incarnation's receipt is
+    exactly the message that must not reclaim a live extent, and a relay
+    that validated it for us would not change who is responsible.
+    """
+    core = _FakeCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    try:
+        _published_lease(core, tracker)
+        assert _ack(tracker, **overrides) == "rejected"
+        assert core.leased == ["key-1"]
+        assert tracker.live_lease_count() == 1
+        assert core.unlock_calls == 0
+    finally:
+        core.allow_publish.set()
+        tracker.close()
+
+
+def test_tracker_can_be_told_to_keep_its_leases_at_shutdown() -> None:
+    """Shutdown does not prove a reader stopped reading.
+
+    A caller that cannot establish what the device is doing passes
+    ``release_leases=False``: unlocking a key lets its entry be deleted and
+    its extent handed to the next writer.
+    """
+    core = _FakeCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    _published_lease(core, tracker)
+    tracker.close(release_leases=False)
+    assert core.leased == ["key-1"]
+    assert tracker.live_lease_count() == 1

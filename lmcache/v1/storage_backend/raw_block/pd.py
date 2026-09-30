@@ -7,9 +7,12 @@ from __future__ import annotations
 # Standard
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Sequence
 import threading
+
+# First Party
+from lmcache.logging import init_logger
 
 if TYPE_CHECKING:
     # First Party
@@ -17,6 +20,8 @@ if TYPE_CHECKING:
         RawBlockCore,
         RawBlockPublicationReceipt,
     )
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -37,6 +42,19 @@ class _RequestState:
 _FINISHED_HISTORY = 4096
 
 
+@dataclass
+class _Lease:
+    """Extents held for one published request until it is acknowledged.
+
+    The receipt is kept so that an acknowledgement can be matched against
+    what was actually published, rather than trusted for naming a request
+    identifier that a restarted consumer could reuse.
+    """
+
+    encoded_keys: list[str]
+    receipt: "RawBlockPublicationReceipt"
+
+
 class RawBlockPDRequestTracker:
     """Turn raw-block batch completions into one publication receipt."""
 
@@ -47,7 +65,17 @@ class RawBlockPDRequestTracker:
         self._finished: OrderedDict[str, Future[RawBlockPublicationReceipt]] = (
             OrderedDict()
         )
-        self._leased_keys: dict[str, list[str]] = {}
+        # Live leases, keyed by the identity the consumer was told. Each
+        # holds the keys whose extents it protects and the receipt an
+        # acknowledgement has to match to release them. This is separate
+        # from `_finished`, which is a bounded record that a request
+        # happened and says nothing about what is still held.
+        self._leases: dict[str, _Lease] = {}
+        self._released: OrderedDict[str, None] = OrderedDict()
+        # Told to consumers so they know where to reply. Set by whoever
+        # built the listener; empty until then, and empty forever if there
+        # is none, which a consumer can see and act on.
+        self.ack_endpoint = ""
         self._publisher = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="raw-block-pd-publish",
@@ -261,8 +289,16 @@ class RawBlockPDRequestTracker:
                     ),
                 )
 
-    def close(self) -> None:
-        """Fail unfinished requests, release leases, and stop publication."""
+    def close(self, release_leases: bool = True) -> None:
+        """Fail unfinished requests, stop publication, and release leases.
+
+        ``release_leases`` false keeps every lease held. Unlocking a key lets
+        its entry be deleted and its extent returned to the free list, so a
+        caller that cannot establish what the device is still doing passes
+        false: the leases are what keep those extents from being handed to
+        the next writer, and shutdown is not proof that a reader has stopped
+        reading them either.
+        """
         with self._lock:
             if self._closed:
                 return
@@ -276,11 +312,116 @@ class RawBlockPDRequestTracker:
                     RuntimeError(f"request {req_id} aborted during shutdown"),
                 )
         self._publisher.shutdown(wait=True, cancel_futures=False)
+        if not release_leases:
+            with self._lock:
+                held = len(self._leases)
+            if held:
+                logger.error(
+                    "RawBlockPDTracker retaining %d lease(s) at shutdown: "
+                    "their extents must not be reused while what the device "
+                    "is doing with them cannot be established.",
+                    held,
+                )
+            return
         with self._lock:
-            leased_keys = list(self._leased_keys.values())
-            self._leased_keys.clear()
+            leased_keys = [lease.encoded_keys for lease in self._leases.values()]
+            self._leases.clear()
         for encoded_keys in leased_keys:
             self._core.unlock_many(encoded_keys)
+
+    def apply_read_ack(
+        self,
+        req_id: str,
+        consumer_instance_id: str,
+        tp_rank: int,
+        writer_epoch: str,
+        checkpoint_seq: int,
+        manifest_digest: str,
+        expected_tp_rank: int,
+    ) -> str:
+        """Release a lease on an acknowledgement this writer can vouch for.
+
+        The writer validates every field itself. A proxy may relay an
+        acknowledgement and may check it, but it does not hold the lease and
+        cannot decide that an extent is reclaimable.
+
+        ``expected_tp_rank`` is the caller's own rank: the identity belongs
+        to whoever owns this tracker, and comparing an acknowledgement
+        against a rank it supplied itself would check nothing.
+
+        Returns one of ``"released"``, ``"already_released"`` or
+        ``"rejected"``. ``"already_released"`` exists because a lost
+        confirmation is safe to retry: a consumer that never heard back
+        sends the same acknowledgement again, and it must free nothing a
+        second time. Any mismatch is ``"rejected"`` and releases nothing --
+        a stale acknowledgement naming a previous incarnation's receipt is
+        exactly the case that must not reclaim a live extent.
+        """
+        with self._lock:
+            lease = self._leases.get(req_id)
+            if lease is None:
+                if req_id in self._released:
+                    return "already_released"
+                logger.warning(
+                    "Raw-block P/D read ack for %s from %s names no live "
+                    "lease; releasing nothing",
+                    req_id,
+                    consumer_instance_id,
+                )
+                return "rejected"
+            receipt = lease.receipt
+            mismatch = (
+                receipt.writer_epoch != writer_epoch
+                or receipt.checkpoint_seq != checkpoint_seq
+                or receipt.manifest_digest != manifest_digest
+            )
+            if mismatch:
+                logger.error(
+                    "Raw-block P/D read ack for %s from %s does not match "
+                    "the receipt this writer published (epoch %s/%s, seq "
+                    "%d/%d, digest %s/%s); releasing nothing",
+                    req_id,
+                    consumer_instance_id,
+                    writer_epoch,
+                    receipt.writer_epoch,
+                    checkpoint_seq,
+                    receipt.checkpoint_seq,
+                    manifest_digest,
+                    receipt.manifest_digest,
+                )
+                return "rejected"
+            if tp_rank != expected_tp_rank:
+                logger.error(
+                    "Raw-block P/D read ack for %s claims rank %d, but this "
+                    "writer holds rank %d's extents; releasing nothing",
+                    req_id,
+                    tp_rank,
+                    expected_tp_rank,
+                )
+                return "rejected"
+            self._leases.pop(req_id, None)
+            self._released[req_id] = None
+            while len(self._released) > _FINISHED_HISTORY:
+                self._released.popitem(last=False)
+            encoded_keys = lease.encoded_keys
+
+        # Outside the lock: unlocking reaches the core, and a lease is
+        # removed first so a duplicate arriving now is already_released
+        # rather than a second unlock.
+        self._core.unlock_many(encoded_keys)
+        logger.info(
+            "Raw-block P/D released %d extent(s) for request %s on an "
+            "acknowledgement from %s",
+            len(encoded_keys),
+            req_id,
+            consumer_instance_id,
+        )
+        return "released"
+
+    def live_lease_count(self) -> int:
+        """Count leases still protecting extents from reuse."""
+        with self._lock:
+            return len(self._leases)
 
     def _maybe_start_publication_locked(
         self,
@@ -334,6 +475,10 @@ class RawBlockPDRequestTracker:
             except BaseException as exc:
                 self.fail_request(req_id, exc)
                 return
+            # Stamped here rather than in the core: the core publishes the
+            # manifest, and where to reply about it is this tracker's
+            # business because it is the thing holding the lease.
+            receipt = replace(receipt, ack_endpoint=self.ack_endpoint)
             with self._lock:
                 state = self._requests.get(req_id)
                 owned = (
@@ -342,7 +487,10 @@ class RawBlockPDRequestTracker:
                     and not terminal.done()
                 )
                 if owned:
-                    self._leased_keys[req_id] = encoded_keys
+                    self._leases[req_id] = _Lease(
+                        encoded_keys=list(encoded_keys),
+                        receipt=receipt,
+                    )
                     terminal.set_result(receipt)
                     self._retire_locked(req_id, terminal)
             if not owned:

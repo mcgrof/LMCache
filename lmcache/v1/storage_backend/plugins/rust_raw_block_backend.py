@@ -24,11 +24,16 @@ from lmcache.v1.storage_backend.raw_block import (
     RawBlockKeySpec,
     RawBlockPDRequestTracker,
     RawBlockPublicationReceipt,
+    RawBlockPutManyResult,
     decode_legacy_key,
     encode_legacy_key,
     normalize_raw_block_io_engine,
     round_up,
     validate_raw_block_io_options,
+)
+from lmcache.v1.storage_backend.storage_pd_protocol import (
+    StoragePDAckReceiver,
+    StoragePDReadAck,
 )
 
 if TYPE_CHECKING:
@@ -40,6 +45,40 @@ if TYPE_CHECKING:
     from lmcache.v1.memory_management import MemoryObj
 
 logger = init_logger(__name__)
+
+# Resources kept alive because a device stopped being able to say what it was
+# doing with them. Nothing reads this list; holding a reference is the whole
+# point, so that no allocator, finalizer or exit handler can release memory a
+# command may still be reaching.
+_RETAINED_AFTER_UNKNOWN_OUTCOME: list[Any] = []
+
+
+def _probe_says_unknown(probe: Optional[Callable[[], Any]], what: str) -> bool:
+    """Read a health probe, insisting that it answer the question asked.
+
+    Only a genuine ``True`` means the outcome is unknown. The probe is a
+    predicate returning a bool, so anything else is a caller that substituted
+    something not answering this question -- and reading that as poison would
+    quarantine on nothing. A probe that *raises* is different: it was asked
+    and could not say, which is exactly the condition to fail closed on.
+    """
+    if probe is None:
+        return False
+    try:
+        answer = probe()
+    except Exception:  # pragma: no cover - a probe must not mask the path
+        logger.exception("RustRawBlockBackend: could not read %s health", what)
+        return True
+    if answer is True:
+        return True
+    if answer is not False:
+        logger.warning(
+            "RustRawBlockBackend: %s health probe answered %r, not a bool; "
+            "reading it as healthy",
+            what,
+            answer,
+        )
+    return False
 
 _DEFAULT_META_MAGIC = b"LMCIDX01"
 _DEFAULT_META_VERSION = 1
@@ -286,9 +325,20 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             if self._storage_pd_mode and self._role == "writer"
             else None
         )
+        # A writer that cannot hear an acknowledgement holds every extent it
+        # ever publishes for its own lifetime, so the listener is built
+        # beside the tracker that owns those leases.
+        self._ack_receiver: Optional[StoragePDAckReceiver] = None
+        self._ack_tp_rank = int(getattr(metadata, "worker_id", 0) or 0)
+        if self._pd_tracker is not None:
+            self._ack_receiver = self._build_ack_receiver(extra)
+            self._pd_tracker.ack_endpoint = self.ack_endpoint()
 
         self._put_lock = threading.Lock()
         self._put_tasks: set[CacheEngineKey] = set()
+        # Batches whose I/O thread is still running after the task awaiting
+        # it went away. Their buffers are nobody's to release until it ends.
+        self._pending_put_owners: list[list[MemoryObj]] = []
         self._pin_lock = threading.Lock()
         self._pinned_keys: set[str] = set()
 
@@ -416,6 +466,21 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             raise RuntimeError("RustRawBlockBackend has no staging pool to load into")
         return self.local_cpu_backend.allocate(shape, dtype, fmt)
 
+    def _outcome_is_unknown(self) -> bool:
+        """Whether the worker or the core has stopped being able to say.
+
+        The core is asked first. It keeps the answer once it has adopted it,
+        and asking it costs nothing, whereas reaching the device can reopen
+        one -- or be refused outright for exactly the reason being asked
+        about.
+        """
+        if _probe_says_unknown(
+            getattr(self._core, "is_poisoned", None),
+            "raw-block core",
+        ):
+            return True
+        return self._native_outcome_is_unknown()
+
     def _native_outcome_is_unknown(self) -> bool:
         """Whether the native engine has stopped being able to say.
 
@@ -423,14 +488,19 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         backend releases can be shown to be safe to release, so it keeps what
         it holds rather than handing it back.
         """
-        probe = getattr(self._raw, "is_poisoned", None)
-        if probe is None:
-            return False
         try:
-            return bool(probe())
-        except Exception:  # pragma: no cover - a probe must not mask the path
-            logger.exception("RustRawBlockBackend: could not read native health")
-            return True
+            probe = getattr(self._raw, "is_poisoned", None)
+        except Exception:
+            # Obtaining the device is itself part of what can fail, and a
+            # core that has stopped being able to say refuses to hand one
+            # out at all. That refusal is not an answer about health: the
+            # core's own flag is, and _outcome_is_unknown reads it.
+            logger.warning(
+                "RustRawBlockBackend: could not reach the native engine to "
+                "ask about its health"
+            )
+            return False
+        return _probe_says_unknown(probe, "native engine")
 
     def _full_chunk_size_bytes(self) -> int:
         """Bytes one full KV chunk occupies, which sizes a device slot.
@@ -960,12 +1030,9 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         """Persist a P/D batch and report only whole-batch success."""
         specs = [item[1] for item in pending]
         memory_objs = [item[2] for item in pending]
+        io_task, io_finished = self._start_put_many(specs, memory_objs)
         try:
-            put_result = await asyncio.to_thread(
-                self._core.put_many,
-                specs,
-                memory_objs,
-            )
+            put_result = await asyncio.shield(io_task)
             if len(put_result.results) != len(pending) or not all(put_result.results):
                 failed = [
                     spec.encoded
@@ -985,20 +1052,10 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             assert self._pd_tracker is not None
             self._pd_tracker.fail_request(req_id, exc)
         finally:
-            # Dropping the reference can return the object's pool slice to the
-            # allocator. That is only safe once the device is known to have
-            # finished with it, and a failed request is not that knowledge:
-            # the engine poisons itself when it cannot say. Keep the
-            # references in that case, so the slice stays out of the
-            # allocator's hands.
-            unknown = self._native_outcome_is_unknown()
-            for key, _spec, memory_obj in pending:
-                if unknown:
-                    self._quarantined_objs.append(memory_obj)
-                else:
-                    memory_obj.ref_count_down()
-                with self._put_lock:
+            with self._put_lock:
+                for key, _spec, _obj in pending:
                     self._put_tasks.discard(key)
+            self._settle_put_owners(pending, io_task, io_finished)
 
     async def _submit_put_one(
         self,
@@ -1048,12 +1105,9 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         keys = [item[0] for item in pending]
         specs = [item[1] for item in pending]
         memory_objs = [item[2] for item in pending]
+        io_task, io_finished = self._start_put_many(specs, memory_objs)
         try:
-            put_result = await asyncio.to_thread(
-                self._core.put_many,
-                specs,
-                memory_objs,
-            )
+            put_result = await asyncio.shield(io_task)
             if len(put_result.results) != len(pending) or not all(put_result.results):
                 failed = []
 
@@ -1084,20 +1138,173 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                             "on_complete_callback failed for key %s: %s", key, e
                         )
         finally:
-            # Dropping the reference can return the object's pool slice to the
-            # allocator. That is only safe once the device is known to have
-            # finished with it, and a failed request is not that knowledge:
-            # the engine poisons itself when it cannot say. Keep the
-            # references in that case, so the slice stays out of the
-            # allocator's hands.
-            unknown = self._native_outcome_is_unknown()
-            for key, _spec, memory_obj in pending:
-                if unknown:
-                    self._quarantined_objs.append(memory_obj)
-                else:
-                    memory_obj.ref_count_down()
-                with self._put_lock:
+            with self._put_lock:
+                for key, _spec, _obj in pending:
                     self._put_tasks.discard(key)
+            self._settle_put_owners(pending, io_task, io_finished)
+
+    def _build_ack_receiver(
+        self, extra: Mapping[str, Any]
+    ) -> Optional[StoragePDAckReceiver]:
+        """Listen for read acknowledgements, or say what that costs.
+
+        A port of zero means the operator has not configured one. That is
+        allowed -- a deployment may genuinely not want the reverse channel --
+        but it is stated rather than assumed, because the consequence is that
+        no extent this writer publishes is ever reclaimed.
+        """
+        host = str(extra.get("rust_raw_block.ack_listen_host", "0.0.0.0") or "")
+        base_port = int(extra.get("rust_raw_block.ack_listen_port", 0) or 0)
+        if base_port <= 0:
+            logger.warning(
+                "Raw-block storage P/D has no acknowledgement listener "
+                "(rust_raw_block.ack_listen_port is unset). Published "
+                "extents stay leased for the life of this writer."
+            )
+            return None
+        # One port per rank, so tensor-parallel writers on one host do not
+        # contend for a single listener.
+        port = base_port + self._ack_tp_rank
+        try:
+            receiver = StoragePDAckReceiver(
+                self._apply_read_ack,
+                host=host,
+                port=port,
+            )
+        except Exception:
+            logger.exception(
+                "Raw-block storage P/D could not listen for acknowledgements "
+                "on %s:%d; published extents will stay leased",
+                host,
+                port,
+            )
+            return None
+        logger.info(
+            "Raw-block storage P/D listening for read acknowledgements on %s",
+            receiver.endpoint,
+        )
+        return receiver
+
+    def _apply_read_ack(self, ack: StoragePDReadAck) -> None:
+        """Hand one acknowledgement to the tracker that owns the lease.
+
+        Everything in ``ack`` came off a network. The tracker re-checks it
+        against what this writer actually published and releases nothing it
+        cannot match, so this only routes and records.
+        """
+        if self._pd_tracker is None:
+            return
+        outcome = self._pd_tracker.apply_read_ack(
+            req_id=ack.req_id,
+            consumer_instance_id=ack.consumer_instance_id,
+            tp_rank=ack.tp_rank,
+            writer_epoch=ack.writer_epoch,
+            checkpoint_seq=ack.checkpoint_seq,
+            manifest_digest=ack.manifest_digest,
+            expected_tp_rank=self._ack_tp_rank,
+        )
+        logger.debug(
+            "Raw-block storage P/D read ack for %s: %s", ack.req_id, outcome
+        )
+
+    def ack_endpoint(self) -> str:
+        """Where a consumer should send this writer's acknowledgements."""
+        return self._ack_receiver.endpoint if self._ack_receiver else ""
+
+    def live_lease_count(self) -> int:
+        """Count extents held pending acknowledgement."""
+        return self._pd_tracker.live_lease_count() if self._pd_tracker else 0
+
+    def _start_put_many(
+        self,
+        specs: Sequence[RawBlockKeySpec],
+        memory_objs: Sequence[MemoryObj],
+    ) -> tuple["asyncio.Future[Any]", threading.Event]:
+        """Start a batched write on a worker thread and track it honestly.
+
+        ``asyncio.to_thread`` hands work to an executor. Cancelling the task
+        that awaits it stops the waiting and never stops the thread, so the
+        task alone cannot say whether the device is still being handed these
+        buffers. The returned event is set by the thread itself and can.
+        """
+        io_finished = threading.Event()
+
+        def _run_put() -> RawBlockPutManyResult:
+            try:
+                return self._core.put_many(list(specs), list(memory_objs))
+            finally:
+                io_finished.set()
+
+        return asyncio.ensure_future(asyncio.to_thread(_run_put)), io_finished
+
+    def _settle_put_owners(
+        self,
+        pending: Sequence[tuple[CacheEngineKey, RawBlockKeySpec, MemoryObj]],
+        io_task: "asyncio.Future[Any]",
+        io_finished: threading.Event,
+    ) -> None:
+        """Release a batch's buffers, or keep them until that is provable.
+
+        Dropping the reference can return the object's pool slice to the
+        allocator, which is only safe once the device is known to have
+        finished with it. Two things make that unknowable: the engine
+        poisoned itself because its worker could not say, or -- the case a
+        failed request does not cover -- this coroutine was cancelled while
+        its I/O thread is still running, so nothing has happened yet that
+        could report an outcome at all.
+        """
+        if not io_finished.is_set():
+            self._retain_put_owners_until_done(pending, io_task, io_finished)
+            return
+        self._release_put_owners(pending)
+
+    def _release_put_owners(
+        self,
+        pending: Sequence[tuple[CacheEngineKey, RawBlockKeySpec, MemoryObj]],
+    ) -> None:
+        unknown = self._outcome_is_unknown()
+        for _key, _spec, memory_obj in pending:
+            if unknown:
+                self._quarantined_objs.append(memory_obj)
+            else:
+                memory_obj.ref_count_down()
+
+    def _retain_put_owners_until_done(
+        self,
+        pending: Sequence[tuple[CacheEngineKey, RawBlockKeySpec, MemoryObj]],
+        io_task: "asyncio.Future[Any]",
+        io_finished: threading.Event,
+    ) -> None:
+        """Hold a batch's buffers until its I/O thread has actually finished.
+
+        The batch is recorded where shutdown can see it, so an engine closing
+        with a write still in a thread does not destroy the memory under it.
+        If the callback never runs -- a loop torn down first, say -- the batch
+        stays recorded, which is the safe direction.
+        """
+        owners = [item[2] for item in pending]
+        with self._put_lock:
+            self._pending_put_owners.append(owners)
+        logger.warning(
+            "Raw-block write for %d key(s) was abandoned while its I/O "
+            "thread is still running; withholding its buffers until it ends",
+            len(owners),
+        )
+
+        def _settle(_task: "asyncio.Future[Any]") -> None:
+            with self._put_lock:
+                try:
+                    self._pending_put_owners.remove(owners)
+                except ValueError:  # pragma: no cover - settled already
+                    return
+            if not io_finished.is_set():
+                # The task ended without its thread ending. Nothing here can
+                # say what the device is doing with these buffers.
+                self._quarantined_objs.extend(owners)
+                return
+            self._release_put_owners(pending)
+
+        io_task.add_done_callback(_settle)
 
     def _batched_get_prefix(
         self,
@@ -1159,15 +1366,68 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             if loaded_count == len(allocated):
                 return allocated
 
+            if self._outcome_is_unknown():
+                # The bitmap's leading True entries are real completions, so
+                # that prefix is proven and is still served. What follows it
+                # is not, and is withheld rather than freed.
+                locked_specs = self._withhold_unproven_reads(
+                    load_specs[loaded_count:],
+                    allocated[loaded_count:],
+                    locked_specs,
+                )
+                return allocated[:loaded_count]
+
             for obj in allocated[loaded_count:]:
                 obj.ref_count_down()
             return allocated[:loaded_count]
         except Exception:
+            if self._outcome_is_unknown():
+                # Nothing was proven here, so none of it is released.
+                locked_specs = self._withhold_unproven_reads(
+                    prefix_specs, allocated, locked_specs
+                )
+                raise
             for obj in allocated:
                 obj.ref_count_down()
             raise
         finally:
             self._core.unlock_many([spec.encoded for spec in locked_specs])
+
+    def _withhold_unproven_reads(
+        self,
+        unproven: Sequence[RawBlockKeySpec],
+        targets: Sequence[MemoryObj],
+        locked_specs: list[RawBlockKeySpec],
+    ) -> list[RawBlockKeySpec]:
+        """Keep a read nobody can vouch for out of everyone's reach.
+
+        Such a read may still be landing. Its destination buffers cannot go
+        back to the allocator, where the next request would be handed memory
+        the device is writing into; and its source extents cannot be
+        unlocked, because an unlocked entry can be evicted and its slot given
+        to a write while the read is still reading it. Neither is released
+        again for the life of this engine.
+
+        The keys are added to the pinned set, which is what already tells a
+        later prefix lookup not to take a lock reference this backend is
+        holding, so nothing re-locks or re-serves them either.
+
+        Returns the list the caller's ``finally`` may unlock. It is a return
+        value rather than a mutation so that there is no way to unlock what
+        this withheld by forgetting to look.
+        """
+        withheld = {spec.encoded for spec in unproven}
+        self._quarantined_objs.extend(targets)
+        with self._pin_lock:
+            self._pinned_keys |= withheld
+        logger.error(
+            "Raw-block read outcome is unknown for %d key(s); withholding "
+            "%d destination buffer(s) and keeping those keys locked. This "
+            "engine will not serve or reuse them again.",
+            len(withheld),
+            len(targets),
+        )
+        return [spec for spec in locked_specs if spec.encoded not in withheld]
 
     def get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         loaded = self._batched_get_prefix([key])
@@ -1316,13 +1576,55 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             if pending == 0 or time.monotonic() >= deadline:
                 break
             time.sleep(0.01)
+
+        # Everything below either releases a resource the device may still be
+        # using or asks a question that reopens the device, so the state is
+        # sampled once, first. A deadline is not a fence: leaving that loop
+        # with work still counted says the wait gave up, not that the device
+        # did.
+        with self._put_lock:
+            retained_batches = len(self._pending_put_owners)
+        unknown = (
+            pending > 0
+            or retained_batches > 0
+            or bool(self._quarantined_objs)
+            or self._outcome_is_unknown()
+        )
+
         if self._pd_tracker is not None:
-            self._pd_tracker.close()
-        self._core.close()
-        if self._gpu_allocator is not None:
-            close_gpu_allocator = getattr(self._gpu_allocator, "close", None)
-            if callable(close_gpu_allocator):
-                close_gpu_allocator()
+            # Releasing a lease lets its extent go back to the free list.
+            self._pd_tracker.close(release_leases=not unknown)
+        try:
+            self._core.close()
+        except Exception as e:
+            # The core refuses to close when it cannot prove quiescence.
+            unknown = True
+            logger.error("Raw-block core close was refused: %s", e)
+
+        if self._ack_receiver is not None:
+            self._ack_receiver.close()
+        if self._gpu_allocator is None:
+            return
+        if unknown:
+            # Closing the allocator calls os.close() on every exported
+            # dma-buf and lets the arena behind it be reused. A command may
+            # still be landing in it, so the allocator, its exports and the
+            # withheld buffers are kept for the life of the process -- and
+            # kept referenced here, so no finalizer reaches close() either.
+            _RETAINED_AFTER_UNKNOWN_OUTCOME.append(
+                (self._gpu_allocator, self._quarantined_objs, self._pending_put_owners)
+            )
+            logger.error(
+                "Raw-block backend retaining its GPU allocator, %d exported "
+                "buffer owner(s) and %d abandoned batch(es) at shutdown: what "
+                "the device is doing with them could not be established.",
+                len(self._quarantined_objs),
+                retained_batches,
+            )
+            return
+        close_gpu_allocator = getattr(self._gpu_allocator, "close", None)
+        if callable(close_gpu_allocator):
+            close_gpu_allocator()
 
     def _pin_if_needed(self, encoded_key: str) -> bool:
         with self._pin_lock:
