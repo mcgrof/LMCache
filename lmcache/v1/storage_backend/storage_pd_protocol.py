@@ -10,8 +10,10 @@ from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Literal, NamedTuple
+import os
 import threading
 import time
+import uuid
 
 # Third Party
 import msgspec
@@ -26,6 +28,16 @@ from lmcache.v1.storage_backend.raw_block.core import RawBlockPublicationReceipt
 logger = init_logger(__name__)
 
 StoragePDState = Literal["READY", "FAILED", "CANCELLED"]
+
+# This process's identity for the storage handoff. A PID alone is not one:
+# the operating system reuses it, so an acknowledgement from a previous
+# occupant of this PID would name a lease the current occupant holds. The
+# random half makes each start distinguishable from every other.
+#
+# It lives here rather than in the vLLM connector because both ends of the
+# handoff need it: the connector puts it on the wire, and the storage
+# backend has to compare an arriving acknowledgement against it.
+STORAGE_PD_INCARNATION = f"pid:{os.getpid()}:{uuid.uuid4().hex[:12]}"
 
 
 class StoragePDStatus(msgspec.Struct, tag=True):

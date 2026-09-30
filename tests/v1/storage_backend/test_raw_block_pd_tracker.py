@@ -14,6 +14,8 @@ import pytest
 from lmcache.v1.storage_backend.raw_block import (
     RawBlockPDRequestTracker,
     RawBlockPublicationReceipt,
+    ReadAckIdentity,
+    ReadAckOutcome,
 )
 
 
@@ -24,6 +26,7 @@ class _FakeCore:
         self.published: list[list[str]] = []
         self.leased: list[str] = []
         self.unlock_calls = 0
+        self.unlock_raises = False
 
     def publish_request(self, encoded_keys: list[str]) -> RawBlockPublicationReceipt:
         self.publish_started.set()
@@ -48,6 +51,8 @@ class _FakeCore:
         return [object() for _ in encoded_keys]
 
     def unlock_many(self, encoded_keys: list[str]) -> None:
+        if self.unlock_raises:
+            raise OSError("the device refused to release these keys")
         self.unlock_calls += 1
         for encoded_key in encoded_keys:
             self.leased.remove(encoded_key)
@@ -525,21 +530,47 @@ def _published_lease(core: _FakeCore, tracker: RawBlockPDRequestTracker) -> None
     terminal.result(timeout=1)
 
 
+def _published_lease_named(
+    core: _FakeCore,
+    tracker: RawBlockPDRequestTracker,
+    req_id: str,
+) -> None:
+    """Drive one further request to a published lease."""
+    terminal = tracker.register_batch(
+        req_id,
+        [f"key-for-{req_id}"],
+        expected_chunks=1,
+        is_last_batch=True,
+    )
+    tracker.complete_batch(req_id, [f"key-for-{req_id}"])
+    terminal.result(timeout=1)
+
+
 def _ack(
     tracker: RawBlockPDRequestTracker,
     **overrides: object,
-) -> str:
+) -> ReadAckOutcome:
     fields: dict[str, object] = {
         "req_id": "request-1",
+        "producer_instance_id": "producer-1",
         "consumer_instance_id": "consumer-1",
         "tp_rank": 0,
         "writer_epoch": "writer-1",
         "checkpoint_seq": 7,
         "manifest_digest": "digest",
-        "expected_tp_rank": 0,
     }
+    expected_rank = int(overrides.pop("expected_tp_rank", 0))  # type: ignore[arg-type]
+    expected_producer = str(
+        overrides.pop("expected_producer_instance_id", "producer-1")
+    )
+    session = str(overrides.pop("session_id", "session-1"))
     fields.update(overrides)
-    return tracker.apply_read_ack(**fields)  # type: ignore[arg-type]
+    return tracker.apply_read_ack(
+        ReadAckIdentity(**fields),  # type: ignore[arg-type]
+        expected_producer_instance_id=expected_producer,
+        expected_tp_rank=expected_rank,
+        session_id=session,
+    )
 
 
 def test_tracker_releases_an_extent_on_a_matching_acknowledgement() -> None:
@@ -551,7 +582,7 @@ def test_tracker_releases_an_extent_on_a_matching_acknowledgement() -> None:
         assert core.leased == ["key-1"]
         assert tracker.live_lease_count() == 1
 
-        assert _ack(tracker) == "released"
+        assert _ack(tracker) is ReadAckOutcome.APPLIED
         assert core.leased == []
         assert tracker.live_lease_count() == 0
     finally:
@@ -570,9 +601,9 @@ def test_tracker_releases_nothing_twice_for_a_duplicate_acknowledgement() -> Non
     tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
     try:
         _published_lease(core, tracker)
-        assert _ack(tracker) == "released"
-        assert _ack(tracker) == "already_released"
-        assert _ack(tracker) == "already_released"
+        assert _ack(tracker) is ReadAckOutcome.APPLIED
+        assert _ack(tracker) is ReadAckOutcome.ALREADY_APPLIED
+        assert _ack(tracker) is ReadAckOutcome.ALREADY_APPLIED
         assert core.unlock_calls == 1
     finally:
         core.allow_publish.set()
@@ -603,7 +634,7 @@ def test_tracker_rejects_an_acknowledgement_it_cannot_match(
     tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
     try:
         _published_lease(core, tracker)
-        assert _ack(tracker, **overrides) == "rejected"
+        assert _ack(tracker, **overrides) is ReadAckOutcome.REJECTED
         assert core.leased == ["key-1"]
         assert tracker.live_lease_count() == 1
         assert core.unlock_calls == 0
@@ -625,3 +656,158 @@ def test_tracker_can_be_told_to_keep_its_leases_at_shutdown() -> None:
     tracker.close(release_leases=False)
     assert core.leased == ["key-1"]
     assert tracker.live_lease_count() == 1
+
+
+def test_tracker_refuses_an_acknowledgement_naming_another_producer() -> None:
+    """A writer only releases holds it published itself.
+
+    The producer identity is on the wire, and comparing it against a field
+    the same message supplied would check nothing, so the writer's own
+    identity arrives separately. Without that comparison a message meant
+    for a different writer -- or naming none -- releases this one's extents.
+    """
+    core = _FakeCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    try:
+        _published_lease(core, tracker)
+        assert (
+            _ack(tracker, producer_instance_id="somebody-else")
+            is ReadAckOutcome.REJECTED
+        )
+        assert core.leased == ["key-1"]
+        assert tracker.live_lease_count() == 1
+    finally:
+        core.allow_publish.set()
+        tracker.close()
+
+
+def test_tracker_refuses_an_acknowledgement_from_nobody() -> None:
+    """An empty consumer identity is not a consumer.
+
+    A message nobody can be held to still carried a matching receipt, and
+    a writer that only logged the consumer released the extents for it.
+    """
+    core = _FakeCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    try:
+        _published_lease(core, tracker)
+        assert _ack(tracker, consumer_instance_id="") is ReadAckOutcome.REJECTED
+        assert core.leased == ["key-1"]
+    finally:
+        core.allow_publish.set()
+        tracker.close()
+
+
+def test_tracker_binds_a_session_to_one_consumer_incarnation() -> None:
+    """A consumer that restarted cannot release holds for reads it never made.
+
+    The first acknowledgement the writer can otherwise vouch for binds the
+    incarnation that sent it. A different one under the same session is a
+    process that came up after the reads it is claiming.
+    """
+    core = _FakeCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    try:
+        _published_lease(core, tracker)
+        assert _ack(tracker) is ReadAckOutcome.APPLIED
+        assert tracker.bound_consumer("session-1") == "consumer-1"
+
+        _published_lease_named(core, tracker, "request-2")
+        assert (
+            _ack(
+                tracker,
+                req_id="request-2",
+                consumer_instance_id="consumer-2-after-a-restart",
+            )
+            is ReadAckOutcome.REJECTED
+        )
+        assert tracker.live_lease_count() == 1
+
+        # A whole-group restart is a new session, and is allowed.
+        assert (
+            _ack(
+                tracker,
+                req_id="request-2",
+                consumer_instance_id="consumer-2-after-a-restart",
+                session_id="session-2",
+            )
+            is ReadAckOutcome.APPLIED
+        )
+    finally:
+        core.allow_publish.set()
+        tracker.close()
+
+
+def test_tracker_does_not_answer_a_mismatched_duplicate_with_success() -> None:
+    """A tombstone keeps the identity that released the hold, not the name.
+
+    Remembering only the request identifier answered any later message
+    naming it with "already applied". That frees nothing extra by itself,
+    and becomes a false success the moment a consumer retires an
+    obligation on the answer.
+    """
+    core = _FakeCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    try:
+        _published_lease(core, tracker)
+        assert _ack(tracker) is ReadAckOutcome.APPLIED
+        assert _ack(tracker) is ReadAckOutcome.ALREADY_APPLIED
+        assert (
+            _ack(tracker, manifest_digest="someone-elses-digest")
+            is ReadAckOutcome.REJECTED
+        )
+        assert core.unlock_calls == 1
+    finally:
+        core.allow_publish.set()
+        tracker.close()
+
+
+def test_tracker_does_not_report_success_before_the_release_returns() -> None:
+    """A release that failed is not a release.
+
+    The hold was dropped from the lease table and recorded as released
+    before the unlock ran, so an unlock that raised left the extents
+    locked forever with nothing able to try again -- and the writer's own
+    accounting said they were free.
+    """
+    core = _FakeCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    try:
+        _published_lease(core, tracker)
+        core.unlock_raises = True
+
+        assert _ack(tracker) is ReadAckOutcome.UNRESOLVED
+        assert tracker.live_lease_count() == 1, "the hold must still be the writer's"
+
+        # And a retry does not run the release a second time: the first one
+        # may have partially applied, and nothing here can say.
+        core.unlock_raises = False
+        assert _ack(tracker) is ReadAckOutcome.UNRESOLVED
+        assert core.unlock_calls == 0
+    finally:
+        core.allow_publish.set()
+        tracker.close()
+
+
+def test_tracker_says_it_cannot_tell_once_a_tombstone_is_gone() -> None:
+    """An evicted record is not evidence of anything.
+
+    Answering "rejected" tells a consumer to stop retrying something that
+    may still be owed; answering "already applied" invents a success. The
+    writer says it cannot tell, and the hold -- if there is one -- stands.
+    """
+    core = _FakeCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    try:
+        _published_lease(core, tracker)
+        assert _ack(tracker) is ReadAckOutcome.APPLIED
+
+        # Evicting by hand: the real bound is thousands of requests, and
+        # what matters is the answer after an eviction, not the number.
+        tracker._released.clear()
+        tracker._forgot_released = True
+
+        assert _ack(tracker) is ReadAckOutcome.UNRESOLVED
+    finally:
+        core.allow_publish.set()
+        tracker.close()

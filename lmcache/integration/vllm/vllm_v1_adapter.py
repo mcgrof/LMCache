@@ -9,7 +9,6 @@ import math
 import os
 import sys
 import threading
-import uuid
 
 # Third Party
 from vllm.config import (
@@ -53,6 +52,7 @@ from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.manager import LMCacheManager
 from lmcache.v1.storage_backend.raw_block import RawBlockPublicationReceipt
 from lmcache.v1.storage_backend.storage_pd_protocol import (
+    STORAGE_PD_INCARNATION,
     StoragePDDelivery,
     StoragePDNotificationQueue,
     StoragePDObligation,
@@ -113,11 +113,6 @@ class DisaggSpec:
 # recognised instead of starting it again. The oldest are forgotten.
 STORAGE_PD_REQUEST_HISTORY = 4096
 
-# This process's identity for the storage handoff. A PID alone is not one:
-# the operating system reuses it, so an acknowledgement from a previous
-# occupant of this PID would name a lease the current occupant holds. The
-# random half makes each start distinguishable from every other.
-STORAGE_PD_INCARNATION = f"pid:{os.getpid()}:{uuid.uuid4().hex[:12]}"
 
 tmp_disagg_tracker: dict[str, DisaggSpec] = {}
 

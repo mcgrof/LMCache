@@ -28,6 +28,8 @@ from lmcache.v1.storage_backend.raw_block import (
     RawBlockPDRequestTracker,
     RawBlockPublicationReceipt,
     RawBlockPutManyResult,
+    ReadAckIdentity,
+    ReadAckOutcome,
     decode_legacy_key,
     encode_legacy_key,
     normalize_raw_block_io_engine,
@@ -35,6 +37,7 @@ from lmcache.v1.storage_backend.raw_block import (
     validate_raw_block_io_options,
 )
 from lmcache.v1.storage_backend.storage_pd_protocol import (
+    STORAGE_PD_INCARNATION,
     StoragePDAckReceiver,
     StoragePDReadAck,
 )
@@ -340,6 +343,14 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         # beside the tracker that owns those leases.
         self._ack_receiver: Optional[StoragePDAckReceiver] = None
         self._ack_tp_rank = int(getattr(metadata, "worker_id", 0) or 0)
+        # Names one producer/consumer group's run. Both ends carry it, so a
+        # restart of the whole group is a new session and a restart of the
+        # consumer alone is not -- which is what lets the writer refuse a
+        # consumer that cannot have done the reading it claims.
+        self._pd_session_id = str(
+            extra.get("rust_raw_block.pd_session_id", "")
+            or os.environ.get("LMCACHE_STORAGE_PD_SESSION", "")
+        )
         if self._pd_tracker is not None:
             self._ack_receiver = self._build_ack_receiver(extra)
             self._pd_tracker.ack_endpoint = self.ack_endpoint()
@@ -1233,25 +1244,35 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         )
         return receiver
 
-    def _apply_read_ack(self, ack: StoragePDReadAck) -> None:
-        """Hand one acknowledgement to the tracker that owns the lease.
+    def _apply_read_ack(self, ack: StoragePDReadAck) -> ReadAckOutcome:
+        """Hand one acknowledgement to the tracker that owns the hold.
 
         Everything in ``ack`` came off a network. The tracker re-checks it
         against what this writer actually published and releases nothing it
-        cannot match, so this only routes and records.
+        cannot match, so this only routes. The outcome is returned because
+        it is what the consumer is told, and a consumer retires its
+        obligation on that answer.
         """
         if self._pd_tracker is None:
-            return
+            return ReadAckOutcome.REJECTED
         outcome = self._pd_tracker.apply_read_ack(
-            req_id=ack.req_id,
-            consumer_instance_id=ack.consumer_instance_id,
-            tp_rank=ack.tp_rank,
-            writer_epoch=ack.writer_epoch,
-            checkpoint_seq=ack.checkpoint_seq,
-            manifest_digest=ack.manifest_digest,
+            ReadAckIdentity(
+                req_id=ack.req_id,
+                producer_instance_id=ack.producer_instance_id,
+                consumer_instance_id=ack.consumer_instance_id,
+                tp_rank=ack.tp_rank,
+                writer_epoch=ack.writer_epoch,
+                checkpoint_seq=ack.checkpoint_seq,
+                manifest_digest=ack.manifest_digest,
+            ),
+            expected_producer_instance_id=STORAGE_PD_INCARNATION,
             expected_tp_rank=self._ack_tp_rank,
+            session_id=self._pd_session_id,
         )
-        logger.debug("Raw-block storage P/D read ack for %s: %s", ack.req_id, outcome)
+        logger.debug(
+            "Raw-block storage P/D read ack for %s: %s", ack.req_id, outcome.value
+        )
+        return outcome
 
     def ack_endpoint(self) -> str:
         """Where a consumer should send this writer's acknowledgements."""

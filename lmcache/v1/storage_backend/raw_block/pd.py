@@ -8,7 +8,8 @@ from __future__ import annotations
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Optional, Sequence
+import enum
 import threading
 
 # First Party
@@ -42,6 +43,43 @@ class _RequestState:
 _FINISHED_HISTORY = 4096
 
 
+class ReadAckOutcome(enum.Enum):
+    """What a writer did about one acknowledgement.
+
+    ``APPLIED`` is reported only after the release operation returned. The
+    two negative answers are kept apart because they mean different things
+    to the consumer that is still responsible for the acknowledgement:
+    ``REJECTED`` says this writer will never apply this message and the
+    consumer should stop offering it, while ``UNRESOLVED`` says the writer
+    cannot say, so the hold stands and the obligation has not been
+    discharged.
+    """
+
+    APPLIED = "APPLIED"
+    ALREADY_APPLIED = "ALREADY_APPLIED"
+    REJECTED = "REJECTED"
+    UNRESOLVED = "UNRESOLVED"
+
+
+@dataclass(frozen=True)
+class ReadAckIdentity:
+    """Everything an acknowledgement must match to release a hold.
+
+    A request identifier is not an identity: a restarted consumer reuses
+    one, and a stale message naming a previous incarnation's receipt is
+    exactly the case that must not reclaim a live extent. Comparing the
+    whole tuple is what makes a duplicate distinguishable from a forgery.
+    """
+
+    req_id: str
+    producer_instance_id: str
+    consumer_instance_id: str
+    tp_rank: int
+    writer_epoch: str
+    checkpoint_seq: int
+    manifest_digest: str
+
+
 @dataclass
 class _Lease:
     """Extents held for one published request until it is acknowledged.
@@ -49,10 +87,16 @@ class _Lease:
     The receipt is kept so that an acknowledgement can be matched against
     what was actually published, rather than trusted for naming a request
     identifier that a restarted consumer could reuse.
+
+    ``unlock_ran`` records that a release was started for these extents and
+    did not report back. Running it again could decrement a reference this
+    writer does not own, so the lease stays and further acknowledgements
+    for it are unresolved rather than applied.
     """
 
     encoded_keys: list[str]
     receipt: "RawBlockPublicationReceipt"
+    unlock_ran: bool = False
 
 
 class RawBlockPDRequestTracker:
@@ -71,7 +115,17 @@ class RawBlockPDRequestTracker:
         # from `_finished`, which is a bounded record that a request
         # happened and says nothing about what is still held.
         self._leases: dict[str, _Lease] = {}
-        self._released: OrderedDict[str, None] = OrderedDict()
+        # Tombstones, keyed by request and holding the whole identity that
+        # released it. A request identifier alone would answer a mismatched
+        # message with "already applied", which is a false success as soon
+        # as a consumer acts on the answer.
+        self._released: OrderedDict[str, ReadAckIdentity] = OrderedDict()
+        # Set once a tombstone is evicted. After that this writer cannot
+        # distinguish a retry of something it released from a message about
+        # a hold it never had, and it says so rather than guessing.
+        self._forgot_released = False
+        # Which consumer incarnation may release each session's holds.
+        self._bound_consumer: dict[str, str] = {}
         # Told to consumers so they know where to reply. Set by whoever
         # built the listener; empty until then, and empty forever if there
         # is none, which a consumer can see and act on.
@@ -329,94 +383,207 @@ class RawBlockPDRequestTracker:
         for encoded_keys in leased_keys:
             self._core.unlock_many(encoded_keys)
 
-    def apply_read_ack(
-        self,
-        req_id: str,
-        consumer_instance_id: str,
-        tp_rank: int,
-        writer_epoch: str,
-        checkpoint_seq: int,
-        manifest_digest: str,
-        expected_tp_rank: int,
-    ) -> str:
-        """Release a lease on an acknowledgement this writer can vouch for.
+    def bind_consumer(self, session_id: str, consumer_instance_id: str) -> bool:
+        """Record which consumer incarnation may release this session's holds.
 
-        The writer validates every field itself. A proxy may relay an
-        acknowledgement and may check it, but it does not hold the lease and
-        cannot decide that an extent is reclaimable.
+        The first acknowledgement this writer can otherwise vouch for binds
+        the incarnation that sent it, for as long as the session lasts. A
+        later, different incarnation under the same session is a consumer
+        that restarted while this writer's holds were live, and it cannot
+        rebind them: the extents it would release belong to reads the new
+        process never made.
 
-        ``expected_tp_rank`` is the caller's own rank: the identity belongs
-        to whoever owns this tracker, and comparing an acknowledgement
-        against a rank it supplied itself would check nothing.
+        A session identifier the operator sets across one producer/consumer
+        group is what makes a whole-group restart legitimate -- the session
+        changes with it -- while a consumer-only restart is not. This is not
+        authentication; it is a fence against reuse by a process that
+        cannot have done the reading.
 
-        Returns one of ``"released"``, ``"already_released"`` or
-        ``"rejected"``. ``"already_released"`` exists because a lost
-        confirmation is safe to retry: a consumer that never heard back
-        sends the same acknowledgement again, and it must free nothing a
-        second time. Any mismatch is ``"rejected"`` and releases nothing --
-        a stale acknowledgement naming a previous incarnation's receipt is
-        exactly the case that must not reclaim a live extent.
+        Returns whether this pair is the bound one.
         """
         with self._lock:
-            lease = self._leases.get(req_id)
-            if lease is None:
-                if req_id in self._released:
-                    return "already_released"
-                logger.warning(
-                    "Raw-block P/D read ack for %s from %s names no live "
-                    "lease; releasing nothing",
-                    req_id,
+            bound = self._bound_consumer.get(session_id)
+            if bound is None:
+                self._bound_consumer[session_id] = consumer_instance_id
+                logger.info(
+                    "Raw-block P/D bound session %s to consumer %s",
+                    session_id,
                     consumer_instance_id,
                 )
-                return "rejected"
+                return True
+            return bound == consumer_instance_id
+
+    def bound_consumer(self, session_id: str) -> Optional[str]:
+        """Which consumer incarnation this session is bound to, if any."""
+        with self._lock:
+            return self._bound_consumer.get(session_id)
+
+    def apply_read_ack(
+        self,
+        identity: ReadAckIdentity,
+        *,
+        expected_producer_instance_id: str,
+        expected_tp_rank: int,
+        session_id: str = "",
+    ) -> ReadAckOutcome:
+        """Release a hold on an acknowledgement this writer can vouch for.
+
+        The writer validates every field against what it published itself.
+        Nothing else holds the lease, so nothing else can decide that an
+        extent is reclaimable -- a relay may carry an acknowledgement and
+        may check it, and neither makes it true.
+
+        ``expected_producer_instance_id`` and ``expected_tp_rank`` are the
+        caller's own identity. Comparing an acknowledgement against fields
+        it supplied itself would check nothing, so they arrive separately
+        from the message.
+
+        ``APPLIED`` is returned only after the release returned. A caller
+        may treat it as proof that this hold is gone; it may treat nothing
+        else that way.
+        """
+        with self._lock:
+            if identity.producer_instance_id != expected_producer_instance_id:
+                logger.error(
+                    "Raw-block P/D read ack for %s names producer %s, but "
+                    "this writer is %s; releasing nothing",
+                    identity.req_id,
+                    identity.producer_instance_id,
+                    expected_producer_instance_id,
+                )
+                return ReadAckOutcome.REJECTED
+            if identity.tp_rank != expected_tp_rank:
+                logger.error(
+                    "Raw-block P/D read ack for %s claims rank %d, but this "
+                    "writer holds rank %d's extents; releasing nothing",
+                    identity.req_id,
+                    identity.tp_rank,
+                    expected_tp_rank,
+                )
+                return ReadAckOutcome.REJECTED
+            if not identity.consumer_instance_id:
+                logger.error(
+                    "Raw-block P/D read ack for %s names no consumer; a "
+                    "message nobody can be held to releases nothing",
+                    identity.req_id,
+                )
+                return ReadAckOutcome.REJECTED
+
+            settled = self._released.get(identity.req_id)
+            lease = self._leases.get(identity.req_id)
+            if lease is None:
+                if settled is not None:
+                    # A lost reply is safe to retry, and only for the same
+                    # message. A different one naming a request this writer
+                    # has already released is not a duplicate.
+                    if settled == identity:
+                        return ReadAckOutcome.ALREADY_APPLIED
+                    logger.error(
+                        "Raw-block P/D read ack for %s does not match the "
+                        "acknowledgement that released it; releasing nothing",
+                        identity.req_id,
+                    )
+                    return ReadAckOutcome.REJECTED
+                if self._forgot_released:
+                    # The record that would answer this was evicted. Saying
+                    # "already applied" here would invent a success, and
+                    # saying "rejected" would tell a consumer to stop
+                    # retrying something that may still be owed.
+                    logger.warning(
+                        "Raw-block P/D read ack for %s names no live hold "
+                        "and no remembered one; this writer cannot say",
+                        identity.req_id,
+                    )
+                    return ReadAckOutcome.UNRESOLVED
+                logger.warning(
+                    "Raw-block P/D read ack for %s names no hold this "
+                    "writer ever had; releasing nothing",
+                    identity.req_id,
+                )
+                return ReadAckOutcome.REJECTED
+
             receipt = lease.receipt
-            mismatch = (
-                receipt.writer_epoch != writer_epoch
-                or receipt.checkpoint_seq != checkpoint_seq
-                or receipt.manifest_digest != manifest_digest
-            )
-            if mismatch:
+            if (
+                receipt.writer_epoch != identity.writer_epoch
+                or receipt.checkpoint_seq != identity.checkpoint_seq
+                or receipt.manifest_digest != identity.manifest_digest
+            ):
                 logger.error(
                     "Raw-block P/D read ack for %s from %s does not match "
                     "the receipt this writer published (epoch %s/%s, seq "
                     "%d/%d, digest %s/%s); releasing nothing",
-                    req_id,
-                    consumer_instance_id,
-                    writer_epoch,
+                    identity.req_id,
+                    identity.consumer_instance_id,
+                    identity.writer_epoch,
                     receipt.writer_epoch,
-                    checkpoint_seq,
+                    identity.checkpoint_seq,
                     receipt.checkpoint_seq,
-                    manifest_digest,
+                    identity.manifest_digest,
                     receipt.manifest_digest,
                 )
-                return "rejected"
-            if tp_rank != expected_tp_rank:
+                return ReadAckOutcome.REJECTED
+            if lease.unlock_ran:
                 logger.error(
-                    "Raw-block P/D read ack for %s claims rank %d, but this "
-                    "writer holds rank %d's extents; releasing nothing",
-                    req_id,
-                    tp_rank,
-                    expected_tp_rank,
+                    "Raw-block P/D already ran a release for %s that did "
+                    "not report back; running it again could drop a "
+                    "reference this writer does not own",
+                    identity.req_id,
                 )
-                return "rejected"
-            self._leases.pop(req_id, None)
-            self._released[req_id] = None
+                return ReadAckOutcome.UNRESOLVED
+
+            bound = self._bound_consumer.get(session_id)
+            if bound is None:
+                self._bound_consumer[session_id] = identity.consumer_instance_id
+                logger.info(
+                    "Raw-block P/D bound session %s to consumer %s",
+                    session_id,
+                    identity.consumer_instance_id,
+                )
+            elif bound != identity.consumer_instance_id:
+                logger.error(
+                    "Raw-block P/D read ack for %s comes from consumer %s, "
+                    "but session %s is bound to %s; a consumer that "
+                    "restarted cannot release holds for reads it never "
+                    "made",
+                    identity.req_id,
+                    identity.consumer_instance_id,
+                    session_id,
+                    bound,
+                )
+                return ReadAckOutcome.REJECTED
+
+            # Marked before the lock is dropped, so a concurrent duplicate
+            # is unresolved rather than a second release of the same keys.
+            lease.unlock_ran = True
+            encoded_keys = list(lease.encoded_keys)
+
+        try:
+            self._core.unlock_many(encoded_keys)
+        except Exception:
+            # The lease stays, still marked, so nothing releases these keys
+            # again on a retry. Holding an extent nobody will reclaim is a
+            # leak; releasing one twice hands a live extent to a later
+            # request.
+            logger.exception(
+                "Raw-block P/D could not release the extents for %s",
+                identity.req_id,
+            )
+            return ReadAckOutcome.UNRESOLVED
+
+        with self._lock:
+            self._leases.pop(identity.req_id, None)
+            self._released[identity.req_id] = identity
             while len(self._released) > _FINISHED_HISTORY:
                 self._released.popitem(last=False)
-            encoded_keys = lease.encoded_keys
-
-        # Outside the lock: unlocking reaches the core, and a lease is
-        # removed first so a duplicate arriving now is already_released
-        # rather than a second unlock.
-        self._core.unlock_many(encoded_keys)
+                self._forgot_released = True
         logger.info(
             "Raw-block P/D released %d extent(s) for request %s on an "
             "acknowledgement from %s",
             len(encoded_keys),
-            req_id,
-            consumer_instance_id,
+            identity.req_id,
+            identity.consumer_instance_id,
         )
-        return "released"
+        return ReadAckOutcome.APPLIED
 
     def live_lease_count(self) -> int:
         """Count leases still protecting extents from reuse."""
