@@ -55,11 +55,18 @@ printf -v extra_config \
     "$role_settings" "$device" "$slot_bytes" "$gpu_buffer_bytes"
 
 # Both nodes must derive the same key for the same tokens, in separate
-# processes. The builtin hash does not: it is randomised per process, and
-# PYTHONHASHSEED pins that only for processes this script starts, which is
-# not a property a shared namespace can rely on. Name a deterministic
-# algorithm instead; PYTHONHASHSEED stays for anything else that reaches
-# for the builtin.
+# processes. Two things decide that, and both have to match.
+#
+# The algorithm: name one, rather than leaving it at the builtin fallback,
+# so the derivation is a documented function instead of whatever the
+# interpreter provides.
+#
+# The seed: measured, the keys still follow PYTHONHASHSEED under either
+# algorithm, because the chunk hash chain starts from a value the serving
+# engine derives from it. So the seed is part of the contract, not a
+# leftover for other hashing. A deterministic function may legitimately
+# take a configured seed; what matters is that both nodes agree on it and
+# that a mismatch is refused rather than read as a miss.
 export LMCACHE_PRE_CACHING_HASH_ALGORITHM=${LMCACHE_PRE_CACHING_HASH_ALGORITHM:-sha256_cbor}
 export PYTHONHASHSEED=0
 export LMCACHE_CHUNK_SIZE=${LMCACHE_CHUNK_SIZE:-256}
