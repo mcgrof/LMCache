@@ -20,13 +20,19 @@ import sys
 import pytest
 
 # First Party
-from lmcache.v1.storage_backend.raw_block import RawBlockCore, encode_object_key
+from lmcache.v1.storage_backend.raw_block import (
+    IncompatibleKeyDerivation,
+    RawBlockCore,
+    RawBlockDerivationDescriptor,
+    encode_object_key,
+)
 from tests.v1.storage_backend.raw_block_test_utils import (
     make_empty_memory_obj,
     make_memory_obj,
     make_object_key,
     make_raw_block_core_config,
     make_raw_block_file,
+    make_test_derivation,
     memory_obj_bytes,
 )
 
@@ -38,7 +44,7 @@ requires_rust_raw_block_io = pytest.mark.skipif(
 
 def _reader_config(path):
     return replace(
-        make_raw_block_core_config(path),
+        make_raw_block_core_config(path, derivation=make_test_derivation()),
         role="reader",
         verify_slot_header_on_load=True,
     )
@@ -48,7 +54,10 @@ def _reader_config(path):
 @pytest.mark.skipif(sys.platform != "linux", reason="raw-block is Linux only")
 def test_reader_adopts_published_index_and_loads(tmp_path):
     path = make_raw_block_file(tmp_path)
-    writer = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    writer = RawBlockCore(
+        make_raw_block_core_config(path, derivation=make_test_derivation()),
+        key_namespace="object",
+    )
     reader = RawBlockCore(_reader_config(path), key_namespace="object")
     try:
         keys = [make_object_key(i) for i in range(3)]
@@ -101,7 +110,10 @@ def test_reader_never_writes(tmp_path):
         reader.close()
     # Closing a reader writes no checkpoint: a writer opening afterwards
     # finds no metadata and starts empty.
-    writer = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    writer = RawBlockCore(
+        make_raw_block_core_config(path, derivation=make_test_derivation()),
+        key_namespace="object",
+    )
     try:
         assert writer.indexed_key_count() == 0
     finally:
@@ -112,7 +124,10 @@ def test_reader_never_writes(tmp_path):
 @pytest.mark.skipif(sys.platform != "linux", reason="raw-block is Linux only")
 def test_reader_rejects_slot_the_writer_reused(tmp_path):
     path = make_raw_block_file(tmp_path)
-    writer = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    writer = RawBlockCore(
+        make_raw_block_core_config(path, derivation=make_test_derivation()),
+        key_namespace="object",
+    )
     reader = RawBlockCore(_reader_config(path), key_namespace="object")
     try:
         first = encode_object_key(make_object_key(1))
@@ -149,7 +164,10 @@ def test_reader_rejects_slot_the_writer_reused(tmp_path):
 @pytest.mark.skipif(sys.platform != "linux", reason="raw-block is Linux only")
 def test_reader_follows_a_writer_that_restarted_empty(tmp_path):
     path = make_raw_block_file(tmp_path)
-    writer = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    writer = RawBlockCore(
+        make_raw_block_core_config(path, derivation=make_test_derivation()),
+        key_namespace="object",
+    )
     first = encode_object_key(make_object_key(1))
     second = encode_object_key(make_object_key(2))
     # Publish several times so the device holds a high sequence number.
@@ -167,7 +185,10 @@ def test_reader_follows_a_writer_that_restarted_empty(tmp_path):
         assert reader.exists_many([first.encoded]) == [True]
         # The writer comes back without loading its old index.
         fresh = RawBlockCore(
-            replace(make_raw_block_core_config(path), load_checkpoint_on_init=False),
+            replace(
+                make_raw_block_core_config(path, derivation=make_test_derivation()),
+                load_checkpoint_on_init=False,
+            ),
             key_namespace="object",
         )
         assert fresh.put_many([second], [make_memory_obj(b"b" * 1024)]).results == [
@@ -189,7 +210,10 @@ def test_reader_follows_a_writer_that_restarted_empty(tmp_path):
 @pytest.mark.skipif(sys.platform != "linux", reason="raw-block is Linux only")
 def test_publish_is_spaced_by_min_interval(tmp_path):
     path = make_raw_block_file(tmp_path)
-    config = replace(make_raw_block_core_config(path), publish_min_interval_ms=60_000)
+    config = replace(
+        make_raw_block_core_config(path, derivation=make_test_derivation()),
+        publish_min_interval_ms=60_000,
+    )
     writer = RawBlockCore(config, key_namespace="object")
     try:
         spec = encode_object_key(make_object_key(1))
@@ -209,7 +233,10 @@ def test_publish_is_spaced_by_min_interval(tmp_path):
 @pytest.mark.skipif(sys.platform != "linux", reason="raw-block is Linux only")
 def test_request_receipt_adopts_exact_and_compatible_later_generation(tmp_path):
     path = make_raw_block_file(tmp_path)
-    writer = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    writer = RawBlockCore(
+        make_raw_block_core_config(path, derivation=make_test_derivation()),
+        key_namespace="object",
+    )
     reader = RawBlockCore(_reader_config(path), key_namespace="object")
     try:
         first = encode_object_key(make_object_key(1))
@@ -252,13 +279,19 @@ def test_request_receipt_adopts_exact_and_compatible_later_generation(tmp_path):
 def test_request_receipt_fences_a_restarted_writer(tmp_path):
     path = make_raw_block_file(tmp_path)
     first = encode_object_key(make_object_key(1))
-    writer = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    writer = RawBlockCore(
+        make_raw_block_core_config(path, derivation=make_test_derivation()),
+        key_namespace="object",
+    )
     assert writer.put_many([first], [make_memory_obj(b"a" * 1024)]).results == [True]
     stale_receipt = writer.publish_request([first.encoded])
     writer.close()
 
     reader = RawBlockCore(_reader_config(path), key_namespace="object")
-    restarted = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    restarted = RawBlockCore(
+        make_raw_block_core_config(path, derivation=make_test_derivation()),
+        key_namespace="object",
+    )
     try:
         fresh_receipt = restarted.publish_request([first.encoded])
         assert fresh_receipt.writer_epoch != stale_receipt.writer_epoch
@@ -278,7 +311,10 @@ def test_request_receipt_fences_a_restarted_writer(tmp_path):
 @pytest.mark.skipif(sys.platform != "linux", reason="raw-block is Linux only")
 def test_request_publication_rejects_a_missing_key(tmp_path):
     path = make_raw_block_file(tmp_path)
-    writer = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    writer = RawBlockCore(
+        make_raw_block_core_config(path, derivation=make_test_derivation()),
+        key_namespace="object",
+    )
     try:
         missing = encode_object_key(make_object_key(1))
         with pytest.raises(RuntimeError, match="uncommitted key"):
@@ -296,9 +332,9 @@ def test_namespace_identity_of_a_block_device_without_hardware_identity():
     another node.
     """
     # Standard
+    from unittest import mock
     import os
     import stat as stat_module
-    from unittest import mock
 
     # First Party
     from lmcache.v1.storage_backend.raw_block import core as core_module
@@ -325,7 +361,10 @@ def test_publication_refuses_an_identity_another_node_cannot_resolve(tmp_path):
     on them would name a different device on the node that reads it.
     """
     path = make_raw_block_file(tmp_path)
-    writer = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    writer = RawBlockCore(
+        make_raw_block_core_config(path, derivation=make_test_derivation()),
+        key_namespace="object",
+    )
     try:
         key = encode_object_key(make_object_key(1))
         assert writer.put_many([key], [make_memory_obj(b"a" * 1024)]).results == [True]
@@ -350,7 +389,10 @@ def test_publication_does_not_reuse_a_generation_that_moved_the_key(tmp_path):
     holds the request takes protect the new extent, not the advertised one.
     """
     path = make_raw_block_file(tmp_path)
-    writer = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    writer = RawBlockCore(
+        make_raw_block_core_config(path, derivation=make_test_derivation()),
+        key_namespace="object",
+    )
     reader = RawBlockCore(_reader_config(path), key_namespace="object")
     try:
         first = encode_object_key(make_object_key(81))
@@ -398,3 +440,171 @@ def test_publication_does_not_reuse_a_generation_that_moved_the_key(tmp_path):
     finally:
         reader.close()
         writer.close()
+
+
+@requires_rust_raw_block_io
+@pytest.mark.skipif(sys.platform != "linux", reason="raw-block is Linux only")
+def test_a_reader_refuses_a_namespace_derived_differently(tmp_path):
+    """Two engines can agree on the layout and still read nothing of each
+    other's.
+
+    A different hash function, seed, chain root or key encoding changes the
+    bytes of every key while leaving the geometry identical. The existing
+    geometry checks answer a mismatch by ignoring the metadata and starting
+    empty, which is the right answer for a layout this engine cannot read and
+    the wrong one here: it means writing our own keys beside someone else's
+    and reporting a cold cache instead of a misconfiguration.
+    """
+    path = make_raw_block_file(tmp_path)
+    writer = RawBlockCore(
+        make_raw_block_core_config(path, derivation=make_test_derivation()),
+        key_namespace="object",
+    )
+    try:
+        keys = [make_object_key(i) for i in range(2)]
+        specs = [encode_object_key(key) for key in keys]
+        objs = [make_memory_obj(f"value-{i}".encode()) for i in range(2)]
+        assert writer.put_many(specs, objs).results == [True, True]
+        writer.publish_request([spec.encoded for spec in specs])
+    finally:
+        writer.close()
+
+    # Refused while opening, before a single entry is adopted: the checkpoint
+    # is read at construction, which is the first moment the two derivations
+    # can be compared.
+    theirs = replace(make_test_derivation(), chain_root="99")
+    with pytest.raises(IncompatibleKeyDerivation, match="chain_root"):
+        RawBlockCore(
+            replace(
+                make_raw_block_core_config(path, derivation=theirs),
+                role="reader",
+            ),
+            key_namespace="object",
+        )
+
+
+@requires_rust_raw_block_io
+@pytest.mark.skipif(sys.platform != "linux", reason="raw-block is Linux only")
+def test_a_reader_refuses_a_namespace_that_states_no_derivation(tmp_path):
+    """Silence is as incompatible as disagreement.
+
+    A writer that said nothing about its derivation named no contract, so
+    nothing can be concluded about the keys already there.
+    """
+    path = make_raw_block_file(tmp_path)
+    writer = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    try:
+        keys = [make_object_key(i) for i in range(2)]
+        specs = [encode_object_key(key) for key in keys]
+        objs = [make_memory_obj(f"value-{i}".encode()) for i in range(2)]
+        assert writer.put_many(specs, objs).results == [True, True]
+        writer.checkpoint_now()
+    finally:
+        writer.close()
+
+    with pytest.raises(IncompatibleKeyDerivation, match="no key derivation"):
+        RawBlockCore(
+            replace(
+                make_raw_block_core_config(path, derivation=make_test_derivation()),
+                role="reader",
+            ),
+            key_namespace="object",
+        )
+
+
+@requires_rust_raw_block_io
+@pytest.mark.skipif(sys.platform != "linux", reason="raw-block is Linux only")
+def test_publication_refuses_without_a_stated_derivation(tmp_path):
+    """Publishing is telling another engine to read these keys."""
+    path = make_raw_block_file(tmp_path)
+    writer = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    try:
+        spec = encode_object_key(make_object_key(0))
+        assert writer.put_many([spec], [make_memory_obj(b"value")]).results == [True]
+        with pytest.raises(IncompatibleKeyDerivation, match="how they were derived"):
+            writer.publish_request([spec.encoded])
+    finally:
+        writer.close()
+
+
+def test_a_derivation_names_every_field_it_disagrees_on() -> None:
+    """A refusal has to say which field differs, or it cannot be acted on."""
+    ours = make_test_derivation()
+    theirs = replace(ours, hash_algorithm="builtin", chain_root="7")
+    mismatches = ours.describe_mismatch(theirs)
+    assert len(mismatches) == 2
+    assert any("hash_algorithm" in item for item in mismatches)
+    assert any("chain_root" in item for item in mismatches)
+    assert ours.describe_mismatch(ours) == []
+    # And a descriptor survives the round trip it is stored through.
+    assert RawBlockDerivationDescriptor.from_payload(ours.as_payload()) == ours
+    assert RawBlockDerivationDescriptor.from_payload(None) is None
+    assert RawBlockDerivationDescriptor.from_payload({"hash_algorithm": "x"}) is None
+
+
+def test_the_hash_seed_is_compared_only_where_it_can_reach_a_key() -> None:
+    """Comparing the seed unconditionally invents an availability failure.
+
+    A cryptographic hash does not consult the process seed, and neither does
+    the interpreter's for a key of integers: measured on this interpreter,
+    ``hash((0, (1, 2, 3), ()))`` is identical under seeds 0, 12345 and 99.
+    Refusing a namespace two nodes derive identically is a failure the check
+    would have created rather than found.
+    """
+    cryptographic = make_test_derivation()
+    other_seed = replace(cryptographic, hash_seed="12345")
+    assert "hash_seed" not in cryptographic.compared_fields(other_seed)
+    assert cryptographic.describe_mismatch(other_seed) == []
+
+    # The interpreter's own hash is the one case where a seed can reach a
+    # key, through a string, so there it is compared.
+    interpreter = replace(
+        cryptographic,
+        hash_algorithm="builtin",
+        hash_implementation="builtins.hash",
+    )
+    interpreter_other_seed = replace(interpreter, hash_seed="12345")
+    assert "hash_seed" in interpreter.compared_fields(interpreter_other_seed)
+    assert any(
+        "hash_seed" in item
+        for item in interpreter.describe_mismatch(interpreter_other_seed)
+    )
+    # And either side naming it is enough to bring the seed into the
+    # comparison, since one of them is hashing that way.
+    assert "hash_seed" in cryptographic.compared_fields(interpreter)
+
+
+@requires_rust_raw_block_io
+@pytest.mark.skipif(sys.platform != "linux", reason="raw-block is Linux only")
+def test_a_core_refuses_a_device_keyed_in_another_namespace(tmp_path):
+    """A namespace mismatch recycled live data, and both answers were unsafe.
+
+    A slot identity is derived from the encoded key and the namespace, so a
+    core reading with a different namespace computes a different identity for
+    every entry, reads each header as stale, drops the entry and returns its
+    extent. The next allocation then lands on live data the other core's
+    checkpoint still advertises -- measured, at exactly the same offset.
+
+    Ignoring the metadata instead is no safer: the slot counter stays at zero
+    and allocation starts from the bottom of the same region.
+    """
+    path = make_raw_block_file(tmp_path)
+    writer = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    try:
+        spec = encode_object_key(make_object_key(0))
+        assert writer.put_many([spec], [make_memory_obj(b"live")]).results == [True]
+        writer.checkpoint_now()
+        occupied = int(writer._index[spec.encoded].offset)
+    finally:
+        writer.close()
+
+    with pytest.raises(IncompatibleKeyDerivation, match="keyed in namespace"):
+        RawBlockCore(make_raw_block_core_config(path), key_namespace="legacy")
+
+    # And the namespace it does belong to still opens and still holds it.
+    reopened = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    try:
+        assert reopened.contains_key(spec.encoded)
+        assert int(reopened._index[spec.encoded].offset) == occupied
+    finally:
+        reopened.close()

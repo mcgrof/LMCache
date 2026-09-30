@@ -173,6 +173,107 @@ def _resolve_sysfs_queue_dir(device_path: str) -> Optional[str]:
 _LOCAL_BLOCK_IDENTITY_PREFIX = "block-local:"
 
 
+# Bumped when the bytes of a key, or the way one is derived, change in a way
+# that makes an older namespace unreadable. It is part of the descriptor
+# rather than implied by the metadata version because two writers can agree
+# on every geometry field and still derive different keys.
+KEY_CODEC_VERSION = 1
+
+
+@dataclass(frozen=True)
+class RawBlockDerivationDescriptor:
+    """How the keys in a namespace were derived.
+
+    Two writers can agree on every geometry field in a checkpoint and still
+    produce different keys: a different hash function, a different seed, a
+    different chain root or a different key encoding all change the bytes
+    while leaving the layout identical. A reader that adopts such a namespace
+    does not fail loudly -- it misses every key, which looks like a cold
+    cache.
+
+    So this travels with the namespace and is compared before adoption. It is
+    deliberately not part of the geometry checks: those treat a mismatch as
+    "ignore this metadata and start empty", and starting empty is exactly the
+    wrong response to a namespace someone else is writing with a different
+    derivation.
+    """
+
+    hash_algorithm: str
+    hash_implementation: str
+    hash_seed: str
+    chain_root: str
+    key_codec_version: int = KEY_CODEC_VERSION
+    key_namespace: str = ""
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "hash_algorithm": self.hash_algorithm,
+            "hash_implementation": self.hash_implementation,
+            "hash_seed": self.hash_seed,
+            "chain_root": self.chain_root,
+            "key_codec_version": int(self.key_codec_version),
+            "key_namespace": self.key_namespace,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> Optional["RawBlockDerivationDescriptor"]:
+        if not isinstance(payload, dict):
+            return None
+        try:
+            return cls(
+                hash_algorithm=str(payload["hash_algorithm"]),
+                hash_implementation=str(payload["hash_implementation"]),
+                hash_seed=str(payload["hash_seed"]),
+                chain_root=str(payload["chain_root"]),
+                key_codec_version=int(payload["key_codec_version"]),
+                key_namespace=str(payload.get("key_namespace", "")),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def uses_the_interpreter_hash(self) -> bool:
+        """Whether keys are hashed by the interpreter's own ``hash``.
+
+        That is the only case in which the process hash seed can reach a key,
+        and then only through a string: measured on this interpreter,
+        ``hash((0, (1, 2, 3), ()))`` is identical under seeds 0, 12345 and
+        99, while the same tuple carrying a string differs under each.
+        """
+        return "builtin" in self.hash_implementation.lower()
+
+    def compared_fields(self, other: "RawBlockDerivationDescriptor") -> tuple[str, ...]:
+        """Which fields have to agree for two engines to read one namespace.
+
+        The seed is recorded always and compared only where it can matter.
+        Comparing it unconditionally refuses a namespace two nodes derive
+        identically, which is an availability failure invented by the check
+        rather than found by it: a cryptographic hash does not consult the
+        seed, and neither does the interpreter's for a key of integers.
+        """
+        fields = [
+            "hash_algorithm",
+            "hash_implementation",
+            "chain_root",
+            "key_codec_version",
+            "key_namespace",
+        ]
+        if self.uses_the_interpreter_hash() or other.uses_the_interpreter_hash():
+            fields.append("hash_seed")
+        return tuple(fields)
+
+    def describe_mismatch(self, other: "RawBlockDerivationDescriptor") -> list[str]:
+        """Name every field on which two derivations disagree."""
+        return [
+            f"{field}: ours={getattr(self, field)!r} theirs={getattr(other, field)!r}"
+            for field in self.compared_fields(other)
+            if getattr(self, field) != getattr(other, field)
+        ]
+
+
+class IncompatibleKeyDerivation(RuntimeError):
+    """A namespace's keys were derived in a way this engine cannot reproduce."""
+
+
 def namespace_identity_is_shareable(identity: str) -> bool:
     """Return whether an identity names the same namespace on another node."""
     return bool(identity) and not identity.startswith(_LOCAL_BLOCK_IDENTITY_PREFIX)
@@ -350,6 +451,11 @@ class RawBlockCoreConfig:
     # verifies that, so two nodes given the same string for different
     # devices will read each other's receipts as their own.
     namespace_identity: str = ""
+    # How this engine derives its keys. Required where a namespace is shared,
+    # because two engines agreeing on every field above can still derive
+    # different keys and read nothing of each other's. Absent elsewhere, and
+    # nothing is compared then.
+    derivation: Optional[RawBlockDerivationDescriptor] = None
 
 
 @dataclass
@@ -474,6 +580,12 @@ class RawBlockCore:
         # ``close()`` return without draining or unregistering, and the point
         # is to hold resources rather than release them.
         self._poisoned = False
+        # Supplied by whoever knows the token database's effective settings.
+        # Absent outside the strict shared-storage lane, where nothing else
+        # is reading these keys.
+        self._derivation: Optional[RawBlockDerivationDescriptor] = getattr(
+            config, "derivation", None
+        )
         configured_namespace = str(getattr(config, "namespace_identity", "") or "")
         self.namespace_identity = configured_namespace or _resolve_namespace_identity(
             self.device_path
@@ -1517,6 +1629,12 @@ class RawBlockCore:
                 raise RuntimeError(
                     "published checkpoint is missing request manifest metadata"
                 )
+            if self._derivation is None:
+                raise IncompatibleKeyDerivation(
+                    "raw-block storage P/D publishes keys for another engine "
+                    "to read, so it must state how they were derived; "
+                    "configure the key derivation descriptor"
+                )
             if not namespace_identity_is_shareable(self.namespace_identity):
                 raise ValueError(
                     "raw-block storage P/D requires a persistent block "
@@ -2382,6 +2500,60 @@ class RawBlockCore:
             if ok
         )
 
+    def _require_matching_key_namespace(self, theirs: Any) -> None:
+        """Refuse a device whose entries were keyed in another namespace.
+
+        A slot identity is derived from the encoded key and the namespace, so
+        a core reading with a different namespace computes a different
+        identity for every entry and header validation reads each one as
+        stale. It then drops the entry and returns the extent -- and the next
+        allocation lands on live data the other core's checkpoint still
+        advertises. Measured on a temp-file device: the first allocation came
+        back at exactly the offset the other core had just written.
+
+        Ignoring the metadata instead is no safer: that leaves the slot
+        counter at zero and allocates from the bottom of the same region.
+        """
+        if theirs is None:
+            # Written before this field existed. Nothing can be concluded,
+            # and the geometry checks above have already accepted it, so this
+            # stays permissive rather than refusing every older device.
+            return
+        if str(theirs) == self.key_namespace:
+            return
+        raise IncompatibleKeyDerivation(
+            f"raw-block device {self.device_path} holds entries keyed in "
+            f"namespace {theirs!r} and this core keys in "
+            f"{self.key_namespace!r}. Every header would read as stale and "
+            "its extent would be recycled over live data; refusing instead."
+        )
+
+    def _require_compatible_derivation(self, payload: Any) -> None:
+        """Refuse a namespace whose keys this engine cannot reproduce.
+
+        Only the strict lane carries a descriptor. Where one is configured,
+        an absent descriptor on the device is as incompatible as a differing
+        one: it names a writer that made no statement about its derivation,
+        so nothing can be concluded about the keys already there.
+        """
+        if self._derivation is None:
+            return
+        theirs = RawBlockDerivationDescriptor.from_payload(payload)
+        if theirs is None:
+            raise IncompatibleKeyDerivation(
+                f"raw-block namespace {self.namespace_identity} carries no key "
+                "derivation descriptor, and this engine requires one. Its "
+                "existing keys cannot be shown to be readable here; refusing "
+                "rather than adding ours beside them."
+            )
+        mismatches = self._derivation.describe_mismatch(theirs)
+        if mismatches:
+            raise IncompatibleKeyDerivation(
+                f"raw-block namespace {self.namespace_identity} derives keys "
+                "differently from this engine, so neither can read the "
+                "other's: " + "; ".join(mismatches)
+            )
+
     def _adopt_native_poison(
         self,
         raw_dev: Any,
@@ -3077,6 +3249,13 @@ class RawBlockCore:
                 "meta_total_bytes": self.meta_total_bytes,
                 "meta_magic": self.meta_magic_text,
                 "meta_version": self.meta_version,
+                # The namespace these keys were derived in. A core reading
+                # this device with a different one computes a different slot
+                # identity for every entry, so it reads each header as stale.
+                "key_namespace": self.key_namespace,
+                "derivation": (
+                    self._derivation.as_payload() if self._derivation else None
+                ),
                 "data_base_offset": self._data_base_offset,
                 "next_slot": self._next_slot,
                 "entries": {
@@ -3333,6 +3512,15 @@ class RawBlockCore:
         if int(data.get("meta_version", self.meta_version)) != self.meta_version:
             logger.warning("Device metadata meta_version mismatch; ignoring metadata")
             return False
+
+        # Deliberately raises, not "return False". Every check above treats a
+        # mismatch as "ignore this metadata and start empty", which is right
+        # for a geometry this engine cannot read and wrong for both of these:
+        # a device someone else is writing with a different derivation is not
+        # empty, and starting empty means allocating over their live extents
+        # while their checkpoint still advertises them.
+        self._require_matching_key_namespace(data.get("key_namespace"))
+        self._require_compatible_derivation(data.get("derivation"))
 
         try:
             next_slot = int(data.get("next_slot", 0))

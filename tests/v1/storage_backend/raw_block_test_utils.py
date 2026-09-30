@@ -6,7 +6,7 @@ from __future__ import annotations
 # Standard
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TypeVar
+from typing import Optional, TypeVar
 import errno
 import importlib
 import os
@@ -27,7 +27,10 @@ from lmcache.v1.memory_management import (
     TensorMemoryObj,
 )
 from lmcache.v1.platform import consume_fd
-from lmcache.v1.storage_backend.raw_block import RawBlockCoreConfig
+from lmcache.v1.storage_backend.raw_block import (
+    RawBlockCoreConfig,
+    RawBlockDerivationDescriptor,
+)
 
 RAW_BLOCK_CI_CAPACITY_BYTES = 128 * 1024 * 1024
 RAW_BLOCK_CI_BLOCK_ALIGN = 4096
@@ -56,15 +59,36 @@ def make_raw_block_file(
     return path
 
 
+def make_test_derivation(
+    key_namespace: str = "object",
+) -> RawBlockDerivationDescriptor:
+    """A derivation descriptor for a test that publishes.
+
+    Publication states how the keys were derived, because a reader adopting a
+    namespace derived differently misses every key and reports a cold cache.
+    A test that publishes therefore has to say something here; what it says
+    only has to be consistent between the two sides it builds.
+    """
+    return RawBlockDerivationDescriptor(
+        hash_algorithm="sha256_cbor",
+        hash_implementation="tests.raw_block_test_utils.fixed",
+        hash_seed="0",
+        chain_root="0",
+        key_namespace=key_namespace,
+    )
+
+
 def make_raw_block_core_config(
     path: Path,
     capacity_bytes: int = RAW_BLOCK_CI_CAPACITY_BYTES,
+    derivation: Optional[RawBlockDerivationDescriptor] = None,
 ) -> RawBlockCoreConfig:
     """Build a small POSIX raw block core config for temp-file tests.
 
     Args:
         path: Backing file path for the raw block device.
         capacity_bytes: Total capacity exposed by the raw block test file.
+        derivation: How this core derives keys. Required to publish.
 
     Returns:
         Raw block core configuration using CI-safe defaults.
@@ -86,6 +110,7 @@ def make_raw_block_core_config(
         meta_verify_on_load=True,
         io_engine="posix",
         iouring_queue_depth=8,
+        derivation=derivation,
     )
 
 

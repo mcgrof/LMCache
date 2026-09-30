@@ -6,8 +6,10 @@ from __future__ import annotations
 # Standard
 from collections.abc import Mapping
 from concurrent.futures import CancelledError
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
+import os
 import threading
 import time
 
@@ -21,6 +23,7 @@ from lmcache.v1.storage_backend.raw_block import (
     DEFAULT_IOURING_QUEUE_DEPTH,
     RawBlockCore,
     RawBlockCoreConfig,
+    RawBlockDerivationDescriptor,
     RawBlockKeySpec,
     RawBlockPDRequestTracker,
     RawBlockPublicationReceipt,
@@ -279,10 +282,16 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                     "arena; set rust_raw_block.gpu_buffer_bytes"
                 )
 
-        self._core = RawBlockCore(
-            self._build_core_config(extra),
-            key_namespace="legacy",
-        )
+        core_config = self._build_core_config(extra)
+        if self._storage_pd_mode:
+            # Derived rather than configured: it is a fact about how this
+            # deployment hashes, not a knob, and a knob would let the two
+            # sides of a handoff disagree with the engines they describe.
+            core_config = replace(
+                core_config,
+                derivation=self._observed_key_derivation("legacy"),
+            )
+        self._core = RawBlockCore(core_config, key_namespace="legacy")
         # A GPU staging pool makes the device the endpoint of every raw-block
         # read and write: the engine registers the pool's slots with io_uring
         # as dma-bufs exported from device memory, stores go out of the
@@ -1064,12 +1073,10 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         memory_obj: MemoryObj,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]],
     ) -> None:
+        pending = [(key, spec, memory_obj)]
+        io_task, io_finished = self._start_put_many([spec], [memory_obj])
         try:
-            put_result = await asyncio.to_thread(
-                self._core.put_many,
-                [spec],
-                [memory_obj],
-            )
+            put_result = await asyncio.shield(io_task)
             if not put_result.results or not put_result.results[0]:
                 raise RuntimeError(f"Failed to persist raw-block key {spec.encoded}")
             if self._publish_after_put:
@@ -1080,12 +1087,12 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                 except Exception as e:
                     logger.warning("on_complete_callback failed for key %s: %s", key, e)
         finally:
-            if self._native_outcome_is_unknown():
-                self._quarantined_objs.append(memory_obj)
-            else:
-                memory_obj.ref_count_down()
             with self._put_lock:
                 self._put_tasks.discard(key)
+            # The same question as the batched paths: a cancelled await has
+            # not stopped the thread, so the buffer is not this coroutine's
+            # to release until it has.
+            self._settle_put_owners(pending, io_task, io_finished)
 
     async def _submit_put_many(
         self,
@@ -1142,6 +1149,45 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                 for key, _spec, _obj in pending:
                     self._put_tasks.discard(key)
             self._settle_put_owners(pending, io_task, io_finished)
+
+    def _observed_key_derivation(
+        self, key_namespace: str
+    ) -> RawBlockDerivationDescriptor:
+        """Read this process's actual key derivation, not its intent.
+
+        The configured algorithm is what was asked for; the token database's
+        resolved function and chain root are what the keys are actually built
+        from, and the two differ when a named algorithm silently falls back.
+        Recording the request rather than the result would put a descriptor
+        on the device that does not describe it.
+        """
+        # First Party
+        from lmcache.v1 import token_database as token_database_module
+
+        requested = str(getattr(self.config, "pre_caching_hash_algorithm", "") or "")
+        implementation = "unresolved"
+        try:
+            database = token_database_module.ChunkedTokenDatabase(
+                self.config, self.metadata
+            )
+            resolved = getattr(database, "hash_func", None)
+            implementation = (
+                f"{getattr(resolved, '__module__', '?')}."
+                f"{getattr(resolved, '__name__', repr(resolved))}"
+            )
+        except Exception:
+            logger.warning(
+                "Raw-block storage P/D could not resolve the effective hash "
+                "function; recording it as unresolved, which will not match "
+                "an engine that did resolve one"
+            )
+        return RawBlockDerivationDescriptor(
+            hash_algorithm=requested,
+            hash_implementation=implementation,
+            hash_seed=str(os.environ.get("PYTHONHASHSEED", "")),
+            chain_root=str(token_database_module.NONE_HASH),
+            key_namespace=key_namespace,
+        )
 
     def _build_ack_receiver(
         self, extra: Mapping[str, Any]
