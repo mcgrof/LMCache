@@ -101,6 +101,19 @@ class ReadClaimOutcome:
     final: bool = False
 
 
+@dataclass(frozen=True)
+class UnreadReleaseOutcome:
+    """A writer's answer to being told one publication has no reader.
+
+    ``released`` is returned only after the release returned, so a caller
+    may treat it as proof the hold is gone and may treat nothing else that
+    way.
+    """
+
+    released: bool
+    reason: str = ""
+
+
 @dataclass
 class _Lease:
     """Extents held for one published request until it is acknowledged.
@@ -751,6 +764,95 @@ class RawBlockPDRequestTracker:
             identity.consumer_instance_id,
         )
         return ReadAckOutcome.APPLIED
+
+    def release_unread(
+        self,
+        req_id: str,
+        receipt: "RawBlockPublicationReceipt",
+        *,
+        expected_writer_epoch: str,
+        reason: str = "",
+    ) -> UnreadReleaseOutcome:
+        """Release a publication that was never handed to a reader.
+
+        Some requests are answered without a decoder: the caller asked for
+        one token, or the producer stopped on its own. The publication is
+        real and durable, and no consumer is ever going to read it, so
+        nothing would acknowledge it and the hold would stand for the life
+        of this writer -- until the admission bound stopped it publishing
+        at all.
+
+        This is the terminal release for exactly that case, and it is the
+        writer's: the party that knows no reader was assigned asks, and this
+        writer checks the one thing that makes the request safe to honour.
+        A publication some consumer claimed is refused, because a claim is a
+        consumer saying it is about to read those extents. Nothing here
+        fabricates an acknowledgement for a read that did not happen.
+        """
+        with self._lock:
+            if not expected_writer_epoch:
+                return UnreadReleaseOutcome(False, "this engine published nothing")
+            if receipt.writer_epoch != expected_writer_epoch:
+                logger.error(
+                    "Raw-block P/D was told %s has no reader, but it names "
+                    "producer %s and this writer is %s; releasing nothing",
+                    req_id,
+                    receipt.writer_epoch,
+                    expected_writer_epoch,
+                )
+                return UnreadReleaseOutcome(False, "this names another producer")
+            lease = self._leases.get(req_id)
+            if lease is None:
+                if req_id in self._released:
+                    return UnreadReleaseOutcome(False, "already released")
+                return UnreadReleaseOutcome(
+                    False, "this writer holds no such publication"
+                )
+            held = lease.receipt
+            if (
+                held.writer_epoch != receipt.writer_epoch
+                or held.checkpoint_seq != receipt.checkpoint_seq
+                or held.manifest_digest != receipt.manifest_digest
+            ):
+                return UnreadReleaseOutcome(
+                    False, "this writer published a different manifest"
+                )
+            if lease.claimed_by:
+                # A consumer said it was about to read these extents. Only
+                # that consumer's acknowledgement releases them, whatever
+                # anyone else believes about who was assigned the read.
+                logger.error(
+                    "Raw-block P/D was told %s has no reader, but %s claimed "
+                    "the read; releasing nothing",
+                    req_id,
+                    lease.claimed_by,
+                )
+                return UnreadReleaseOutcome(False, "a consumer claimed this read")
+            if lease.unlock_ran:
+                return UnreadReleaseOutcome(
+                    False, "a release for this did not report back"
+                )
+            lease.unlock_ran = True
+            encoded_keys = list(lease.encoded_keys)
+
+        try:
+            self._core.unlock_many(encoded_keys)
+        except Exception:
+            logger.exception(
+                "Raw-block P/D could not release the unread extents for %s",
+                req_id,
+            )
+            return UnreadReleaseOutcome(False, "the release did not return")
+
+        with self._lock:
+            self._leases.pop(req_id, None)
+        logger.info(
+            "Raw-block P/D released %d unread extent(s) for request %s%s",
+            len(encoded_keys),
+            req_id,
+            f": {reason}" if reason else "",
+        )
+        return UnreadReleaseOutcome(True, "")
 
     def live_lease_count(self) -> int:
         """Count leases still protecting extents from reuse."""

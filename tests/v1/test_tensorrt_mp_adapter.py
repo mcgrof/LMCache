@@ -76,8 +76,8 @@ def test_failed_retrieve_waits_for_device_result_and_fails_closed(
     event.ipc_handle.return_value = b"producer-event"
     event_backend = MagicMock(name="event_backend")
     event_backend.create_event.return_value = event
-    event_backend.export_event.side_effect = (
-        lambda exported_event, device: exported_event.ipc_handle()
+    event_backend.export_event.side_effect = lambda exported_event, device: (
+        exported_event.ipc_handle()
     )
     worker._event_backend = event_backend
 
@@ -119,8 +119,8 @@ def test_store_wait_retains_event_on_raw_future(
     event.ipc_handle.return_value = b"producer-event"
     event_backend = MagicMock(name="event_backend")
     event_backend.create_event.return_value = event
-    event_backend.export_event.side_effect = (
-        lambda exported_event, device: exported_event.ipc_handle()
+    event_backend.export_event.side_effect = lambda exported_event, device: (
+        exported_event.ipc_handle()
     )
     worker._event_backend = event_backend
 

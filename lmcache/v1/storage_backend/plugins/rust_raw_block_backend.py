@@ -43,6 +43,8 @@ from lmcache.v1.storage_backend.storage_pd_ack import (
     StoragePDAckServer,
     StoragePDClaimAnswer,
     StoragePDClaimRequest,
+    StoragePDUnreadAnswer,
+    StoragePDUnreadRequest,
 )
 
 if TYPE_CHECKING:
@@ -1272,6 +1274,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             server = StoragePDAckServer(
                 self._answer_read_ack,
                 claim_handler=self._answer_read_claim,
+                unread_handler=self._answer_unread_publication,
                 bind_host=host,
                 port=port,
                 advertise_host=advertise,
@@ -1331,6 +1334,61 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             outcome.reason,
         )
         return StoragePDClaimAnswer(outcome.granted, outcome.reason, outcome.final)
+
+    def _answer_unread_publication(
+        self, request: StoragePDUnreadRequest
+    ) -> StoragePDUnreadAnswer:
+        """Resolve a publication the caller says was never given a reader.
+
+        Everything in the request came off a network. What makes it safe to
+        honour is checked here rather than trusted: the tracker releases
+        nothing a consumer claimed, so a caller that is wrong about the
+        reader assignment cannot reclaim an extent somebody is reading.
+        """
+        if self._pd_tracker is None:
+            return StoragePDUnreadAnswer(False, "this engine holds no publications")
+        status = request.status
+        if self._pd_session_id and request.session_id != self._pd_session_id:
+            return StoragePDUnreadAnswer(
+                False, "this names another producer/consumer session"
+            )
+        if status.tp_rank != self._ack_tp_rank:
+            return StoragePDUnreadAnswer(
+                False, "this names another tensor-parallel rank"
+            )
+        try:
+            receipt = status.publication_receipt()
+        except ValueError as exc:
+            return StoragePDUnreadAnswer(False, str(exc))
+        outcome = self._pd_tracker.release_unread(
+            status.req_id,
+            receipt,
+            expected_writer_epoch=self._core.writer_epoch,
+            reason=request.reason,
+        )
+        return StoragePDUnreadAnswer(outcome.released, outcome.reason)
+
+    def release_unread_publication(
+        self,
+        req_id: str,
+        receipt: RawBlockPublicationReceipt,
+        *,
+        reason: str = "",
+    ) -> bool:
+        """Resolve one of this engine's own publications that has no reader.
+
+        For the configuration that runs without a consumer at all: nobody
+        was ever told about these publications, so nothing will acknowledge
+        them, and this engine can say so about itself.
+        """
+        if self._pd_tracker is None:
+            return False
+        return self._pd_tracker.release_unread(
+            req_id,
+            receipt,
+            expected_writer_epoch=self._core.writer_epoch,
+            reason=reason,
+        ).released
 
     def _answer_read_ack(self, request: StoragePDAckRequest) -> tuple[str, str]:
         """Apply one acknowledgement and say what happened.

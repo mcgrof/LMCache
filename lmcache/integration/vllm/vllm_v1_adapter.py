@@ -1072,6 +1072,34 @@ class LMCacheConnectorV1Impl:
             )
         return status, published_tokens
 
+    def _release_unread_storage_pd(
+        self,
+        req_id: str,
+        status: StoragePDStatus,
+    ) -> None:
+        """Resolve a publication this worker is not telling anyone about."""
+        if status.state != "READY" or self.lmcache_engine is None:
+            return
+        try:
+            released = self.lmcache_engine.release_unread_storage_publication(
+                status.req_id,
+                status.publication_receipt(),
+                reason="no consumer is configured for this writer",
+            )
+        except Exception:
+            logger.exception(
+                "Raw-block storage P/D could not resolve the unread "
+                "publication for request %s; its extents stay held",
+                req_id,
+            )
+            return
+        if not released:
+            logger.error(
+                "Raw-block storage P/D did not release the unread "
+                "publication for request %s; its extents stay held",
+                req_id,
+            )
+
     def _claim_storage_pd_read(self, status: StoragePDStatus) -> None:
         """Take room to acknowledge, then ask the producer to be its reader.
 
@@ -1920,7 +1948,12 @@ class LMCacheConnectorV1Impl:
                     "consumer"
                 )
             # Configured to run without a consumer: there is nobody to tell,
-            # so the request is done as soon as its bytes are durable.
+            # so the request is done as soon as its bytes are durable -- and
+            # nothing is ever going to acknowledge the publication, so the
+            # writer resolves its own hold rather than keeping it until the
+            # admission bound stops it publishing at all.
+            for req_id, status in pending_sends:
+                self._release_unread_storage_pd(req_id, status)
             with self._storage_pd_lock:
                 for req_id, _ in pending_sends:
                     releasable.add(req_id)

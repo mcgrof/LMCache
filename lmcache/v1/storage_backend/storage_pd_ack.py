@@ -53,7 +53,10 @@ import zmq
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.rpc_utils import get_zmq_context, get_zmq_socket
-from lmcache.v1.storage_backend.storage_pd_protocol import StoragePDReadAck
+from lmcache.v1.storage_backend.storage_pd_protocol import (
+    StoragePDReadAck,
+    StoragePDStatus,
+)
 
 logger = init_logger(__name__)
 
@@ -98,6 +101,13 @@ class StoragePDClaimAnswer(NamedTuple):
     final: bool = False
 
 
+class StoragePDUnreadAnswer(NamedTuple):
+    """What a writer decides about a publication reported to have no reader."""
+
+    released: bool
+    reason: str = ""
+
+
 class StoragePDClaimRequest(msgspec.Struct, tag=True):
     """A consumer asking to become the reader of one publication.
 
@@ -133,6 +143,33 @@ class StoragePDClaimReply(msgspec.Struct, tag=True):
     final: bool = False
 
 
+class StoragePDUnreadRequest(msgspec.Struct, tag=True):
+    """Telling a writer one of its publications will never be read.
+
+    Some requests are answered without a decoder, so nothing will ever
+    acknowledge the publication and the writer would hold its extents for
+    its own lifetime. The party that knows no reader was assigned says so;
+    ``status`` is the READY it was told about, forwarded unchanged, so the
+    writer matches against what it published rather than against anything
+    reconstructed on the way.
+    """
+
+    status: StoragePDStatus
+    session_id: str
+    nonce: str
+    reason: str = ""
+
+
+class StoragePDUnreadReply(msgspec.Struct, tag=True):
+    """Whether the writer released a publication nobody will read."""
+
+    released: bool
+    req_id: str
+    writer_epoch: str
+    nonce: str
+    reason: str = ""
+
+
 class StoragePDAckReply(msgspec.Struct, tag=True):
     """A writer's answer, sent only after it has acted.
 
@@ -154,6 +191,8 @@ StoragePDAckWire = (
     | StoragePDAckReply
     | StoragePDClaimRequest
     | StoragePDClaimReply
+    | StoragePDUnreadRequest
+    | StoragePDUnreadReply
 )
 
 
@@ -178,6 +217,7 @@ class StoragePDAckServer:
         handler: Callable[[StoragePDAckRequest], tuple[str, str]],
         *,
         claim_handler: Callable[[StoragePDClaimRequest], StoragePDClaimAnswer],
+        unread_handler: Callable[[StoragePDUnreadRequest], StoragePDUnreadAnswer],
         bind_host: str,
         port: int,
         advertise_host: str = "",
@@ -198,6 +238,7 @@ class StoragePDAckServer:
             )
         self._handler = handler
         self._claim_handler = claim_handler
+        self._unread_handler = unread_handler
         self.endpoint = f"{advertised}:{port}"
         self.bind_endpoint = f"{bind_host}:{port}"
         context = get_zmq_context(use_asyncio=False)
@@ -285,6 +326,9 @@ class StoragePDAckServer:
         if isinstance(message, StoragePDClaimRequest):
             self._answer_claim(message)
             return
+        if isinstance(message, StoragePDUnreadRequest):
+            self._answer_unread(message)
+            return
         if not isinstance(message, StoragePDAckRequest):
             self._send(
                 StoragePDAckReply(
@@ -348,7 +392,32 @@ class StoragePDAckServer:
             )
         )
 
-    def _send(self, reply: StoragePDAckReply | StoragePDClaimReply) -> None:
+    def _answer_unread(self, message: StoragePDUnreadRequest) -> None:
+        """Answer one unread-publication report, releasing nothing on doubt."""
+        try:
+            answer = self._unread_handler(message)
+        except Exception:
+            logger.exception(
+                "Storage P/D could not resolve the unread publication %s",
+                message.status.req_id,
+            )
+            answer = StoragePDUnreadAnswer(
+                False, "the writer could not resolve the publication"
+            )
+        self._send(
+            StoragePDUnreadReply(
+                released=answer.released,
+                req_id=message.status.req_id,
+                writer_epoch=message.status.writer_epoch,
+                nonce=message.nonce,
+                reason=answer.reason,
+            )
+        )
+
+    def _send(
+        self,
+        reply: StoragePDAckReply | StoragePDClaimReply | StoragePDUnreadReply,
+    ) -> None:
         try:
             self._socket.send(msgspec.msgpack.encode(reply))
         except zmq.ZMQError:

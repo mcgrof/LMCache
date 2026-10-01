@@ -39,6 +39,8 @@ from lmcache.v1.storage_backend.storage_pd_ack import (
     StoragePDAckServer,
     StoragePDClaimAnswer,
     StoragePDClaimRequest,
+    StoragePDUnreadAnswer,
+    StoragePDUnreadRequest,
 )
 from lmcache.v1.storage_backend.storage_pd_protocol import StoragePDReadAck
 
@@ -72,6 +74,7 @@ class _Writer:
         self.applied: list[str] = []
         self.seen: list[StoragePDAckRequest] = []
         self.claims: list[StoragePDClaimRequest] = []
+        self.unread_reports: list[StoragePDUnreadRequest] = []
         self.lock = threading.Lock()
         self.reply_after_apply = True
         self.raise_in_handler = False
@@ -93,6 +96,18 @@ class _Writer:
             if self.held.get(request.read.req_id, 0) <= 0:
                 return StoragePDClaimAnswer(False, "no such publication")
             return StoragePDClaimAnswer(True)
+
+    def unread(self, request: StoragePDUnreadRequest) -> StoragePDUnreadAnswer:
+        """Release a publication nothing claimed."""
+        with self.lock:
+            self.unread_reports.append(request)
+            req_id = request.status.req_id
+            if self.held.get(req_id, 0) <= 0:
+                return StoragePDUnreadAnswer(False, "no such publication")
+            if any(claim.read.req_id == req_id for claim in self.claims):
+                return StoragePDUnreadAnswer(False, "a consumer claimed this read")
+            self.held[req_id] -= 1
+            return StoragePDUnreadAnswer(True)
 
     def handle(self, request: StoragePDAckRequest) -> tuple[str, str]:
         with self.lock:
@@ -134,6 +149,7 @@ def server(writer):
     instance = StoragePDAckServer(
         writer.handle,
         claim_handler=writer.claim,
+        unread_handler=writer.unread,
         bind_host=LOOPBACK,
         port=port,
         advertise_host=LOOPBACK,
@@ -268,6 +284,7 @@ def test_a_writer_that_arrives_late_is_still_reached(client, writer):
     server = StoragePDAckServer(
         writer.handle,
         claim_handler=writer.claim,
+        unread_handler=writer.unread,
         bind_host=LOOPBACK,
         port=port,
         advertise_host=LOOPBACK,
@@ -382,6 +399,7 @@ def test_saturation_refuses_new_work_and_recovers_without_a_next_request(
     server = StoragePDAckServer(
         writer.handle,
         claim_handler=writer.claim,
+        unread_handler=writer.unread,
         bind_host=LOOPBACK,
         port=port,
         advertise_host=LOOPBACK,
@@ -442,6 +460,7 @@ def test_an_advertised_wildcard_is_refused(writer):
         StoragePDAckServer(
             writer.handle,
             claim_handler=writer.claim,
+            unread_handler=writer.unread,
             bind_host="0.0.0.0",
             port=_free_port(),
         )
@@ -644,6 +663,7 @@ def test_a_claim_handler_that_raised_grants_nothing(writer, client):
     server = StoragePDAckServer(
         writer.handle,
         claim_handler=explode,
+        unread_handler=writer.unread,
         bind_host=LOOPBACK,
         port=port,
         advertise_host=LOOPBACK,

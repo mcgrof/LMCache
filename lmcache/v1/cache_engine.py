@@ -1260,6 +1260,44 @@ class LMCacheEngine:
                 # touch_cache is tightly coupled with batched_contains
                 self.storage_manager.touch_cache()
 
+    def release_unread_storage_publication(
+        self,
+        req_id: str,
+        receipt: RawBlockPublicationReceipt,
+        *,
+        reason: str = "",
+    ) -> bool:
+        """Resolve one published request that will never be read.
+
+        For the configuration that runs without a consumer: nothing was
+        ever told about these publications, so nothing will acknowledge
+        them, and the extents would stay held until the writer stopped
+        publishing altogether. The backend still refuses to release a
+        publication some consumer claimed.
+
+        Args:
+            req_id: The request name the publication was announced under.
+            receipt: Durable publication identity to match against.
+            reason: Why no reader was assigned, for the writer's log.
+
+        Returns:
+            Whether the hold was released.
+        """
+        if self.storage_manager is None:
+            raise RuntimeError("storage P/D requires a storage manager")
+        backends = [
+            backend
+            for backend in self.storage_manager.storage_backends.values()
+            if callable(getattr(backend, "release_unread_publication", None))
+        ]
+        if len(backends) != 1:
+            raise RuntimeError(
+                "storage P/D requires exactly one publication-aware backend"
+            )
+        return cast(Any, backends[0]).release_unread_publication(
+            req_id, receipt, reason=reason
+        )
+
     def adopt_storage_publication(
         self,
         tokens: Union[torch.Tensor, List[int]],

@@ -29,6 +29,11 @@ from lmcache.v1.storage_backend.pd_backend import (
     ProxyNotif,
     StoragePDStatus,
 )
+from lmcache.v1.storage_backend.storage_pd_ack import (
+    StoragePDAckWire,
+    StoragePDUnreadReply,
+    StoragePDUnreadRequest,
+)
 from lmcache.v1.storage_backend.storage_pd_protocol import (
     order_storage_pd_ready_statuses,
 )
@@ -307,6 +312,17 @@ def parse_args():
         help="Require durable per-rank raw-block READY statuses before decode.",
     )
     parser.add_argument(
+        "--storage-pd-session",
+        type=str,
+        default=os.environ.get("LMCACHE_STORAGE_PD_SESSION", ""),
+        help=(
+            "The producer/consumer session identifier this deployment uses. "
+            "It must be the same string every participating engine was given "
+            "(LMCACHE_STORAGE_PD_SESSION), because a producer only answers "
+            "control messages naming its own session."
+        ),
+    )
+    parser.add_argument(
         "--storage-pd-ready-timeout-s",
         type=float,
         default=30.0,
@@ -349,6 +365,15 @@ def parse_args():
     args = parser.parse_args()
     if args.storage_pd_ready_timeout_s <= 0:
         parser.error("--storage-pd-ready-timeout-s must be positive")
+    if args.storage_pd and not args.storage_pd_session:
+        # Without it this proxy cannot resolve a publication nobody will
+        # read: the producer answers only for its own session, so the
+        # extents would stay held until the writer stopped publishing.
+        parser.error(
+            "--storage-pd needs --storage-pd-session (or "
+            "LMCACHE_STORAGE_PD_SESSION) set to the same value every "
+            "participating engine was given"
+        )
     return args
 
 
@@ -392,6 +417,74 @@ pd_buffer_semaphore: Optional[WeightedSemaphore] = None
 
 zmq_ctx = zmq.asyncio.Context()
 run_proxy = True  # Shutdown flag
+
+
+async def tell_producers_nobody_will_read(
+    statuses: list[StoragePDStatus],
+    *,
+    reason: str,
+    timeout_ms: int = 2000,
+) -> None:
+    """Tell each producer rank that its publication has no reader.
+
+    The publication is real and durable; what is missing is a decoder, so
+    nothing is ever going to acknowledge it and the producer would hold
+    those extents until its own admission bound stopped it publishing. This
+    proxy is the party that knows no reader was assigned, so it says so --
+    and nothing here fabricates a read acknowledgement, because no read
+    happened. The producer still refuses to release a publication some
+    consumer claimed, so being wrong about this costs nothing.
+
+    A failure is logged and nothing else: the extents stay held, which is
+    the same outcome as not asking.
+    """
+    for status in statuses:
+        if status.state != "READY" or not status.ack_endpoint:
+            continue
+        request = StoragePDUnreadRequest(
+            status=status,
+            session_id=global_args.storage_pd_session,
+            nonce=uuid.uuid4().hex,
+            reason=reason,
+        )
+        socket = zmq_ctx.socket(zmq.REQ)
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
+        try:
+            socket.connect(f"tcp://{status.ack_endpoint}")
+            await socket.send(msgspec.msgpack.encode(request))
+            raw = await socket.recv()
+            reply = msgspec.msgpack.decode(raw, type=StoragePDAckWire)
+            if not isinstance(reply, StoragePDUnreadReply):
+                logger.error(
+                    "Storage P/D got a %s answering for the unread publication %s",
+                    type(reply).__name__,
+                    status.req_id,
+                )
+            elif reply.nonce != request.nonce:
+                logger.error(
+                    "Storage P/D got an answer about %s while asking about "
+                    "%s; discarding it",
+                    reply.nonce,
+                    request.nonce,
+                )
+            elif not reply.released:
+                logger.error(
+                    "Storage P/D producer %s kept the unread publication %s: %s",
+                    status.ack_endpoint,
+                    status.req_id,
+                    reply.reason or "no reason given",
+                )
+        except (zmq.ZMQError, msgspec.DecodeError, msgspec.ValidationError):
+            logger.exception(
+                "Storage P/D could not tell %s that %s has no reader; its "
+                "extents stay held",
+                status.ack_endpoint,
+                status.req_id,
+            )
+        finally:
+            socket.close(linger=0)
 
 
 async def zmq_pull_server():
@@ -867,7 +960,18 @@ async def handle_completions(request: Request):
                 storage_pd=global_args.storage_pd,
                 deadline=handoff_deadline,
             )
-            if statuses:
+            if statuses and producer_only:
+                # No decoder is going to read these, so nothing would ever
+                # acknowledge them. Say so now, while the statuses that
+                # identify the publications are still in hand.
+                await tell_producers_nobody_will_read(
+                    statuses,
+                    reason=(
+                        "the producer's single token is the whole answer, so "
+                        "no decoder was assigned this publication"
+                    ),
+                )
+            elif statuses:
                 req_data["kv_transfer_params"] = {
                     "lmcache.storage_pd_request_id": req_id,
                     "lmcache.storage_pd_statuses": [
@@ -1031,7 +1135,18 @@ async def handle_chat_completions(request: Request):
                 storage_pd=global_args.storage_pd,
                 deadline=handoff_deadline,
             )
-            if statuses:
+            if statuses and producer_only:
+                # No decoder is going to read these, so nothing would ever
+                # acknowledge them. Say so now, while the statuses that
+                # identify the publications are still in hand.
+                await tell_producers_nobody_will_read(
+                    statuses,
+                    reason=(
+                        "the producer's single token is the whole answer, so "
+                        "no decoder was assigned this publication"
+                    ),
+                )
+            elif statuses:
                 req_data["kv_transfer_params"] = {
                     "lmcache.storage_pd_request_id": req_id,
                     "lmcache.storage_pd_statuses": [

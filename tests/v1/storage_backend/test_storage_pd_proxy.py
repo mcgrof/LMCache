@@ -2,6 +2,8 @@
 """Durable READY barrier tests for the disaggregated prefill proxy."""
 
 # Standard
+from types import SimpleNamespace
+import socket as socketlib
 import time
 
 # Third Party
@@ -10,7 +12,32 @@ import pytest
 # First Party
 from examples.disagg_prefill import disagg_proxy_server as proxy
 from lmcache.v1.storage_backend.raw_block import RawBlockPublicationReceipt
+from lmcache.v1.storage_backend.storage_pd_ack import (
+    StoragePDAckServer,
+    StoragePDClaimAnswer,
+    StoragePDUnreadAnswer,
+    StoragePDUnreadRequest,
+)
 from lmcache.v1.storage_backend.storage_pd_protocol import StoragePDStatus
+
+LOOPBACK = "127.0.0.1"
+
+
+def _free_port() -> int:
+    with socketlib.socket(socketlib.AF_INET, socketlib.SOCK_STREAM) as probe:
+        probe.bind((LOOPBACK, 0))
+        return int(probe.getsockname()[1])
+
+
+class _RecordingWriter:
+    """A writer that records what it was told and releases it."""
+
+    def __init__(self) -> None:
+        self.reports: list[StoragePDUnreadRequest] = []
+
+    def unread(self, request: StoragePDUnreadRequest) -> StoragePDUnreadAnswer:
+        self.reports.append(request)
+        return StoragePDUnreadAnswer(True)
 
 
 def _reset_proxy_state() -> None:
@@ -616,3 +643,72 @@ def test_a_producer_first_token_is_carried_into_the_prompt() -> None:
     )
     assert first == 77
     assert req["prompt"] == [1, 2, 3, 77]
+
+
+@pytest.mark.asyncio
+async def test_the_proxy_tells_every_rank_a_publication_has_no_reader(
+    monkeypatch,
+) -> None:
+    """A single-token answer leaves real publications nobody will read.
+
+    The proxy is the party that knows no decoder was assigned, and the only
+    one holding the statuses that identify the publications, so it is the
+    one that says so. The writer is still the one that decides.
+    """
+    port = _free_port()
+    writer = _RecordingWriter()
+    server = StoragePDAckServer(
+        lambda request: ("REJECTED", "no reads here"),
+        claim_handler=lambda request: StoragePDClaimAnswer(False, "no reads here"),
+        unread_handler=writer.unread,
+        bind_host=LOOPBACK,
+        port=port,
+        advertise_host=LOOPBACK,
+        recv_timeout_ms=50,
+    )
+    monkeypatch.setattr(
+        proxy,
+        "global_args",
+        SimpleNamespace(storage_pd_session="session-1"),
+        raising=False,
+    )
+    try:
+        receipt = RawBlockPublicationReceipt(
+            "writer-1", 3, 1, "digest", ack_endpoint=server.endpoint
+        )
+        statuses = [StoragePDStatus.ready("request-1", 0, receipt)]
+
+        await proxy.tell_producers_nobody_will_read(
+            statuses, reason="the producer's single token is the whole answer"
+        )
+    finally:
+        server.close(timeout_s=5.0)
+
+    assert len(writer.reports) == 1
+    report = writer.reports[0]
+    assert report.status == statuses[0]
+    assert report.session_id == "session-1"
+    assert "single token" in report.reason
+
+
+@pytest.mark.asyncio
+async def test_the_proxy_says_nothing_about_a_producer_with_no_endpoint(
+    monkeypatch,
+) -> None:
+    """A producer that advertised nowhere cannot be told anything.
+
+    Nothing could ever release that publication either way, and inventing a
+    destination would only log a failure that says nothing new.
+    """
+    receipt = RawBlockPublicationReceipt("writer-1", 3, 1, "digest")
+    monkeypatch.setattr(
+        proxy,
+        "global_args",
+        SimpleNamespace(storage_pd_session="session-1"),
+        raising=False,
+    )
+
+    # Returns rather than raising or blocking on a nonexistent peer.
+    await proxy.tell_producers_nobody_will_read(
+        [StoragePDStatus.ready("request-1", 0, receipt)], reason="no decoder"
+    )

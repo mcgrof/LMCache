@@ -32,6 +32,7 @@ from lmcache.v1.storage_backend.raw_block.pd import (
     ReadAckIdentity,
     ReadAckOutcome,
     ReadClaimOutcome,
+    UnreadReleaseOutcome,
 )
 
 __all__ = [
@@ -51,6 +52,7 @@ __all__ = [
     "ReadAckIdentity",
     "ReadAckOutcome",
     "ReadClaimOutcome",
+    "UnreadReleaseOutcome",
     "decode_legacy_key",
     "normalize_raw_block_placement_ids",
     "decode_object_key",

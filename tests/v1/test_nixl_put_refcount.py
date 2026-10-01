@@ -559,8 +559,8 @@ class TestWriteFailureCleanup:
         backend.agent.create_batched_storage_handler.side_effect = (
             fail_after_file_creation
         )
-        backend.agent.nixl_desc_exists.side_effect = (
-            lambda meta_info, path: os.path.exists(os.path.join(path, meta_info))
+        backend.agent.nixl_desc_exists.side_effect = lambda meta_info, path: (
+            os.path.exists(os.path.join(path, meta_info))
         )
 
         for method in (
@@ -728,8 +728,8 @@ class TestReadAndAcquisitionCleanup:
         handle = Mock()
         backend.agent.get_storage_to_mem_handle.return_value = handle
         release_ref_counts = []
-        backend.agent.release_handle.side_effect = (
-            lambda released_handle: release_ref_counts.append(obj.get_ref_count())
+        backend.agent.release_handle.side_effect = lambda released_handle: (
+            release_ref_counts.append(obj.get_ref_count())
         )
 
         if failure_stage == "handle":

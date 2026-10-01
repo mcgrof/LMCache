@@ -45,6 +45,8 @@ from lmcache.v1.storage_backend.storage_pd_ack import (
     StoragePDAckRequest,
     StoragePDClaimAnswer,
     StoragePDClaimRequest,
+    StoragePDUnreadAnswer,
+    StoragePDUnreadRequest,
 )
 from lmcache.v1.storage_backend.storage_pd_protocol import (
     STORAGE_PD_INCARNATION,
@@ -143,6 +145,22 @@ class _Producer:
                 read=ack,
                 session_id=session_id,
                 nonce=uuid.uuid4().hex,
+            )
+        )
+
+    def report_unread(
+        self,
+        status: StoragePDStatus,
+        *,
+        session_id: str = SESSION,
+    ) -> StoragePDUnreadAnswer:
+        """Tell the writer this publication was never given a reader."""
+        return self.backend._answer_unread_publication(
+            StoragePDUnreadRequest(
+                status=status,
+                session_id=session_id,
+                nonce=uuid.uuid4().hex,
+                reason="no decoder was assigned this publication",
             )
         )
 
@@ -340,4 +358,72 @@ def test_a_claim_under_another_session_is_not_this_writers_business(
     )
 
     assert not answer.granted
+    assert producer.tracker.live_lease_count() == 1
+
+
+def test_a_publication_nobody_was_given_can_be_resolved(producer) -> None:
+    """A request answered without a decoder still has to resolve its hold.
+
+    The caller asked for one token, or the producer stopped on its own.
+    Nothing is ever going to acknowledge the publication, so a writer that
+    only released on acknowledgements would hold those extents until its
+    own admission bound stopped it publishing at all.
+    """
+    status = producer.publish("request-1", ["key-1"])
+    assert producer.tracker.live_lease_count() == 1
+
+    answer = producer.report_unread(status)
+
+    assert answer.released
+    assert producer.tracker.live_lease_count() == 0
+    assert producer.core.locked == []
+
+
+def test_a_claimed_publication_is_not_resolved_as_unread(producer) -> None:
+    """A consumer that took the read is the only one who can release it.
+
+    Only that consumer's acknowledgement frees these extents, whatever
+    anybody else believes about who was assigned the read -- and a caller
+    that is wrong about the assignment must not reclaim an extent somebody
+    is reading.
+    """
+    status = producer.publish("request-1", ["key-1"])
+    ack = producer.read(status, STORAGE_PD_INCARNATION)
+
+    answer = producer.report_unread(status)
+
+    assert not answer.released
+    assert producer.tracker.live_lease_count() == 1
+    assert producer.core.locked == ["key-1"]
+    # And the real acknowledgement still works afterwards.
+    assert producer.answer(ack)[0] == ACK_APPLIED
+
+
+def test_an_unread_report_naming_another_producer_releases_nothing(
+    producer,
+) -> None:
+    """A report is matched against what this writer published, like an ack."""
+    status = producer.publish("request-1", ["key-1"])
+    other = _Producer()
+    try:
+        elsewhere = other.publish("request-1", ["key-1"])
+        answer = producer.report_unread(elsewhere)
+    finally:
+        other.close()
+
+    assert not answer.released
+    assert producer.tracker.live_lease_count() == 1
+    assert status.writer_epoch != elsewhere.writer_epoch
+
+
+def test_an_unread_report_for_a_different_manifest_releases_nothing(
+    producer,
+) -> None:
+    """Same writer, same rank, different publication."""
+    status = producer.publish("request-1", ["key-1"])
+    stale = msgspec.structs.replace(status, manifest_digest="not-what-was-published")
+
+    answer = producer.report_unread(stale)
+
+    assert not answer.released
     assert producer.tracker.live_lease_count() == 1
