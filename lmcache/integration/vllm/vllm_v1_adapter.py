@@ -963,15 +963,20 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_retriever)
                     self.layerwise_retrievers.append(layerwise_retriever)
             else:
-                ret_token_mask = self.lmcache_engine.retrieve(
-                    tokens[:lmcache_cached_tokens],
-                    token_mask[:lmcache_cached_tokens],
-                    kvcaches=kvcaches,
-                    slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                    vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
-                    request_configs=request.request_configs,
-                    req_id=request.req_id,
-                )
+                try:
+                    ret_token_mask = self.lmcache_engine.retrieve(
+                        tokens[:lmcache_cached_tokens],
+                        token_mask[:lmcache_cached_tokens],
+                        kvcaches=kvcaches,
+                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                        request_configs=request.request_configs,
+                        req_id=request.req_id,
+                    )
+                except BaseException:
+                    if adopted_publication is not None:
+                        self._release_storage_pd_ack_reservation(adopted_publication[0])
+                    raise
 
                 # Check the result
                 num_retrieved_tokens = ret_token_mask.sum().item()
@@ -979,6 +984,8 @@ class LMCacheConnectorV1Impl:
                     lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
                 )
                 if num_retrieved_tokens < num_expected_tokens:
+                    if adopted_publication is not None:
+                        self._release_storage_pd_ack_reservation(adopted_publication[0])
                     logger.error(
                         "Request %s"
                         "The number of retrieved tokens is less than the "
@@ -1012,6 +1019,7 @@ class LMCacheConnectorV1Impl:
                     if lmcache_cached_tokens < published_tokens or (
                         resident_tokens + restored_tokens < published_tokens
                     ):
+                        self._release_storage_pd_ack_reservation(status)
                         raise RuntimeError(
                             "storage P/D restore did not cover the advertised "
                             f"manifest for {request.req_id}: published_tokens="
@@ -1059,19 +1067,36 @@ class LMCacheConnectorV1Impl:
                 5000,
             )
         )
-        published_tokens = self.lmcache_engine.adopt_storage_publication(
-            request.token_ids,
-            status.publication_receipt(),
-            request_configs=request.request_configs,
-            timeout_ms=timeout_ms,
-            request_id=status.req_id,
-        )
-        if published_tokens is None:
-            raise RuntimeError(
-                "storage P/D reader could not adopt the advertised request "
-                f"manifest for {request.req_id} rank {self._storage_pd_tp_rank}"
+        try:
+            published_tokens = self.lmcache_engine.adopt_storage_publication(
+                request.token_ids,
+                status.publication_receipt(),
+                request_configs=request.request_configs,
+                timeout_ms=timeout_ms,
+                request_id=status.req_id,
             )
+            if published_tokens is None:
+                raise RuntimeError(
+                    "storage P/D reader could not adopt the advertised request "
+                    f"manifest for {request.req_id} rank {self._storage_pd_tp_rank}"
+                )
+        except BaseException:
+            self._release_storage_pd_ack_reservation(status)
+            raise
         return status, published_tokens
+
+    def _release_storage_pd_ack_reservation(self, status: StoragePDStatus) -> None:
+        """Return local acknowledgement capacity for an unfinished restore.
+
+        The writer's claim and extent hold remain live: a failed restore
+        establishes nothing about outstanding device reads. A later retry
+        must reserve acknowledgement capacity and claim the read again.
+        """
+        with self._storage_pd_lock:
+            claim = self._storage_pd_claims.pop(status.req_id, None)
+        if claim is not None:
+            _, reservation = claim
+            reservation.release()
 
     def _release_unread_storage_pd(
         self,
