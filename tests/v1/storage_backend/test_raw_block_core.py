@@ -46,6 +46,7 @@ from tests.v1.storage_backend.raw_block_test_utils import (
     make_object_key,
     make_raw_block_core_config,
     make_raw_block_file,
+    make_test_derivation,
     memory_obj_bytes,
 )
 import lmcache.v1.storage_backend.raw_block.core as raw_block_core
@@ -2563,3 +2564,65 @@ def test_raw_block_core_says_a_published_index_it_cannot_vouch_for(tmp_path):
         assert outcome.may_release_backing_resources is False
     finally:
         core.set_raw_device_for_testing(raw)
+
+
+def test_close_reports_no_final_checkpoint_when_it_wrote_none(tmp_path) -> None:
+    """A generation that was not written is not a generation.
+
+    The checkpoint helper answers false for state that needed no checkpoint,
+    and reporting that as written describes a durable index that does not
+    exist. Everything downstream reads this field as "there is a newer
+    generation than the one on the device", including the warning that a
+    published index may name an unproven extent.
+    """
+    path = make_raw_block_file(tmp_path)
+    core = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    key = encode_object_key(make_object_key(91))
+    assert core.put_many([key], [make_memory_obj(b"g" * 512)]).results == [True]
+    # Published already, so the state close finds is clean and its
+    # checkpoint has nothing to write.
+    assert core.publish_index() is True
+
+    outcome = core.close()
+
+    assert outcome.quiescence is NativeQuiescence.PROVEN
+    assert outcome.final_checkpoint_written is False
+    assert outcome.final_checkpoint_is_vouched_for is False
+
+
+def test_a_closed_core_refuses_to_reopen_its_device(tmp_path) -> None:
+    """Close decided this device's fate, and that decision was acted on.
+
+    Handing out a device afterwards either opens a fresh one that knows
+    nothing about what the old one was doing, or hands back a handle that
+    was retained precisely so nobody would touch it again. Both turn a
+    settled teardown into an open question.
+    """
+    path = make_raw_block_file(tmp_path)
+    core = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    assert core.close().quiescence is NativeQuiescence.PROVEN
+
+    with pytest.raises(RuntimeError, match="will not be reopened"):
+        core._rawdev()
+    # And a repeated close still reports the first result rather than
+    # reaching the accessor for a fresh one.
+    assert core.close().quiescence is NativeQuiescence.PROVEN
+
+
+def test_a_closing_core_refuses_to_publish_a_request(tmp_path) -> None:
+    """A publication that arrives during shutdown writes nothing.
+
+    It would open a device the caller's teardown has already accounted for
+    and write an index into it that nobody is watching.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(
+        make_raw_block_core_config(path), derivation=make_test_derivation()
+    )
+    core = RawBlockCore(config, key_namespace="object")
+    key = encode_object_key(make_object_key(92))
+    assert core.put_many([key], [make_memory_obj(b"h" * 512)]).results == [True]
+    assert core.close().quiescence is NativeQuiescence.PROVEN
+
+    with pytest.raises(RuntimeError, match="stopped admitting publications"):
+        core.publish_request([key])

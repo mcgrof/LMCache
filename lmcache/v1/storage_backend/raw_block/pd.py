@@ -11,6 +11,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Optional, Sequence
 import enum
 import threading
+import time
 
 # First Party
 from lmcache.logging import init_logger
@@ -183,6 +184,13 @@ class RawBlockPDRequestTracker:
             max_workers=1,
             thread_name_prefix="raw-block-pd-publish",
         )
+        # Requests whose publication has been handed to the publisher and
+        # has not finished, whether it ran, failed or was cancelled. This is
+        # what shutdown waits on: a request still in here is one whose work
+        # may be inside the core right now, and closing the core under it is
+        # what the wait exists to prevent. An empty put set does not say
+        # this, because publication is not a put.
+        self._publishing: set[str] = set()
         self._closed = False
 
     def register_batch(
@@ -407,8 +415,12 @@ class RawBlockPDRequestTracker:
                     ),
                 )
 
-    def close(self) -> None:
+    def close(self, timeout_s: float = 5.0) -> bool:
         """Fail unfinished requests, stop publication, and keep every lease.
+
+        Returns whether publication was confirmed finished. A publication
+        reaches the core, so a caller about to close that core needs to know
+        the difference between "nothing is running" and "the wait gave up".
 
         This writer going away is not news about a reader. A lease is what
         keeps an extent from being handed to the next writer, and the only
@@ -423,7 +435,7 @@ class RawBlockPDRequestTracker:
         """
         with self._lock:
             if self._closed:
-                return
+                return not self._publishing
             self._closed = True
             # Failing a request retires it, which removes it from this
             # table, so take the entries before walking them.
@@ -433,7 +445,26 @@ class RawBlockPDRequestTracker:
                     state,
                     RuntimeError(f"request {req_id} aborted during shutdown"),
                 )
-        self._publisher.shutdown(wait=True, cancel_futures=False)
+        # Cancel what has not started: a queued publication would pin keys
+        # and write an index through a core its caller has already finished
+        # accounting for. Then wait, on a budget, for whatever is already
+        # inside the core to leave it -- without holding the lock that work
+        # needs, which is why this runs after the block above and not in it.
+        self._publisher.shutdown(wait=False, cancel_futures=True)
+        deadline = time.monotonic() + timeout_s
+        while True:
+            with self._lock:
+                running = len(self._publishing)
+            if running == 0 or time.monotonic() >= deadline:
+                break
+            time.sleep(0.005)
+        if running:
+            logger.error(
+                "RawBlockPDTracker did not confirm %d publication(s) had "
+                "finished within %.1fs; they may still be inside the core",
+                running,
+                timeout_s,
+            )
         with self._lock:
             held = len(self._leases)
             unresolved = sum(1 for lease in self._leases.values() if lease.unlock_ran)
@@ -446,6 +477,7 @@ class RawBlockPDRequestTracker:
                 held,
                 unresolved,
             )
+        return running == 0
 
     def release_quiesced_leases(self) -> int:
         """Release the holds of a group that has stopped, and count them.
@@ -928,6 +960,11 @@ class RawBlockPDRequestTracker:
         encoded_keys: list[str],
         terminal: Future[RawBlockPublicationReceipt],
     ) -> None:
+        with self._lock:
+            # Recorded before the handoff, so a caller joining publication
+            # cannot miss a job that has been accepted and not yet started.
+            self._publishing.add(req_id)
+
         def pin_then_publish() -> RawBlockPublicationReceipt:
             """Hold the extents, then describe them.
 
@@ -953,6 +990,11 @@ class RawBlockPDRequestTracker:
         publication = self._publisher.submit(pin_then_publish)
 
         def finish(done: Future[RawBlockPublicationReceipt]) -> None:
+            # Runs for every submitted job -- completed, failed or cancelled
+            # -- which is what makes the record below reliable as the thing
+            # shutdown waits on.
+            with self._lock:
+                self._publishing.discard(req_id)
             try:
                 receipt = done.result()
             except BaseException as exc:

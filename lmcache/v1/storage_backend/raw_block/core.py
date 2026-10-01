@@ -745,6 +745,10 @@ class RawBlockCore:
     # guard that only the initializer installs is a guard that is sometimes
     # absent from the very paths it protects.
     _poisoned: bool = False
+    # Whether close has decided this device's fate. Declared here for the
+    # same reason: a reopen guard that only the initializer installs is
+    # absent from a core built another way.
+    _terminal: bool = False
     # Slots withheld because the device may still be writing them. A class
     # default keeps it readable on a core built without __init__; the first
     # quarantine replaces it with an instance dict.
@@ -825,6 +829,11 @@ class RawBlockCore:
         # ``close()`` return without draining or unregistering, and the point
         # is to hold resources rather than release them.
         self._poisoned = False
+        # Set once close has decided this device's fate. Separate from
+        # ``_closed``, which is set on the way in so nothing new is
+        # admitted: close's own final checkpoint still runs between the two,
+        # and it needs the device it is checkpointing.
+        self._terminal = False
         # Supplied by whoever knows the token database's effective settings.
         # Absent outside the strict shared-storage lane, where nothing else
         # is reading these keys.
@@ -1112,6 +1121,17 @@ class RawBlockCore:
 
     def _rawdev(self):
         """Return the lazily opened Rust raw-block device binding."""
+        if self._terminal:
+            # Close has made its decision about this device, and that
+            # decision is what the caller's own teardown acted on -- freeing
+            # the memory behind it, or deliberately keeping it. Handing out a
+            # device here would either open a fresh one that knows nothing
+            # about the old one, or hand back a handle that was retained
+            # precisely so nobody would touch it again.
+            raise RuntimeError(
+                f"raw-block device {self.device_path} is closed; it will not "
+                "be reopened for work that arrived afterwards"
+            )
         if self._raw is None and self._poisoned:
             # Opening a fresh device here would answer every question about
             # quiescence with a confident "nothing outstanding", which is
@@ -1841,6 +1861,15 @@ class RawBlockCore:
         """
         if self.role != "writer":
             raise RuntimeError("only a writer core can publish a request")
+        if self._closed:
+            # A publication queued before shutdown and started after it
+            # would reopen a device the caller's teardown has already
+            # accounted for, and name extents in an index written by a core
+            # nobody is watching any more.
+            raise RuntimeError(
+                "raw-block core cannot publish: it is shutting down and "
+                "stopped admitting publications"
+            )
         if self._poisoned:
             # A receipt tells a reader where to look. This core can no longer
             # say what the device is doing with the extents it would name.
@@ -2140,8 +2169,10 @@ class RawBlockCore:
             # publish an index naming it. publish_request already refuses
             # while running, and shutdown is not an exemption.
             try:
-                self._checkpoint_once(force=True)
-                checkpointed = True
+                # The helper's own answer: it returns false for state that
+                # needed no checkpoint, and reporting that as "written"
+                # describes a generation that does not exist.
+                checkpointed = bool(self._checkpoint_once(force=True))
             except Exception as e:
                 logger.warning("RawBlockCore final checkpoint failed: %s", e)
         elif self.role == "writer":
@@ -2161,6 +2192,8 @@ class RawBlockCore:
                 final_checkpoint_written=checkpointed,
             )
             self._close_outcome = outcome
+            # From here nothing may open or be handed this device again.
+            self._terminal = True
             if outcome.final_checkpoint_written and not (
                 outcome.final_checkpoint_is_vouched_for
             ):
@@ -2232,6 +2265,7 @@ class RawBlockCore:
             finally:
                 self._raw = None
         self._closed = True
+        self._terminal = True
 
     def _byte_view(self, buf: Any) -> memoryview:
         """Return a byte-addressable memoryview over a Python buffer.

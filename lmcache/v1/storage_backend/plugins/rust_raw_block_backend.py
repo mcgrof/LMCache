@@ -375,6 +375,11 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         # it went away. Their buffers are nobody's to release until it ends.
         self._pending_put_owners: list[list[MemoryObj]] = []
         self._closed_once = False
+        # Set at the top of close, before anything waits. A wait that runs
+        # while new work is still being admitted has no end, and every
+        # admission path below checks this rather than discovering a
+        # half-torn-down engine on its own.
+        self._sealed = False
         self._pin_lock = threading.Lock()
         self._pinned_keys: set[str] = set()
 
@@ -762,6 +767,11 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         """Adopt the request generation advertised by a storage-P/D writer."""
         if self._role != "reader":
             raise RuntimeError("only a raw-block reader can adopt a publication")
+        if self._sealed:
+            raise RuntimeError(
+                "raw-block storage P/D is shutting down and adopts no "
+                "further publications"
+            )
         encoded_keys = [encode_legacy_key(key).encoded for key in keys]
         return self._core.refresh_until_publication(
             receipt,
@@ -778,6 +788,11 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         """Publish a final P/D request whose last iteration wrote no new KV."""
         if self._pd_tracker is None or self._role != "writer":
             raise RuntimeError("raw-block storage P/D writer is unavailable")
+        if self._sealed:
+            raise RuntimeError(
+                "raw-block storage P/D is shutting down and admits no "
+                "further publications"
+            )
         req_id = str(getattr(transfer_spec, "req_id", "") or "")
         expected_chunks = int(getattr(transfer_spec, "total_chunks", 0) or 0)
         if self._pd_tracker.has_request(req_id):
@@ -853,6 +868,13 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         transfer_spec: Any = None,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> list[Future] | None:
+        if self._sealed:
+            logger.warning(
+                "RustRawBlockBackend on %s is shutting down and admits no "
+                "further stores",
+                self.device_path,
+            )
+            return None
         if self._storage_pd_mode:
             return self._batched_submit_pd_request(
                 keys,
@@ -1798,6 +1820,11 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         )
 
     def close(self) -> None:
+        # Seal admission before waiting for anything. A wait that runs while
+        # new work is still being taken on is a wait with no end, and the
+        # only reason to wait is to reach a state nothing can leave again.
+        self._sealed = True
+
         deadline = time.monotonic() + 10.0
         while True:
             with self._put_lock:
@@ -1826,6 +1853,21 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         if self._ack_receiver is not None:
             control_quiesced = self._ack_receiver.close()
 
+        # Publication runs on the tracker's own thread and reaches the core,
+        # so it stops here -- while the native worker is still alive, and
+        # before the core is closed underneath it. A publication queued
+        # before this point and started after would otherwise open a fresh
+        # device and write an index into it. The core refuses a publication
+        # once it is shutting down, which is the backstop; stopping the
+        # thread is what makes the refusal unnecessary.
+        publication_quiesced = True
+        if self._pd_tracker is not None:
+            try:
+                publication_quiesced = self._pd_tracker.close()
+            except Exception as e:
+                publication_quiesced = False
+                logger.error("Raw-block P/D tracker close raised: %s", e)
+
         # Everything below either releases a resource the device may still be
         # using or asks a question that could reopen the device, so the state
         # is sampled once, first. A deadline is not a fence: leaving that loop
@@ -1838,10 +1880,21 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             or retained_batches > 0
             or bool(self._quarantined_objs)
             or not control_quiesced
+            or not publication_quiesced
             or self._outcome_is_unknown()
         )
 
-        # The local close comes first, because its result is what says
+        if not control_quiesced or not publication_quiesced:
+            # Something that reaches the core could not be confirmed
+            # stopped. Closing the core now destroys it underneath a live
+            # handler, and retaining the memory afterwards does not undo a
+            # handler that already touched a device freed beneath it. So
+            # this teardown does not complete: the whole graph is kept, the
+            # core included, and nothing is released.
+            self._retain_whole_graph(retained_batches)
+            return
+
+        # The local close comes next, because its result is what says
         # whether the memory behind this device is free. Asking afterwards is
         # asking a device that no longer exists.
         try:
@@ -1857,11 +1910,10 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             # Two different decisions, and only the first is ours to make
             # here: local quiescence says the memory behind this device is
             # free, and says nothing about a reader elsewhere still holding
-            # a lease. So close keeps every hold, and releasing them needs
-            # the operator's assertion that the whole group has stopped --
-            # which is a statement about other machines that nothing in this
-            # process can observe.
-            self._pd_tracker.close()
+            # a lease. So the tracker's own close above kept every hold, and
+            # releasing them needs the operator's assertion that the whole
+            # group has stopped -- which is a statement about other machines
+            # that nothing in this process can observe.
             if self._pd_group_quiesced_teardown and not unknown:
                 released = self._pd_tracker.release_quiesced_leases()
                 logger.warning(
@@ -1872,38 +1924,46 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                     released,
                 )
 
-        if self._gpu_allocator is None:
-            return
         if unknown:
-            # Closing the allocator calls os.close() on every exported
-            # dma-buf and lets the arena behind it be reused. A command may
-            # still be landing in it, so the allocator, its exports and the
-            # withheld buffers are kept for the life of the process -- and
-            # kept referenced here, so no finalizer reaches close() either.
-            # One owner for the whole graph, the core included: the native
-            # engine is retaining owners of its own, and dropping the core
-            # runs the destructor that frees them. Two retentions that cannot
-            # see each other are one retention.
-            _RETAINED_AFTER_UNKNOWN_OUTCOME.append(
-                (
-                    self._core,
-                    self._gpu_allocator,
-                    self._quarantined_objs,
-                    self._pending_put_owners,
-                    self._pd_tracker,
-                )
-            )
-            logger.error(
-                "Raw-block backend retaining its GPU allocator, %d exported "
-                "buffer owner(s) and %d abandoned batch(es) at shutdown: what "
-                "the device is doing with them could not be established.",
-                len(self._quarantined_objs),
-                retained_batches,
-            )
+            self._retain_whole_graph(retained_batches)
+            return
+        if self._gpu_allocator is None:
             return
         close_gpu_allocator = getattr(self._gpu_allocator, "close", None)
         if callable(close_gpu_allocator):
             close_gpu_allocator()
+
+    def _retain_whole_graph(self, retained_batches: int) -> None:
+        """Keep everything this teardown could not account for, and say so.
+
+        Closing the allocator calls os.close() on every exported dma-buf and
+        lets the arena behind it be reused. A command may still be landing in
+        it, so the allocator, its exports and the withheld buffers are kept
+        for the life of the process -- and kept referenced here, so no
+        finalizer reaches close() either.
+
+        One owner for the whole graph, the core included: the native engine
+        is retaining owners of its own, and dropping the core runs the
+        destructor that frees them. Two retentions that cannot see each other
+        are one retention.
+        """
+        _RETAINED_AFTER_UNKNOWN_OUTCOME.append(
+            (
+                self._core,
+                self._gpu_allocator,
+                self._quarantined_objs,
+                self._pending_put_owners,
+                self._pd_tracker,
+            )
+        )
+        logger.error(
+            "Raw-block backend retaining its native device, its GPU "
+            "allocator, %d exported buffer owner(s) and %d abandoned "
+            "batch(es) at shutdown: what the device is doing with them "
+            "could not be established.",
+            len(self._quarantined_objs),
+            retained_batches,
+        )
 
     def _pin_if_needed(self, encoded_key: str) -> bool:
         with self._pin_lock:

@@ -45,6 +45,7 @@ from lmcache.v1.storage_backend.plugins.rust_raw_block_backend import (
 from lmcache.v1.storage_backend.raw_block import (
     NativeQuiescence,
     RawBlockCloseOutcome,
+    RawBlockPDRequestTracker,
     encode_legacy_key,
 )
 
@@ -80,9 +81,11 @@ class _RecordingTracker:
     def __init__(self) -> None:
         self.close_calls = 0
         self.quiesced_release_calls = 0
+        self.publication_quiesced = True
 
-    def close(self) -> None:
+    def close(self, timeout_s: float = 5.0) -> bool:
         self.close_calls += 1
+        return self.publication_quiesced
 
     def release_quiesced_leases(self) -> int:
         self.quiesced_release_calls += 1
@@ -491,3 +494,115 @@ def test_a_quiesced_declaration_does_not_survive_an_unknown_outcome(backend):
     assert tracker.quiesced_release_calls == 0
     assert backend._gpu_allocator.close_calls == 0
     assert len(_retained_now(before)) == 1
+
+
+def _publication_tracker(backend) -> RawBlockPDRequestTracker:
+    """Give this backend a real publication tracker over its real core."""
+    tracker = RawBlockPDRequestTracker(backend._core)
+    tracker.ack_endpoint = "127.0.0.1:0"
+    backend._pd_tracker = tracker
+    return tracker
+
+
+def test_a_queued_publication_never_reaches_the_closed_core(backend):
+    """Publication is not a put, and an empty put set does not cover it.
+
+    A publication accepted before shutdown and started after it would open a
+    fresh device -- one that knows nothing about what the old one was doing
+    -- pin keys in it and write an index nobody is watching. So shutdown
+    cancels what has not started, and the core refuses a publication once it
+    is shutting down.
+    """
+    tracker = _publication_tracker(backend)
+    occupied = threading.Event()
+    gate = threading.Event()
+
+    def occupy() -> None:
+        occupied.set()
+        assert gate.wait(10), "the test gate was never released"
+
+    tracker._publisher.submit(occupy)
+    assert occupied.wait(5)
+
+    key = CacheEngineKey("test_model", 1, 0, 9001, torch.bfloat16)
+    encoded = encode_legacy_key(key).encoded
+    terminal = tracker.register_batch(
+        "request-1",
+        [encoded],
+        expected_chunks=1,
+        is_last_batch=True,
+        completed_keys=[encoded],
+    )
+
+    closed = threading.Thread(target=backend.close)
+    closed.start()
+    deadline = time.monotonic() + 10.0
+    while not tracker._closed and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert tracker._closed, "close never reached publication shutdown"
+
+    gate.set()
+    closed.join(timeout=20.0)
+    assert not closed.is_alive()
+
+    # The publication did not happen, and nothing opened a device for it.
+    assert terminal.done() and terminal.exception() is not None
+    assert backend._core._raw is None
+    assert backend._core._terminal
+    with pytest.raises(RuntimeError, match="will not be reopened"):
+        backend._core._rawdev()
+
+
+def test_a_publication_inside_the_core_blocks_every_release(backend):
+    """Work that could not be confirmed stopped is work the core still has.
+
+    Closing the core here destroys it underneath a publication that is
+    inside it, and retaining the memory afterwards does not undo a job that
+    already touched a device freed beneath it. So the teardown does not
+    complete: the whole graph is kept, the core included.
+    """
+    tracker = _publication_tracker(backend)
+    allocator = backend._gpu_allocator
+    inside = threading.Event()
+    gate = threading.Event()
+    # Gated at the first thing publication asks of the core, so the job is
+    # provably inside it when close runs. What the publication goes on to
+    # do with the answer is not the question here.
+    real_prefix = backend._core.get_metadata_prefix
+
+    def gated_prefix(encoded_keys, *, lock=False):
+        inside.set()
+        assert gate.wait(20), "the test gate was never released"
+        return real_prefix(encoded_keys, lock=lock)
+
+    backend._core.get_metadata_prefix = gated_prefix  # type: ignore[method-assign]
+
+    key = CacheEngineKey("test_model", 1, 0, 9002, torch.bfloat16)
+    encoded = encode_legacy_key(key).encoded
+    tracker.register_batch(
+        "request-1",
+        [encoded],
+        expected_chunks=1,
+        is_last_batch=True,
+        completed_keys=[encoded],
+    )
+    assert inside.wait(10), "publication never reached the core"
+
+    before = len(plugin._RETAINED_AFTER_UNKNOWN_OUTCOME)
+    # A short budget, because the point is what happens when the wait gives
+    # up rather than how long it waits.
+    tracker_close = tracker.close
+    backend._pd_tracker.close = lambda timeout_s=0.2: tracker_close(timeout_s=0.2)  # type: ignore[method-assign]
+    backend.close()
+
+    assert allocator.close_calls == 0
+    assert backend._core._raw is not None
+    assert not backend._core._closed
+    assert len(_retained_now(before)) == 1
+
+    gate.set()
+    # The publication finishes against the core that was deliberately kept.
+    deadline = time.monotonic() + 10.0
+    while tracker._publishing and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert not tracker._publishing
