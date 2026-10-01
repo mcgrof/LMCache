@@ -343,10 +343,10 @@ def test_a_cancelled_put_keeps_its_buffer_until_the_thread_lets_go(
     may_finish = threading.Event()
     real_put_many = backend._core.put_many
 
-    def _blocks_inside_the_thread(specs, objs):
+    def _blocks_inside_the_thread(specs, objs, **kwargs):
         in_the_thread.set()
         assert may_finish.wait(10)
-        return real_put_many(specs, objs)
+        return real_put_many(specs, objs, **kwargs)
 
     backend._core.put_many = _blocks_inside_the_thread  # type: ignore[method-assign]
 

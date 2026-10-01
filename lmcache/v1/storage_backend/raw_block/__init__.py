@@ -27,6 +27,10 @@ from lmcache.v1.storage_backend.raw_block.key_codec import (
     object_key_to_string,
     slot_identity_from_encoded_key,
 )
+from lmcache.v1.storage_backend.raw_block.core import (
+    RawBlockIoAttribution,
+    RawBlockIoContext,
+)
 from lmcache.v1.storage_backend.raw_block.pd import (
     RawBlockPDRequestTracker,
     ReadAckIdentity,
@@ -48,6 +52,8 @@ __all__ = [
     "RawBlockCloseOutcome",
     "RawBlockDerivationDescriptor",
     "RawBlockPublicationReceipt",
+    "RawBlockIoAttribution",
+    "RawBlockIoContext",
     "RawBlockPDRequestTracker",
     "ReadAckIdentity",
     "ReadAckOutcome",

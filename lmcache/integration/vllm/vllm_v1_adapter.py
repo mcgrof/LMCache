@@ -1064,6 +1064,7 @@ class LMCacheConnectorV1Impl:
             status.publication_receipt(),
             request_configs=request.request_configs,
             timeout_ms=timeout_ms,
+            request_id=status.req_id,
         )
         if published_tokens is None:
             raise RuntimeError(

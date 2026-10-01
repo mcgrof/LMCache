@@ -109,8 +109,8 @@ def test_decoder_adoption_retries_without_the_continuation_token() -> None:
         def __init__(self) -> None:
             self.keys: list[int] = []
 
-        def adopt_publication(self, receipt, keys, *, timeout_ms):
-            del receipt, timeout_ms
+        def adopt_publication(self, receipt, keys, *, timeout_ms, request_id=""):
+            del receipt, timeout_ms, request_id
             self.keys.append(keys[0].chunk_hash)
             return keys[0].chunk_hash == hash((1, 2, 3))
 

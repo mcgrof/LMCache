@@ -33,6 +33,8 @@ from lmcache.v1.storage_backend.raw_block import (
 )
 from lmcache.v1.storage_backend.raw_block.core import (
     IO_PATH_IOURING_BATCHED,
+    RawBlockIoAttribution,
+    RawBlockIoContext,
     RawBlockIoLedger,
 )
 from tests.v1.storage_backend.raw_block_test_utils import (
@@ -84,6 +86,7 @@ class _RecordingUringCmdRawDevice:
         buffers: list[memoryview],
         lengths: list[int],
         placement_ids: list[int | None] | None = None,
+        request_tag: str | None = None,
     ) -> int:
         del placement_ids
         self.offsets = offsets
@@ -97,6 +100,7 @@ class _RecordingUringCmdRawDevice:
         offsets: list[int],
         buffers: list[memoryview],
         lengths: list[int],
+        request_tag: str | None = None,
     ) -> int:
         for target, total_len in zip(buffers, lengths, strict=True):
             self.read_buffers.append(target)
@@ -123,6 +127,7 @@ class _RecordingNativeRawDevice:
         offsets: list[int],
         buffers: list[Any],
         total_lens: list[int],
+        request_tag: str | None = None,
     ) -> int:
         """Record and submit a batch through the wrapped Rust implementation.
 
@@ -478,6 +483,7 @@ class _RecordingRawDevice:
         buffers: Sequence[Buffer],
         total_lens: Sequence[int],
         placement_ids: Sequence[int | None] | None = None,
+        request_tag: str | None = None,
     ) -> int:
         self.batched_write_calls.append(
             _BatchedWriteCall(
@@ -515,6 +521,7 @@ class _RecordingRawDevice:
         offsets: Sequence[int],
         buffers: Sequence[Buffer],
         total_lens: Sequence[int],
+        request_tag: str | None = None,
     ) -> int:
         for off, buf, total in zip(offsets, buffers, total_lens, strict=True):
             self._copy_into(int(off), buf, int(total))
@@ -533,6 +540,7 @@ class _RecordingRawDevice:
         payload_len: int,
         total_len: int,
         placement_id: int | None = None,
+        request_tag: str | None = None,
     ) -> None:
         self.write_uring_count += 1
         self.store[int(offset)] = bytes(buf)[: int(total_len)]
@@ -1106,6 +1114,7 @@ class _FakeRawDevice:
         buffers: list[bytearray],
         total_lens: list[int],
         placement_ids: list[int | None] | None = None,
+        request_tag: str | None = None,
     ) -> int:
         del buffers
         self.batched_write_calls.append((offsets, total_lens, placement_ids))
@@ -1123,6 +1132,7 @@ class _FakeRawDevice:
         payload_len: int,
         total_len: int,
         placement_id: int | None = None,
+        request_tag: str | None = None,
     ) -> None:
         del data
         self.write_uring_calls.append((offset, payload_len, total_len, placement_id))
@@ -2180,7 +2190,7 @@ def test_raw_block_core_still_drops_an_entry_whose_header_is_not_its_own(tmp_pat
         slot = core._offset_to_slot(int(core._index[key.encoded].offset))
 
         def _bytes_that_are_not_ours(
-            offsets, buffers, payload_lens, total_lens, kinds=None
+            offsets, buffers, payload_lens, total_lens, kinds=None, **kwargs
         ):
             for buf in buffers:
                 buf[:] = b"\x00" * len(buf)
@@ -2219,7 +2229,7 @@ def test_raw_block_core_withholds_a_dropped_entry_when_it_cannot_say(tmp_path):
         slot = core._offset_to_slot(int(core._index[key.encoded].offset))
 
         def _bytes_that_are_not_ours(
-            offsets, buffers, payload_lens, total_lens, kinds=None
+            offsets, buffers, payload_lens, total_lens, kinds=None, **kwargs
         ):
             for buf in buffers:
                 buf[:] = b"\x00" * len(buf)
@@ -2838,3 +2848,108 @@ def test_the_ledger_counts_logical_requests_apart_from_submissions(tmp_path) -> 
         assert row["completed_padded_bytes"] == row["padded_bytes"]
     finally:
         core.close()
+
+
+def test_io_is_attributed_to_its_request_and_its_actual_path(tmp_path) -> None:
+    """Which request moved the bytes, and which buffer path really carried them.
+
+    The Python route name says which helper was used, not which kind of SQE
+    it produced: a configured dma-buf pool whose buffers miss the
+    registration map issues ordinary SQEs, and the configuration cannot tell
+    you that. So the path here is the native engine's own choice, recorded
+    where the SQE is built.
+
+    The request name comes with the job rather than from a "current request"
+    read when the completion is reaped -- by then the submitting thread is
+    gone and the I/O worker never had it.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        context = RawBlockIoContext(
+            run_id="run-under-test",
+            request_id="wire-request-7",
+            tp_rank=3,
+            incarnation="writer-under-test",
+        )
+        key = encode_object_key(make_object_key(99))
+        assert core.put_many(
+            [key], [make_memory_obj(b"o" * 512)], io_context=context
+        ).results == [True]
+
+        attribution = core.report_status()["io_by_request"]
+        rows = attribution["rows"]
+        mine = {
+            name: counts
+            for name, counts in rows.items()
+            if name.startswith(context.tag() + "/")
+        }
+        assert mine, rows
+
+        # Every row names a real native path, not a Python helper route.
+        for name in mine:
+            assert name.rsplit("/", 1)[1] in (
+                "regular",
+                "bounce",
+                "host_fixed",
+                "dmabuf_fixed",
+                "uring_cmd",
+                "uring_cmd_fixed",
+            )
+        # And every operation was answered for, which is the gate.
+        assert attribution["unanswered"] == {}
+        assert attribution["untagged_operations"] == 0
+        assert attribution["dropped_rows"] == 0
+        for counts in mine.values():
+            answered = counts["completed"] + counts["short"] + counts["failed"]
+            assert counts["submitted"] == answered
+    finally:
+        core.close()
+
+
+def test_an_operation_nobody_named_is_counted_not_attributed(tmp_path) -> None:
+    """An unnamed operation is not somebody else's.
+
+    Attributing it to a neighbouring request would make that request's
+    accounting wrong in a way nothing could detect afterwards, so it is
+    counted apart and the count is part of the receipt.
+    """
+    record = RawBlockIoAttribution()
+    record.record(
+        [
+            {
+                "request_tag": "",
+                "direction": "write",
+                "path": "regular",
+                "outcome": "submitted",
+                "bytes": "4096",
+            }
+        ]
+    )
+
+    assert record.snapshot() == {}
+    assert record.untagged_operations == 1
+
+
+def test_an_unanswered_operation_is_a_failed_evidence_gate() -> None:
+    """A submission with no outcome is the gap, not a rounding error.
+
+    No total that happens to add up changes the fact that this request's
+    bytes cannot be accounted for.
+    """
+    record = RawBlockIoAttribution()
+    rows = [
+        {
+            "request_tag": "run/req/r0/epoch",
+            "direction": "read",
+            "path": "dmabuf_fixed",
+            "outcome": outcome,
+            "bytes": "4096",
+        }
+        for outcome in ("submitted", "submitted", "completed")
+    ]
+    record.record(rows, dropped=2)
+
+    assert record.unanswered() == {"run/req/r0/epoch/read/dmabuf_fixed": 1}
+    assert record.as_payload()["dropped_rows"] == 2

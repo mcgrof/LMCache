@@ -18,7 +18,7 @@
 use pyo3::exceptions::{PyMemoryError, PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::io;
 use std::os::unix::io::AsRawFd;
@@ -1729,6 +1729,127 @@ struct IoSubmission {
     payload_len: Option<usize>,         // For bounce buffer reads
     batch_id: u64,                      // Batch ID for per-batch tracking
     nvme_cmd_data: Option<NvmeCmdData>, // NVMe command data for io_uring_cmd
+    // Who this operation is for, as the caller named it when it handed the
+    // batch over. Immutable and carried with the submission rather than
+    // looked up later: the completion is reaped on the worker thread, long
+    // after whatever "current request" a thread-local could have named.
+    request_tag: Option<Arc<str>>,
+}
+
+/// Which buffer path a submission actually took.
+///
+/// Not which route the Python helper chose, and not what the engine was
+/// configured to prefer: this is the flavour of SQE that was built, decided
+/// by whether the buffer was found in the registration map and what kind of
+/// registration it was. A configured dma-buf pool whose buffers miss the map
+/// quietly issues ordinary SQEs, and nothing above this layer can tell.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeIoPath {
+    /// A passthrough NVMe command.
+    UringCmd,
+    /// A passthrough NVMe command against a registered buffer.
+    UringCmdFixed,
+    /// Read/write against a registered dma-buf: the device reaches the
+    /// exporting memory directly.
+    DmabufFixed,
+    /// Read/write against a classic registered host buffer.
+    HostFixed,
+    /// Read/write through an aligned copy this engine owns.
+    Bounce,
+    /// Read/write against an ordinary process address.
+    Regular,
+}
+
+impl NativeIoPath {
+    fn of(sub: &IoSubmission) -> Self {
+        if sub.nvme_cmd_data.is_some() {
+            if sub.fixed_buffer_idx.is_some() {
+                return NativeIoPath::UringCmdFixed;
+            }
+            return NativeIoPath::UringCmd;
+        }
+        if sub.fixed_dmabuf.is_some() {
+            return NativeIoPath::DmabufFixed;
+        }
+        if sub.fixed_buffer_idx.is_some() {
+            return NativeIoPath::HostFixed;
+        }
+        if sub.bounce.is_some() {
+            return NativeIoPath::Bounce;
+        }
+        NativeIoPath::Regular
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            NativeIoPath::UringCmd => "uring_cmd",
+            NativeIoPath::UringCmdFixed => "uring_cmd_fixed",
+            NativeIoPath::DmabufFixed => "dmabuf_fixed",
+            NativeIoPath::HostFixed => "host_fixed",
+            NativeIoPath::Bounce => "bounce",
+            NativeIoPath::Regular => "regular",
+        }
+    }
+}
+
+/// What one physical operation did, and who it was for.
+///
+/// Recorded when the SQE is built and again when the device answers, so a
+/// reader can join the two and see an operation nobody answered for rather
+/// than inferring it from a total that happens to match. The request tag is
+/// the caller's own immutable identity for the work, carried on the
+/// submission: a "current request" global would be read on the worker
+/// thread, which is nobody's request.
+#[derive(Clone)]
+struct NativeIoEvent {
+    request_tag: Option<Arc<str>>,
+    batch_id: u64,
+    is_write: bool,
+    path: &'static str,
+    /// "submitted", "completed", "short" or "failed".
+    outcome: &'static str,
+    bytes: i64,
+}
+
+/// How many operation records the native journal keeps before dropping the
+/// oldest. One entry is a few words; this bounds the diagnostic at roughly a
+/// megabyte while covering far more operations than any single request.
+const NATIVE_IO_JOURNAL_CAPACITY: usize = 16384;
+
+/// A bounded record of what the device was asked to do, and what it did.
+///
+/// Bounded because it is a diagnostic, not a log of record: an engine that
+/// kept one entry per operation forever would run out of memory on a long
+/// serving run. Dropping is counted, so a reader can see that the record is
+/// incomplete rather than trusting a sum that silently lost rows.
+struct NativeIoJournal {
+    events: Mutex<VecDeque<NativeIoEvent>>,
+    capacity: usize,
+    dropped: AtomicU64,
+}
+
+impl NativeIoJournal {
+    fn new(capacity: usize) -> Self {
+        NativeIoJournal {
+            events: Mutex::new(VecDeque::with_capacity(capacity.min(1024))),
+            capacity,
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, event: NativeIoEvent) {
+        let mut events = self.events.lock().unwrap();
+        if events.len() >= self.capacity {
+            events.pop_front();
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        events.push_back(event);
+    }
+
+    fn drain(&self) -> Vec<NativeIoEvent> {
+        let mut events = self.events.lock().unwrap();
+        events.drain(..).collect()
+    }
 }
 
 type FixedBufferRange = (u16, usize, Option<usize>);
@@ -1819,6 +1940,7 @@ impl Default for IoSubmission {
             payload_len: None,
             batch_id: 0,
             nvme_cmd_data: None,
+            request_tag: None,
         }
     }
 }
@@ -1988,6 +2110,9 @@ struct RawBlockDevice {
     // terminal retention takes the ring and forgets it, and a test asking
     // afterwards whether the engine broke an ownership rule on its way out
     // must still get an answer.
+    // What the device was actually asked to do, and what it did, recorded
+    // per physical operation. Bounded: a diagnostic, not a log of record.
+    io_journal: Arc<NativeIoJournal>,
     #[cfg(feature = "fault-injection")]
     fake_state: Option<Arc<Mutex<FakeRingState>>>,
     #[cfg(feature = "fault-injection")]
@@ -2147,6 +2272,11 @@ impl RawBlockDevice {
         #[cfg(feature = "fault-injection")]
         let fault_plan: Option<Arc<FaultPlan>> = Some(Arc::new(FaultPlan::default()));
 
+        // Shared with the worker, because the two halves of an operation are
+        // recorded in different places: the submission where the SQE is
+        // built, the outcome where the completion is reaped.
+        let io_journal = Arc::new(NativeIoJournal::new(NATIVE_IO_JOURNAL_CAPACITY));
+
         let (
             ring_opt,
             queue_opt,
@@ -2252,6 +2382,7 @@ impl RawBlockDevice {
             let poisoned = Arc::new(AtomicBool::new(false));
             let quarantined_batches_worker = Arc::clone(&quarantined_batches);
             let poisoned_worker = Arc::clone(&poisoned);
+            let io_journal_worker = Arc::clone(&io_journal);
             #[cfg(feature = "fault-injection")]
             let fault_plan_worker = fault_plan.clone();
             let batched_completions =
@@ -2377,10 +2508,25 @@ impl RawBlockDevice {
             // Helper function to build and submit an SQE for a submission
             fn build_and_submit_sqe(
                 ring: &IoUringWrapper,
+                journal: &NativeIoJournal,
                 sub: &IoSubmission,
                 user_data: u64,
             ) -> Result<(), PyErr> {
                 let ptr = sub.ptr_addr as *mut u8;
+                // Recorded here rather than from the configuration: which
+                // buffer path this operation takes is decided by whether its
+                // address is in the registration map and what kind of
+                // registration that is. A configured dma-buf pool whose
+                // buffers miss the map issues ordinary SQEs, and nothing
+                // above this layer can tell the difference.
+                journal.record(NativeIoEvent {
+                    request_tag: sub.request_tag.clone(),
+                    batch_id: sub.batch_id,
+                    is_write: sub.is_write,
+                    path: NativeIoPath::of(sub).name(),
+                    outcome: "submitted",
+                    bytes: sub.len as i64,
+                });
 
                 // Check if this is an io_uring_cmd submission
                 if let Some(nvme_data) = &sub.nvme_cmd_data {
@@ -2555,6 +2701,14 @@ impl RawBlockDevice {
                                         sub.fixed_dmabuf.is_some(),
                                     );
                                     if short_action == ShortIoAction::FailTerminally {
+                                        io_journal_worker.record(NativeIoEvent {
+                                            request_tag: sub.request_tag.clone(),
+                                            batch_id,
+                                            is_write: sub.is_write,
+                                            path: NativeIoPath::of(&sub).name(),
+                                            outcome: "short",
+                                            bytes: cqe_result as i64,
+                                        });
                                         let result =
                                             handle_completion_result(&mut sub, -libc::EIO, false);
                                         sub.completion.set(result);
@@ -2612,7 +2766,12 @@ impl RawBlockDevice {
                                         // "nothing was queued" reports the
                                         // operation finished while the kernel may
                                         // still act on it.
-                                        match build_and_submit_sqe(&ring_clone, &sub, user_data) {
+                                        match build_and_submit_sqe(
+                                            &ring_clone,
+                                            &io_journal_worker,
+                                            &sub,
+                                            user_data,
+                                        ) {
                                             Ok(()) => {
                                                 resident_sqes = true;
                                             }
@@ -2638,6 +2797,18 @@ impl RawBlockDevice {
                                     }
 
                                     // Handle completion result
+                                    io_journal_worker.record(NativeIoEvent {
+                                        request_tag: sub.request_tag.clone(),
+                                        batch_id,
+                                        is_write: sub.is_write,
+                                        path: NativeIoPath::of(&sub).name(),
+                                        outcome: if cqe_result >= 0 {
+                                            "completed"
+                                        } else {
+                                            "failed"
+                                        },
+                                        bytes: cqe_result as i64,
+                                    });
                                     let result =
                                         handle_completion_result(&mut sub, cqe_result, false);
                                     sub.completion.set(result);
@@ -2799,7 +2970,12 @@ impl RawBlockDevice {
                             for sub in batch.iter().take(to_submit_count) {
                                 let user_data = next_user_data;
                                 next_user_data = next_user_data.wrapping_add(1);
-                                match build_and_submit_sqe(&ring_clone, sub, user_data) {
+                                match build_and_submit_sqe(
+                                    &ring_clone,
+                                    &io_journal_worker,
+                                    sub,
+                                    user_data,
+                                ) {
                                     Ok(()) => {
                                         user_data_list.push(user_data);
                                         built_submissions.push(sub.clone());
@@ -3071,6 +3247,7 @@ impl RawBlockDevice {
                 .unwrap_or_else(|| Arc::new(Mutex::new(HashSet::new()))),
             poisoned: poisoned_opt.unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
             retained_owners: Arc::new(AtomicUsize::new(0)),
+            io_journal,
             quarantined_owners: quarantined_owners_opt
                 .unwrap_or_else(|| Arc::new(Mutex::new(Vec::new()))),
             #[cfg(feature = "fault-injection")]
@@ -3419,7 +3596,7 @@ impl RawBlockDevice {
     /// completion and obtain a success bitmap plus sparse completion errors.
     /// Validation or request-preparation errors are raised instead of returning
     /// a batch ID.
-    #[pyo3(signature = (offsets, buffers, total_lens, placement_ids = None))]
+    #[pyo3(signature = (offsets, buffers, total_lens, placement_ids = None, request_tag = None))]
     fn batched_write(
         &self,
         py: Python<'_>,
@@ -3427,7 +3604,9 @@ impl RawBlockDevice {
         buffers: Vec<Bound<'_, PyAny>>,
         total_lens: Vec<usize>,
         placement_ids: Option<Vec<Option<i32>>>,
+        request_tag: Option<String>,
     ) -> PyResult<u64> {
+        let request_tag: Option<Arc<str>> = request_tag.map(|tag| Arc::from(tag.as_str()));
         if !self.use_iouring {
             return Err(PyRuntimeError::new_err("io_uring not enabled"));
         }
@@ -3636,6 +3815,7 @@ impl RawBlockDevice {
                     payload_len: None,
                     batch_id,
                     nvme_cmd_data,
+                    request_tag: request_tag.clone(),
                 };
 
                 submissions.push((sub, comp));
@@ -3875,6 +4055,48 @@ impl RawBlockDevice {
         Ok(())
     }
 
+    /// Take what the device was asked to do, and what it did, as rows.
+    ///
+    /// Each row names the request the operation was for, the batch it
+    /// belonged to, the buffer path it actually took, the outcome and the
+    /// byte count. Two rows per operation: one where its SQE was built and
+    /// one where the device answered, so an operation nobody answered for
+    /// shows up as the submission with no outcome beside it, rather than
+    /// having to be inferred from totals that happen to agree.
+    ///
+    /// Draining is deliberate. These are consumed by whoever is summing
+    /// them, and a reader that took them twice would count them twice.
+    /// ``dropped`` is how many rows the bound discarded before this call,
+    /// so a sum known to be incomplete says so.
+    fn take_io_journal(&self) -> PyResult<(Vec<HashMap<String, String>>, u64)> {
+        let dropped = self.io_journal.dropped.swap(0, Ordering::Relaxed);
+        let rows = self
+            .io_journal
+            .drain()
+            .into_iter()
+            .map(|event| {
+                let mut row: HashMap<String, String> = HashMap::new();
+                row.insert(
+                    "request_tag".to_string(),
+                    event
+                        .request_tag
+                        .as_ref()
+                        .map_or_else(String::new, |tag| tag.to_string()),
+                );
+                row.insert("batch_id".to_string(), event.batch_id.to_string());
+                row.insert(
+                    "direction".to_string(),
+                    if event.is_write { "write" } else { "read" }.to_string(),
+                );
+                row.insert("path".to_string(), event.path.to_string());
+                row.insert("outcome".to_string(), event.outcome.to_string());
+                row.insert("bytes".to_string(), event.bytes.to_string());
+                row
+            })
+            .collect();
+        Ok((rows, dropped))
+    }
+
     /// Entries pushed and not yet taken by a submit.
     #[cfg(feature = "fault-injection")]
     fn fake_resident(&self) -> PyResult<Vec<u64>> {
@@ -4047,7 +4269,12 @@ impl RawBlockDevice {
     }
 
     /// Synchronous write using io_uring.
-    #[pyo3(signature = (offset, data, payload_len, total_len = None, placement_id = None))]
+    ///
+    /// The argument list mirrors one SQE's worth of parameters plus the
+    /// attribution the caller carries, which is what it takes to describe
+    /// one padded placement-directed write without a side channel.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (offset, data, payload_len, total_len = None, placement_id = None, request_tag = None))]
     fn write_uring(
         &self,
         py: Python<'_>,
@@ -4056,7 +4283,9 @@ impl RawBlockDevice {
         payload_len: usize,
         total_len: Option<usize>,
         placement_id: Option<i32>,
+        request_tag: Option<String>,
     ) -> PyResult<()> {
+        let request_tag: Option<Arc<str>> = request_tag.map(|tag| Arc::from(tag.as_str()));
         if !self.use_iouring {
             return Err(PyRuntimeError::new_err("io_uring not enabled"));
         }
@@ -4165,6 +4394,7 @@ impl RawBlockDevice {
                 original_ptr: None,
                 payload_len: None,
                 batch_id,
+                request_tag: request_tag.clone(),
                 nvme_cmd_data: self._build_nvme_cmd_data(
                     if placement_id_u16.is_some() { 0x2 } else { 0x0 },
                     placement_id_u16.unwrap_or(0),
@@ -4202,6 +4432,7 @@ impl RawBlockDevice {
                 original_ptr: None,
                 payload_len: Some(payload_len),
                 batch_id,
+                request_tag: request_tag.clone(),
                 nvme_cmd_data: self._build_nvme_cmd_data(
                     if placement_id_u16.is_some() { 0x2 } else { 0x0 },
                     placement_id_u16.unwrap_or(0),
@@ -4242,14 +4473,16 @@ impl RawBlockDevice {
     /// completion and obtain a success bitmap plus sparse completion errors.
     /// Validation or request-preparation errors are raised instead of returning
     /// a batch ID.
-    #[pyo3(signature = (offsets, buffers, total_lens))]
+    #[pyo3(signature = (offsets, buffers, total_lens, request_tag = None))]
     fn batched_read(
         &self,
         py: Python<'_>,
         offsets: Vec<u64>,
         buffers: Vec<Bound<'_, PyAny>>,
         total_lens: Vec<usize>,
+        request_tag: Option<String>,
     ) -> PyResult<u64> {
+        let request_tag: Option<Arc<str>> = request_tag.map(|tag| Arc::from(tag.as_str()));
         if !self.use_iouring {
             return Err(PyRuntimeError::new_err("io_uring not enabled"));
         }
@@ -4439,6 +4672,7 @@ impl RawBlockDevice {
                     payload_len: payload_len_opt,
                     batch_id,
                     nvme_cmd_data: nvme_cmd_data.clone(),
+                    request_tag: request_tag.clone(),
                 };
 
                 submissions.push((sub, comp));

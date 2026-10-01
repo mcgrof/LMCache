@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 # Standard
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -325,6 +326,146 @@ class RawBlockIoTally:
             "completed_operations": self.completed_operations,
             "completed_padded_bytes": self.completed_padded_bytes,
         }
+
+
+@dataclass(frozen=True)
+class RawBlockIoContext:
+    """Immutable identity for the work one batch of I/O belongs to.
+
+    Carried with the job rather than looked up when a completion is reaped.
+    A "current request" global, thread-local or otherwise, is read on
+    whichever thread happens to be reaping -- the executor thread that
+    submitted is already gone by then, and the I/O worker never had the
+    context at all -- so an attribution built that way names whoever was
+    most recently active instead of whoever the bytes are for.
+
+    ``request_id`` is the name the *peer* knows this request by, because
+    that is what a receipt, a READY status and an acknowledgement all carry;
+    an engine-local name correlates with nothing on the other side.
+    """
+
+    run_id: str = ""
+    request_id: str = ""
+    tp_rank: int = -1
+    incarnation: str = ""
+
+    def tag(self) -> str:
+        """One opaque string, stable for the life of this request."""
+        if not self.request_id:
+            return ""
+        rank = "?" if self.tp_rank < 0 else str(self.tp_rank)
+        return f"{self.run_id}/{self.request_id}/r{rank}/{self.incarnation}"
+
+
+class RawBlockIoAttribution:
+    """What each request's operations did, by the path they actually took.
+
+    Separate from the ledger because it answers a different question. The
+    ledger says how much a route moved; this says which request moved it,
+    over which buffer path the device really used, and whether every
+    operation was answered for.
+
+    The "path" here is the native engine's own choice -- registered dma-buf,
+    classic host-fixed, bounce or ordinary -- not the Python helper route
+    that led there. A configured dma-buf pool whose buffers miss the
+    registration map issues ordinary SQEs, and the configuration cannot tell
+    you that.
+
+    Bounded by the number of requests it remembers, because a long serving
+    run has unboundedly many. Eviction is counted, so a reader can see that
+    a sum is incomplete rather than trusting one that quietly lost rows.
+    """
+
+    _OUTCOMES = ("submitted", "completed", "short", "failed")
+
+    def __init__(self, max_requests: int = 4096) -> None:
+        if max_requests <= 0:
+            raise ValueError("an attribution record needs a request bound")
+        self._lock = threading.Lock()
+        self._max_requests = max_requests
+        self._rows: OrderedDict[tuple[str, str, str], dict[str, int]] = OrderedDict()
+        self._tags: OrderedDict[str, None] = OrderedDict()
+        self.dropped_rows = 0
+        self.evicted_requests = 0
+        self.untagged_operations = 0
+
+    def record(
+        self,
+        rows: Sequence[Mapping[str, str]],
+        dropped: int = 0,
+    ) -> None:
+        """Take a drained native journal, one row per operation event."""
+        with self._lock:
+            self.dropped_rows += int(dropped)
+            for row in rows:
+                outcome = str(row.get("outcome", ""))
+                if outcome not in self._OUTCOMES:
+                    continue
+                tag = str(row.get("request_tag", ""))
+                if not tag:
+                    # An operation nobody named. Counted rather than
+                    # attributed to a neighbour, because guessing which
+                    # request it belonged to is what this record exists to
+                    # avoid.
+                    self.untagged_operations += 1
+                    continue
+                key = (tag, str(row.get("direction", "")), str(row.get("path", "")))
+                counts = self._rows.get(key)
+                if counts is None:
+                    counts = dict.fromkeys(self._OUTCOMES, 0)
+                    counts["bytes"] = 0
+                    self._rows[key] = counts
+                counts[outcome] += 1
+                if outcome != "submitted":
+                    counts["bytes"] += max(0, int(row.get("bytes", 0) or 0))
+                self._tags.pop(tag, None)
+                self._tags[tag] = None
+            while len(self._tags) > self._max_requests:
+                evicted, _ = self._tags.popitem(last=False)
+                for key in [key for key in self._rows if key[0] == evicted]:
+                    del self._rows[key]
+                self.evicted_requests += 1
+
+    def snapshot(self) -> dict[str, dict[str, int]]:
+        """Every attributed row, keyed "request/direction/native-path"."""
+        with self._lock:
+            return {
+                f"{tag}/{direction}/{path}": dict(counts)
+                for (tag, direction, path), counts in sorted(self._rows.items())
+            }
+
+    def unanswered(self) -> dict[str, int]:
+        """Rows where operations were submitted and never answered for.
+
+        A nonzero entry here is a failed evidence gate: the bytes of that
+        request cannot be accounted for, and no total that happens to add up
+        changes that.
+        """
+        with self._lock:
+            gaps: dict[str, int] = {}
+            for (tag, direction, path), counts in sorted(self._rows.items()):
+                answered = sum(
+                    counts[outcome] for outcome in ("completed", "short", "failed")
+                )
+                outstanding = counts["submitted"] - answered
+                if outstanding:
+                    gaps[f"{tag}/{direction}/{path}"] = outstanding
+            return gaps
+
+    def as_payload(self) -> dict[str, Any]:
+        """Everything a receipt needs, including what makes it incomplete."""
+        return {
+            "rows": self.snapshot(),
+            "unanswered": self.unanswered(),
+            "untagged_operations": self.untagged_operations,
+            "dropped_rows": self.dropped_rows,
+            "evicted_requests": self.evicted_requests,
+        }
+
+
+def _io_tag(io_context: Optional[RawBlockIoContext]) -> str:
+    """The attribution one batch carries, or nothing when it has none."""
+    return io_context.tag() if io_context is not None else ""
 
 
 class RawBlockIoLedger:
@@ -804,6 +945,15 @@ class RawBlockCore:
     # Bytes this engine never had to write because the key was already on
     # the device. Not an I/O quantity, so it is not in the ledger.
     _bytes_deduplicated: int = 0
+    # The attribution record, declared on the class for the same reason as
+    # the ledger below: a core built without __init__ must still be able to
+    # attribute an operation.
+    _io_attribution_instance: Optional["RawBlockIoAttribution"] = None
+    # This engine's own metadata traffic: index checkpoints and slot headers
+    # it reads to validate. Named rather than left unattributed, because an
+    # unnamed operation is a gap in a request's accounting and these are not
+    # that -- they belong to no request, which is a different statement.
+    _metadata_io_context = RawBlockIoContext(request_id="<engine-metadata>")
     # The I/O ledger, declared on the class so it exists however the core
     # was built. Several tests construct one through __new__ without
     # running __init__, and accounting that only exists when the
@@ -1486,6 +1636,8 @@ class RawBlockCore:
         keys: Sequence[RawBlockKeySpec],
         objs: Sequence[MemoryObj],
         placement_ids: Sequence[PlacementId] | None = None,
+        *,
+        io_context: Optional[RawBlockIoContext] = None,
     ) -> RawBlockPutManyResult:
         """Persist a batch of memory objects into raw-block slots.
 
@@ -1528,7 +1680,9 @@ class RawBlockCore:
         )
 
         if self.io_engine == "io_uring" and len(keys) > 1:
-            return self._put_many_batch_io(keys, objs, per_key_placement_ids)
+            return self._put_many_batch_io(
+                keys, objs, per_key_placement_ids, io_context=io_context
+            )
 
         results = [False] * len(keys)
         stored_keys: list[str] = []
@@ -1580,7 +1734,9 @@ class RawBlockCore:
                 )
                 self._inflight[key.encoded] = _Inflight(offset=offset, meta=meta)
 
-            success = self._write_one(key, obj, offset, placement_id=placement_id)
+            success = self._write_one(
+                key, obj, offset, placement_id=placement_id, io_context=io_context
+            )
 
             with self._lock:
                 inflight = self._inflight.pop(key.encoded, None)
@@ -1639,6 +1795,8 @@ class RawBlockCore:
         self,
         encoded_keys: Sequence[str],
         objs: Sequence[MemoryObj],
+        *,
+        io_context: Optional[RawBlockIoContext] = None,
     ) -> list[bool]:
         """Load raw-block payloads into caller-provided memory objects.
 
@@ -1756,6 +1914,7 @@ class RawBlockCore:
                         read_payload_lens,
                         read_total_lens,
                         read_kinds,
+                        io_context=io_context,
                     )
                 except Exception as e:
                     logger.error("RawBlockCore batched load failed: %s", e)
@@ -2172,6 +2331,40 @@ class RawBlockCore:
         return self._poisoned
 
     @property
+    def _io_attribution(self) -> "RawBlockIoAttribution":
+        """This core's request attribution, created on first use."""
+        record = self._io_attribution_instance
+        if record is None:
+            with RawBlockCore._io_ledger_creation_lock:
+                record = self._io_attribution_instance
+                if record is None:
+                    record = RawBlockIoAttribution()
+                    self._io_attribution_instance = record
+        return record
+
+    def _collect_native_io_journal(self) -> None:
+        """Take what the device recorded and attribute it.
+
+        Drained rather than read, so no row is counted twice, and drained
+        wherever this engine is already waiting on the device: the native
+        record is bounded, and leaving it to fill means losing the oldest
+        rows of the very request being measured.
+        """
+        # Asked of the device this core has, if it has one. A core built
+        # without an initializer -- as several tests do -- has none, and the
+        # accessor would open one just to be asked for a journal.
+        take = getattr(getattr(self, "_raw", None), "take_io_journal", None)
+        if take is None:
+            return
+        try:
+            rows, dropped = take()
+        except Exception:
+            logger.warning("RawBlockCore could not read the native I/O journal")
+            return
+        if rows or dropped:
+            self._io_attribution.record(rows, dropped)
+
+    @property
     def _io_ledger(self) -> "RawBlockIoLedger":
         """This core's I/O ledger, created on first use."""
         ledger = self._io_ledger_instance
@@ -2190,6 +2383,7 @@ class RawBlockCore:
         ledger has its own; taking both in one order here and the other way
         anywhere else is how a deadlock is built.
         """
+        self._collect_native_io_journal()
         payload_writes = self._io_ledger.totals(direction="write", kind=IO_KIND_PAYLOAD)
         payload_reads = self._io_ledger.totals(direction="read", kind=IO_KIND_PAYLOAD)
         with self._lock:
@@ -2215,6 +2409,7 @@ class RawBlockCore:
                 "payload_writes": payload_writes.as_payload(),
                 "payload_reads": payload_reads.as_payload(),
                 "io_by_kind_and_path": self._io_ledger.snapshot(),
+                "io_by_request": self._io_attribution.as_payload(),
                 "next_slot": self._next_slot,
                 "max_slots": self._max_slots,
                 "metadata_seq": self._meta_seq,
@@ -2624,6 +2819,8 @@ class RawBlockCore:
         total_lens: Sequence[int],
         placement_ids: Sequence[PlacementId] | None = None,
         kinds: Sequence[str] | None = None,
+        *,
+        io_context: Optional[RawBlockIoContext] = None,
     ) -> None:
         """Write buffers as chunks bounded by ``max_data_transfer_size``.
 
@@ -2709,6 +2906,7 @@ class RawBlockCore:
             chunk_buffers,
             chunk_lens,
             chunk_placement_ids,
+            request_tag=_io_tag(io_context),
         )
         completed = self._wait_iouring_results(
             raw_dev,
@@ -2734,6 +2932,8 @@ class RawBlockCore:
         payload_lens: Sequence[int],
         total_lens: Sequence[int],
         kinds: Sequence[str] | None = None,
+        *,
+        io_context: Optional[RawBlockIoContext] = None,
     ) -> list[bool]:
         """Read buffers as bounded NVMe raw-command chunks.
 
@@ -2818,6 +3018,7 @@ class RawBlockCore:
                 chunk_offsets,
                 chunk_buffers,
                 chunk_lens,
+                request_tag=_io_tag(io_context),
             )
             chunk_results = self._wait_iouring_results(
                 raw_dev,
@@ -2858,6 +3059,8 @@ class RawBlockCore:
         total_lens: Sequence[int],
         placement_ids: Sequence[PlacementId] | None = None,
         kinds: Sequence[str] | None = None,
+        *,
+        io_context: Optional[RawBlockIoContext] = None,
     ) -> None:
         """Write one or more buffers through the configured Rust I/O path.
 
@@ -2906,6 +3109,7 @@ class RawBlockCore:
                 total_lens,
                 per_write_placement_ids,
                 write_kinds,
+                io_context=io_context,
             )
             return
 
@@ -2933,6 +3137,7 @@ class RawBlockCore:
                 list(buffers),
                 [int(total_len) for total_len in total_lens],
                 per_write_placement_ids,
+                request_tag=_io_tag(io_context),
             )
             completed = self._wait_iouring_results(
                 raw_dev,
@@ -2977,7 +3182,12 @@ class RawBlockCore:
         ):
             try:
                 raw_dev.write_uring(
-                    int(offset), buf, int(payload_len), int(total_len), placement_id
+                    int(offset),
+                    buf,
+                    int(payload_len),
+                    int(total_len),
+                    placement_id,
+                    request_tag=_io_tag(io_context),
                 )
             except BaseException:
                 self._adopt_native_poison(raw_dev, "io_uring write")
@@ -2998,6 +3208,8 @@ class RawBlockCore:
         payload_lens: Sequence[int],
         total_lens: Sequence[int],
         kinds: Sequence[str] | None = None,
+        *,
+        io_context: Optional[RawBlockIoContext] = None,
     ) -> list[bool]:
         """Read one or more buffers through the configured Rust I/O path.
 
@@ -3044,6 +3256,7 @@ class RawBlockCore:
                 payload_lens,
                 total_lens,
                 read_kinds,
+                io_context=io_context,
             )
 
         self._io_ledger.logical_request(
@@ -3060,6 +3273,7 @@ class RawBlockCore:
             [int(offset) for offset in offsets],
             list(buffers),
             [int(total_len) for total_len in total_lens],
+            request_tag=_io_tag(io_context),
         )
         results = self._wait_iouring_results(
             raw_dev,
@@ -3201,6 +3415,10 @@ class RawBlockCore:
         """
         results, completion_errors = raw_dev.wait_iouring(batch_id)
         results = list(results)
+        # Here, because this is where the engine is already waiting on the
+        # device. The native record is bounded, so leaving it to fill means
+        # losing the oldest rows of the very request being measured.
+        self._collect_native_io_journal()
         self._adopt_native_poison(raw_dev, operation, batch_id)
         for operation_index, error in completion_errors:
             logger.error(
@@ -3227,6 +3445,7 @@ class RawBlockCore:
         offset: int,
         *,
         placement_id: PlacementId = None,
+        io_context: Optional[RawBlockIoContext] = None,
     ) -> bool:
         """Write one object header and payload into a raw-block slot.
 
@@ -3271,6 +3490,7 @@ class RawBlockCore:
                     [hdr_total, total_len],
                     [placement_id, placement_id],
                     [IO_KIND_SLOT_HEADER, IO_KIND_PAYLOAD],
+                    io_context=io_context,
                 )
             finally:
                 with self._lock:
@@ -3286,6 +3506,8 @@ class RawBlockCore:
         keys: Sequence[RawBlockKeySpec],
         objs: Sequence[MemoryObj],
         placement_ids: Sequence[PlacementId],
+        *,
+        io_context: Optional[RawBlockIoContext] = None,
     ) -> RawBlockPutManyResult:
         """Persist objects using bounded io_uring batch submissions.
 
@@ -3314,7 +3536,9 @@ class RawBlockCore:
                 have the same length.
         """
         if len(keys) <= _MAX_PUT_MANY_IO_URING_BATCH_KEYS:
-            return self._put_many_batch_io_chunk(keys, objs, placement_ids)
+            return self._put_many_batch_io_chunk(
+                keys, objs, placement_ids, io_context=io_context
+            )
 
         results = [False] * len(keys)
         stored_keys: list[str] = []
@@ -3341,6 +3565,7 @@ class RawBlockCore:
                 [key for _, key, _, _ in chunk],
                 [obj for _, _, obj, _ in chunk],
                 [placement_id for _, _, _, placement_id in chunk],
+                io_context=io_context,
             )
             for local_i, (global_i, _key, _obj, _placement_id) in enumerate(chunk):
                 results[global_i] = chunk_result.results[local_i]
@@ -3356,6 +3581,8 @@ class RawBlockCore:
         keys: Sequence[RawBlockKeySpec],
         objs: Sequence[MemoryObj],
         placement_ids: Sequence[PlacementId],
+        *,
+        io_context: Optional[RawBlockIoContext] = None,
     ) -> RawBlockPutManyResult:
         """Persist one bounded chunk through a single ``_write_buffers`` call.
 
@@ -3524,6 +3751,7 @@ class RawBlockCore:
                     total_lens,
                     write_placement_ids,
                     write_kinds,
+                    io_context=io_context,
                 )
             except Exception as e:
                 write_succeeded = False
@@ -3601,6 +3829,7 @@ class RawBlockCore:
                     [self.header_bytes],
                     [self.header_bytes],
                     [IO_KIND_SLOT_HEADER],
+                    io_context=self._metadata_io_context,
                 )
             ):
                 return "unreadable", None
@@ -3772,6 +4001,7 @@ class RawBlockCore:
                     [self.block_align],
                     [self.block_align],
                     [IO_KIND_CHECKPOINT],
+                    io_context=self._metadata_io_context,
                 )
             ):
                 return None
@@ -3807,6 +4037,7 @@ class RawBlockCore:
                     [payload_len],
                     [total_len],
                     [IO_KIND_CHECKPOINT],
+                    io_context=self._metadata_io_context,
                 )
             ):
                 return None
@@ -4004,6 +4235,7 @@ class RawBlockCore:
             [payload_total_len],
             [placement_id],
             [IO_KIND_CHECKPOINT],
+            io_context=self._metadata_io_context,
         )
         self._write_buffers(
             [target],
@@ -4012,6 +4244,7 @@ class RawBlockCore:
             [self.block_align],
             [placement_id],
             [IO_KIND_CHECKPOINT],
+            io_context=self._metadata_io_context,
         )
 
         with self._lock:

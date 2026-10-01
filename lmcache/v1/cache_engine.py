@@ -1305,6 +1305,7 @@ class LMCacheEngine:
         *,
         request_configs: Optional[dict] = None,
         timeout_ms: int = 5000,
+        request_id: str = "",
     ) -> Optional[int]:
         """Fence a shared-storage reader to an advertised request manifest.
 
@@ -1318,6 +1319,9 @@ class LMCacheEngine:
             receipt: Durable publication identity advertised by the writer.
             request_configs: Per-request cache key configuration.
             timeout_ms: Maximum time to wait for the compatible generation.
+            request_id: The name the writer published this request under, so
+                this reader's I/O is attributed to the same request on both
+                sides of the handoff.
 
         Returns:
             The number of tokens covered by the adopted manifest, or None when
@@ -1355,6 +1359,7 @@ class LMCacheEngine:
                 receipt,
                 keys,
                 timeout_ms=candidate_timeout,
+                request_id=request_id,
             ):
                 return len(candidate_tokens)
         return None

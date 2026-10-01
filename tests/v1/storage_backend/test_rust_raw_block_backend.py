@@ -90,11 +90,12 @@ class _FakeRawBlockDevice:
         payload_len: int | None = None,
         total_len: int | None = None,
         placement_id: int | None = None,
+        request_tag: str | None = None,
     ) -> None:
         del placement_id
         self.pwrite_from_buffer(offset, data, payload_len, total_len)
 
-    def batched_read(self, offsets, buffers, total_lens):
+    def batched_read(self, offsets, buffers, total_lens, request_tag=None):
         batch_id = self._next_batch_id
         self._next_batch_id += 1
         self.batched_reads.append((list(offsets), list(total_lens)))
@@ -111,6 +112,7 @@ class _FakeRawBlockDevice:
         buffers: list[Any],
         total_lens: list[int],
         placement_ids: list[int | None] | None = None,
+        request_tag: str | None = None,
     ) -> int:
         del placement_ids
         batch_id = self._next_batch_id
@@ -2933,8 +2935,9 @@ def test_rust_raw_block_backend_batched_submit_rolls_back_only_unscheduled_refs(
         def fake_put_many(
             keys: list[RawBlockKeySpec],
             objs: list[Any],
+            **kwargs: Any,
         ) -> RawBlockPutManyResult:
-            del objs
+            del objs, kwargs
             return RawBlockPutManyResult(
                 results=[True] * len(keys),
                 stored_keys=[key.encoded for key in keys],

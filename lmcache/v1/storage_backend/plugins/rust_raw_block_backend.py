@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 # Standard
+from collections import OrderedDict
 from collections.abc import Mapping
 from concurrent.futures import CancelledError
 from dataclasses import replace
@@ -24,6 +25,7 @@ from lmcache.v1.storage_backend.raw_block import (
     RawBlockCore,
     RawBlockCoreConfig,
     RawBlockDerivationDescriptor,
+    RawBlockIoContext,
     RawBlockKeySpec,
     RawBlockPDRequestTracker,
     RawBlockPublicationReceipt,
@@ -36,6 +38,7 @@ from lmcache.v1.storage_backend.raw_block import (
     round_up,
     validate_raw_block_io_options,
 )
+from lmcache.v1.storage_backend.storage_pd_protocol import STORAGE_PD_INCARNATION
 from lmcache.v1.storage_backend.storage_pd_ack import (
     ACK_REJECTED,
     ACK_UNRESOLVED,
@@ -62,6 +65,12 @@ logger = init_logger(__name__)
 # point, so that no allocator, finalizer or exit handler can release memory a
 # command may still be reaching.
 _RETAINED_AFTER_UNKNOWN_OUTCOME: list[Any] = []
+
+# How many adopted publications a reader remembers the request name of. One
+# entry is two short strings; this covers far more in-flight restores than a
+# decoder has, and a reader that has forgotten one attributes its reads to no
+# request rather than to the wrong one.
+_ADOPTED_REQUEST_HISTORY = 4096
 
 
 def _probe_says_unknown(probe: Optional[Callable[[], Any]], what: str) -> bool:
@@ -382,6 +391,17 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         self._sealed = False
         self._pin_lock = threading.Lock()
         self._pinned_keys: set[str] = set()
+        # This deployment's run, so an attribution row names which run it
+        # came from rather than only which request.
+        self._run_id = str(getattr(config, "lmcache_instance_id", "") or "") or str(
+            extra.get("rust_raw_block.run_id", "") or ""
+        )
+        # Which published request each adopted key belongs to. A reader's
+        # attribution comes from the receipt it adopted, because that is
+        # the name the writer, the READY status and the acknowledgement all
+        # use; an engine-local request name correlates with nothing on the
+        # side that published the bytes.
+        self._adopted_requests: OrderedDict[str, str] = OrderedDict()
 
     def __str__(self) -> str:
         return "RustRawBlockBackend"
@@ -771,6 +791,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         keys: Sequence[CacheEngineKey],
         *,
         timeout_ms: int,
+        request_id: str = "",
     ) -> bool:
         """Adopt the request generation advertised by a storage-P/D writer."""
         if self._role != "reader":
@@ -781,12 +802,20 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                 "further publications"
             )
         encoded_keys = [encode_legacy_key(key).encoded for key in keys]
-        return self._core.refresh_until_publication(
+        adopted = self._core.refresh_until_publication(
             receipt,
             encoded_keys,
             timeout_ms=timeout_ms,
             refresh_interval_ms=max(self._index_refresh_min_ms, 1),
         )
+        if adopted and request_id:
+            with self._pin_lock:
+                for encoded in encoded_keys:
+                    self._adopted_requests.pop(encoded, None)
+                    self._adopted_requests[encoded] = request_id
+                while len(self._adopted_requests) > _ADOPTED_REQUEST_HISTORY:
+                    self._adopted_requests.popitem(last=False)
+        return adopted
 
     def publish_existing_request(
         self,
@@ -1096,7 +1125,9 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         """Persist a P/D batch and report only whole-batch success."""
         specs = [item[1] for item in pending]
         memory_objs = [item[2] for item in pending]
-        io_task, io_finished = self._start_put_many(specs, memory_objs)
+        io_task, io_finished = self._start_put_many(
+            specs, memory_objs, request_id=req_id
+        )
         try:
             put_result = await asyncio.shield(io_task)
             if len(put_result.results) != len(pending) or not all(put_result.results):
@@ -1169,6 +1200,10 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         keys = [item[0] for item in pending]
         specs = [item[1] for item in pending]
         memory_objs = [item[2] for item in pending]
+        # The generic cache path has no peer-visible request name: these keys
+        # were stored because the engine chose to, not because a peer asked
+        # for a request by name. Attribution rows for them say so rather
+        # than borrowing a name from somewhere else.
         io_task, io_finished = self._start_put_many(specs, memory_objs)
         try:
             put_result = await asyncio.shield(io_task)
@@ -1486,10 +1521,27 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         """Count extents held pending acknowledgement."""
         return self._pd_tracker.live_lease_count() if self._pd_tracker else 0
 
+    def _io_context(self, request_id: str = "") -> RawBlockIoContext:
+        """Who this engine's next batch of I/O is for.
+
+        Built here and handed to the core with the job, because the fields
+        that identify it -- the run, the request as the *peer* names it, this
+        rank and this writer's incarnation -- are known at submission time
+        and nowhere near the thread that reaps the completion.
+        """
+        return RawBlockIoContext(
+            run_id=self._run_id,
+            request_id=request_id,
+            tp_rank=self._ack_tp_rank,
+            incarnation=self._core.writer_epoch or STORAGE_PD_INCARNATION,
+        )
+
     def _start_put_many(
         self,
         specs: Sequence[RawBlockKeySpec],
         memory_objs: Sequence[MemoryObj],
+        *,
+        request_id: str = "",
     ) -> tuple["asyncio.Future[Any]", threading.Event]:
         """Start a batched write on a worker thread and track it honestly.
 
@@ -1499,10 +1551,13 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         buffers. The returned event is set by the thread itself and can.
         """
         io_finished = threading.Event()
+        io_context = self._io_context(request_id)
 
         def _run_put() -> RawBlockPutManyResult:
             try:
-                return self._core.put_many(list(specs), list(memory_objs))
+                return self._core.put_many(
+                    list(specs), list(memory_objs), io_context=io_context
+                )
             finally:
                 io_finished.set()
 
@@ -1586,6 +1641,15 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
 
         specs = [encode_legacy_key(key) for key in keys]
         encoded_keys = [spec.encoded for spec in specs]
+        with self._pin_lock:
+            request_id = next(
+                (
+                    self._adopted_requests[encoded]
+                    for encoded in encoded_keys
+                    if encoded in self._adopted_requests
+                ),
+                "",
+            )
         allocated: list[MemoryObj] = []
         locked_specs: list[RawBlockKeySpec] = []
         with self._pin_lock:
@@ -1628,6 +1692,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             load_results = self._core.load_many_into(
                 [spec.encoded for spec in load_specs],
                 allocated,
+                io_context=self._io_context(request_id),
             )
             loaded_count = 0
             for ok in load_results:
