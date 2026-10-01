@@ -505,6 +505,7 @@ SCRIPTED_SUBMISSION_QUEUE_FULL = SCRIPTED_PREAMBLE + textwrap.dedent(
     results, errors = dev.wait_iouring(batch)
     report["results"] = list(results)
     report["errors"] = [str(e) for _, e in errors]
+    report["journal"], report["dropped"] = dev.take_io_journal()
     report["violations"] = dev.fake_violations()
     report["poisoned"] = dev.is_poisoned()
     print(json.dumps(report))
@@ -543,6 +544,7 @@ SCRIPTED_PARTIAL_TAKE = SCRIPTED_PREAMBLE + textwrap.dedent(
     dev.fake_complete(suffix[0]["user_data"], 4096)
     results, errors = dev.wait_iouring(batch)
     print(json.dumps({
+        "journal": dev.take_io_journal()[0],
         "resident_before": resident_before,
         "accepted": accepted,
         "suffix_while_held": suffix_while_held,
@@ -642,6 +644,11 @@ def test_a_full_submission_queue_is_reported_not_panicked_on(tmp_path) -> None:
     refused = [index for index, ok in enumerate(report["results"]) if not ok]
     assert len(refused) == 1, report
     assert any("submission queue full" in error for error in report["errors"]), report
+    assert report["dropped"] == 0, report
+    assert [row["outcome"] for row in report["journal"]] == [
+        "submitted",
+        "completed",
+    ], report
 
 
 def test_a_partial_take_delivers_the_suffix_once(tmp_path) -> None:
@@ -673,6 +680,11 @@ def test_a_partial_take_delivers_the_suffix_once(tmp_path) -> None:
     assert report["suffix_while_held"] == [resident_before[1]], report
     assert report["suffix"] == [resident_before[1]], report
     assert report["accepted"][0]["user_data"] != report["suffix"][0]["user_data"]
+    operations: dict[str, list[str]] = {}
+    for row in report["journal"]:
+        operations.setdefault(row["operation_id"], []).append(row["outcome"])
+    assert len(operations) == 2, report
+    assert all(events == ["submitted", "completed"] for events in operations.values())
 
     assert report["results"] == [True, True]
     assert report["errors"] == []
@@ -1168,7 +1180,10 @@ SCRIPTED_SHORT_REMAINDER_RETRIED = SCRIPTED_PREAMBLE + textwrap.dedent(
     remainder = dev.fake_owned_sqes()
     dev.fake_complete(remainder[0]["user_data"], 4096)
     results, errors = dev.wait_iouring(batch)
+    journal, dropped = dev.take_io_journal()
     report.update({
+        "journal": journal,
+        "dropped": dropped,
         "remainder": remainder,
         "results": list(results),
         "errors": [str(e) for _, e in errors],
@@ -1207,6 +1222,17 @@ def test_a_refused_remainder_submit_is_retried_and_lands(tmp_path) -> None:
     # A retryable submit error is not an unknown outcome.
     assert report["poisoned_after_refusal"] is False, report
     assert report["remainder"] == report["resident_after_refusal"], report
+    assert report["dropped"] == 0, report
+    journal = report["journal"]
+    assert [row["outcome"] for row in journal] == [
+        "submitted",
+        "short",
+        "submitted",
+        "completed",
+    ], report
+    assert [int(row["bytes"]) for row in journal] == [8192, 4096, 4096, 4096], report
+    assert [int(row["attempt"]) for row in journal] == [0, 0, 1, 1], report
+    assert len({row["operation_id"] for row in journal}) == 1, report
 
     assert report["results"] == [True], report
     assert report["errors"] == [], report
@@ -1236,7 +1262,10 @@ SCRIPTED_COMPLETION_DURING_CLOSE = SCRIPTED_PREAMBLE + textwrap.dedent(
     dev.close()
     results, errors = dev.wait_iouring(batch)
     gc.collect()
+    journal, dropped = dev.take_io_journal()
     print(json.dumps({
+        "journal": journal,
+        "dropped": dropped,
         "before": before,
         "delivered": dev.fake_shutdown_delivered(),
         "owned": dev.fake_owned(),
@@ -1275,6 +1304,12 @@ def test_a_completion_during_close_is_reaped_before_releasing_its_owner(
     assert report["retained"] == 0, report
     assert report["owner_alive_after_poll"] is False, report
     assert report["violations"] == [], report
+    assert report["dropped"] == 0, report
+    journal = report["journal"]
+    outcome = "completed" if result == 4096 else "short" if result >= 0 else "failed"
+    assert [row["outcome"] for row in journal] == ["submitted", outcome], report
+    assert [int(row["bytes"]) for row in journal] == [4096, result], report
+    assert len({(row["operation_id"], row["attempt"]) for row in journal}) == 1, report
 
 
 SCRIPTED_FATAL_SHORT_REMAINDER = SCRIPTED_PREAMBLE + textwrap.dedent(

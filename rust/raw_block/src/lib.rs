@@ -1779,6 +1779,8 @@ struct IoSubmission {
     // looked up later: the completion is reaped on the worker thread, long
     // after whatever "current request" a thread-local could have named.
     request_tag: Option<Arc<str>>,
+    /// Zero for the initial SQE; incremented for each short-I/O remainder.
+    attempt: u64,
 }
 
 /// Which buffer path a submission actually took.
@@ -1839,7 +1841,7 @@ impl NativeIoPath {
 
 /// What one physical operation did, and who it was for.
 ///
-/// Recorded when the SQE is built and again when the device answers, so a
+/// Recorded after the SQE enters the ring and again when the device answers, so a
 /// reader can join the two and see an operation nobody answered for rather
 /// than inferring it from a total that happens to match. The request tag is
 /// the caller's own immutable identity for the work, carried on the
@@ -1849,6 +1851,8 @@ impl NativeIoPath {
 struct NativeIoEvent {
     request_tag: Option<Arc<str>>,
     batch_id: u64,
+    operation_id: u64,
+    attempt: u64,
     is_write: bool,
     path: &'static str,
     /// "submitted", "completed", "short" or "failed".
@@ -1891,9 +1895,51 @@ impl NativeIoJournal {
         events.push_back(event);
     }
 
-    fn drain(&self) -> Vec<NativeIoEvent> {
+    fn record_submission(&self, sub: &IoSubmission, operation_id: u64) {
+        self.record(NativeIoEvent {
+            request_tag: sub.request_tag.clone(),
+            batch_id: sub.batch_id,
+            operation_id,
+            attempt: sub.attempt,
+            is_write: sub.is_write,
+            path: NativeIoPath::of(sub).name(),
+            outcome: "submitted",
+            bytes: sub.len as i64,
+        });
+    }
+
+    fn record_completion(&self, sub: &IoSubmission, operation_id: u64, result: i32) {
+        // NVMe passthrough CQEs carry command status, not a byte count.
+        let (outcome, bytes) = if sub.nvme_cmd_data.is_some() {
+            if result == 0 {
+                ("completed", sub.len as i64)
+            } else {
+                ("failed", 0)
+            }
+        } else if result < 0 {
+            ("failed", result as i64)
+        } else if (result as usize) < sub.len {
+            ("short", result as i64)
+        } else {
+            ("completed", result as i64)
+        };
+        self.record(NativeIoEvent {
+            request_tag: sub.request_tag.clone(),
+            batch_id: sub.batch_id,
+            operation_id,
+            attempt: sub.attempt,
+            is_write: sub.is_write,
+            path: NativeIoPath::of(sub).name(),
+            outcome,
+            bytes,
+        });
+    }
+
+    fn drain(&self) -> (Vec<NativeIoEvent>, u64) {
         let mut events = self.events.lock().unwrap();
-        events.drain(..).collect()
+        // Keep lost rows in the same snapshot as the rows they displaced.
+        let dropped = self.dropped.swap(0, Ordering::Relaxed);
+        (events.drain(..).collect(), dropped)
     }
 }
 
@@ -1986,6 +2032,7 @@ impl Default for IoSubmission {
             batch_id: 0,
             nvme_cmd_data: None,
             request_tag: None,
+            attempt: 0,
         }
     }
 }
@@ -2558,21 +2605,6 @@ impl RawBlockDevice {
                 user_data: u64,
             ) -> Result<(), PyErr> {
                 let ptr = sub.ptr_addr as *mut u8;
-                // Recorded here rather than from the configuration: which
-                // buffer path this operation takes is decided by whether its
-                // address is in the registration map and what kind of
-                // registration that is. A configured dma-buf pool whose
-                // buffers miss the map issues ordinary SQEs, and nothing
-                // above this layer can tell the difference.
-                journal.record(NativeIoEvent {
-                    request_tag: sub.request_tag.clone(),
-                    batch_id: sub.batch_id,
-                    is_write: sub.is_write,
-                    path: NativeIoPath::of(sub).name(),
-                    outcome: "submitted",
-                    bytes: sub.len as i64,
-                });
-
                 // Check if this is an io_uring_cmd submission
                 if let Some(nvme_data) = &sub.nvme_cmd_data {
                     // Prepare NVMe uring command
@@ -2642,6 +2674,7 @@ impl RawBlockDevice {
                     let sqe = sqe.user_data(user_data);
                     ring.push_regular(&sqe, user_data, SqeDescriptor::describe(sub, user_data))?;
                 }
+                journal.record_submission(sub, user_data);
                 Ok(())
             }
 
@@ -2735,6 +2768,8 @@ impl RawBlockDevice {
                                 if let Some(mut sub) = in_flight.remove(&user_data) {
                                     let batch_id = sub.batch_id;
                                     let cqe_result = cqe.result;
+                                    io_journal_worker
+                                        .record_completion(&sub, user_data, cqe_result);
 
                                     // Decide a short completion before pushing
                                     // anything. io_uring_cmd is never retried, and
@@ -2746,14 +2781,6 @@ impl RawBlockDevice {
                                         sub.fixed_dmabuf.is_some(),
                                     );
                                     if short_action == ShortIoAction::FailTerminally {
-                                        io_journal_worker.record(NativeIoEvent {
-                                            request_tag: sub.request_tag.clone(),
-                                            batch_id,
-                                            is_write: sub.is_write,
-                                            path: NativeIoPath::of(&sub).name(),
-                                            outcome: "short",
-                                            bytes: cqe_result as i64,
-                                        });
                                         let result =
                                             handle_completion_result(&mut sub, -libc::EIO, false);
                                         sub.completion.set(result);
@@ -2770,6 +2797,7 @@ impl RawBlockDevice {
                                         // Update offset and length for resubmission
                                         sub.offset += bytes_transferred as u64;
                                         sub.len -= bytes_transferred;
+                                        sub.attempt += 1;
                                         // Update buffer pointer for writes and direct reads
                                         if sub.is_write || sub.bounce.is_none() {
                                             sub.ptr_addr += bytes_transferred;
@@ -2842,18 +2870,6 @@ impl RawBlockDevice {
                                     }
 
                                     // Handle completion result
-                                    io_journal_worker.record(NativeIoEvent {
-                                        request_tag: sub.request_tag.clone(),
-                                        batch_id,
-                                        is_write: sub.is_write,
-                                        path: NativeIoPath::of(&sub).name(),
-                                        outcome: if cqe_result >= 0 {
-                                            "completed"
-                                        } else {
-                                            "failed"
-                                        },
-                                        bytes: cqe_result as i64,
-                                    });
                                     let result =
                                         handle_completion_result(&mut sub, cqe_result, false);
                                     sub.completion.set(result);
@@ -3164,6 +3180,7 @@ impl RawBlockDevice {
                         {
                             if let Some(mut sub) = in_flight.remove(&user_data) {
                                 let batch_id = sub.batch_id;
+                                io_journal_worker.record_completion(&sub, user_data, cqe_result);
                                 let result = handle_completion_result(&mut sub, cqe_result, true);
                                 sub.completion.set(result);
                                 decrement_in_flight(
@@ -3865,6 +3882,7 @@ impl RawBlockDevice {
                     batch_id,
                     nvme_cmd_data,
                     request_tag: request_tag.clone(),
+                    attempt: 0,
                 };
 
                 submissions.push((sub, comp));
@@ -4108,8 +4126,10 @@ impl RawBlockDevice {
     ///
     /// Each row names the request the operation was for, the batch it
     /// belonged to, the buffer path it actually took, the outcome and the
-    /// byte count. Two rows per operation: one where its SQE was built and
-    /// one where the device answered, so an operation nobody answered for
+    /// byte count. A submitted row means the SQE entered the ring, which
+    /// does not yet prove kernel acceptance. Pair it with a completion by
+    /// operation_id and attempt: a short transfer starts another attempt
+    /// with the same operation_id. An operation nobody answered for
     /// shows up as the submission with no outcome beside it, rather than
     /// having to be inferred from totals that happen to agree.
     ///
@@ -4118,10 +4138,8 @@ impl RawBlockDevice {
     /// ``dropped`` is how many rows the bound discarded before this call,
     /// so a sum known to be incomplete says so.
     fn take_io_journal(&self) -> PyResult<(Vec<HashMap<String, String>>, u64)> {
-        let dropped = self.io_journal.dropped.swap(0, Ordering::Relaxed);
-        let rows = self
-            .io_journal
-            .drain()
+        let (events, dropped) = self.io_journal.drain();
+        let rows = events
             .into_iter()
             .map(|event| {
                 let mut row: HashMap<String, String> = HashMap::new();
@@ -4133,6 +4151,8 @@ impl RawBlockDevice {
                         .map_or_else(String::new, |tag| tag.to_string()),
                 );
                 row.insert("batch_id".to_string(), event.batch_id.to_string());
+                row.insert("operation_id".to_string(), event.operation_id.to_string());
+                row.insert("attempt".to_string(), event.attempt.to_string());
                 row.insert(
                     "direction".to_string(),
                     if event.is_write { "write" } else { "read" }.to_string(),
@@ -4468,6 +4488,7 @@ impl RawBlockDevice {
                 payload_len: None,
                 batch_id,
                 request_tag: request_tag.clone(),
+                attempt: 0,
                 nvme_cmd_data: self._build_nvme_cmd_data(
                     if placement_id_u16.is_some() { 0x2 } else { 0x0 },
                     placement_id_u16.unwrap_or(0),
@@ -4506,6 +4527,7 @@ impl RawBlockDevice {
                 payload_len: Some(payload_len),
                 batch_id,
                 request_tag: request_tag.clone(),
+                attempt: 0,
                 nvme_cmd_data: self._build_nvme_cmd_data(
                     if placement_id_u16.is_some() { 0x2 } else { 0x0 },
                     placement_id_u16.unwrap_or(0),
@@ -4746,6 +4768,7 @@ impl RawBlockDevice {
                     batch_id,
                     nvme_cmd_data: nvme_cmd_data.clone(),
                     request_tag: request_tag.clone(),
+                    attempt: 0,
                 };
 
                 submissions.push((sub, comp));
@@ -5388,5 +5411,64 @@ mod classify_submit_tests {
         // Nothing is known about the ring, so the safe reading is fatal.
         let e: io::Result<usize> = Err(io::Error::other("no errno"));
         assert_eq!(classify_submit(&e), SubmitOutcome::Fatal);
+    }
+}
+
+#[cfg(test)]
+mod io_journal_tests {
+    use super::{IoSubmission, NativeIoJournal, NvmeCmdData};
+
+    #[test]
+    fn nvme_success_counts_the_transfer_instead_of_the_status() {
+        let journal = NativeIoJournal::new(8);
+        let sub = IoSubmission {
+            len: 4096,
+            nvme_cmd_data: Some(NvmeCmdData {
+                nsid: 1,
+                lba_shift: 12,
+                dtype: 0,
+                dspec: 0,
+            }),
+            ..Default::default()
+        };
+        journal.record_completion(&sub, 7, 0);
+        journal.record_completion(&sub, 8, 1);
+        let (events, dropped) = journal.drain();
+        assert_eq!(dropped, 0);
+        assert_eq!(events[0].outcome, "completed");
+        assert_eq!(events[0].bytes, 4096);
+        assert_eq!(events[1].outcome, "failed");
+        assert_eq!(events[1].bytes, 0);
+    }
+
+    #[test]
+    fn short_and_zero_byte_completions_keep_their_actual_counts() {
+        let journal = NativeIoJournal::new(8);
+        let sub = IoSubmission {
+            len: 4096,
+            ..Default::default()
+        };
+        journal.record_completion(&sub, 7, 2048);
+        journal.record_completion(&sub, 8, 0);
+        let (events, dropped) = journal.drain();
+        assert_eq!(dropped, 0);
+        assert_eq!(events[0].outcome, "short");
+        assert_eq!(events[0].bytes, 2048);
+        assert_eq!(events[1].outcome, "short");
+        assert_eq!(events[1].bytes, 0);
+    }
+
+    #[test]
+    fn dropped_rows_are_returned_with_the_snapshot_that_lost_them() {
+        let journal = NativeIoJournal::new(1);
+        let sub = IoSubmission::default();
+        journal.record_submission(&sub, 7);
+        journal.record_completion(&sub, 7, 0);
+        let (events, dropped) = journal.drain();
+        assert_eq!(events.len(), 1);
+        assert_eq!(dropped, 1);
+        let (events, dropped) = journal.drain();
+        assert!(events.is_empty());
+        assert_eq!(dropped, 0);
     }
 }
