@@ -51,7 +51,10 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.manager import LMCacheManager
 from lmcache.v1.storage_backend.raw_block import RawBlockPublicationReceipt
-from lmcache.v1.storage_backend.storage_pd_ack import StoragePDAckClient
+from lmcache.v1.storage_backend.storage_pd_ack import (
+    StoragePDAckClient,
+    StoragePDAckReservation,
+)
 from lmcache.v1.storage_backend.storage_pd_protocol import (
     STORAGE_PD_INCARNATION,
     StoragePDDelivery,
@@ -601,6 +604,13 @@ class LMCacheConnectorV1Impl:
         # once and survives a queue that has no room for it yet.
         self._storage_pd_obligations: dict[str, StoragePDObligation] = {}
         self._storage_pd_acks_sent: OrderedDict[str, None] = OrderedDict()
+        # Granted read claims with the acknowledgement room taken for them,
+        # from before the read until the acknowledgement is owed. Keyed by
+        # the producer's own request name, which is what the claim and the
+        # acknowledgement both carry.
+        self._storage_pd_claims: OrderedDict[
+            str, tuple[StoragePDReadAck, StoragePDAckReservation]
+        ] = OrderedDict()
         # Acknowledgements this consumer owes producers, each owed until
         # its writer answers. Owned by the client's own worker rather than
         # by the restore that created it: the request is long gone before a
@@ -1037,6 +1047,11 @@ class LMCacheConnectorV1Impl:
             raise RuntimeError(
                 "storage P/D status does not identify this READY request"
             )
+        # Asked before the adoption that precedes the restore, because the
+        # producer has to settle which incarnation may acknowledge these
+        # extents before any of them is read, and because room to
+        # acknowledge has to exist before there is something to acknowledge.
+        self._claim_storage_pd_read(status)
         assert self.lmcache_engine is not None
         timeout_ms = int(
             (self.config.extra_config or {}).get(
@@ -1056,6 +1071,70 @@ class LMCacheConnectorV1Impl:
                 f"manifest for {request.req_id} rank {self._storage_pd_tp_rank}"
             )
         return status, published_tokens
+
+    def _claim_storage_pd_read(self, status: StoragePDStatus) -> None:
+        """Take room to acknowledge, then ask the producer to be its reader.
+
+        Both have to happen before the bytes move. Room first: a consumer
+        that reads and then finds it cannot take on another acknowledgement
+        has already consumed a publication nothing will release, and the
+        producer holds those extents for its own lifetime. Permission
+        second: a producer settles which consumer incarnation may release
+        its holds, and a consumer that restarted cannot inherit reads the
+        previous one made.
+
+        Raises rather than reading anyway. Refusing the restore leaves the
+        publication exactly as it was, which is the outcome both of these
+        exist to reach.
+        """
+        client = self._storage_pd_ack_client
+        if client is None:
+            raise RuntimeError(
+                "raw-block storage P/D cannot read a publication it has no "
+                f"way to acknowledge: {status.req_id} has no acknowledgement "
+                "client on this rank"
+            )
+        ack = StoragePDReadAck.for_status(
+            status,
+            consumer_instance_id=STORAGE_PD_INCARNATION,
+        )
+        with self._storage_pd_lock:
+            if status.req_id in self._storage_pd_claims:
+                # Already claimed and reserved for this publication; a
+                # second adoption of the same one needs neither again.
+                return
+        reservation = client.reserve(endpoint=status.ack_endpoint)
+        if reservation is None:
+            raise RuntimeError(
+                "raw-block storage P/D has no room to acknowledge another "
+                f"read; refusing to restore {status.req_id} rather than "
+                "read extents nothing would release"
+            )
+        granted = False
+        try:
+            granted = client.claim(
+                ack,
+                endpoint=status.ack_endpoint,
+                session_id=self._storage_pd_session_id,
+            )
+        finally:
+            if not granted:
+                reservation.release()
+        if not granted:
+            raise RuntimeError(
+                "raw-block storage P/D producer did not grant this consumer "
+                f"the read of {status.req_id}; its extents belong to another "
+                "reader"
+            )
+        with self._storage_pd_lock:
+            self._storage_pd_claims[status.req_id] = (ack, reservation)
+            while len(self._storage_pd_claims) > STORAGE_PD_REQUEST_HISTORY:
+                _, (_, stale) = self._storage_pd_claims.popitem(last=False)
+                # A claim this old belongs to a restore that never reached
+                # its acknowledgement, so nothing is going to owe one. The
+                # producer still holds those extents, which is correct: a
+                # read that did not finish releases nothing.
+                stale.release()
 
     def _ack_storage_pd_restore(
         self,
@@ -1079,28 +1158,29 @@ class LMCacheConnectorV1Impl:
         if req_id in self._storage_pd_acks_sent:
             return
         client = self._storage_pd_ack_client
-        if client is None:
+        with self._storage_pd_lock:
+            claim = self._storage_pd_claims.pop(status.req_id, None)
+        if client is None or claim is None:
+            # Nothing reaches here without a granted claim, which is what
+            # permitted the read in the first place.
             logger.error(
-                "Raw-block storage P/D restored request %s with no way to "
-                "acknowledge it; the producer's extents stay held",
+                "Raw-block storage P/D restored request %s without the "
+                "claim that permitted it; the producer's extents stay held",
                 req_id,
             )
             return
-        ack = StoragePDReadAck.for_status(
-            status,
-            consumer_instance_id=STORAGE_PD_INCARNATION,
-        )
+        ack, reservation = claim
         obligation = client.owe(
             ack,
             endpoint=status.ack_endpoint,
             session_id=self._storage_pd_session_id,
             deadline_s=self._storage_pd_ack_deadline_s,
+            reservation=reservation,
         )
         if obligation is None:
-            # Refused: either the producer advertised nowhere to reply or
-            # this consumer already owes as many acknowledgements as it is
-            # allowed to. Neither is recorded as sent, so a later restore
-            # of the same request tries again.
+            # The client is shutting down. Its own close settles what it
+            # owes as unresolved, and the extents stay held.
+            reservation.release()
             return
         self._storage_pd_acks_sent.pop(req_id, None)
         self._storage_pd_acks_sent[req_id] = None
@@ -1910,6 +1990,14 @@ class LMCacheConnectorV1Impl:
             elif self._storage_pd_status_sender is not None:
                 self._storage_pd_status_sender.close()
             if self._storage_pd_ack_client is not None:
+                with self._storage_pd_lock:
+                    claims = list(self._storage_pd_claims.values())
+                    self._storage_pd_claims.clear()
+                for _, reservation in claims:
+                    # Reads that never finished owe nothing, and their
+                    # producers go on holding those extents, which is
+                    # correct: nothing here observed a read complete.
+                    reservation.release()
                 # Unsettled obligations settle as unresolved here, because
                 # that is what they are: nothing heard a producer say
                 # anything about them, and the extents stay held.

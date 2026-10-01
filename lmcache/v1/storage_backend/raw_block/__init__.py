@@ -31,6 +31,7 @@ from lmcache.v1.storage_backend.raw_block.pd import (
     RawBlockPDRequestTracker,
     ReadAckIdentity,
     ReadAckOutcome,
+    ReadClaimOutcome,
 )
 
 __all__ = [
@@ -49,6 +50,7 @@ __all__ = [
     "RawBlockPDRequestTracker",
     "ReadAckIdentity",
     "ReadAckOutcome",
+    "ReadClaimOutcome",
     "decode_legacy_key",
     "normalize_raw_block_placement_ids",
     "decode_object_key",

@@ -43,6 +43,8 @@ from lmcache.v1.storage_backend.storage_pd_ack import (
     ACK_APPLIED,
     ACK_REJECTED,
     StoragePDAckRequest,
+    StoragePDClaimAnswer,
+    StoragePDClaimRequest,
 )
 from lmcache.v1.storage_backend.storage_pd_protocol import (
     STORAGE_PD_INCARNATION,
@@ -129,6 +131,27 @@ class _Producer:
             )
         )
 
+    def answer_claim(
+        self,
+        ack: StoragePDReadAck,
+        *,
+        session_id: str = SESSION,
+    ) -> StoragePDClaimAnswer:
+        """Answer one read claim through the backend's own handler."""
+        return self.backend._answer_read_claim(
+            StoragePDClaimRequest(
+                read=ack,
+                session_id=session_id,
+                nonce=uuid.uuid4().hex,
+            )
+        )
+
+    def read(self, status: StoragePDStatus, consumer: str) -> StoragePDReadAck:
+        """Claim and then acknowledge, the order a restore does it in."""
+        ack = _consumer_ack(status, consumer)
+        assert self.answer_claim(ack).granted
+        return ack
+
     def close(self) -> None:
         self.tracker.close(release_leases=False)
 
@@ -140,7 +163,10 @@ def producer():
     instance.close()
 
 
-def _consumer_ack(status: StoragePDStatus) -> StoragePDReadAck:
+def _consumer_ack(
+    status: StoragePDStatus,
+    consumer_instance_id: str = STORAGE_PD_INCARNATION,
+) -> StoragePDReadAck:
     """Build the acknowledgement a consumer owes, over the real wire codec.
 
     The round trip through msgspec is the point: a field the producer
@@ -151,15 +177,16 @@ def _consumer_ack(status: StoragePDStatus) -> StoragePDReadAck:
     adopted = msgspec.msgpack.decode(encoded, type=StoragePDStatus)
     return StoragePDReadAck.for_status(
         adopted,
-        consumer_instance_id=STORAGE_PD_INCARNATION,
+        consumer_instance_id=consumer_instance_id,
     )
 
 
 def test_an_ordinary_ready_is_acknowledged_by_its_own_writer(producer) -> None:
     status = producer.publish("request-1", ["key-1", "key-2"])
     assert producer.tracker.live_lease_count() == 1
+    ack = producer.read(status, STORAGE_PD_INCARNATION)
 
-    outcome, reason = producer.answer(_consumer_ack(status))
+    outcome, reason = producer.answer(ack)
 
     assert (outcome, reason) == (ACK_APPLIED, "")
     assert producer.tracker.live_lease_count() == 0
@@ -168,7 +195,7 @@ def test_an_ordinary_ready_is_acknowledged_by_its_own_writer(producer) -> None:
 
 def test_a_lost_reply_is_safe_to_retry(producer) -> None:
     status = producer.publish("request-1", ["key-1"])
-    ack = _consumer_ack(status)
+    ack = producer.read(status, STORAGE_PD_INCARNATION)
 
     assert producer.answer(ack)[0] == ACK_APPLIED
     # The consumer heard nothing and asks again with the same message.
@@ -196,8 +223,11 @@ def test_an_acknowledgement_for_an_earlier_generation_releases_nothing(
     producer,
 ) -> None:
     first = producer.publish("request-1", ["key-1"])
-    assert producer.answer(_consumer_ack(first))[0] == ACK_APPLIED
+    assert producer.answer(producer.read(first, STORAGE_PD_INCARNATION))[0] == (
+        ACK_APPLIED
+    )
     second = producer.publish("request-2", ["key-2"])
+    producer.read(second, STORAGE_PD_INCARNATION)
     assert second.checkpoint_seq != first.checkpoint_seq
 
     # Same writer, same rank, same session, but the manifest and generation
@@ -218,6 +248,7 @@ def test_a_reader_engine_answers_for_no_publication() -> None:
     producer = _Producer()
     try:
         status = producer.publish("request-1", ["key-1"])
+        producer.read(status, STORAGE_PD_INCARNATION)
         # A reader core adopted this namespace's epoch from a checkpoint.
         # The epoch it holds names the writer that published, not itself, so
         # it is not an identity an acknowledgement can be addressed by.
@@ -242,3 +273,71 @@ def test_a_failed_status_names_no_producer_to_acknowledge() -> None:
     )
     with pytest.raises(ValueError, match="not READY"):
         StoragePDReadAck.for_status(failed, consumer_instance_id="consumer")
+
+
+def test_a_consumer_that_restarted_before_acknowledging_takes_nothing_over(
+    producer,
+) -> None:
+    """The reader is settled before the read, not by whoever asks first.
+
+    A consumer reads one publication and has not acknowledged it yet when
+    the process is replaced. The replacement is handed a second publication
+    and gets there first. If the binding were settled by the first
+    acknowledgement, the replacement would take the session and the
+    original's completed read would be refused forever.
+    """
+    original = producer.publish("request-1", ["key-1"])
+    replacement = producer.publish("request-2", ["key-2"])
+
+    # The original consumer claims and reads, and is slow to acknowledge.
+    original_ack = producer.read(original, "consumer-before-the-restart")
+
+    # Its replacement comes up and asks for the other publication first.
+    refused = producer.answer_claim(
+        _consumer_ack(replacement, "consumer-after-the-restart")
+    )
+    assert not refused.granted
+    assert refused.final
+
+    # The original's acknowledgement still applies, and the publication the
+    # replacement was refused is still held for nobody -- which is correct:
+    # a process that came up afterwards did not do that reading.
+    assert producer.answer(original_ack)[0] == ACK_APPLIED
+    assert producer.tracker.live_lease_count() == 1
+    assert producer.core.locked == ["key-2"]
+
+
+def test_two_requests_sharing_a_key_hold_it_twice(producer) -> None:
+    """Deduplication does not merge two reads into one release.
+
+    Two requests naming the same extent each take a hold, so the extent
+    stays protected until both consumers are done with it.
+    """
+    first = producer.publish("request-1", ["shared-key"])
+    second = producer.publish("request-2", ["shared-key"])
+    assert producer.core.locked == ["shared-key", "shared-key"]
+
+    assert producer.answer(producer.read(first, STORAGE_PD_INCARNATION))[0] == (
+        ACK_APPLIED
+    )
+    assert producer.core.locked == ["shared-key"]
+
+    assert producer.answer(producer.read(second, STORAGE_PD_INCARNATION))[0] == (
+        ACK_APPLIED
+    )
+    assert producer.core.locked == []
+
+
+def test_a_claim_under_another_session_is_not_this_writers_business(
+    producer,
+) -> None:
+    """A producer answers for the group it was configured into, and no other."""
+    status = producer.publish("request-1", ["key-1"])
+
+    answer = producer.answer_claim(
+        _consumer_ack(status),
+        session_id="a-different-deployment",
+    )
+
+    assert not answer.granted
+    assert producer.tracker.live_lease_count() == 1

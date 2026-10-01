@@ -88,6 +88,19 @@ class ReadAckIdentity:
     manifest_digest: str
 
 
+@dataclass(frozen=True)
+class ReadClaimOutcome:
+    """A writer's answer to a consumer asking to read one publication.
+
+    ``final`` says the answer cannot change while the session lasts, so a
+    consumer told that stops asking instead of asking once per request.
+    """
+
+    granted: bool
+    reason: str = ""
+    final: bool = False
+
+
 @dataclass
 class _Lease:
     """Extents held for one published request until it is acknowledged.
@@ -100,11 +113,18 @@ class _Lease:
     did not report back. Running it again could decrement a reference this
     writer does not own, so the lease stays and further acknowledgements
     for it are unresolved rather than applied.
+
+    ``claimed_by`` names the consumer incarnation that asked to read this
+    publication before reading it, and is empty while nobody has. Only that
+    incarnation can acknowledge it, and only a publication nobody claimed
+    can be released for want of a reader.
     """
 
     encoded_keys: list[str]
     receipt: "RawBlockPublicationReceipt"
     unlock_ran: bool = False
+    claimed_by: str = ""
+    claimed_session: str = ""
 
 
 class RawBlockPDRequestTracker:
@@ -414,40 +434,156 @@ class RawBlockPDRequestTracker:
         for encoded_keys in leased_keys:
             self._core.unlock_many(encoded_keys)
 
-    def bind_consumer(self, session_id: str, consumer_instance_id: str) -> bool:
-        """Record which consumer incarnation may release this session's holds.
+    def claim_read(
+        self,
+        identity: ReadAckIdentity,
+        *,
+        expected_writer_epoch: str,
+        expected_tp_rank: int,
+        session_id: str = "",
+    ) -> "ReadClaimOutcome":
+        """Record a consumer as the reader of one publication, or refuse.
 
-        The first acknowledgement this writer can otherwise vouch for binds
-        the incarnation that sent it, for as long as the session lasts. A
-        later, different incarnation under the same session is a consumer
-        that restarted while this writer's holds were live, and it cannot
-        rebind them: the extents it would release belong to reads the new
-        process never made.
+        This is asked before any bytes move, which is the whole point. The
+        acknowledgement that follows is the only thing that releases an
+        extent, so the writer has to settle *before* the read which
+        incarnation is going to owe it one. Settling that on whichever
+        acknowledgement arrives first is a race between a consumer and the
+        process that replaced it, and the loser's reads are then held for
+        the writer's lifetime.
 
-        A session identifier the operator sets across one producer/consumer
-        group is what makes a whole-group restart legitimate -- the session
-        changes with it -- while a consumer-only restart is not. This is not
-        authentication; it is a fence against reuse by a process that
-        cannot have done the reading.
+        The first claim binds the session's reader for as long as the
+        session lasts. A later, different incarnation under the same session
+        is a consumer that restarted while these holds were live, and it is
+        refused: the extents it would read and release belong to reads the
+        new process never made. An operator changes the session identifier
+        when the whole group restarts, which is what makes that legitimate.
+        This is not authentication; it is a fence against reuse by a process
+        that cannot have done the reading.
 
-        Returns whether this pair is the bound one.
+        Returns whether this consumer may read, why not when it may not,
+        and whether asking again could ever change the answer.
         """
         with self._lock:
+            if self._closed:
+                return ReadClaimOutcome(False, "this writer is shutting down")
+            refusal = self._identity_refusal_locked(
+                identity,
+                expected_writer_epoch=expected_writer_epoch,
+                expected_tp_rank=expected_tp_rank,
+            )
+            if refusal is not None:
+                return ReadClaimOutcome(False, refusal)
+            lease = self._leases.get(identity.req_id)
+            if lease is None:
+                # Nothing is held under this name, so there is nothing to
+                # grant the reading of. Granting anyway would let a consumer
+                # read extents this writer has already released or never
+                # published, and acknowledge them afterwards.
+                return ReadClaimOutcome(False, "this writer holds no such publication")
+            if not self._receipt_matches(lease.receipt, identity):
+                return ReadClaimOutcome(
+                    False, "this writer published a different manifest"
+                )
+
             bound = self._bound_consumer.get(session_id)
             if bound is None:
-                self._bound_consumer[session_id] = consumer_instance_id
+                self._bound_consumer[session_id] = identity.consumer_instance_id
                 logger.info(
                     "Raw-block P/D bound session %s to consumer %s",
                     session_id,
-                    consumer_instance_id,
+                    identity.consumer_instance_id,
                 )
-                return True
-            return bound == consumer_instance_id
+            elif bound != identity.consumer_instance_id:
+                logger.error(
+                    "Raw-block P/D refused the read of %s by consumer %s: "
+                    "session %s is bound to %s, and a consumer that "
+                    "restarted cannot take over reads it never made",
+                    identity.req_id,
+                    identity.consumer_instance_id,
+                    session_id,
+                    bound,
+                )
+                return ReadClaimOutcome(
+                    False,
+                    "another consumer incarnation is this session's reader",
+                    final=True,
+                )
+            if lease.claimed_by and lease.claimed_by != identity.consumer_instance_id:
+                return ReadClaimOutcome(
+                    False, "another consumer is already reading this publication"
+                )
+            lease.claimed_by = identity.consumer_instance_id
+            lease.claimed_session = session_id
+            return ReadClaimOutcome(True, "")
 
     def bound_consumer(self, session_id: str) -> Optional[str]:
         """Which consumer incarnation this session is bound to, if any."""
         with self._lock:
             return self._bound_consumer.get(session_id)
+
+    def _identity_refusal_locked(
+        self,
+        identity: ReadAckIdentity,
+        *,
+        expected_writer_epoch: str,
+        expected_tp_rank: int,
+    ) -> Optional[str]:
+        """Say why this message is not addressed to this writer, or nothing.
+
+        The expected fields are the caller's own identity rather than the
+        message's: comparing an arriving message against values it supplied
+        itself would check nothing.
+        """
+        if not expected_writer_epoch:
+            # An engine with no epoch published nothing, so it holds nothing
+            # a consumer could read or release. Matching an empty name
+            # against an empty name would accept every message that arrived
+            # with the field unset.
+            logger.error(
+                "Raw-block P/D control message for %s reached an engine "
+                "with no writer epoch",
+                identity.req_id,
+            )
+            return "this engine published nothing"
+        if identity.writer_epoch != expected_writer_epoch:
+            logger.error(
+                "Raw-block P/D control message for %s names producer %s, "
+                "but this writer is %s",
+                identity.req_id,
+                identity.writer_epoch,
+                expected_writer_epoch,
+            )
+            return "this message names another producer"
+        if identity.tp_rank != expected_tp_rank:
+            logger.error(
+                "Raw-block P/D control message for %s claims rank %d, but "
+                "this writer holds rank %d's extents",
+                identity.req_id,
+                identity.tp_rank,
+                expected_tp_rank,
+            )
+            return "this message names another tensor-parallel rank"
+        if not identity.consumer_instance_id:
+            logger.error(
+                "Raw-block P/D control message for %s names no consumer; a "
+                "message nobody can be held to decides nothing",
+                identity.req_id,
+            )
+            return "this message names no consumer"
+        return None
+
+    @staticmethod
+    def _receipt_matches(
+        receipt: "RawBlockPublicationReceipt",
+        identity: ReadAckIdentity,
+    ) -> bool:
+        """Whether a message names the publication this lease protects."""
+        return (
+            receipt.writer_epoch == identity.writer_epoch
+            and receipt.checkpoint_seq == identity.checkpoint_seq
+            and receipt.manifest_digest == identity.manifest_digest
+        )
 
     def apply_read_ack(
         self,
@@ -472,46 +608,24 @@ class RawBlockPDRequestTracker:
         naming a different epoch is addressed to a different producer even
         when it reaches this socket.
 
+        Only the consumer that claimed the read may acknowledge it. The
+        claim happened before the bytes moved, so by the time one of these
+        arrives the reader is already settled and this compares rather than
+        decides.
+
         ``APPLIED`` is returned only after the release returned. A caller
         may treat it as proof that this hold is gone; it may treat nothing
         else that way.
         """
         with self._lock:
-            if not expected_writer_epoch:
-                # An engine with no epoch published nothing, so it holds
-                # nothing an acknowledgement could release. Matching an
-                # empty name against an empty name would accept every
-                # message that arrived with the field unset.
-                logger.error(
-                    "Raw-block P/D read ack for %s reached an engine with "
-                    "no writer epoch; releasing nothing",
-                    identity.req_id,
+            if (
+                self._identity_refusal_locked(
+                    identity,
+                    expected_writer_epoch=expected_writer_epoch,
+                    expected_tp_rank=expected_tp_rank,
                 )
-                return ReadAckOutcome.REJECTED
-            if identity.writer_epoch != expected_writer_epoch:
-                logger.error(
-                    "Raw-block P/D read ack for %s names producer %s, but "
-                    "this writer is %s; releasing nothing",
-                    identity.req_id,
-                    identity.writer_epoch,
-                    expected_writer_epoch,
-                )
-                return ReadAckOutcome.REJECTED
-            if identity.tp_rank != expected_tp_rank:
-                logger.error(
-                    "Raw-block P/D read ack for %s claims rank %d, but this "
-                    "writer holds rank %d's extents; releasing nothing",
-                    identity.req_id,
-                    identity.tp_rank,
-                    expected_tp_rank,
-                )
-                return ReadAckOutcome.REJECTED
-            if not identity.consumer_instance_id:
-                logger.error(
-                    "Raw-block P/D read ack for %s names no consumer; a "
-                    "message nobody can be held to releases nothing",
-                    identity.req_id,
-                )
+                is not None
+            ):
                 return ReadAckOutcome.REJECTED
 
             settled = self._released.get(identity.req_id)
@@ -548,11 +662,7 @@ class RawBlockPDRequestTracker:
                 return ReadAckOutcome.REJECTED
 
             receipt = lease.receipt
-            if (
-                receipt.writer_epoch != identity.writer_epoch
-                or receipt.checkpoint_seq != identity.checkpoint_seq
-                or receipt.manifest_digest != identity.manifest_digest
-            ):
+            if not self._receipt_matches(receipt, identity):
                 logger.error(
                     "Raw-block P/D read ack for %s from %s does not match "
                     "the receipt this writer published (epoch %s/%s, seq "
@@ -576,24 +686,36 @@ class RawBlockPDRequestTracker:
                 )
                 return ReadAckOutcome.UNRESOLVED
 
-            bound = self._bound_consumer.get(session_id)
-            if bound is None:
-                self._bound_consumer[session_id] = identity.consumer_instance_id
-                logger.info(
-                    "Raw-block P/D bound session %s to consumer %s",
-                    session_id,
-                    identity.consumer_instance_id,
-                )
-            elif bound != identity.consumer_instance_id:
+            if not lease.claimed_by:
+                # Nobody asked to read this before reading it, so nobody
+                # established that they had. Binding the session here
+                # instead would settle who the reader is on whichever
+                # message arrives first, which is the race claim_read()
+                # exists to replace.
                 logger.error(
                     "Raw-block P/D read ack for %s comes from consumer %s, "
-                    "but session %s is bound to %s; a consumer that "
-                    "restarted cannot release holds for reads it never "
-                    "made",
+                    "which never claimed the read; releasing nothing",
                     identity.req_id,
                     identity.consumer_instance_id,
+                )
+                return ReadAckOutcome.REJECTED
+            if lease.claimed_session != session_id:
+                logger.error(
+                    "Raw-block P/D read ack for %s arrives under session %s, "
+                    "but the read was claimed under %s; releasing nothing",
+                    identity.req_id,
                     session_id,
-                    bound,
+                    lease.claimed_session,
+                )
+                return ReadAckOutcome.REJECTED
+            if lease.claimed_by != identity.consumer_instance_id:
+                logger.error(
+                    "Raw-block P/D read ack for %s comes from consumer %s, "
+                    "but %s claimed that read; a consumer that restarted "
+                    "cannot release holds for reads it never made",
+                    identity.req_id,
+                    identity.consumer_instance_id,
+                    lease.claimed_by,
                 )
                 return ReadAckOutcome.REJECTED
 

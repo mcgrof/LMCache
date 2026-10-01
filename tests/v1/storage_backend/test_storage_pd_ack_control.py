@@ -37,6 +37,8 @@ from lmcache.v1.storage_backend.storage_pd_ack import (
     StoragePDAckReply,
     StoragePDAckRequest,
     StoragePDAckServer,
+    StoragePDClaimAnswer,
+    StoragePDClaimRequest,
 )
 from lmcache.v1.storage_backend.storage_pd_protocol import StoragePDReadAck
 
@@ -69,13 +71,28 @@ class _Writer:
         self.held: dict[str, int] = {}
         self.applied: list[str] = []
         self.seen: list[StoragePDAckRequest] = []
+        self.claims: list[StoragePDClaimRequest] = []
         self.lock = threading.Lock()
         self.reply_after_apply = True
         self.raise_in_handler = False
+        self.refuse_claims = False
+        self.refusal_is_final = False
 
     def hold(self, req_id: str, count: int = 1) -> None:
         with self.lock:
             self.held[req_id] = self.held.get(req_id, 0) + count
+
+    def claim(self, request: StoragePDClaimRequest) -> StoragePDClaimAnswer:
+        """Grant a read of anything this writer is actually holding."""
+        with self.lock:
+            self.claims.append(request)
+            if self.refuse_claims:
+                return StoragePDClaimAnswer(
+                    False, "bound elsewhere", final=self.refusal_is_final
+                )
+            if self.held.get(request.read.req_id, 0) <= 0:
+                return StoragePDClaimAnswer(False, "no such publication")
+            return StoragePDClaimAnswer(True)
 
     def handle(self, request: StoragePDAckRequest) -> tuple[str, str]:
         with self.lock:
@@ -116,6 +133,7 @@ def server(writer):
     port = _free_port()
     instance = StoragePDAckServer(
         writer.handle,
+        claim_handler=writer.claim,
         bind_host=LOOPBACK,
         port=port,
         advertise_host=LOOPBACK,
@@ -141,10 +159,24 @@ def _settled(obligation, timeout: float = 10.0) -> Optional[str]:
     return obligation.wait(timeout=timeout)
 
 
+def _owe(client: StoragePDAckClient, ack: StoragePDReadAck, **kwargs):
+    """Take room for an acknowledgement and then owe it, as a restore does.
+
+    Serving reserves before the read and owes after it. These tests are not
+    reading anything, so the two happen together -- but they still happen in
+    that order, because ``owe`` cannot be called without the room.
+    """
+    reservation = client.reserve(endpoint=kwargs["endpoint"])
+    if reservation is None:
+        return None
+    return client.owe(ack, reservation=reservation, **kwargs)
+
+
 def test_a_writer_applies_and_the_consumer_hears_it(server, client, writer):
     """The ordinary case: one request, one release, one validated answer."""
     writer.hold("request-1")
-    obligation = client.owe(
+    obligation = _owe(
+        client,
         _ack(),
         endpoint=server.endpoint,
         session_id="session-1",
@@ -166,7 +198,8 @@ def test_a_dropped_reply_after_a_release_frees_nothing_twice(server, client, wri
     """
     writer.hold("request-1")
     writer.reply_after_apply = False
-    obligation = client.owe(
+    obligation = _owe(
+        client,
         _ack(),
         endpoint=server.endpoint,
         session_id="session-1",
@@ -195,7 +228,8 @@ def test_an_unreachable_writer_leaves_the_obligation_owed(client, writer):
     until its own deadline and then reports that it was never answered --
     it never reports that the hold is gone.
     """
-    obligation = client.owe(
+    obligation = _owe(
+        client,
         _ack(),
         endpoint=f"{LOOPBACK}:{_free_port()}",
         session_id="session-1",
@@ -216,7 +250,8 @@ def test_a_writer_that_arrives_late_is_still_reached(client, writer):
     """
     port = _free_port()
     writer.hold("request-1")
-    obligation = client.owe(
+    obligation = _owe(
+        client,
         _ack(),
         endpoint=f"{LOOPBACK}:{port}",
         session_id="session-1",
@@ -232,6 +267,7 @@ def test_a_writer_that_arrives_late_is_still_reached(client, writer):
 
     server = StoragePDAckServer(
         writer.handle,
+        claim_handler=writer.claim,
         bind_host=LOOPBACK,
         port=port,
         advertise_host=LOOPBACK,
@@ -261,7 +297,8 @@ def test_a_wrong_identity_releases_nothing(server, client, writer, overrides):
     over something that can only be answered one way.
     """
     writer.hold("request-1")
-    obligation = client.owe(
+    obligation = _owe(
+        client,
         _ack(**overrides),
         endpoint=server.endpoint,
         session_id="session-1",
@@ -283,7 +320,8 @@ def test_two_requests_sharing_a_key_have_two_holds(server, client, writer):
     """
     writer.hold("request-1")
     writer.hold("request-2")
-    first = client.owe(
+    first = _owe(
+        client,
         _ack("request-1"),
         endpoint=server.endpoint,
         session_id="session-1",
@@ -294,7 +332,8 @@ def test_two_requests_sharing_a_key_have_two_holds(server, client, writer):
 
     assert writer.held == {"request-1": 0, "request-2": 1}
 
-    second = client.owe(
+    second = _owe(
+        client,
         _ack("request-2"),
         endpoint=server.endpoint,
         session_id="session-1",
@@ -322,7 +361,8 @@ def test_saturation_refuses_new_work_and_recovers_without_a_next_request(
     owed = []
     for index in range(4):
         writer.hold(f"request-{index}")
-        obligation = client.owe(
+        obligation = _owe(
+            client,
             _ack(f"request-{index}"),
             endpoint=endpoint,
             session_id="session-1",
@@ -331,20 +371,17 @@ def test_saturation_refuses_new_work_and_recovers_without_a_next_request(
         assert obligation is not None
         owed.append(obligation)
 
+    # The refusal lands on the reservation, before the read: a consumer that
+    # read first and then found no room would already hold bytes nothing
+    # will release.
     writer.hold("one-too-many")
-    assert (
-        client.owe(
-            _ack("one-too-many"),
-            endpoint=endpoint,
-            session_id="session-1",
-            deadline_s=20.0,
-        )
-        is None
-    )
+    assert client.reserve(endpoint=endpoint) is None
     assert client.live_count() == 4
+    assert client.reserved_count() == 0
 
     server = StoragePDAckServer(
         writer.handle,
+        claim_handler=writer.claim,
         bind_host=LOOPBACK,
         port=port,
         advertise_host=LOOPBACK,
@@ -362,7 +399,8 @@ def test_saturation_refuses_new_work_and_recovers_without_a_next_request(
     while client.live_count() > 0 and time.monotonic() < deadline:
         time.sleep(0.01)
     assert client.live_count() == 0
-    again = client.owe(
+    again = _owe(
+        client,
         _ack("one-too-many"),
         endpoint=endpoint,
         session_id="session-1",
@@ -379,7 +417,8 @@ def test_a_writer_that_cannot_say_is_not_a_writer_that_applied(server, client, w
     """
     writer.hold("request-1")
     writer.raise_in_handler = True
-    obligation = client.owe(
+    obligation = _owe(
+        client,
         _ack(),
         endpoint=server.endpoint,
         session_id="session-1",
@@ -402,6 +441,7 @@ def test_an_advertised_wildcard_is_refused(writer):
     with pytest.raises(ValueError, match="not an address"):
         StoragePDAckServer(
             writer.handle,
+            claim_handler=writer.claim,
             bind_host="0.0.0.0",
             port=_free_port(),
         )
@@ -465,7 +505,8 @@ def test_a_reply_about_something_else_is_not_an_answer(client):
     responder = threading.Thread(target=_answer_the_wrong_question, daemon=True)
     responder.start()
     try:
-        obligation = client.owe(
+        obligation = _owe(
+            client,
             _ack(),
             endpoint=f"{LOOPBACK}:{port}",
             session_id="session-1",
@@ -510,7 +551,8 @@ def test_an_unintelligible_request_still_gets_an_answer(server, writer):
         poll_interval_s=0.01,
     )
     try:
-        obligation = client.owe(
+        obligation = _owe(
+            client,
             _ack(),
             endpoint=server.endpoint,
             session_id="session-1",
@@ -520,3 +562,108 @@ def test_an_unintelligible_request_still_gets_an_answer(server, writer):
         assert _settled(obligation) == ACK_APPLIED
     finally:
         client.close(timeout_s=5.0)
+
+
+def test_a_granted_claim_is_what_permits_a_read(server, client, writer):
+    """The ordinary case: ask before reading, and be told yes."""
+    writer.hold("request-1")
+
+    assert client.claim(_ack(), endpoint=server.endpoint, session_id="session-1")
+
+    assert len(writer.claims) == 1
+    assert writer.claims[0].read.req_id == "request-1"
+    assert writer.claims[0].session_id == "session-1"
+
+
+def test_a_claim_for_nothing_the_writer_holds_is_refused(server, client, writer):
+    """A read cannot be granted over a publication that is not held."""
+    assert not client.claim(
+        _ack("never-published"),
+        endpoint=server.endpoint,
+        session_id="session-1",
+    )
+
+
+def test_a_final_refusal_stops_the_consumer_asking(server, client, writer):
+    """A session bound to another incarnation stays bound for its life.
+
+    Asking once per request would spend a round trip to be told the same
+    thing, on the restore path, where it delays every read.
+    """
+    writer.hold("request-1")
+    writer.hold("request-2")
+    writer.refuse_claims = True
+    writer.refusal_is_final = True
+
+    assert not client.claim(_ack(), endpoint=server.endpoint, session_id="session-1")
+    assert not client.claim(
+        _ack("request-2"), endpoint=server.endpoint, session_id="session-1"
+    )
+
+    assert len(writer.claims) == 1
+
+
+def test_a_refusal_that_could_change_is_asked_again(server, client, writer):
+    """A publication this writer does not hold yet may be held later."""
+    writer.hold("request-1")
+    writer.hold("request-2")
+    writer.refuse_claims = True
+
+    assert not client.claim(_ack(), endpoint=server.endpoint, session_id="session-1")
+    assert not client.claim(
+        _ack("request-2"), endpoint=server.endpoint, session_id="session-1"
+    )
+
+    # One attempt each, both asked: 3 attempts per claim at the fixture's
+    # settings would be 6, so count the requests the writer saw rather than
+    # the calls made.
+    assert [request.read.req_id for request in writer.claims] == [
+        "request-1",
+        "request-2",
+    ]
+
+
+def test_an_unreachable_writer_does_not_grant_a_read(client):
+    """Nothing is granted by a writer that never answered.
+
+    Reading on the assumption that it would have granted the read is how a
+    consumer ends up holding bytes it can never legitimately release.
+    """
+    endpoint = f"{LOOPBACK}:{_free_port()}"
+
+    assert not client.claim(_ack(), endpoint=endpoint, session_id="session-1")
+
+
+def test_a_claim_handler_that_raised_grants_nothing(writer, client):
+    """A writer that could not decide has not recorded a reader."""
+    port = _free_port()
+
+    def explode(request: StoragePDClaimRequest) -> StoragePDClaimAnswer:
+        raise OSError("the writer could not reach its own state")
+
+    server = StoragePDAckServer(
+        writer.handle,
+        claim_handler=explode,
+        bind_host=LOOPBACK,
+        port=port,
+        advertise_host=LOOPBACK,
+        recv_timeout_ms=50,
+    )
+    try:
+        assert not client.claim(
+            _ack(), endpoint=server.endpoint, session_id="session-1"
+        )
+        # The socket is still in step: it answered, so the next exchange works.
+        writer.hold("request-1")
+        assert client.live_count() == 0
+        obligation = _owe(
+            client,
+            _ack(),
+            endpoint=server.endpoint,
+            session_id="session-1",
+            deadline_s=10.0,
+        )
+        assert obligation is not None
+        assert _settled(obligation) == ACK_APPLIED
+    finally:
+        server.close(timeout_s=5.0)

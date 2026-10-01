@@ -20,6 +20,16 @@ retry of something it applied from a different message naming the same
 request. A duplicate frees nothing twice and a mismatch frees nothing at
 all.
 
+A read is claimed before it happens. The acknowledgement that follows is
+the only thing that frees an extent, so the writer has to know, before any
+bytes move, which consumer incarnation is going to owe it one: a consumer
+that restarted cannot inherit the reads the previous one made, and a
+binding settled by whichever acknowledgement happens to arrive first is a
+race, not a fence. The claim is also where the consumer reserves room to
+keep its side of the bargain, because a consumer that reads first and then
+discovers it has no capacity to acknowledge has already taken something it
+cannot give back.
+
 The transport is deliberately small: one bounded request/reply per attempt
 on the endpoint the writer already publishes in its READY status. There is
 no relay, because a relay's word about an acknowledgement is not the
@@ -31,7 +41,7 @@ from __future__ import annotations
 
 # Standard
 from collections.abc import Callable
-from typing import Optional
+from typing import Any, NamedTuple, Optional
 import threading
 import time
 import uuid
@@ -75,6 +85,54 @@ class StoragePDAckRequest(msgspec.Struct, tag=True):
     nonce: str
 
 
+class StoragePDClaimAnswer(NamedTuple):
+    """What a writer's claim handler decides.
+
+    ``final`` says asking again cannot change the answer while the session
+    lasts, so the consumer stops asking rather than retrying once per
+    request.
+    """
+
+    granted: bool
+    reason: str = ""
+    final: bool = False
+
+
+class StoragePDClaimRequest(msgspec.Struct, tag=True):
+    """A consumer asking to become the reader of one publication.
+
+    ``read`` is the acknowledgement this consumer will owe once it has read.
+    A claim and the acknowledgement that follows it name the same
+    publication and the same consumer, so they carry the same identity
+    rather than two that have to be kept in step.
+    """
+
+    read: StoragePDReadAck
+    session_id: str
+    nonce: str
+
+
+class StoragePDClaimReply(msgspec.Struct, tag=True):
+    """Whether this consumer may read this publication.
+
+    A refusal is a real answer and the consumer must not read: the extents
+    belong to reads another incarnation made, or to a publication this
+    writer is not holding.
+    """
+
+    granted: bool
+    req_id: str
+    writer_epoch: str
+    consumer_instance_id: str
+    nonce: str
+    reason: str = ""
+    # Whether this refusal can change while the session lasts. A session
+    # bound to another incarnation stays bound for its life, so a consumer
+    # told this stops asking that writer instead of asking once per
+    # request; every other refusal describes something that can change.
+    final: bool = False
+
+
 class StoragePDAckReply(msgspec.Struct, tag=True):
     """A writer's answer, sent only after it has acted.
 
@@ -91,7 +149,12 @@ class StoragePDAckReply(msgspec.Struct, tag=True):
     reason: str = ""
 
 
-StoragePDAckWire = StoragePDAckRequest | StoragePDAckReply
+StoragePDAckWire = (
+    StoragePDAckRequest
+    | StoragePDAckReply
+    | StoragePDClaimRequest
+    | StoragePDClaimReply
+)
 
 
 class StoragePDAckServer:
@@ -105,14 +168,16 @@ class StoragePDAckServer:
     ``handler`` validates the request against what this writer published
     and performs the release. Its return value is what goes back, so it
     must not report success before the release it describes has happened.
-    Everything reaching it came off a network and is trusted for nothing
-    but its shape.
+    ``claim_handler`` answers the question a consumer asks before it reads.
+    Everything reaching either came off a network and is trusted for
+    nothing but its shape.
     """
 
     def __init__(
         self,
         handler: Callable[[StoragePDAckRequest], tuple[str, str]],
         *,
+        claim_handler: Callable[[StoragePDClaimRequest], StoragePDClaimAnswer],
         bind_host: str,
         port: int,
         advertise_host: str = "",
@@ -132,6 +197,7 @@ class StoragePDAckServer:
                 f"{advertised!r} is a bind wildcard, not an address"
             )
         self._handler = handler
+        self._claim_handler = claim_handler
         self.endpoint = f"{advertised}:{port}"
         self.bind_endpoint = f"{bind_host}:{port}"
         context = get_zmq_context(use_asyncio=False)
@@ -216,6 +282,9 @@ class StoragePDAckServer:
                 )
             )
             return
+        if isinstance(message, StoragePDClaimRequest):
+            self._answer_claim(message)
+            return
         if not isinstance(message, StoragePDAckRequest):
             self._send(
                 StoragePDAckReply(
@@ -249,7 +318,37 @@ class StoragePDAckServer:
             )
         )
 
-    def _send(self, reply: StoragePDAckReply) -> None:
+    def _answer_claim(self, message: StoragePDClaimRequest) -> None:
+        """Answer one claim, refusing it if the handler could not decide.
+
+        A claim this writer cannot answer is not granted. The consumer then
+        does not read, which leaves the publication exactly as it was --
+        whereas granting a claim nobody validated would let a restarted
+        consumer read extents it can never legitimately release.
+        """
+        try:
+            answer = self._claim_handler(message)
+        except Exception:
+            logger.exception(
+                "Storage P/D could not decide the read claim for %s",
+                message.read.req_id,
+            )
+            answer = StoragePDClaimAnswer(
+                False, "the writer could not decide the claim"
+            )
+        self._send(
+            StoragePDClaimReply(
+                granted=answer.granted,
+                req_id=message.read.req_id,
+                writer_epoch=message.read.writer_epoch,
+                consumer_instance_id=message.read.consumer_instance_id,
+                nonce=message.nonce,
+                reason=answer.reason,
+                final=answer.final,
+            )
+        )
+
+    def _send(self, reply: StoragePDAckReply | StoragePDClaimReply) -> None:
         try:
             self._socket.send(msgspec.msgpack.encode(reply))
         except zmq.ZMQError:
@@ -312,6 +411,44 @@ class StoragePDAckObligation:
         self._settled.set()
 
 
+class StoragePDAckReservation:
+    """Room for one acknowledgement, taken before the read that owes it.
+
+    Capacity has to be taken before the bytes move. A consumer that reads
+    first and then finds it cannot take on another acknowledgement has
+    already consumed a publication it has no way to release, and no later
+    restore is guaranteed to come along and retry: the writer would hold
+    those extents for its own lifetime.
+
+    A reservation is therefore held from before the read until the
+    acknowledgement it was taken for is owed, and given back if that read
+    does not happen.
+    """
+
+    __slots__ = ("endpoint", "_client", "_spent")
+
+    def __init__(self, client: "StoragePDAckClient", endpoint: str) -> None:
+        self._client = client
+        self.endpoint = endpoint
+        self._spent = False
+
+    @property
+    def spent(self) -> bool:
+        return self._spent
+
+    def release(self) -> None:
+        """Give the room back, for a read that did not happen."""
+        if self._spent:
+            return
+        self._spent = True
+        self._client._return_reservation()
+
+    def _spend(self) -> None:
+        if self._spent:
+            raise RuntimeError("this acknowledgement reservation is already spent")
+        self._spent = True
+
+
 class StoragePDAckClient:
     """Own the acknowledgements a consumer owes, and keep asking.
 
@@ -337,17 +474,31 @@ class StoragePDAckClient:
         retry_interval_s: float = 1.0,
         max_live_obligations: int = 1024,
         poll_interval_s: float = 0.05,
+        claim_attempts: int = 3,
     ) -> None:
         if attempt_timeout_ms <= 0:
             raise ValueError("an acknowledgement attempt needs a timeout")
         if max_live_obligations <= 0:
             raise ValueError("an acknowledgement client needs a live bound")
+        if claim_attempts <= 0:
+            raise ValueError("a read claim needs at least one attempt")
         self._attempt_timeout_ms = attempt_timeout_ms
         self._retry_interval_s = retry_interval_s
         self._max_live = max_live_obligations
         self._poll_interval_s = poll_interval_s
+        self._claim_attempts = claim_attempts
         self._lock = threading.Lock()
         self._owed: list[StoragePDAckObligation] = []
+        # Room taken for acknowledgements that are not owed yet because
+        # their reads have not finished. Counted against the same bound as
+        # the owed ones: the bound is on acknowledgements this consumer is
+        # responsible for, and a read in progress is already one of those.
+        self._reserved = 0
+        # Sessions a writer has told this consumer it is not the reader of.
+        # The answer cannot change while the session lasts -- the binding is
+        # another incarnation's for its life -- so asking again would only
+        # delay the refusal the caller already has.
+        self._refused: set[tuple[str, str]] = set()
         self._next_attempt: dict[int, float] = {}
         self._context = get_zmq_context(use_asyncio=False)
         self._stopping = False
@@ -364,6 +515,122 @@ class StoragePDAckClient:
         with self._lock:
             return len(self._owed)
 
+    def reserved_count(self) -> int:
+        with self._lock:
+            return self._reserved
+
+    def reserve(self, *, endpoint: str) -> Optional[StoragePDAckReservation]:
+        """Take room for one acknowledgement, before the read that owes it.
+
+        Refusing is a real answer and the caller must not read. The
+        alternative is to read anyway and discover afterwards that there is
+        no room to acknowledge, which leaves a writer holding extents for a
+        read that did happen -- the one outcome this whole exchange exists
+        to prevent.
+        """
+        if not endpoint:
+            logger.error(
+                "Storage P/D will not read a publication whose producer "
+                "advertised no endpoint: nothing could ever release it"
+            )
+            return None
+        with self._lock:
+            if self._stopping:
+                return None
+            self._owed = [item for item in self._owed if not item.settled]
+            if len(self._owed) + self._reserved >= self._max_live:
+                logger.error(
+                    "Storage P/D owes %d unanswered acknowledgement(s) and "
+                    "has %d read(s) in progress, at its bound of %d; "
+                    "refusing to read more rather than read something it "
+                    "cannot acknowledge",
+                    len(self._owed),
+                    self._reserved,
+                    self._max_live,
+                )
+                return None
+            self._reserved += 1
+        return StoragePDAckReservation(self, endpoint)
+
+    def _return_reservation(self) -> None:
+        with self._lock:
+            if self._reserved > 0:
+                self._reserved -= 1
+
+    def claim(
+        self,
+        ack: StoragePDReadAck,
+        *,
+        endpoint: str,
+        session_id: str,
+    ) -> bool:
+        """Ask a writer to record this consumer as the reader, and wait.
+
+        This runs before the read and the answer decides whether the read
+        happens at all, so it is bounded and synchronous: a writer that
+        cannot be reached has not recorded anything, and reading on the
+        assumption that it would have is how a restarted consumer ends up
+        holding bytes it can never release.
+        """
+        key = (endpoint, session_id)
+        with self._lock:
+            if self._stopping:
+                return False
+            if key in self._refused:
+                logger.error(
+                    "Storage P/D will not read %s: %s already bound session "
+                    "%s to another consumer",
+                    ack.req_id,
+                    endpoint,
+                    session_id,
+                )
+                return False
+        for attempt in range(1, self._claim_attempts + 1):
+            request = StoragePDClaimRequest(
+                read=ack,
+                session_id=session_id,
+                nonce=uuid.uuid4().hex,
+            )
+            reply = self._exchange(endpoint, request, StoragePDClaimReply)
+            if reply is None:
+                logger.warning(
+                    "Storage P/D read claim attempt %d for %s did not reach %s",
+                    attempt,
+                    ack.req_id,
+                    endpoint,
+                )
+                continue
+            if not self._claim_correlates(reply, request):
+                logger.warning(
+                    "Storage P/D got a claim answer for %s/%s while waiting "
+                    "on %s/%s; discarding it",
+                    reply.req_id,
+                    reply.nonce,
+                    request.read.req_id,
+                    request.nonce,
+                )
+                continue
+            if reply.granted:
+                return True
+            logger.error(
+                "Storage P/D was refused the read of %s by %s: %s",
+                ack.req_id,
+                endpoint,
+                reply.reason or "no reason given",
+            )
+            if reply.final:
+                with self._lock:
+                    self._refused.add(key)
+            return False
+        logger.error(
+            "Storage P/D could not claim the read of %s from %s in %d "
+            "attempt(s); not reading it",
+            ack.req_id,
+            endpoint,
+            self._claim_attempts,
+        )
+        return False
+
     def owe(
         self,
         ack: StoragePDReadAck,
@@ -371,20 +638,18 @@ class StoragePDAckClient:
         endpoint: str,
         session_id: str,
         deadline_s: float,
+        reservation: StoragePDAckReservation,
     ) -> Optional[StoragePDAckObligation]:
-        """Take on one acknowledgement, or refuse to take on any more.
+        """Take on one acknowledgement against room already reserved.
 
-        Refusing is a real answer. The alternative is to evict an older
-        obligation to make room, which silently abandons a writer's hold to
-        keep admitting work -- the caller has to stop publishing instead.
+        The reservation is what makes this unable to refuse for capacity:
+        the room was taken before the read, so a read that happened always
+        has somewhere to put the acknowledgement it owes.
         """
-        if not endpoint:
-            logger.error(
-                "Storage P/D cannot acknowledge request %s: the producer "
-                "advertised no endpoint, so its extents stay held",
-                ack.req_id,
+        if reservation.endpoint != endpoint:
+            raise ValueError(
+                "this acknowledgement reservation was taken for another producer"
             )
-            return None
         obligation = StoragePDAckObligation(
             ack,
             endpoint=endpoint,
@@ -394,16 +659,10 @@ class StoragePDAckClient:
         with self._lock:
             if self._stopping:
                 return None
+            reservation._spend()
+            if self._reserved > 0:
+                self._reserved -= 1
             self._owed = [item for item in self._owed if not item.settled]
-            if len(self._owed) >= self._max_live:
-                logger.error(
-                    "Storage P/D already owes %d unanswered acknowledgements; "
-                    "refusing to take on request %s rather than abandoning "
-                    "one of them",
-                    len(self._owed),
-                    ack.req_id,
-                )
-                return None
             self._owed.append(obligation)
         self._wake.set()
         return obligation
@@ -522,9 +781,19 @@ class StoragePDAckClient:
     def _exchange(
         self,
         endpoint: str,
-        request: StoragePDAckRequest,
-    ) -> Optional[StoragePDAckReply]:
+        request: StoragePDAckRequest | StoragePDClaimRequest,
+        expect: type = StoragePDAckReply,
+        *,
+        timeout_ms: Optional[int] = None,
+    ) -> Any:
         """Make one bounded attempt on a socket used for nothing else."""
+        req_id = (
+            request.ack.req_id
+            if isinstance(request, StoragePDAckRequest)
+            else request.read.req_id
+        )
+        attempt = request.attempt if isinstance(request, StoragePDAckRequest) else 1
+        budget_ms = self._attempt_timeout_ms if timeout_ms is None else timeout_ms
         socket = None
         try:
             socket = get_zmq_socket(
@@ -535,23 +804,23 @@ class StoragePDAckClient:
                 "connect",
             )
             socket.setsockopt(zmq.LINGER, 0)
-            socket.setsockopt(zmq.RCVTIMEO, self._attempt_timeout_ms)
-            socket.setsockopt(zmq.SNDTIMEO, self._attempt_timeout_ms)
+            socket.setsockopt(zmq.RCVTIMEO, budget_ms)
+            socket.setsockopt(zmq.SNDTIMEO, budget_ms)
             socket.send(msgspec.msgpack.encode(request))
             raw = socket.recv()
         except zmq.Again:
             logger.warning(
-                "Storage P/D acknowledgement attempt %d for %s timed out against %s",
-                request.attempt,
-                request.ack.req_id,
+                "Storage P/D control attempt %d for %s timed out against %s",
+                attempt,
+                req_id,
                 endpoint,
             )
             return None
         except zmq.ZMQError:
             logger.warning(
-                "Storage P/D acknowledgement attempt %d for %s could not reach %s",
-                request.attempt,
-                request.ack.req_id,
+                "Storage P/D control attempt %d for %s could not reach %s",
+                attempt,
+                req_id,
                 endpoint,
             )
             return None
@@ -566,11 +835,12 @@ class StoragePDAckClient:
         try:
             message = msgspec.msgpack.decode(raw, type=StoragePDAckWire)
         except Exception:
-            logger.warning("Storage P/D acknowledgement reply was undecodable")
+            logger.warning("Storage P/D control reply was undecodable")
             return None
-        if not isinstance(message, StoragePDAckReply):
+        if not isinstance(message, expect):
             logger.warning(
-                "Storage P/D acknowledgement got a %s in reply",
+                "Storage P/D expected a %s in reply and got a %s",
+                expect.__name__,
                 type(message).__name__,
             )
             return None
@@ -587,4 +857,17 @@ class StoragePDAckClient:
             and reply.req_id == request.ack.req_id
             and reply.writer_epoch == request.ack.writer_epoch
             and reply.consumer_instance_id == request.ack.consumer_instance_id
+        )
+
+    @staticmethod
+    def _claim_correlates(
+        reply: StoragePDClaimReply,
+        request: StoragePDClaimRequest,
+    ) -> bool:
+        """Whether this answer is about the claim that is waiting for one."""
+        return (
+            reply.nonce == request.nonce
+            and reply.req_id == request.read.req_id
+            and reply.writer_epoch == request.read.writer_epoch
+            and reply.consumer_instance_id == request.read.consumer_instance_id
         )

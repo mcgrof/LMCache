@@ -16,6 +16,7 @@ from lmcache.v1.storage_backend.raw_block import (
     RawBlockPublicationReceipt,
     ReadAckIdentity,
     ReadAckOutcome,
+    ReadClaimOutcome,
 )
 
 
@@ -546,10 +547,8 @@ def _published_lease_named(
     terminal.result(timeout=1)
 
 
-def _ack(
-    tracker: RawBlockPDRequestTracker,
-    **overrides: object,
-) -> ReadAckOutcome:
+def _message(**overrides: object) -> tuple[ReadAckIdentity, str, int, str]:
+    """Build one control message and the writer identity it is checked against."""
     fields: dict[str, object] = {
         "req_id": "request-1",
         "consumer_instance_id": "consumer-1",
@@ -562,12 +561,52 @@ def _ack(
     expected_epoch = str(overrides.pop("expected_writer_epoch", "writer-1"))
     session = str(overrides.pop("session_id", "session-1"))
     fields.update(overrides)
-    return tracker.apply_read_ack(
+    return (
         ReadAckIdentity(**fields),  # type: ignore[arg-type]
-        expected_writer_epoch=expected_epoch,
-        expected_tp_rank=expected_rank,
+        expected_epoch,
+        expected_rank,
+        session,
+    )
+
+
+def _claim(
+    tracker: RawBlockPDRequestTracker,
+    **overrides: object,
+) -> ReadClaimOutcome:
+    identity, epoch, rank, session = _message(**overrides)
+    return tracker.claim_read(
+        identity,
+        expected_writer_epoch=epoch,
+        expected_tp_rank=rank,
         session_id=session,
     )
+
+
+def _ack(
+    tracker: RawBlockPDRequestTracker,
+    **overrides: object,
+) -> ReadAckOutcome:
+    identity, epoch, rank, session = _message(**overrides)
+    return tracker.apply_read_ack(
+        identity,
+        expected_writer_epoch=epoch,
+        expected_tp_rank=rank,
+        session_id=session,
+    )
+
+
+def _claimed_lease(
+    core: _FakeCore,
+    tracker: RawBlockPDRequestTracker,
+    **overrides: object,
+) -> None:
+    """Publish one request and let a consumer take the read, as serving does."""
+    req_id = str(overrides.get("req_id", "request-1"))
+    if req_id == "request-1":
+        _published_lease(core, tracker)
+    else:
+        _published_lease_named(core, tracker, req_id)
+    assert _claim(tracker, **overrides).granted
 
 
 def test_tracker_releases_an_extent_on_a_matching_acknowledgement() -> None:
@@ -575,7 +614,7 @@ def test_tracker_releases_an_extent_on_a_matching_acknowledgement() -> None:
     core = _FakeCore()
     tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
     try:
-        _published_lease(core, tracker)
+        _claimed_lease(core, tracker)
         assert core.leased == ["key-1"]
         assert tracker.live_lease_count() == 1
 
@@ -597,7 +636,7 @@ def test_tracker_releases_nothing_twice_for_a_duplicate_acknowledgement() -> Non
     core = _FakeCore()
     tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
     try:
-        _published_lease(core, tracker)
+        _claimed_lease(core, tracker)
         assert _ack(tracker) is ReadAckOutcome.APPLIED
         assert _ack(tracker) is ReadAckOutcome.ALREADY_APPLIED
         assert _ack(tracker) is ReadAckOutcome.ALREADY_APPLIED
@@ -630,7 +669,7 @@ def test_tracker_rejects_an_acknowledgement_it_cannot_match(
     core = _FakeCore()
     tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
     try:
-        _published_lease(core, tracker)
+        _claimed_lease(core, tracker)
         assert _ack(tracker, **overrides) is ReadAckOutcome.REJECTED
         assert core.leased == ["key-1"]
         assert tracker.live_lease_count() == 1
@@ -666,7 +705,7 @@ def test_tracker_refuses_an_acknowledgement_naming_another_producer() -> None:
     core = _FakeCore()
     tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
     try:
-        _published_lease(core, tracker)
+        _claimed_lease(core, tracker)
         assert _ack(tracker, writer_epoch="somebody-else") is ReadAckOutcome.REJECTED
         assert core.leased == ["key-1"]
         assert tracker.live_lease_count() == 1
@@ -684,7 +723,7 @@ def test_tracker_refuses_an_acknowledgement_from_nobody() -> None:
     core = _FakeCore()
     tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
     try:
-        _published_lease(core, tracker)
+        _claimed_lease(core, tracker)
         assert _ack(tracker, consumer_instance_id="") is ReadAckOutcome.REJECTED
         assert core.leased == ["key-1"]
     finally:
@@ -692,32 +731,44 @@ def test_tracker_refuses_an_acknowledgement_from_nobody() -> None:
         tracker.close()
 
 
-def test_tracker_binds_a_session_to_one_consumer_incarnation() -> None:
-    """A consumer that restarted cannot release holds for reads it never made.
+def test_tracker_binds_a_session_before_any_read_happens() -> None:
+    """A consumer that restarted cannot take over reads it never made.
 
-    The first acknowledgement the writer can otherwise vouch for binds the
-    incarnation that sent it. A different one under the same session is a
-    process that came up after the reads it is claiming.
+    The binding is settled by the claim, which happens before the bytes
+    move. Settling it on whichever acknowledgement arrives first is a race
+    between a consumer and the process that replaced it, and the loser's
+    reads are then held for the writer's lifetime.
     """
     core = _FakeCore()
     tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
     try:
         _published_lease(core, tracker)
-        assert _ack(tracker) is ReadAckOutcome.APPLIED
+        assert _claim(tracker).granted
         assert tracker.bound_consumer("session-1") == "consumer-1"
 
         _published_lease_named(core, tracker, "request-2")
-        assert (
-            _ack(
-                tracker,
-                req_id="request-2",
-                consumer_instance_id="consumer-2-after-a-restart",
-            )
-            is ReadAckOutcome.REJECTED
+        restarted = _claim(
+            tracker,
+            req_id="request-2",
+            consumer_instance_id="consumer-2-after-a-restart",
         )
+        assert not restarted.granted
+        # The answer cannot change while this session lasts, and the
+        # consumer is told so rather than asking once per request.
+        assert restarted.final
+
+        # The original consumer has not acknowledged anything yet, and its
+        # read is still the one this session is bound to.
+        assert _ack(tracker) is ReadAckOutcome.APPLIED
         assert tracker.live_lease_count() == 1
 
         # A whole-group restart is a new session, and is allowed.
+        assert _claim(
+            tracker,
+            req_id="request-2",
+            consumer_instance_id="consumer-2-after-a-restart",
+            session_id="session-2",
+        ).granted
         assert (
             _ack(
                 tracker,
@@ -727,6 +778,46 @@ def test_tracker_binds_a_session_to_one_consumer_incarnation() -> None:
             )
             is ReadAckOutcome.APPLIED
         )
+    finally:
+        core.allow_publish.set()
+        tracker.close()
+
+
+def test_tracker_refuses_an_acknowledgement_for_a_read_nobody_claimed() -> None:
+    """Only the consumer that took the read may release it.
+
+    Without this, the writer would settle who its reader is on whichever
+    acknowledgement arrived first -- which is a message from a process that
+    may have come up after the reads it is naming.
+    """
+    core = _FakeCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    try:
+        _published_lease(core, tracker)
+        assert _ack(tracker) is ReadAckOutcome.REJECTED
+        assert core.leased == ["key-1"]
+        assert tracker.live_lease_count() == 1
+        assert core.unlock_calls == 0
+    finally:
+        core.allow_publish.set()
+        tracker.close()
+
+
+def test_tracker_refuses_a_claim_for_a_publication_it_does_not_hold() -> None:
+    """A read cannot be granted over extents this writer is not holding.
+
+    Granting one would let a consumer read a publication already released
+    or never made, and then acknowledge it.
+    """
+    core = _FakeCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    try:
+        _published_lease(core, tracker)
+        assert not _claim(tracker, req_id="request-never-published").granted
+        assert not _claim(tracker, manifest_digest="someone-elses-digest").granted
+        assert not _claim(tracker, writer_epoch="somebody-else").granted
+        assert not _claim(tracker, consumer_instance_id="").granted
+        assert tracker.live_lease_count() == 1
     finally:
         core.allow_publish.set()
         tracker.close()
@@ -743,7 +834,7 @@ def test_tracker_does_not_answer_a_mismatched_duplicate_with_success() -> None:
     core = _FakeCore()
     tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
     try:
-        _published_lease(core, tracker)
+        _claimed_lease(core, tracker)
         assert _ack(tracker) is ReadAckOutcome.APPLIED
         assert _ack(tracker) is ReadAckOutcome.ALREADY_APPLIED
         assert (
@@ -767,7 +858,7 @@ def test_tracker_does_not_report_success_before_the_release_returns() -> None:
     core = _FakeCore()
     tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
     try:
-        _published_lease(core, tracker)
+        _claimed_lease(core, tracker)
         core.unlock_raises = True
 
         assert _ack(tracker) is ReadAckOutcome.UNRESOLVED
@@ -793,7 +884,7 @@ def test_tracker_says_it_cannot_tell_once_a_tombstone_is_gone() -> None:
     core = _FakeCore()
     tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
     try:
-        _published_lease(core, tracker)
+        _claimed_lease(core, tracker)
         assert _ack(tracker) is ReadAckOutcome.APPLIED
 
         # Evicting by hand: the real bound is thousands of requests, and
@@ -844,6 +935,9 @@ def test_tracker_stops_admitting_before_its_hold_bound_is_exceeded() -> None:
             )
 
         # Acknowledging one frees exactly one hold, and admission resumes.
+        assert _claim(
+            tracker, req_id="request-0", consumer_instance_id="consumer-1"
+        ).granted
         assert (
             _ack(tracker, req_id="request-0", consumer_instance_id="consumer-1")
             is ReadAckOutcome.APPLIED

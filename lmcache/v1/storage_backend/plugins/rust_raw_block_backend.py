@@ -41,6 +41,8 @@ from lmcache.v1.storage_backend.storage_pd_ack import (
     ACK_UNRESOLVED,
     StoragePDAckRequest,
     StoragePDAckServer,
+    StoragePDClaimAnswer,
+    StoragePDClaimRequest,
 )
 
 if TYPE_CHECKING:
@@ -1269,6 +1271,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         try:
             server = StoragePDAckServer(
                 self._answer_read_ack,
+                claim_handler=self._answer_read_claim,
                 bind_host=host,
                 port=port,
                 advertise_host=advertise,
@@ -1289,6 +1292,45 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             server.bind_endpoint,
         )
         return server
+
+    def _answer_read_claim(
+        self, request: StoragePDClaimRequest
+    ) -> StoragePDClaimAnswer:
+        """Say whether this consumer may read the publication it names.
+
+        Asked before any bytes move, so this is what settles which
+        incarnation will be allowed to acknowledge. Everything in the
+        request came off a network; the tracker checks it against what this
+        writer is actually holding and grants nothing it cannot match.
+        """
+        if self._pd_tracker is None:
+            return StoragePDClaimAnswer(False, "this engine holds no publications")
+        read = request.read
+        if self._pd_session_id and request.session_id != self._pd_session_id:
+            return StoragePDClaimAnswer(
+                False, "the claim names another producer/consumer session"
+            )
+        outcome = self._pd_tracker.claim_read(
+            ReadAckIdentity(
+                req_id=read.req_id,
+                consumer_instance_id=read.consumer_instance_id,
+                tp_rank=read.tp_rank,
+                writer_epoch=read.writer_epoch,
+                checkpoint_seq=read.checkpoint_seq,
+                manifest_digest=read.manifest_digest,
+            ),
+            expected_writer_epoch=self._core.writer_epoch,
+            expected_tp_rank=self._ack_tp_rank,
+            session_id=request.session_id,
+        )
+        logger.debug(
+            "Raw-block storage P/D read claim for %s by %s: granted=%s %s",
+            read.req_id,
+            read.consumer_instance_id,
+            outcome.granted,
+            outcome.reason,
+        )
+        return StoragePDClaimAnswer(outcome.granted, outcome.reason, outcome.final)
 
     def _answer_read_ack(self, request: StoragePDAckRequest) -> tuple[str, str]:
         """Apply one acknowledgement and say what happened.
