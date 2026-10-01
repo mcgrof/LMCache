@@ -384,6 +384,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         # it went away. Their buffers are nobody's to release until it ends.
         self._pending_put_owners: list[list[MemoryObj]] = []
         self._closed_once = False
+        self._active_operations = 0
         # Set at the top of close, before anything waits. A wait that runs
         # while new work is still being admitted has no end, and every
         # admission path below checks this rather than discovering a
@@ -757,16 +758,24 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
     def _refresh_index(self) -> bool:
         """Re-read the writer's index, no more often than the configured
         minimum spacing.  Returns True when the index changed."""
-        with self._refresh_lock:
-            now = time.monotonic()
-            if (now - self._last_refresh_ts) * 1000.0 < self._index_refresh_min_ms:
+        with self._put_lock:
+            if self._sealed:
                 return False
-            self._last_refresh_ts = now
-            try:
-                return bool(self._core.refresh_index_from_device())
-            except Exception as e:
-                logger.warning("RustRawBlockBackend: index refresh failed: %s", e)
-                return False
+            self._active_operations += 1
+        try:
+            with self._refresh_lock:
+                now = time.monotonic()
+                if (now - self._last_refresh_ts) * 1000.0 < self._index_refresh_min_ms:
+                    return False
+                self._last_refresh_ts = now
+                try:
+                    return bool(self._core.refresh_index_from_device())
+                except Exception as e:
+                    logger.warning("RustRawBlockBackend: index refresh failed: %s", e)
+                    return False
+        finally:
+            with self._put_lock:
+                self._active_operations -= 1
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         with self._put_lock:
@@ -796,26 +805,29 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         """Adopt the request generation advertised by a storage-P/D writer."""
         if self._role != "reader":
             raise RuntimeError("only a raw-block reader can adopt a publication")
-        if self._sealed:
-            raise RuntimeError(
-                "raw-block storage P/D is shutting down and adopts no "
-                "further publications"
+        with self._put_lock:
+            if self._sealed:
+                raise RuntimeError("raw-block storage P/D is shutting down")
+            self._active_operations += 1
+        try:
+            encoded_keys = [encode_legacy_key(key).encoded for key in keys]
+            adopted = self._core.refresh_until_publication(
+                receipt,
+                encoded_keys,
+                timeout_ms=timeout_ms,
+                refresh_interval_ms=max(self._index_refresh_min_ms, 1),
             )
-        encoded_keys = [encode_legacy_key(key).encoded for key in keys]
-        adopted = self._core.refresh_until_publication(
-            receipt,
-            encoded_keys,
-            timeout_ms=timeout_ms,
-            refresh_interval_ms=max(self._index_refresh_min_ms, 1),
-        )
-        if adopted and request_id:
-            with self._pin_lock:
-                for encoded in encoded_keys:
-                    self._adopted_requests.pop(encoded, None)
-                    self._adopted_requests[encoded] = request_id
-                while len(self._adopted_requests) > _ADOPTED_REQUEST_HISTORY:
-                    self._adopted_requests.popitem(last=False)
-        return adopted
+            if adopted and request_id:
+                with self._pin_lock:
+                    for encoded in encoded_keys:
+                        self._adopted_requests.pop(encoded, None)
+                        self._adopted_requests[encoded] = request_id
+                    while len(self._adopted_requests) > _ADOPTED_REQUEST_HISTORY:
+                        self._adopted_requests.popitem(last=False)
+            return adopted
+        finally:
+            with self._put_lock:
+                self._active_operations -= 1
 
     def publish_existing_request(
         self,
@@ -905,13 +917,30 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         transfer_spec: Any = None,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> list[Future] | None:
-        if self._sealed:
-            logger.warning(
-                "RustRawBlockBackend on %s is shutting down and admits no "
-                "further stores",
-                self.device_path,
+        with self._put_lock:
+            if self._sealed:
+                logger.warning(
+                    "RustRawBlockBackend on %s is shutting down and admits no "
+                    "further stores",
+                    self.device_path,
+                )
+                return None
+            self._active_operations += 1
+        try:
+            return self._submit_put_tasks(
+                keys, objs, transfer_spec, on_complete_callback
             )
-            return None
+        finally:
+            with self._put_lock:
+                self._active_operations -= 1
+
+    def _submit_put_tasks(
+        self,
+        keys: Sequence[CacheEngineKey],
+        objs: List[MemoryObj],
+        transfer_spec: Any,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]],
+    ) -> list[Future] | None:
         if self._storage_pd_mode:
             return self._batched_submit_pd_request(
                 keys,
@@ -1158,10 +1187,10 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             assert self._pd_tracker is not None
             self._pd_tracker.fail_request(req_id, exc)
         finally:
+            self._settle_put_owners(pending, io_task, io_finished)
             with self._put_lock:
                 for key, _spec, _obj in pending:
                     self._put_tasks.discard(key)
-            self._settle_put_owners(pending, io_task, io_finished)
 
     async def _submit_put_one(
         self,
@@ -1184,12 +1213,10 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                 except Exception as e:
                     logger.warning("on_complete_callback failed for key %s: %s", key, e)
         finally:
-            with self._put_lock:
-                self._put_tasks.discard(key)
-            # The same question as the batched paths: a cancelled await has
-            # not stopped the thread, so the buffer is not this coroutine's
-            # to release until it has.
             self._settle_put_owners(pending, io_task, io_finished)
+            with self._put_lock:
+                for key, _spec, _obj in pending:
+                    self._put_tasks.discard(key)
 
     async def _submit_put_many(
         self,
@@ -1246,10 +1273,10 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                             "on_complete_callback failed for key %s: %s", key, e
                         )
         finally:
+            self._settle_put_owners(pending, io_task, io_finished)
             with self._put_lock:
                 for key, _spec, _obj in pending:
                     self._put_tasks.discard(key)
-            self._settle_put_owners(pending, io_task, io_finished)
 
     def _observed_key_derivation(
         self, key_namespace: str
@@ -1629,20 +1656,41 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
 
         def _settle(_task: "asyncio.Future[Any]") -> None:
             with self._put_lock:
-                try:
-                    self._pending_put_owners.remove(owners)
-                except ValueError:  # pragma: no cover - settled already
+                if not any(batch is owners for batch in self._pending_put_owners):
                     return
             if not io_finished.is_set():
                 # The task ended without its thread ending. Nothing here can
                 # say what the device is doing with these buffers.
                 self._quarantined_objs.extend(owners)
-                return
-            self._release_put_owners(pending)
+            else:
+                self._release_put_owners(pending)
+            # Keep the batch visible until releasing or quarantining every
+            # owner is finished; shutdown must not miss that transition.
+            with self._put_lock:
+                for index, batch in enumerate(self._pending_put_owners):
+                    if batch is owners:
+                        del self._pending_put_owners[index]
+                        break
 
         io_task.add_done_callback(_settle)
 
     def _batched_get_prefix(
+        self,
+        keys: Sequence[CacheEngineKey],
+    ) -> list[MemoryObj]:
+        # Include preparation and cleanup, not just the native read: the
+        # allocator is already in use while a destination is being built.
+        with self._put_lock:
+            if self._sealed:
+                return []
+            self._active_operations += 1
+        try:
+            return self._load_prefix(keys)
+        finally:
+            with self._put_lock:
+                self._active_operations -= 1
+
+    def _load_prefix(
         self,
         keys: Sequence[CacheEngineKey],
     ) -> list[MemoryObj]:
@@ -1918,25 +1966,20 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         # Seal admission before waiting for anything. A wait that runs while
         # new work is still being taken on is a wait with no end, and the
         # only reason to wait is to reach a state nothing can leave again.
-        self._sealed = True
+        with self._put_lock:
+            if self._closed_once:
+                logger.warning("Raw-block backend close was already run")
+                return
+            self._closed_once = True
+            self._sealed = True
 
         deadline = time.monotonic() + 10.0
         while True:
             with self._put_lock:
-                pending = len(self._put_tasks)
+                pending = len(self._put_tasks) + self._active_operations
             if pending == 0 or time.monotonic() >= deadline:
                 break
             time.sleep(0.01)
-
-        if self._closed_once:
-            # Running the rest again is not a repeat of a no-op. The core has
-            # no device handle by then, and asking it about the device's
-            # health goes through an accessor that opens a new writable one
-            # on the same path -- which then gets closed along with a second
-            # release of the allocator.
-            logger.warning("Raw-block backend close was already run")
-            return
-        self._closed_once = True
 
         # The control handler reaches the core -- releasing a hold unlocks
         # keys through it -- so it stops first. A timed join that returns is
@@ -1979,7 +2022,12 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             or self._outcome_is_unknown()
         )
 
-        if not control_quiesced or not publication_quiesced:
+        if (
+            pending > 0
+            or retained_batches > 0
+            or not control_quiesced
+            or not publication_quiesced
+        ):
             # Something that reaches the core could not be confirmed
             # stopped. Closing the core now destroys it underneath a live
             # handler, and retaining the memory afterwards does not undo a

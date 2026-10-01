@@ -46,6 +46,7 @@ from lmcache.v1.storage_backend.raw_block import (
     NativeQuiescence,
     RawBlockCloseOutcome,
     RawBlockPDRequestTracker,
+    RawBlockPublicationReceipt,
     encode_legacy_key,
 )
 
@@ -718,3 +719,82 @@ def test_an_unknown_outcome_withholds_the_extent_and_the_buffer(iouring_backend)
 
     assert allocator.close_calls == 0
     assert len(_retained_now(before)) == 1
+
+
+@pytest.mark.parametrize("operation", ["read", "store", "adopt"])
+def test_close_keeps_a_caller_preparing_work_alive(
+    backend: RustRawBlockBackend, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    """Count preparation before it reaches either a put task or native I/O."""
+    # Standard
+    from concurrent.futures import Future, ThreadPoolExecutor
+
+    entered = threading.Event()
+    resume = threading.Event()
+    result: list[Any] | bool | None = (
+        [] if operation == "read" else False if operation == "adopt" else None
+    )
+    allocator = backend.get_memory_allocator()
+    assert isinstance(allocator, _CountingAllocator)
+
+    def delayed(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        assert resume.wait(5), "the admitted caller did not resume"
+        return result
+
+    if operation == "adopt":
+        backend._role = "reader"
+        monkeypatch.setattr(backend._core, "refresh_until_publication", delayed)
+    elif operation == "read":
+        monkeypatch.setattr(backend._core, "get_metadata_prefix", delayed)
+    else:
+        backend._storage_pd_mode = True
+        monkeypatch.setattr(backend, "_batched_submit_pd_request", delayed)
+    clock = time.monotonic()
+    ticks = iter([clock, clock + 11])
+    # Expire only this backend's drain budget; its core and the executor
+    # continue to use the real clock.
+    monkeypatch.setattr(
+        plugin,
+        "time",
+        type("Clock", (), {"monotonic": lambda: next(ticks), "sleep": time.sleep}),
+    )
+    before = len(plugin._RETAINED_AFTER_UNKNOWN_OUTCOME)
+    with ThreadPoolExecutor(max_workers=1) as caller:
+        pending: Future[Any]
+        if operation == "read":
+            key = CacheEngineKey("test_model", 1, 0, 9011, torch.bfloat16)
+            pending = caller.submit(backend.get_blocking, key)
+        elif operation == "adopt":
+            receipt = RawBlockPublicationReceipt("writer", 1, 0, "manifest")
+            pending = caller.submit(
+                backend.adopt_publication, receipt, [], timeout_ms=1
+            )
+        else:
+            pending = caller.submit(backend.batched_submit_put_task, [], [])
+        try:
+            assert entered.wait(5), "the caller was not admitted"
+            backend.close()
+            assert allocator.close_calls == 0
+            assert not backend._core._closed
+            assert len(_retained_now(before)) == 1
+            resume.set()
+            assert pending.result(timeout=5) is (
+                False if operation == "adopt" else None
+            )
+        finally:
+            resume.set()
+
+
+def test_close_refuses_a_reader_before_allocating(
+    backend: RustRawBlockBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Do not allocate a new read destination after allocator shutdown."""
+    backend.close()
+
+    def unexpected_read(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("a closed backend attempted to prepare a read")
+
+    monkeypatch.setattr(backend._core, "get_metadata_prefix", unexpected_read)
+    key = CacheEngineKey("test_model", 1, 0, 9010, torch.bfloat16)
+    assert backend.get_blocking(key) is None
