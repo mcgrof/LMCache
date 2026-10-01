@@ -567,6 +567,78 @@ async def test_cancelled_stream_resolves_a_publication_not_claimed_by_decode(
     assert reported[0].publication_receipt() == receipt
 
 
+def test_decoder_stream_completion_requires_done_without_an_error() -> None:
+    """A normal SSE EOF after an engine error is not a completed decode."""
+    success = proxy.DecoderStreamCompletion()
+    success.feed(b'data: {"choices": [{"finish_reason": "stop"}]}\n\ndata: [DO')
+    success.feed(b"NE]\n\n")
+    success.finish()
+    assert success.succeeded
+
+    failed = proxy.DecoderStreamCompletion()
+    failed.feed(b'data: {"err')
+    failed.feed(b'or": {"code": 500}}\n\ndata: [DONE]\n\n')
+    failed.finish()
+    assert failed.saw_done
+    assert failed.saw_error
+    assert not failed.succeeded
+
+    truncated = proxy.DecoderStreamCompletion()
+    truncated.feed(b'data: {"choices": []}\n\n')
+    truncated.finish()
+    assert not truncated.succeeded
+
+    empty_done = proxy.DecoderStreamCompletion()
+    empty_done.feed(b"data: [DONE]\n\n")
+    empty_done.finish()
+    assert empty_done.saw_done
+    assert not empty_done.succeeded
+
+
+@pytest.mark.asyncio
+async def test_decoder_sse_error_resolves_an_unclaimed_publication(
+    monkeypatch,
+) -> None:
+    """An SSE error plus DONE is failure, even though HTTP and EOF are clean."""
+    receipt = RawBlockPublicationReceipt(
+        "writer",
+        1,
+        1,
+        "digest",
+        ack_endpoint="127.0.0.1:9999",
+    )
+    prefill_response = {
+        "id": "cmpl-1",
+        "created": 0,
+        "model": "probe-model",
+        "kv_transfer_params": {"first_tok": 7},
+    }
+    _endpoint_env(monkeypatch, prefill_response)
+    reported: list[StoragePDStatus] = []
+
+    async def wait(req_id, *_args, **_kwargs):
+        return [StoragePDStatus.ready(req_id, 0, receipt)]
+
+    async def stream(_client, _endpoint, _data):
+        yield b'data: {"error": {"code": 500}}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    async def report(statuses, **_kwargs):
+        reported.extend(statuses)
+        return []
+
+    monkeypatch.setattr(proxy, "wait_decode_kv_ready", wait)
+    monkeypatch.setattr(proxy, "stream_service_response", stream)
+    monkeypatch.setattr(proxy, "tell_producers_nobody_will_read", report)
+
+    response = await proxy.handle_completions(_fake_request())
+    chunks = [chunk async for chunk in response.body_iterator]
+
+    assert any(b'"error"' in chunk for chunk in chunks)
+    assert len(reported) == 1
+    assert reported[0].publication_receipt() == receipt
+
+
 @pytest.mark.asyncio
 async def test_endpoint_releases_its_permit_once_on_the_successful_path(
     monkeypatch,

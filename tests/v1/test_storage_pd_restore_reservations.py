@@ -8,6 +8,7 @@ from typing import Any
 import threading
 
 # Third Party
+from vllm import SamplingParams
 import msgspec
 import pytest
 import torch
@@ -58,6 +59,64 @@ def test_direct_storage_pd_params_override_extra_args_copy() -> None:
 
     assert extracted_statuses is direct_statuses
     assert request_id == "direct"
+
+
+def test_storage_pd_miss_is_scheduled_for_receipt_adoption() -> None:
+    """A READY miss must fail adoption, not recompute and orphan its hold."""
+    status = StoragePDStatus.ready(
+        "published-request",
+        0,
+        RawBlockPublicationReceipt(
+            "writer-epoch", 1, 1, "digest", ack_endpoint="127.0.0.1:5999"
+        ),
+    )
+
+    class Lookup:
+        cached = -1
+
+        @staticmethod
+        def lookup_cache(*, lookup_id: str) -> int:
+            assert lookup_id == "local-request"
+            return Lookup.cached
+
+        @staticmethod
+        def lookup(tokens, *, lookup_id: str, request_configs: Any) -> int:
+            assert tokens == list(range(7))
+            assert lookup_id == "local-request"
+            Lookup.cached = 0
+            return 0
+
+    connector = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    connector.kv_role = "kv_consumer"
+    connector._manager = SimpleNamespace(lookup_client=Lookup())  # type: ignore[assignment]
+    connector._requests_priority = {}
+    connector.skip_last_n_tokens = 1
+    connector.config = SimpleNamespace(min_retrieve_tokens=0)
+    connector._max_tokens_per_load = 0
+    connector._lmcache_chunk_size = 256
+    connector.load_specs = {}
+    request = SimpleNamespace(
+        request_id="local-request",
+        num_tokens=8,
+        all_token_ids=list(range(8)),
+        prompt_token_ids=list(range(8)),
+        sampling_params=SamplingParams(),
+        priority=0,
+        mm_features=[],
+        kv_transfer_params={
+            "lmcache.storage_pd_request_id": status.req_id,
+            "lmcache.storage_pd_statuses": [msgspec.to_builtins(status)],
+        },
+    )
+
+    matched = connector.get_num_new_matched_tokens(request, 0)
+    matched_from_cached_miss = connector.get_num_new_matched_tokens(request, 0)
+
+    assert matched == 7
+    assert matched_from_cached_miss == 7
+    spec = connector.load_specs[request.request_id]
+    assert spec.lmcache_cached_tokens == 7
+    assert not spec.can_load
 
 
 @pytest.mark.parametrize(

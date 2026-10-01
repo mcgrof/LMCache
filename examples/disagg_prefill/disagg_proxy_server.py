@@ -567,6 +567,65 @@ async def stream_service_response(
             yield chunk
 
 
+class DecoderStreamCompletion:
+    """Recognize a successful terminal SSE event without consuming the stream.
+
+    An HTTP 200 and an exhausted response iterator do not mean decode
+    succeeded. vLLM reports engine failures as an SSE ``error`` object and
+    can then send ``[DONE]`` before closing normally. The storage P/D proxy
+    must distinguish that from a completed restore/decode, because only the
+    latter authorizes it to stop owning the unread-publication outcome.
+
+    ``httpx`` may split an SSE line at any byte boundary, so observations are
+    buffered through newlines rather than matched within individual chunks.
+    The bytes are still forwarded unchanged by callers.
+    """
+
+    def __init__(self) -> None:
+        self._buffer = b""
+        self.saw_done = False
+        self.saw_error = False
+        self.saw_terminal_choice = False
+
+    def feed(self, chunk: bytes) -> None:
+        self._buffer += chunk
+        while b"\n" in self._buffer:
+            line, self._buffer = self._buffer.split(b"\n", 1)
+            self._observe_line(line.rstrip(b"\r"))
+
+    def finish(self) -> None:
+        if self._buffer:
+            self._observe_line(self._buffer.rstrip(b"\r"))
+            self._buffer = b""
+
+    @property
+    def succeeded(self) -> bool:
+        return self.saw_done and self.saw_terminal_choice and not self.saw_error
+
+    def _observe_line(self, line: bytes) -> None:
+        if not line.startswith(b"data:"):
+            return
+        payload = line[len(b"data:") :].strip()
+        if payload == b"[DONE]":
+            self.saw_done = True
+            return
+        if not payload:
+            return
+        try:
+            message = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if isinstance(message, dict) and "error" in message:
+            self.saw_error = True
+        if isinstance(message, dict):
+            choices = message.get("choices")
+            if isinstance(choices, list) and any(
+                isinstance(choice, dict) and choice.get("finish_reason") is not None
+                for choice in choices
+            ):
+                self.saw_terminal_choice = True
+
+
 def round_robin_pick_client(clients, idx):
     return clients[idx % len(clients)]
 
@@ -988,6 +1047,7 @@ async def handle_completions(request: Request):
         # Stream response from decode service
         async def generate_stream():
             decode_finished = False
+            completion = DecoderStreamCompletion()
             try:
                 yield (
                     "data: "
@@ -1014,8 +1074,10 @@ async def handle_completions(request: Request):
                 async for chunk in stream_service_response(
                     decode_client.client, "/v1/completions", req_data
                 ):
+                    completion.feed(chunk)
                     yield chunk
-                decode_finished = True
+                completion.finish()
+                decode_finished = completion.succeeded
             finally:
                 if ready_statuses and not producer_only and not decode_finished:
                     await tell_producers_nobody_will_read(
@@ -1188,6 +1250,8 @@ async def handle_chat_completions(request: Request):
 
         producer_choice = (prefill_output.get("choices") or [{}])[0]
 
+        decode_completion = DecoderStreamCompletion()
+
         # Stream response from decode service
         async def generate_stream_body():
             initial_chunk = {
@@ -1250,6 +1314,7 @@ async def handle_chat_completions(request: Request):
             async for chunk in stream_service_response(
                 decode_client.client, "/v1/completions", req_data
             ):
+                decode_completion.feed(chunk)
                 chunk_str = chunk.decode("utf-8")
                 if chunk_str.startswith("data: ") and not chunk_str.startswith(
                     "data: [DONE]"
@@ -1315,7 +1380,11 @@ async def handle_chat_completions(request: Request):
             try:
                 async for chunk in generate_stream_body():
                     yield chunk
-                decode_finished = True
+                if producer_only:
+                    decode_finished = True
+                else:
+                    decode_completion.finish()
+                    decode_finished = decode_completion.succeeded
             finally:
                 if ready_statuses and not producer_only and not decode_finished:
                     await tell_producers_nobody_will_read(

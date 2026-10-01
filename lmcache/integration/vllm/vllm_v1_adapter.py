@@ -2137,6 +2137,22 @@ class LMCacheConnectorV1Impl:
         if self.lookup_client is None:
             return 0
 
+        # token_ids = request.prompt_token_ids
+        # all token ids covers the preemption case
+        token_ids = request.all_token_ids
+
+        # If the request has multimodal hashes, apply them to the token ids
+        mm_hashes, mm_positions = extract_mm_features(request)
+        if mm_hashes and mm_positions:
+            # TODO(Jiayi): Optimize this
+            token_ids = torch.tensor(request.prompt_token_ids)
+            apply_mm_hashes_to_token_ids(token_ids, mm_hashes, mm_positions)
+            token_ids = token_ids.tolist()
+
+        request_configs = extract_request_configs(request.sampling_params)
+        if self.skip_last_n_tokens > 0:
+            token_ids = token_ids[: -self.skip_last_n_tokens]
+
         if (
             num_external_hit_tokens := self.lookup_client.lookup_cache(lookup_id=req_id)
         ) != -1:
@@ -2151,27 +2167,37 @@ class LMCacheConnectorV1Impl:
             logger.debug("Looking up cache for the first time for request %s!", req_id)
             self._requests_priority[req_id] = getattr(request, "priority", 0)
 
-            # token_ids = request.prompt_token_ids
-            # all token ids covers the preemption case
-            token_ids = request.all_token_ids
-
-            # If the request has multimodal hashes, apply them to the token ids
-            mm_hashes, mm_positions = extract_mm_features(request)
-            if mm_hashes and mm_positions:
-                # TODO(Jiayi): Optimize this
-                token_ids = torch.tensor(request.prompt_token_ids)
-                apply_mm_hashes_to_token_ids(token_ids, mm_hashes, mm_positions)
-                token_ids = token_ids.tolist()
-
-            request_configs = extract_request_configs(request.sampling_params)
-            if self.skip_last_n_tokens > 0:
-                token_ids = token_ids[: -self.skip_last_n_tokens]
-
             num_external_hit_tokens = self.lookup_client.lookup(
                 token_ids,
                 lookup_id=req_id,
                 request_configs=request_configs,
             )
+
+        # A storage-P/D READY receipt is stronger than an ordinary cache
+        # lookup hint: it says the producer published this request's entire
+        # prefill manifest and is holding those extents for this consumer.
+        # A miss must therefore reach the worker's claim/adopt check rather
+        # than silently falling back to local computation. Otherwise a wrong
+        # prompt/key can return a normal decode while the writer retains an
+        # unread lease forever, and neither side owns its terminal outcome.
+        kv_transfer_params = getattr(request, "kv_transfer_params", None)
+        storage_pd_statuses, _ = _extract_storage_pd_request(
+            kv_transfer_params,
+            request_configs,
+        )
+        if storage_pd_statuses is not None:
+            advertised_tokens = len(token_ids)
+            if num_external_hit_tokens != advertised_tokens:
+                logger.warning(
+                    "Storage P/D request %s advertised a publication for %d "
+                    "tokens while ordinary lookup reported %s; scheduling "
+                    "adoption so the receipt is verified instead of silently "
+                    "recomputing",
+                    req_id,
+                    advertised_tokens,
+                    num_external_hit_tokens,
+                )
+            num_external_hit_tokens = advertised_tokens
 
         if num_external_hit_tokens is None:
             logger.debug(
@@ -2661,9 +2687,17 @@ class LMCacheConnectorV1Impl:
         # NOTE: Used to stream back the first token
         # for disagg prefill
         if params is not None and "ret_first_tok" in params:
-            return_params = {
-                "first_tok": request._output_token_ids[0],
-            }
+            output_token_ids = getattr(request, "_output_token_ids", ())
+            if output_token_ids:
+                return_params = {
+                    "first_tok": output_token_ids[0],
+                }
+            else:
+                logger.info(
+                    "Request %s ended before producing its storage P/D "
+                    "handoff token; returning no first token",
+                    request.request_id,
+                )
 
         if self.config.get_extra_config_value(
             "enable_cache_usage_details_in_response", False
