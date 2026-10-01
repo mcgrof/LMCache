@@ -598,8 +598,8 @@ def test_a_full_submission_queue_is_reported_not_panicked_on(tmp_path) -> None:
 
     The ring has room for one entry and is given two. Whatever the engine
     does with the second, it must not claim the device accepted it, and it
-    must not take the process down -- the push error on this path used to be
-    an `expect`.
+    must not take the process down: a full submission queue is an ordinary
+    condition on this path, and the only one that reports it is the push.
     """
     device = tmp_path / "dev.bin"
     with open(device, "wb") as handle:

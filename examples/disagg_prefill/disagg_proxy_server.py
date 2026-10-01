@@ -503,8 +503,9 @@ def take_prefill_budget(req_data: dict) -> int:
     A handoff spends one token on the prefiller, so a request asking for a
     single token leaves the decoder none, which the engine rejects. Refuse it
     here, naming the reason, rather than forwarding a request that cannot be
-    served. The chat spelling is accepted too: a request carrying only
-    ``max_completion_tokens`` used to raise a KeyError and return 500.
+    served. Both spellings of the budget are read, because a chat request
+    carries only ``max_completion_tokens`` and a request whose budget this
+    cannot find is a 500 rather than a refusal with a reason.
     """
     budget = req_data.get("max_tokens")
     if budget is None:
