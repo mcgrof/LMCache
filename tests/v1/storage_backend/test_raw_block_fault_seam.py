@@ -485,23 +485,26 @@ SCRIPTED_UNANSWERED_CLOSE = SCRIPTED_PREAMBLE + textwrap.dedent(
 SCRIPTED_SUBMISSION_QUEUE_FULL = SCRIPTED_PREAMBLE + textwrap.dedent(
     """
     # One entry fits. The second push is refused, which is the only way a
-    # real submission queue reports being full.
+    # real submission queue reports being full. Submits are held so the
+    # first entry is still resident when the second arrives -- otherwise
+    # the first is gone by then and there is no full queue to report.
     dev = device(capacity=1)
+    dev.fake_hold_submits(True)
     a = bytearray(b"a" * 4096)
     b = bytearray(b"b" * 4096)
-    report = {}
-    try:
-        batch = dev.batched_write([0, 4096], [a, b], [4096, 4096], [None, None])
-        report["submitted"] = True
-        assert wait_until(lambda: bool(dev.fake_owned()))
-        for held in list(dev.fake_owned()):
-            dev.fake_complete(held, 4096)
-        results, errors = dev.wait_iouring(batch)
-        report["results"] = list(results)
-        report["errors"] = [str(e) for _, e in errors]
-    except BaseException as exc:
-        report["submitted"] = False
-        report["raised"] = f"{type(exc).__name__}: {exc}"
+    batch = dev.batched_write([0, 4096], [a, b], [4096, 4096], [None, None])
+    assert wait_until(lambda: len(dev.fake_resident()) == 1)
+    report = {"resident_while_full": dev.fake_resident_sqes()}
+
+    # Let the queue drain and answer for whatever the ring took.
+    dev.fake_hold_submits(False)
+    assert wait_until(lambda: bool(dev.fake_owned()))
+    for held in list(dev.fake_owned()):
+        dev.fake_complete(held, 4096)
+    assert wait_until(lambda: not dev.fake_owned() and not dev.fake_resident())
+    results, errors = dev.wait_iouring(batch)
+    report["results"] = list(results)
+    report["errors"] = [str(e) for _, e in errors]
     report["violations"] = dev.fake_violations()
     report["poisoned"] = dev.is_poisoned()
     print(json.dumps(report))
@@ -514,18 +517,36 @@ SCRIPTED_PARTIAL_TAKE = SCRIPTED_PREAMBLE + textwrap.dedent(
     dev = device()
     a = bytearray(b"a" * 4096)
     b = bytearray(b"b" * 4096)
-    # The ring really hands over a prefix this time, and the suffix really
-    # stays the worker's.
-    dev.fake_submit_takes(1)
+    # Hold the submits first, so both entries are resident at once. Without
+    # that, batched_write signals each item separately and the worker can
+    # make two submissions of one entry each -- where "take one" is a full
+    # take and nothing partial has happened.
+    dev.fake_hold_submits(True)
     batch = dev.batched_write([0, 4096], [a, b], [4096, 4096], [None, None])
-    assert wait_until(lambda: len(dev.fake_owned()) == 2)
-    owned = dev.fake_owned()
-    for held in list(owned):
-        dev.fake_complete(held, 4096)
+    assert wait_until(lambda: len(dev.fake_resident()) == 2)
+    resident_before = dev.fake_resident_sqes()
+
+    # Now one real partial take: the ring hands over a prefix, and the
+    # suffix really stays the worker's. The hold stays on, so this is the
+    # only submit that takes anything and the suffix can be looked at
+    # rather than raced against the worker's next loop.
+    dev.fake_submit_takes(1)
+    assert wait_until(lambda: len(dev.fake_owned()) == 1)
+    accepted = dev.fake_owned_sqes()
+    suffix_while_held = dev.fake_resident_sqes()
+    dev.fake_complete(accepted[0]["user_data"], 4096)
+
+    # The suffix reaches the kernel on a later submit, unchanged.
+    dev.fake_hold_submits(False)
+    assert wait_until(lambda: len(dev.fake_owned()) == 1)
+    suffix = dev.fake_owned_sqes()
+    dev.fake_complete(suffix[0]["user_data"], 4096)
     results, errors = dev.wait_iouring(batch)
     print(json.dumps({
-        "owned": owned,
-        "delivered_once": len(owned) == len(set(owned)),
+        "resident_before": resident_before,
+        "accepted": accepted,
+        "suffix_while_held": suffix_while_held,
+        "suffix": suffix,
         "results": list(results),
         "errors": [str(e) for _, e in errors],
         "syncs": dev.fake_syncs(),
@@ -607,11 +628,20 @@ def test_a_full_submission_queue_is_reported_not_panicked_on(tmp_path) -> None:
     report = _run_scenario(SCRIPTED_SUBMISSION_QUEUE_FULL, device)
 
     assert report["violations"] == []
-    if report["submitted"]:
-        # The entry that did not fit must not be reported as written.
-        assert report["results"].count(True) <= 1, report
-    else:
-        assert "raised" in report
+    assert report["poisoned"] is False, report
+    # The queue really was full: one entry resident against a capacity of
+    # one, which is what makes the second push the refusal under test.
+    assert len(report["resident_while_full"]) == 1, report
+    assert report["resident_while_full"][0]["len"] == 4096
+
+    # Both operations end, and each ends as itself: the one the ring took is
+    # written, and the one it refused is reported as an error against its
+    # own index rather than quietly dropped or counted as written.
+    assert len(report["results"]) == 2, report
+    assert report["results"].count(True) == 1, report
+    refused = [index for index, ok in enumerate(report["results"]) if not ok]
+    assert len(refused) == 1, report
+    assert any("submission queue full" in error for error in report["errors"]), report
 
 
 def test_a_partial_take_delivers_the_suffix_once(tmp_path) -> None:
@@ -626,12 +656,27 @@ def test_a_partial_take_delivers_the_suffix_once(tmp_path) -> None:
         handle.truncate(16 * 1024 * 1024)
     report = _run_scenario(SCRIPTED_PARTIAL_TAKE, device)
 
-    assert report["delivered_once"] is True, report
-    assert len(report["owned"]) == 2
+    assert report["violations"] == []
+    # A real partial take: strictly between nothing and everything. "Take
+    # one of one" is a full take, and a test that accepted it would pass
+    # against a worker that never partially submitted anything.
+    resident_before = report["resident_before"]
+    assert len(resident_before) == 2, report
+    assert len(report["accepted"]) == 1, report
+    assert 0 < len(report["accepted"]) < len(resident_before), report
+
+    # The prefix is the first entry as it was built, and the suffix is the
+    # second -- not a re-derived operation that happens to carry the same
+    # bytes. Repeated payload bytes make a readback comparison agree with a
+    # remainder aimed anywhere, so the geometry is what is compared.
+    assert report["accepted"][0] == resident_before[0], report
+    assert report["suffix_while_held"] == [resident_before[1]], report
+    assert report["suffix"] == [resident_before[1]], report
+    assert report["accepted"][0]["user_data"] != report["suffix"][0]["user_data"]
+
     assert report["results"] == [True, True]
     assert report["errors"] == []
     assert report["syncs"] > 0, "the worker must have flushed the ring"
-    assert report["violations"] == []
 
 
 def test_the_scripted_ring_refuses_a_completion_it_does_not_hold(tmp_path) -> None:
@@ -804,3 +849,288 @@ def test_a_read_nobody_answered_for_keeps_its_destination(tmp_path) -> None:
     assert report["retained"] == 1
     assert report["destination_alive_after_close_and_drop"] is True
     assert report["violations"] == []
+
+
+SCRIPTED_FATAL_AFTER_WITHHELD = SCRIPTED_PREAMBLE + textwrap.dedent(
+    """
+    dev = device()
+    first = bytearray(b"a" * 4096)
+    second = bytearray(b"b" * 4096)
+
+    # Work the kernel took and will never answer for.
+    earlier = dev.batched_write([0], [first], [4096], [None])
+    assert wait_until(lambda: len(dev.fake_owned()) == 1)
+    withheld = dev.fake_owned_sqes()
+
+    # Now a submit that fails in a way that says nothing about what the ring
+    # already holds. EIO is not EAGAIN: there is no retry that makes this
+    # knowable.
+    dev.fake_submit_fails(5)
+    later = dev.batched_write([4096], [second], [4096], [None])
+
+    # Both waiters have to be answered. The earlier one is the point: its
+    # completion is never coming, and before this the only thing that woke
+    # it was somebody closing the device from outside.
+    #
+    # Waited on from a thread with a bound, because an unanswered waiter is
+    # exactly what this is testing for: blocking here instead would report a
+    # timeout, and a timeout says nothing about which rule was broken.
+    import threading
+
+    answered = {}
+
+    def collect(name, handle):
+        try:
+            results, errors = dev.wait_iouring(handle)
+            answered[name] = (list(results), [str(e) for _, e in errors])
+        except BaseException as exc:
+            answered[name] = ("raised", f"{type(exc).__name__}: {exc}")
+
+    # Daemons: a waiter that is never answered is the defect under test,
+    # and a non-daemon thread stuck in it would keep this process alive at
+    # exit -- which reports a timeout instead of the rule that was broken.
+    waiters = [
+        threading.Thread(target=collect, args=("later", later), daemon=True),
+        threading.Thread(target=collect, args=("earlier", earlier), daemon=True),
+    ]
+    for waiter in waiters:
+        waiter.start()
+    for waiter in waiters:
+        waiter.join(timeout=15)
+
+    report = {
+        "withheld": withheld,
+        "earlier_answered": "earlier" in answered,
+        "later_answered": "later" in answered,
+        "earlier": answered.get("earlier"),
+        "later": answered.get("later"),
+        "poisoned": dev.is_poisoned(),
+        "quarantined_batches": dev.quarantined_batch_count(),
+        "quarantined_owners": dev.quarantined_owner_count(),
+        "still_owned": dev.fake_owned_sqes(),
+    }
+    try:
+        dev.close()
+        report["close"] = "returned"
+    except BaseException as exc:
+        report["close"] = type(exc).__name__
+    report["retained"] = dev.retained_owner_count()
+    report["violations"] = dev.fake_violations()
+    print(json.dumps(report))
+    sys.stdout.flush()
+    # Leave without running interpreter shutdown: a thread deliberately
+    # left waiting on an unanswered request would be joined there, and this
+    # scenario has already said everything it has to say.
+    os._exit(0)
+    """
+)
+
+
+SCRIPTED_SYNCHRONOUS_UNANSWERED = SCRIPTED_PREAMBLE + textwrap.dedent(
+    """
+    import threading
+
+    dev = device()
+    payload = bytearray(b"x" * 8192)
+    other = bytearray(b"y" * 4096)
+    outcome = {}
+
+    def write_and_wait():
+        # The synchronous route waits inside the call. Nothing answers this
+        # request, so what wakes it has to be the engine deciding it cannot
+        # say -- not a completion anybody invented.
+        try:
+            dev.write_uring(0, payload, 4095, 4096, None)
+            outcome["raised"] = None
+        except BaseException as exc:
+            outcome["raised"] = type(exc).__name__
+
+    writing = threading.Thread(target=write_and_wait, daemon=True)
+    writing.start()
+    assert wait_until(lambda: len(dev.fake_owned()) == 1)
+    owned_while_writing = dev.fake_owned_sqes()
+
+    # A fatal submit on different work. The engine can no longer describe
+    # what the kernel holds, including the request above.
+    dev.fake_submit_fails(5)
+
+    def drive_the_fatal_submit():
+        try:
+            dev.wait_iouring(dev.batched_write([8192], [other], [4096], [None]))
+        except BaseException:
+            pass
+
+    driving = threading.Thread(target=drive_the_fatal_submit, daemon=True)
+    driving.start()
+    driving.join(timeout=15)
+    writing.join(timeout=15)
+
+    report = {
+        "owned_while_writing": owned_while_writing,
+        "writer_finished": not writing.is_alive(),
+        "writer_raised": outcome.get("raised"),
+        "poisoned": dev.is_poisoned(),
+        "quarantined_owners": dev.quarantined_owner_count(),
+    }
+    try:
+        dev.close()
+        report["close"] = "returned"
+    except BaseException as exc:
+        report["close"] = type(exc).__name__
+    report["retained"] = dev.retained_owner_count()
+    report["violations"] = dev.fake_violations()
+    print(json.dumps(report))
+    """
+)
+
+
+SCRIPTED_DMABUF_SHORT_TERMINAL = SCRIPTED_PREAMBLE + textwrap.dedent(
+    """
+    import ctypes
+
+    dev = device()
+    payload = bytearray(b"x" * 8192)
+    address = ctypes.addressof((ctypes.c_char * len(payload)).from_buffer(payload))
+    # A nonzero offset inside the registration, which is the case a
+    # remainder would get wrong: the SQE address of a registered dma-buf
+    # transfer is an offset into the registration, not a process address.
+    base = address - 4096
+    dev.register_fixed_dmabufs([address], [len(payload)], [7], [base])
+    registrations = dev.fake_registrations()
+
+    batch = dev.batched_write([0], [payload], [8192], [None])
+    assert wait_until(lambda: len(dev.fake_owned()) == 1)
+    submitted = dev.fake_owned_sqes()
+
+    # Half the bytes, and known to be half: a positive short completion.
+    dev.fake_complete(submitted[0]["user_data"], 4096)
+
+    # Look at the ring before waiting on the batch. A remainder nobody is
+    # going to answer for makes that wait never return, and a test that
+    # times out has reported nothing at all.
+    remainder = wait_until(
+        lambda: bool(dev.fake_resident()) or bool(dev.fake_owned()), seconds=2
+    )
+    report = {
+        "registrations": registrations,
+        "submitted": submitted,
+        "remainder_appeared": remainder,
+        "resident_after": dev.fake_resident_sqes(),
+        "owned_after": dev.fake_owned_sqes(),
+    }
+    if not remainder:
+        results, errors = dev.wait_iouring(batch)
+        report["results"] = list(results)
+        report["errors"] = [str(e) for _, e in errors]
+    report["poisoned"] = dev.is_poisoned()
+    report["quarantined_owners"] = dev.quarantined_owner_count()
+    report["violations"] = dev.fake_violations()
+    print(json.dumps(report))
+    """
+)
+
+
+def test_a_fatal_submit_answers_work_the_kernel_already_took(tmp_path) -> None:
+    """A fatal submit is not news about one batch.
+
+    A request the kernel took earlier, and will now never answer for, has a
+    waiter. Failing only the batch whose submit reported the error leaves
+    that waiter blocked until somebody closes the device from outside --
+    which is not an answer, it is a hang with a cause.
+
+    So every unresolved operation gets a bounded logical failure, and every
+    one of them keeps its owners: a logical failure is not a DMA fence, and
+    nothing here invents a completion or declares the device finished.
+    """
+    device = tmp_path / "dev.bin"
+    with open(device, "wb") as handle:
+        handle.truncate(16 * 1024 * 1024)
+    report = _run_scenario(SCRIPTED_FATAL_AFTER_WITHHELD, device)
+
+    assert report["violations"] == []
+    assert len(report["withheld"]) == 1, report
+
+    # The earlier waiter was answered, and answered as a failure.
+    assert report["earlier_answered"] is True, report
+    assert report["later_answered"] is True, report
+    assert report["earlier"][0] == [False], report
+    assert report["earlier"][1], report
+    assert report["later"][0] == [False], report
+
+    # And nothing was released on the strength of that answer.
+    assert report["poisoned"] is True, report
+    assert report["quarantined_batches"] == 2, report
+    assert report["quarantined_owners"] >= 2, report
+    assert report["close"] == "RuntimeError", report
+    assert report["retained"] >= 2, report
+
+
+def test_a_synchronous_write_nobody_answered_for_is_woken_and_kept(tmp_path) -> None:
+    """The route with no batch to poll still has to be answered.
+
+    A synchronous write waits inside its own call, so an unresolved outcome
+    there is a thread that never returns. The engine wakes it by deciding it
+    cannot say -- not by inventing the completion it is waiting for -- and
+    keeps the buffer, because a logical failure says nothing about whether
+    the device is still reaching it.
+    """
+    device = tmp_path / "dev.bin"
+    with open(device, "wb") as handle:
+        handle.truncate(16 * 1024 * 1024)
+    report = _run_scenario(SCRIPTED_SYNCHRONOUS_UNANSWERED, device)
+
+    assert report["violations"] == []
+    assert len(report["owned_while_writing"]) == 1, report
+    assert report["writer_finished"] is True, report
+    assert report["writer_raised"] is not None, (
+        "a write nobody answered for must not report success"
+    )
+    assert report["poisoned"] is True, report
+    assert report["quarantined_owners"] >= 1, report
+    assert report["close"] == "RuntimeError", report
+    assert report["retained"] >= 1, report
+
+
+def test_a_short_registered_dmabuf_transfer_ends_there(tmp_path) -> None:
+    """A registered dma-buf transfer has no remainder to retry.
+
+    The SQE address of one is a byte offset inside the registration rather
+    than a process address, so advancing it by the bytes transferred aims
+    the next submission at an offset nobody registered. There is also no
+    bounce buffer to fall back to: the whole point of the registration is
+    that the device reaches that memory directly.
+
+    So a known short completion ends the operation. The registration here
+    is explicitly synthetic -- no descriptor reached a kernel -- which makes
+    this evidence about the engine's own decision and about nothing else.
+    """
+    device = tmp_path / "dev.bin"
+    with open(device, "wb") as handle:
+        handle.truncate(16 * 1024 * 1024)
+    report = _run_scenario(SCRIPTED_DMABUF_SHORT_TERMINAL, device)
+
+    assert report["violations"] == []
+    # The registration really went through the shared path: a sparse table
+    # and one dma-buf slot.
+    kinds = [record["kind"] for record in report["registrations"]]
+    assert kinds == [1, 2], report
+
+    # The submission carried the registration, at a nonzero offset inside
+    # it, with the registered index rather than a process address.
+    assert len(report["submitted"]) == 1, report
+    sqe = report["submitted"][0]
+    assert sqe["fixed_index"] == 0, report
+    assert sqe["dmabuf_offset"] == 4096, report
+    assert sqe["addr"] == 4096, report
+    assert sqe["len"] == 8192, report
+
+    # It ended there: no remainder was submitted and none is waiting to be.
+    assert report["remainder_appeared"] is False, report
+    assert report["resident_after"] == [], report
+    assert report["owned_after"] == [], report
+    assert report["results"] == [False], report
+    assert report["errors"], report
+    # A known short completion is a known outcome. The device answered for
+    # this request, so nothing is withheld on its account.
+    assert report["poisoned"] is False, report
+    assert report["quarantined_owners"] == 0, report

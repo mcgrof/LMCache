@@ -87,7 +87,13 @@ impl IoUringWrapper {
     ///
     /// Only the big-entry ring can carry one: a 64-byte SQE has no room for
     /// the NVMe command, so a standard ring refuses rather than truncating.
-    fn push_cmd(&self, sqe: &Entry128, user_data: u64) -> Result<(), PyErr> {
+    fn push_cmd(
+        &self,
+        sqe: &Entry128,
+        user_data: u64,
+        #[cfg_attr(not(feature = "fault-injection"), allow(unused_variables))]
+        descriptor: SqeDescriptor,
+    ) -> Result<(), PyErr> {
         match self {
             IoUringWrapper::Big(ring) => {
                 let mut ring = ring.lock().unwrap();
@@ -102,7 +108,7 @@ impl IoUringWrapper {
                 "io_uring_cmd requires big entries (kernel 5.19+)",
             )),
             #[cfg(feature = "fault-injection")]
-            IoUringWrapper::Fake(ring) => ring.push(user_data).map_err(|()| {
+            IoUringWrapper::Fake(ring) => ring.push(descriptor).map_err(|()| {
                 PyRuntimeError::new_err(format!(
                     "submission queue full pushing request {user_data}"
                 ))
@@ -114,7 +120,13 @@ impl IoUringWrapper {
     ///
     /// A big-entry ring takes the same operation widened to 128 bytes; the
     /// trailing space is unused for anything but a passthrough command.
-    fn push_regular(&self, sqe: &SqueueEntry, user_data: u64) -> Result<(), PyErr> {
+    fn push_regular(
+        &self,
+        sqe: &SqueueEntry,
+        user_data: u64,
+        #[cfg_attr(not(feature = "fault-injection"), allow(unused_variables))]
+        descriptor: SqeDescriptor,
+    ) -> Result<(), PyErr> {
         match self {
             IoUringWrapper::Big(ring) => {
                 let widened: Entry128 = sqe.clone().into();
@@ -136,7 +148,7 @@ impl IoUringWrapper {
                 })
             }
             #[cfg(feature = "fault-injection")]
-            IoUringWrapper::Fake(ring) => ring.push(user_data).map_err(|()| {
+            IoUringWrapper::Fake(ring) => ring.push(descriptor).map_err(|()| {
                 PyRuntimeError::new_err(format!(
                     "submission queue full pushing request {user_data}"
                 ))
@@ -189,7 +201,46 @@ impl IoUringWrapper {
                 .submitter()
                 .register_buffers_sparse(count),
             #[cfg(feature = "fault-injection")]
-            IoUringWrapper::Fake(_) => Err(io::Error::from_raw_os_error(libc::ENOTSUP)),
+            IoUringWrapper::Fake(ring) => ring.register("sparse", count, 0),
+        }
+    }
+
+    /// Install one dma-buf in the fixed-buffer table.
+    ///
+    /// The descriptor validation and the registration map are built by the
+    /// caller, which is what both ring kinds share. This is only the
+    /// registration itself: the real rings make the syscall, and the
+    /// fault-injection ring records an explicitly synthetic entry so the
+    /// path above it can be driven on a machine with no dma-buf to register.
+    /// No synthetic record is evidence that a kernel registered anything.
+    fn register_dmabuf_slot(
+        &self,
+        index: u32,
+        dmabuf_fd: RawFd,
+        device_fd: RawFd,
+    ) -> io::Result<()> {
+        match self {
+            IoUringWrapper::Standard(_) | IoUringWrapper::Big(_) => {
+                let ring_fd = self
+                    .ring_fd()
+                    .map_err(|_| io::Error::from_raw_os_error(libc::EBADF))?;
+                io_uring_register_dmabuf(ring_fd, index, dmabuf_fd, device_fd)
+            }
+            #[cfg(feature = "fault-injection")]
+            IoUringWrapper::Fake(ring) => ring.register("dmabuf", 1, index),
+        }
+    }
+
+    /// How many bytes the dma-buf behind this descriptor covers.
+    ///
+    /// Also dispatched, because a machine with no dma-buf to register has
+    /// none to measure either, and the bounds check above this is part of
+    /// what a test needs to reach.
+    fn dmabuf_extent(&self, dmabuf_fd: RawFd) -> io::Result<usize> {
+        match self {
+            IoUringWrapper::Standard(_) | IoUringWrapper::Big(_) => dmabuf_extent_bytes(dmabuf_fd),
+            #[cfg(feature = "fault-injection")]
+            IoUringWrapper::Fake(ring) => Ok(ring.synthetic_dmabuf_extent()),
         }
     }
 
@@ -203,7 +254,7 @@ impl IoUringWrapper {
             IoUringWrapper::Standard(ring) => ring.lock().unwrap().submitter().unregister_buffers(),
             IoUringWrapper::Big(ring) => ring.lock().unwrap().submitter().unregister_buffers(),
             #[cfg(feature = "fault-injection")]
-            IoUringWrapper::Fake(_) => Ok(()),
+            IoUringWrapper::Fake(ring) => ring.register("unregister", 0, 0),
         }
     }
 
@@ -250,6 +301,57 @@ struct RingCompletion {
     result: i32,
 }
 
+/// What one submission asks the device to do, in terms both rings share.
+///
+/// Built where the SQE is built, so there is one description of an
+/// operation's geometry rather than one per ring type. A real ring ignores
+/// it -- the SQE it was handed is the request -- and the fault-injection
+/// ring records it, because `user_data` alone cannot tell a correct
+/// remainder from one pointed at the wrong offset, the wrong address or the
+/// wrong length. Two submissions carrying the same bytes compare equal; two
+/// carrying the same bytes from different places do not.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "fault-injection"), allow(dead_code))]
+struct SqeDescriptor {
+    user_data: u64,
+    /// A passthrough NVMe command rather than an ordinary read or write.
+    is_cmd: bool,
+    is_write: bool,
+    /// Device offset, in bytes.
+    offset: u64,
+    /// Transfer length, in bytes.
+    len: u32,
+    /// The address the SQE carries. For a registered dma-buf transfer this
+    /// is a byte offset inside the registration, not a process address,
+    /// which is exactly the distinction a short-I/O remainder can get wrong.
+    addr: u64,
+    /// Registered-buffer index, or -1 when this is not a fixed operation.
+    fixed_index: i64,
+    /// Byte offset inside a registered dma-buf, or -1 when the address
+    /// above is an ordinary process address.
+    dmabuf_offset: i64,
+}
+
+#[cfg_attr(not(feature = "fault-injection"), allow(dead_code))]
+impl SqeDescriptor {
+    fn describe(sub: &IoSubmission, user_data: u64) -> Self {
+        let addr = match sub.fixed_dmabuf {
+            Some(offset) => offset as u64,
+            None => sub.ptr_addr as u64,
+        };
+        SqeDescriptor {
+            user_data,
+            is_cmd: sub.nvme_cmd_data.is_some(),
+            is_write: sub.is_write,
+            offset: sub.offset,
+            len: sub.len as u32,
+            addr,
+            fixed_index: sub.fixed_buffer_idx.map_or(-1, |idx| idx as i64),
+            dmabuf_offset: sub.fixed_dmabuf.map_or(-1, |off| off as i64),
+        }
+    }
+}
+
 /// A submission and completion ring with no kernel behind it.
 ///
 /// The submit seam substitutes what one *submit call reports*, before the
@@ -270,17 +372,27 @@ struct FakeRingState {
     /// a real submission queue reports being full.
     sq_capacity: usize,
     /// Pushed and not yet taken by a submit. This is what `submission_len`
-    /// reports, and what residency means.
-    resident: Vec<u64>,
+    /// reports, and what residency means. Each entry carries the geometry it
+    /// was built with, so a remainder can be checked against where it is
+    /// meant to be reading or writing rather than only being counted.
+    resident: Vec<SqeDescriptor>,
     /// Taken by a submit and not yet answered for. The kernel's, not ours:
     /// anything still here when the device closes is memory the device may
     /// still be reaching.
-    owned: Vec<u64>,
+    owned: Vec<SqeDescriptor>,
     /// Completions queued for the worker to drain.
     ready: Vec<RingCompletion>,
     /// How many resident entries the next submit takes. `None` takes all of
     /// them, which is what a healthy ring does.
     take_next: Option<usize>,
+    /// While set, every submit takes nothing and reports that it took
+    /// nothing. A real submit reports zero when the entries it would have
+    /// flushed were not flushed, and the worker has to leave them resident
+    /// and come back. Holding it is how a test gets more than one entry
+    /// resident at the same time, which is the only way a partial take can
+    /// be more than a full take of one entry. The worker already paces
+    /// itself when the ring will not drain, so holding does not spin.
+    hold_submits: bool,
     /// What the next submit reports instead of taking anything.
     submit_error: Option<i32>,
     /// Ownership rules this ring saw broken, in the order it saw them.
@@ -288,6 +400,42 @@ struct FakeRingState {
     /// How many times the worker synced the submission queue, which a test
     /// uses to tell a flush apart from a no-op.
     syncs: usize,
+    /// What this ring reports as the extent of any dma-buf it is asked
+    /// about. A machine with no dma-buf to register has none to measure,
+    /// and the bounds check in the registration path is part of what a test
+    /// needs to reach.
+    dmabuf_extent: usize,
+    /// Registrations this ring was asked to make. Synthetic: no descriptor
+    /// is passed to the kernel, and a test says so by reading them from
+    /// here rather than from a device.
+    registrations: Vec<FakeRegistration>,
+}
+
+/// One resident or owned entry, as a flat map a test can compare exactly.
+#[cfg(feature = "fault-injection")]
+fn describe_fake_sqe(entry: &SqeDescriptor) -> HashMap<String, i64> {
+    let mut described: HashMap<String, i64> = HashMap::new();
+    described.insert("user_data".to_string(), entry.user_data as i64);
+    described.insert("is_cmd".to_string(), entry.is_cmd as i64);
+    described.insert("is_write".to_string(), entry.is_write as i64);
+    described.insert("offset".to_string(), entry.offset as i64);
+    described.insert("len".to_string(), entry.len as i64);
+    described.insert("addr".to_string(), entry.addr as i64);
+    described.insert("fixed_index".to_string(), entry.fixed_index);
+    described.insert("dmabuf_offset".to_string(), entry.dmabuf_offset);
+    described
+}
+
+/// One synthetic buffer registration, as the fault-injection ring records it.
+#[cfg(feature = "fault-injection")]
+#[derive(Clone)]
+struct FakeRegistration {
+    /// What was asked: "host", "sparse", "dmabuf" or "unregister".
+    kind: String,
+    /// How many slots the request covers.
+    count: u32,
+    /// Where in the registration table it starts.
+    offset: u32,
 }
 
 #[cfg(feature = "fault-injection")]
@@ -311,20 +459,23 @@ impl FakeRing {
                 owned: Vec::new(),
                 ready: Vec::new(),
                 take_next: None,
+                hold_submits: false,
                 submit_error: None,
                 violations: Vec::new(),
                 syncs: 0,
+                dmabuf_extent: 1 << 30,
+                registrations: Vec::new(),
             })),
             notify,
         }
     }
 
-    fn push(&self, user_data: u64) -> Result<(), ()> {
+    fn push(&self, sqe: SqeDescriptor) -> Result<(), ()> {
         let mut state = self.state.lock().unwrap();
         if state.resident.len() >= state.sq_capacity {
             return Err(());
         }
-        state.resident.push(user_data);
+        state.resident.push(sqe);
         Ok(())
     }
 
@@ -336,11 +487,53 @@ impl FakeRing {
             // reasons about them correctly is what a test is asking.
             return Err(io::Error::from_raw_os_error(errno));
         }
+        // An instruction for one submit outranks the hold, so a test can
+        // let exactly one partial take happen and have the ring stop again
+        // afterwards -- which is what makes the suffix observable instead
+        // of a race against the worker's next loop.
+        let instructed = state.take_next.take();
+        if instructed.is_none() && state.hold_submits {
+            // Took nothing and says so. Everything stays resident, which is
+            // what lets a second entry join the first.
+            return Ok(0);
+        }
         let available = state.resident.len();
-        let taking = state.take_next.take().unwrap_or(available).min(available);
-        let taken: Vec<u64> = state.resident.drain(..taking).collect();
+        let taking = instructed.unwrap_or(available).min(available);
+        let taken: Vec<SqeDescriptor> = state.resident.drain(..taking).collect();
         state.owned.extend(taken);
         Ok(taking)
+    }
+
+    fn synthetic_dmabuf_extent(&self) -> usize {
+        self.state.lock().unwrap().dmabuf_extent
+    }
+
+    /// Record one synthetic registration, or refuse one that makes no sense.
+    ///
+    /// The descriptor validation and the registration map are built in the
+    /// shared code above; this stands in only for the syscall at the end of
+    /// it. A record here is explicitly synthetic and is never evidence that
+    /// a kernel registered anything.
+    fn register(&self, kind: &str, count: u32, offset: u32) -> io::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        if kind == "unregister" {
+            state.registrations.clear();
+            state.registrations.push(FakeRegistration {
+                kind: kind.to_string(),
+                count,
+                offset,
+            });
+            return Ok(());
+        }
+        if count == 0 {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        state.registrations.push(FakeRegistration {
+            kind: kind.to_string(),
+            count,
+            offset,
+        });
+        Ok(())
     }
 
     fn take_completions(&self) -> Vec<RingCompletion> {
@@ -366,13 +559,20 @@ impl FakeRing {
     fn complete(&self, user_data: u64, result: i32) -> Result<(), String> {
         {
             let mut state = self.state.lock().unwrap();
-            match state.owned.iter().position(|held| *held == user_data) {
+            match state
+                .owned
+                .iter()
+                .position(|held| held.user_data == user_data)
+            {
                 Some(at) => {
                     state.owned.remove(at);
                     state.ready.push(RingCompletion { user_data, result });
                 }
                 None => {
-                    let resident = state.resident.contains(&user_data);
+                    let resident = state
+                        .resident
+                        .iter()
+                        .any(|entry| entry.user_data == user_data);
                     let complaint = format!(
                         "completion for request {user_data} which this ring \
                          does not hold (resident: {resident})"
@@ -2214,7 +2414,7 @@ impl RawBlockDevice {
                     }
 
                     let sqe128 = uring_cmd.build().user_data(user_data);
-                    ring.push_cmd(&sqe128, user_data)?;
+                    ring.push_cmd(&sqe128, user_data, SqeDescriptor::describe(sub, user_data))?;
                 } else {
                     // Regular read/write operations
                     // A dma-buf registered buffer has no user address in the
@@ -2249,7 +2449,7 @@ impl RawBlockDevice {
                             .build()
                     };
                     let sqe = sqe.user_data(user_data);
-                    ring.push_regular(&sqe, user_data)?;
+                    ring.push_regular(&sqe, user_data, SqeDescriptor::describe(sub, user_data))?;
                 }
                 Ok(())
             }
@@ -2651,26 +2851,30 @@ impl RawBlockDevice {
                                             resident_sqes = ring_clone.submission_len() > 0;
                                         }
                                         SubmitOutcome::Fatal => {
-                                            // Error: fail all pending submissions in this batch.
-                                            // Remove in_flight entries since these won't generate completions
                                             // This submit failed in a way that says
                                             // nothing about what the ring already
-                                            // holds. Stop admitting work, because the
-                                            // engine can no longer describe what the
-                                            // kernel is doing, and tell each waiter
-                                            // its operation failed so none of them
-                                            // hangs. Do not treat that logical
-                                            // failure as the end of the device's
-                                            // access: quarantine every submission,
-                                            // with all the owners it holds.
+                                            // holds -- including what it held before
+                                            // this batch existed. Stop admitting
+                                            // work, because the engine can no longer
+                                            // describe what the kernel is doing, and
+                                            // tell every waiter on every unresolved
+                                            // operation that its operation failed.
+                                            // Failing only this batch leaves a
+                                            // request the kernel took earlier, and
+                                            // will now never answer for, with its
+                                            // waiter blocked until somebody closes
+                                            // the device from outside.
+                                            //
+                                            // Do not treat that logical failure as
+                                            // the end of the device's access:
+                                            // quarantine every submission, with all
+                                            // the owners it holds.
                                             admissions_closed = true;
-                                            for user_data in user_data_list.iter() {
-                                                in_flight.remove(user_data);
-                                            }
-                                            for sub in built_submissions.iter_mut() {
+                                            resident_sqes = false;
+                                            for (_user_data, sub) in in_flight.drain() {
                                                 let batch_id = sub.batch_id;
                                                 fail_unknown(
-                                                    sub,
+                                                    &sub,
                                                     &mut quarantined,
                                                     PyRuntimeError::new_err(format!(
                                                         "io_uring submit error: {:?}",
@@ -3090,6 +3294,10 @@ impl RawBlockDevice {
                 "buffer_ptrs, buffer_sizes, dmabuf_fds and dmabuf_bases must have same length",
             ));
         }
+        let ring = match &self.ring {
+            Some(ring) => ring,
+            None => return Err(PyRuntimeError::new_err("io_uring ring not available")),
+        };
         let mut extent_by_fd: HashMap<i32, (usize, usize)> = HashMap::new();
         let mut registration_by_ptr: HashMap<usize, (usize, i32, usize)> = HashMap::new();
         for i in 0..n {
@@ -3113,7 +3321,7 @@ impl RawBlockDevice {
                     *known_extent
                 }
                 None => {
-                    let extent = dmabuf_extent_bytes(fd).map_err(|e| {
+                    let extent = ring.dmabuf_extent(fd).map_err(|e| {
                         PyValueError::new_err(format!("failed to query dma-buf fd {fd} size: {e}"))
                     })?;
                     if extent == 0 {
@@ -3164,12 +3372,6 @@ impl RawBlockDevice {
             }
         }
 
-        let ring = match &self.ring {
-            Some(ring) => ring,
-            None => return Err(PyRuntimeError::new_err("io_uring ring not available")),
-        };
-        let ring_fd = ring.ring_fd()?;
-
         // A sparse table of the right size, then one extended update per slot.
         let sparse = ring.register_sparse_buffers(fds_in_order.len() as u32);
         if let Err(e) = sparse {
@@ -3180,7 +3382,7 @@ impl RawBlockDevice {
         }
 
         for (idx, fd) in fds_in_order.iter().enumerate() {
-            if let Err(e) = io_uring_register_dmabuf(ring_fd, idx as u32, *fd, self.fd) {
+            if let Err(e) = ring.register_dmabuf_slot(idx as u32, *fd, self.fd) {
                 // Leave no half-registered table behind.
                 let _ = ring.unregister_buffers();
                 return Err(PyRuntimeError::new_err(format!(
@@ -3676,7 +3878,14 @@ impl RawBlockDevice {
     /// Entries pushed and not yet taken by a submit.
     #[cfg(feature = "fault-injection")]
     fn fake_resident(&self) -> PyResult<Vec<u64>> {
-        Ok(self.scripted_state()?.lock().unwrap().resident.clone())
+        Ok(self
+            .scripted_state()?
+            .lock()
+            .unwrap()
+            .resident
+            .iter()
+            .map(|entry| entry.user_data)
+            .collect())
     }
 
     /// Requests a submit handed over and that have not been answered for.
@@ -3685,7 +3894,78 @@ impl RawBlockDevice {
     /// be reaching, which is the state the whole retention rule exists for.
     #[cfg(feature = "fault-injection")]
     fn fake_owned(&self) -> PyResult<Vec<u64>> {
-        Ok(self.scripted_state()?.lock().unwrap().owned.clone())
+        Ok(self
+            .scripted_state()?
+            .lock()
+            .unwrap()
+            .owned
+            .iter()
+            .map(|entry| entry.user_data)
+            .collect())
+    }
+
+    /// The geometry of every entry still resident, in submission order.
+    ///
+    /// Counting entries cannot tell a correct remainder from one aimed at
+    /// the wrong offset, address or length -- and repeated payload bytes
+    /// make a readback comparison agree with either. This is what the
+    /// submission actually asks the device to do.
+    #[cfg(feature = "fault-injection")]
+    fn fake_resident_sqes(&self) -> PyResult<Vec<HashMap<String, i64>>> {
+        let state = self.scripted_state()?;
+        let state = state.lock().unwrap();
+        Ok(state.resident.iter().map(describe_fake_sqe).collect())
+    }
+
+    /// The geometry of every entry the ring handed to its imaginary kernel.
+    #[cfg(feature = "fault-injection")]
+    fn fake_owned_sqes(&self) -> PyResult<Vec<HashMap<String, i64>>> {
+        let state = self.scripted_state()?;
+        let state = state.lock().unwrap();
+        Ok(state.owned.iter().map(describe_fake_sqe).collect())
+    }
+
+    /// Make every submit take nothing and report zero, until released.
+    ///
+    /// A real submit reports zero when the entries it would have flushed
+    /// were not flushed, and the worker has to leave them resident and come
+    /// back. Holding it is how more than one entry becomes resident at the
+    /// same time, which is the only way a partial take is more than a full
+    /// take of one entry.
+    #[cfg(feature = "fault-injection")]
+    fn fake_hold_submits(&self, held: bool) -> PyResult<()> {
+        self.scripted_state()?.lock().unwrap().hold_submits = held;
+        Ok(())
+    }
+
+    /// Synthetic registrations this ring was asked to make, in order.
+    ///
+    /// Explicitly synthetic: no descriptor reached a kernel, so a record
+    /// here is evidence about the engine's own registration path and about
+    /// nothing else.
+    #[cfg(feature = "fault-injection")]
+    fn fake_registrations(&self) -> PyResult<Vec<HashMap<String, i64>>> {
+        let state = self.scripted_state()?;
+        let state = state.lock().unwrap();
+        Ok(state
+            .registrations
+            .iter()
+            .map(|record| {
+                let mut described: HashMap<String, i64> = HashMap::new();
+                described.insert("count".to_string(), record.count as i64);
+                described.insert("offset".to_string(), record.offset as i64);
+                described.insert(
+                    "kind".to_string(),
+                    match record.kind.as_str() {
+                        "host" => 0,
+                        "sparse" => 1,
+                        "dmabuf" => 2,
+                        _ => 3,
+                    },
+                );
+                described
+            })
+            .collect())
     }
 
     /// Ownership rules this ring saw broken, in order.
