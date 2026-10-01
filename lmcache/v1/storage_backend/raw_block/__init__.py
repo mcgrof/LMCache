@@ -10,8 +10,11 @@ from lmcache.v1.storage_backend.raw_block.core import (
     RawBlockCore,
     RawBlockCoreConfig,
     RawBlockDerivationDescriptor,
+    RawBlockIoAttribution,
+    RawBlockIoContext,
     RawBlockPublicationReceipt,
     RawBlockPutManyResult,
+    RawBlockReadContext,
     normalize_raw_block_io_engine,
     normalize_raw_block_placement_ids,
     round_up,
@@ -26,10 +29,6 @@ from lmcache.v1.storage_backend.raw_block.key_codec import (
     encode_object_key,
     object_key_to_string,
     slot_identity_from_encoded_key,
-)
-from lmcache.v1.storage_backend.raw_block.core import (
-    RawBlockIoAttribution,
-    RawBlockIoContext,
 )
 from lmcache.v1.storage_backend.raw_block.pd import (
     RawBlockPDRequestTracker,
@@ -52,6 +51,7 @@ __all__ = [
     "RawBlockCloseOutcome",
     "RawBlockDerivationDescriptor",
     "RawBlockPublicationReceipt",
+    "RawBlockReadContext",
     "RawBlockIoAttribution",
     "RawBlockIoContext",
     "RawBlockPDRequestTracker",

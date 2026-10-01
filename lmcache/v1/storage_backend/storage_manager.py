@@ -44,6 +44,7 @@ from lmcache.v1.storage_backend.abstract_backend import (
     StorageBackendInterface,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.storage_backend.raw_block import RawBlockReadContext
 
 if TYPE_CHECKING:
     # First Party
@@ -542,13 +543,30 @@ class StorageManager:
         self,
         keys: List[CacheEngineKey],
         location: Optional[str] = None,
+        *,
+        storage_pd_read_context: Optional[RawBlockReadContext] = None,
     ) -> List[Optional[MemoryObj]]:
-        """
-        Blocking function to get the memory objects from the storages.
+        """Load objects synchronously from the selected storage backends.
+
+        Args:
+            keys: Ordered cache keys to load.
+            location: Backend name, or None to search all active backends.
+            storage_pd_read_context: Adopted request identity to carry with
+                this restore. Publication-aware backends receive it with each
+                read; ordinary cache hits keep their existing behavior.
+
+        Returns:
+            Loaded objects aligned with keys, using None for misses.
         """
         # TODO (ApostaC): remove the nested optional here
         for backend_name, storage_backend in self.get_active_storage_backends(location):
-            memory_objs = storage_backend.batched_get_blocking(keys)
+            read_publication = getattr(
+                storage_backend, "batched_get_for_publication", None
+            )
+            if storage_pd_read_context is not None and callable(read_publication):
+                memory_objs = read_publication(keys, storage_pd_read_context)
+            else:
+                memory_objs = storage_backend.batched_get_blocking(keys)
             if memory_objs:
                 # Align with single-key `get()` logic:
                 # auto-write remote data to local CPU cache

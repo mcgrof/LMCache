@@ -61,7 +61,10 @@ from lmcache.v1.memory_management import (
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.platform import current_device_spec
-from lmcache.v1.storage_backend.raw_block import RawBlockPublicationReceipt
+from lmcache.v1.storage_backend.raw_block import (
+    RawBlockPublicationReceipt,
+    RawBlockReadContext,
+)
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.system_detection import NUMADetector, NUMAMapping
 from lmcache.v1.token_database import (
@@ -793,6 +796,8 @@ class LMCacheEngine:
         self,
         tokens: Union[torch.Tensor, list[int]],
         mask: Optional[torch.Tensor] = None,
+        *,
+        storage_pd_read_context: Optional[RawBlockReadContext] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Retrieve the KV caches from the cache engine. And put the retrieved
@@ -804,6 +809,10 @@ class LMCacheEngine:
             have the same length as tokens. And the mask should ALWAYS be like
             FFFFFTTTTTTT, where True means the tokens needs to be matched,
             and the Falses will ALWAYS be at the PREFIX of the tensor.
+
+        :param Optional[RawBlockReadContext] storage_pd_read_context:
+            Identity of the adopted publication for a synchronous storage P/D
+            restore. This follows storage reads, not GPU connector operations.
 
         :param **kwargs: The additional arguments for the storage backend which
             will be passed into the gpu_connector.
@@ -862,6 +871,7 @@ class LMCacheEngine:
                         tokens,
                         mask,
                         ret_mask,
+                        storage_pd_read_context=storage_pd_read_context,
                         **kwargs,
                     )
 
@@ -1305,7 +1315,6 @@ class LMCacheEngine:
         *,
         request_configs: Optional[dict] = None,
         timeout_ms: int = 5000,
-        request_id: str = "",
     ) -> Optional[int]:
         """Fence a shared-storage reader to an advertised request manifest.
 
@@ -1319,9 +1328,6 @@ class LMCacheEngine:
             receipt: Durable publication identity advertised by the writer.
             request_configs: Per-request cache key configuration.
             timeout_ms: Maximum time to wait for the compatible generation.
-            request_id: The name the writer published this request under, so
-                this reader's I/O is attributed to the same request on both
-                sides of the handoff.
 
         Returns:
             The number of tokens covered by the adopted manifest, or None when
@@ -1359,7 +1365,6 @@ class LMCacheEngine:
                 receipt,
                 keys,
                 timeout_ms=candidate_timeout,
-                request_id=request_id,
             ):
                 return len(candidate_tokens)
         return None
@@ -1903,12 +1908,17 @@ class LMCacheEngine:
         else:
             block_mapping = self.storage_manager.get_block_mapping(chunk_infos)
 
+        get_options: dict[str, Any] = {}
+        if kwargs.get("storage_pd_read_context") is not None:
+            get_options["storage_pd_read_context"] = kwargs["storage_pd_read_context"]
+
         last_failed_block_start = None
         for location, blocks in block_mapping.items():
             keys = [key for key, _, _ in blocks]
             memory_objs = self.storage_manager.batched_get(
                 keys=keys,
                 location=location,
+                **get_options,
             )
 
             used_keys: set[CacheEngineKey] = set()

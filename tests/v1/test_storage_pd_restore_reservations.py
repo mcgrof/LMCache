@@ -67,6 +67,9 @@ def test_failed_restore_returns_its_acknowledgement_capacity(
             return 16 if failure == "coverage" else 8
 
         def retrieve(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+            read_context = kwargs["storage_pd_read_context"]
+            assert read_context.request_id == status.req_id
+            assert read_context.receipt == status.publication_receipt()
             if failure == "retrieve_raises":
                 raise OSError("payload read failed")
             mask = torch.ones(8, dtype=torch.bool)

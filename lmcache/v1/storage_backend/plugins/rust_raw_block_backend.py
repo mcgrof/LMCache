@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 # Standard
-from collections import OrderedDict
 from collections.abc import Mapping
 from concurrent.futures import CancelledError
 from dataclasses import replace
@@ -30,6 +29,7 @@ from lmcache.v1.storage_backend.raw_block import (
     RawBlockPDRequestTracker,
     RawBlockPublicationReceipt,
     RawBlockPutManyResult,
+    RawBlockReadContext,
     ReadAckIdentity,
     ReadAckOutcome,
     decode_legacy_key,
@@ -38,7 +38,6 @@ from lmcache.v1.storage_backend.raw_block import (
     round_up,
     validate_raw_block_io_options,
 )
-from lmcache.v1.storage_backend.storage_pd_protocol import STORAGE_PD_INCARNATION
 from lmcache.v1.storage_backend.storage_pd_ack import (
     ACK_REJECTED,
     ACK_UNRESOLVED,
@@ -49,6 +48,7 @@ from lmcache.v1.storage_backend.storage_pd_ack import (
     StoragePDUnreadAnswer,
     StoragePDUnreadRequest,
 )
+from lmcache.v1.storage_backend.storage_pd_protocol import STORAGE_PD_INCARNATION
 
 if TYPE_CHECKING:
     # Standard
@@ -65,12 +65,6 @@ logger = init_logger(__name__)
 # point, so that no allocator, finalizer or exit handler can release memory a
 # command may still be reaching.
 _RETAINED_AFTER_UNKNOWN_OUTCOME: list[Any] = []
-
-# How many adopted publications a reader remembers the request name of. One
-# entry is two short strings; this covers far more in-flight restores than a
-# decoder has, and a reader that has forgotten one attributes its reads to no
-# request rather than to the wrong one.
-_ADOPTED_REQUEST_HISTORY = 4096
 
 
 def _probe_says_unknown(probe: Optional[Callable[[], Any]], what: str) -> bool:
@@ -397,12 +391,6 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         self._run_id = str(getattr(config, "lmcache_instance_id", "") or "") or str(
             extra.get("rust_raw_block.run_id", "") or ""
         )
-        # Which published request each adopted key belongs to. A reader's
-        # attribution comes from the receipt it adopted, because that is
-        # the name the writer, the READY status and the acknowledgement all
-        # use; an engine-local request name correlates with nothing on the
-        # side that published the bytes.
-        self._adopted_requests: OrderedDict[str, str] = OrderedDict()
 
     def __str__(self) -> str:
         return "RustRawBlockBackend"
@@ -800,7 +788,6 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         keys: Sequence[CacheEngineKey],
         *,
         timeout_ms: int,
-        request_id: str = "",
     ) -> bool:
         """Adopt the request generation advertised by a storage-P/D writer."""
         if self._role != "reader":
@@ -817,13 +804,6 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                 timeout_ms=timeout_ms,
                 refresh_interval_ms=max(self._index_refresh_min_ms, 1),
             )
-            if adopted and request_id:
-                with self._pin_lock:
-                    for encoded in encoded_keys:
-                        self._adopted_requests.pop(encoded, None)
-                        self._adopted_requests[encoded] = request_id
-                    while len(self._adopted_requests) > _ADOPTED_REQUEST_HISTORY:
-                        self._adopted_requests.popitem(last=False)
             return adopted
         finally:
             with self._put_lock:
@@ -1677,6 +1657,8 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
     def _batched_get_prefix(
         self,
         keys: Sequence[CacheEngineKey],
+        *,
+        io_context: Optional[RawBlockIoContext] = None,
     ) -> list[MemoryObj]:
         # Include preparation and cleanup, not just the native read: the
         # allocator is already in use while a destination is being built.
@@ -1685,7 +1667,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                 return []
             self._active_operations += 1
         try:
-            return self._load_prefix(keys)
+            return self._load_prefix(keys, io_context=io_context)
         finally:
             with self._put_lock:
                 self._active_operations -= 1
@@ -1693,21 +1675,14 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
     def _load_prefix(
         self,
         keys: Sequence[CacheEngineKey],
+        *,
+        io_context: Optional[RawBlockIoContext] = None,
     ) -> list[MemoryObj]:
         if not keys:
             return []
 
         specs = [encode_legacy_key(key) for key in keys]
         encoded_keys = [spec.encoded for spec in specs]
-        with self._pin_lock:
-            request_id = next(
-                (
-                    self._adopted_requests[encoded]
-                    for encoded in encoded_keys
-                    if encoded in self._adopted_requests
-                ),
-                "",
-            )
         allocated: list[MemoryObj] = []
         locked_specs: list[RawBlockKeySpec] = []
         with self._pin_lock:
@@ -1750,7 +1725,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             load_results = self._core.load_many_into(
                 [spec.encoded for spec in load_specs],
                 allocated,
-                io_context=self._io_context(request_id),
+                io_context=io_context,
             )
             loaded_count = 0
             for ok in load_results:
@@ -1846,6 +1821,40 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         if not keys:
             return []
         loaded = self._batched_get_prefix(keys)
+        return [*loaded, *([None] * (len(keys) - len(loaded)))]
+
+    def batched_get_for_publication(
+        self,
+        keys: List[CacheEngineKey],
+        context: RawBlockReadContext,
+    ) -> List[Optional[MemoryObj]]:
+        """Load a prefix with the identity captured for this restore.
+
+        Args:
+            keys: Ordered legacy cache keys to load.
+            context: Request identity and receipt already adopted by the caller.
+
+        Returns:
+            Loaded objects for the hit prefix and None for its missing suffix.
+
+        Raises:
+            ValueError: If the context has no request or writer identity.
+            RuntimeError: If this backend is not a reader of that namespace.
+        """
+        if not context.request_id or not context.receipt.writer_epoch:
+            raise ValueError("publication reads require request and writer identities")
+        if (
+            self._role != "reader"
+            or context.receipt.namespace_identity != self._core.namespace_identity
+        ):
+            raise RuntimeError("publication read does not name this reader's namespace")
+        io_context = RawBlockIoContext(
+            run_id=self._run_id,
+            request_id=context.request_id,
+            tp_rank=self._ack_tp_rank,
+            incarnation=context.receipt.writer_epoch,
+        )
+        loaded = self._batched_get_prefix(keys, io_context=io_context)
         return [*loaded, *([None] * (len(keys) - len(loaded)))]
 
     async def batched_async_contains(

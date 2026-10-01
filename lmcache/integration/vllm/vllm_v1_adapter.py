@@ -50,7 +50,10 @@ from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.manager import LMCacheManager
-from lmcache.v1.storage_backend.raw_block import RawBlockPublicationReceipt
+from lmcache.v1.storage_backend.raw_block import (
+    RawBlockPublicationReceipt,
+    RawBlockReadContext,
+)
 from lmcache.v1.storage_backend.storage_pd_ack import (
     StoragePDAckClient,
     StoragePDAckReservation,
@@ -972,6 +975,14 @@ class LMCacheConnectorV1Impl:
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         request_configs=request.request_configs,
                         req_id=request.req_id,
+                        storage_pd_read_context=(
+                            RawBlockReadContext(
+                                adopted_publication[0].req_id,
+                                adopted_publication[0].publication_receipt(),
+                            )
+                            if adopted_publication is not None
+                            else None
+                        ),
                     )
                 except BaseException:
                     if adopted_publication is not None:
@@ -1073,7 +1084,6 @@ class LMCacheConnectorV1Impl:
                 status.publication_receipt(),
                 request_configs=request.request_configs,
                 timeout_ms=timeout_ms,
-                request_id=status.req_id,
             )
             if published_tokens is None:
                 raise RuntimeError(

@@ -919,6 +919,14 @@ class RawBlockPublicationReceipt:
     ack_endpoint: str = ""
 
 
+@dataclass(frozen=True)
+class RawBlockReadContext:
+    """Identify the adopted publication a particular restore reads."""
+
+    request_id: str
+    receipt: RawBlockPublicationReceipt
+
+
 class RawBlockCore:
     """
     Shared raw-block storage engine used by both legacy non-MP and MP L2 paths.
