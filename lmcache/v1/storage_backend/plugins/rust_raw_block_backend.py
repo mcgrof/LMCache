@@ -1177,12 +1177,24 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         from, and the two differ when a named algorithm silently falls back.
         Recording the request rather than the result would put a descriptor
         on the device that does not describe it.
+
+        The chain root is a module global that building a token database
+        sets, so it is read by building one -- twice. Measured: with
+        ``PYTHONHASHSEED`` unset, every construction produces a *different*
+        root, because the value is derived through the interpreter's
+        randomized hash of fresh input. A root like that describes nothing:
+        the engine that recorded it will not reproduce it, and two engines
+        in one process refuse each other. That is refused here, with the
+        variable named, rather than written to a device for a reader to
+        discover as a mismatch.
         """
         # First Party
         from lmcache.v1 import token_database as token_database_module
 
         requested = str(getattr(self.config, "pre_caching_hash_algorithm", "") or "")
         implementation = "unresolved"
+        first_root = str(token_database_module.NONE_HASH)
+        second_root = first_root
         try:
             database = token_database_module.ChunkedTokenDatabase(
                 self.config, self.metadata
@@ -1192,17 +1204,30 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                 f"{getattr(resolved, '__module__', '?')}."
                 f"{getattr(resolved, '__name__', repr(resolved))}"
             )
+            first_root = str(token_database_module.NONE_HASH)
+            token_database_module.ChunkedTokenDatabase(self.config, self.metadata)
+            second_root = str(token_database_module.NONE_HASH)
         except Exception:
             logger.warning(
                 "Raw-block storage P/D could not resolve the effective hash "
                 "function; recording it as unresolved, which will not match "
                 "an engine that did resolve one"
             )
+        if first_root != second_root:
+            raise ValueError(
+                "raw-block storage P/D cannot describe this process's key "
+                f"derivation: the chain root moved from {first_root} to "
+                f"{second_root} between two token databases built from the "
+                "same configuration, so it is not a property of the "
+                "configuration and no two engines can agree on it. Set "
+                "PYTHONHASHSEED to the same value on every node, or "
+                "configure a deterministic pre-caching hash algorithm."
+            )
         return RawBlockDerivationDescriptor(
             hash_algorithm=requested,
             hash_implementation=implementation,
             hash_seed=str(os.environ.get("PYTHONHASHSEED", "")),
-            chain_root=str(token_database_module.NONE_HASH),
+            chain_root=first_root,
             key_namespace=key_namespace,
         )
 

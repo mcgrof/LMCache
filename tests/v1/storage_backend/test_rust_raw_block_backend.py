@@ -2744,12 +2744,43 @@ def _make_raw_block_backend(
     )
 
 
+def _pin_the_chain_root(monkeypatch, value: int = 424242) -> None:
+    """Give this process a reproducible key-derivation chain root.
+
+    vLLM derives the root from ``os.urandom`` when ``PYTHONHASHSEED`` is
+    unset, so every token database built in such a process gets a
+    *different* one -- no two engines can agree, not even in one process.
+    A test cannot set that variable (it only takes effect at interpreter
+    start), so the root is pinned here instead, which is what a serving
+    deployment achieves by exporting the seed.
+
+    The engine refuses an unreproducible root outright rather than writing
+    one to a device; that refusal has its own test.
+    """
+    # First Party
+    from lmcache.v1 import token_database as token_database_module
+
+    monkeypatch.setattr(token_database_module, "NONE_HASH", value, raising=False)
+    original = token_database_module.ChunkedTokenDatabase.__init__
+
+    def _init_without_rerandomizing(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        token_database_module.NONE_HASH = value
+
+    monkeypatch.setattr(
+        token_database_module.ChunkedTokenDatabase,
+        "__init__",
+        _init_without_rerandomizing,
+    )
+
+
 def test_storage_pd_backend_publishes_then_reader_adopts(
     monkeypatch,
     memory_allocator,
     loop_in_thread,
 ):
     """Request completion includes writes and an adoptable generation."""
+    _pin_the_chain_root(monkeypatch)
     _install_fake_raw_block_device(
         monkeypatch,
         size_bytes=64 * 1024 * 1024,

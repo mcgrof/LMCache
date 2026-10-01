@@ -18,8 +18,11 @@ import sys
 
 # Third Party
 import pytest
+import torch
 
 # First Party
+from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.raw_block import (
     IncompatibleKeyDerivation,
     RawBlockCore,
@@ -608,3 +611,44 @@ def test_a_core_refuses_a_device_keyed_in_another_namespace(tmp_path):
         assert int(reopened._index[spec.encoded].offset) == occupied
     finally:
         reopened.close()
+
+
+def test_the_backend_refuses_a_process_whose_chain_root_moves(monkeypatch):
+    """The real observer performs that comparison, on the real database.
+
+    Driven through the backend's own method rather than a restatement of
+    it, so a later change that reads the root once again fails here.
+    """
+    # First Party
+    from lmcache.v1 import token_database as token_database_module
+    from lmcache.v1.storage_backend.plugins.rust_raw_block_backend import (
+        RustRawBlockBackend,
+    )
+
+    roots = iter(range(1000, 2000))
+    original = token_database_module.ChunkedTokenDatabase.__init__
+
+    def _init_with_a_fresh_root(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        token_database_module.NONE_HASH = next(roots)
+
+    monkeypatch.setattr(
+        token_database_module.ChunkedTokenDatabase,
+        "__init__",
+        _init_with_a_fresh_root,
+    )
+
+    backend = RustRawBlockBackend.__new__(RustRawBlockBackend)
+    backend.config = LMCacheEngineConfig.from_defaults(chunk_size=256)
+    backend.metadata = LMCacheMetadata(
+        model_name="m",
+        world_size=1,
+        local_world_size=1,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=torch.bfloat16,
+        kv_shape=(4, 2, 256, 8, 128),
+    )
+
+    with pytest.raises(ValueError, match="PYTHONHASHSEED"):
+        backend._observed_key_derivation("object")
