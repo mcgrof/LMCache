@@ -1366,21 +1366,19 @@ class RawBlockCore:
                 iouring_queue_depth=self.iouring_queue_depth,
                 use_uring_cmd=self.use_uring_cmd,
             )
-            if self.require_native_idle_capability and not hasattr(
-                self._raw, "is_idle"
-            ):
-                # This lane publishes an index for another engine to read,
-                # and what makes that safe is being able to ask whether the
-                # device has answered for everything it was handed. A build
-                # that cannot be asked can only answer the weaker health
-                # question, and accepting that silently would qualify this
-                # engine on a question it never asked.
-                raise RuntimeError(
-                    f"raw-block device {self.device_path} is backed by a "
-                    "native engine that cannot report whether anything is "
-                    "outstanding; rebuild the rust_raw_block_io extension "
-                    "from this tree"
-                )
+        if self.require_native_idle_capability and not hasattr(self._raw, "is_idle"):
+            # This lane publishes an index for another engine to read,
+            # and what makes that safe is being able to ask whether the
+            # device has answered for everything it was handed. A build
+            # that cannot be asked can only answer the weaker health
+            # question, and accepting that silently would qualify this
+            # engine on a question it never asked.
+            raise RuntimeError(
+                f"raw-block device {self.device_path} is backed by a "
+                "native engine that cannot report whether anything is "
+                "outstanding; rebuild the rust_raw_block_io extension "
+                "from this tree"
+            )
         return self._raw
 
     def raw_device(self) -> Any:

@@ -2719,8 +2719,11 @@ def test_a_strict_engine_refuses_a_native_build_it_cannot_ask(tmp_path) -> None:
 
     stub = types.SimpleNamespace(RawBlockDevice=_CannotBeAsked)
     with patch.dict(sys.modules, {"lmcache_rust_raw_block_io": stub}):
-        with pytest.raises(RuntimeError, match="cannot report whether anything"):
-            core._rawdev()
+        # Retrying must not return the incompatible handle cached by the
+        # failed first open.
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="cannot report whether anything"):
+                core._rawdev()
 
 
 def test_a_populated_namespace_is_refused_before_its_geometry_is_judged(
