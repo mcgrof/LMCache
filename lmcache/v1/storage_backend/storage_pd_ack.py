@@ -810,6 +810,13 @@ class StoragePDAckClient:
             )
             obligation._settle(ACK_UNRESOLVED, "the deadline passed unanswered")
             return
+        # One attempt may not outspend what the obligation has left. The
+        # deadline is absolute and is never refreshed, so an attempt given
+        # its own full timeout could start just inside it and return long
+        # after -- which makes the deadline a suggestion rather than the
+        # bound the obligation is reported against.
+        remaining_ms = int((obligation.deadline - now) * 1000)
+        attempt_timeout_ms = max(1, min(self._attempt_timeout_ms, remaining_ms))
         obligation.attempts += 1
         nonce = uuid.uuid4().hex
         request = StoragePDAckRequest(
@@ -818,7 +825,9 @@ class StoragePDAckClient:
             attempt=obligation.attempts,
             nonce=nonce,
         )
-        reply = self._exchange(obligation.endpoint, request)
+        reply = self._exchange(
+            obligation.endpoint, request, timeout_ms=attempt_timeout_ms
+        )
         if reply is None:
             self._next_attempt[id(obligation)] = now + self._retry_interval_s
             return

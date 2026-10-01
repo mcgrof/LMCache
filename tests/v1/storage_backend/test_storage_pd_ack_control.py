@@ -34,6 +34,7 @@ from lmcache.v1.storage_backend.storage_pd_ack import (
     ACK_REJECTED,
     ACK_UNRESOLVED,
     StoragePDAckClient,
+    StoragePDAckObligation,
     StoragePDAckReply,
     StoragePDAckRequest,
     StoragePDAckServer,
@@ -687,3 +688,31 @@ def test_a_claim_handler_that_raised_grants_nothing(writer, client):
         assert _settled(obligation) == ACK_APPLIED
     finally:
         server.close(timeout_s=5.0)
+
+
+def test_an_attempt_does_not_outspend_its_obligation(client, monkeypatch):
+    """The deadline is absolute, so an attempt may not reach past it.
+
+    An attempt given its own full timeout can start just inside the
+    obligation's deadline and return long after it, which makes the
+    deadline a suggestion rather than the bound the obligation is reported
+    against.
+    """
+    spent: list[int] = []
+
+    def record(endpoint, request, expect=StoragePDAckReply, *, timeout_ms=None):
+        spent.append(timeout_ms)
+        return None
+
+    monkeypatch.setattr(client, "_exchange", record)
+    # The configured attempt timeout is 300ms; this obligation has 50 left.
+    obligation = StoragePDAckObligation(
+        _ack(),
+        endpoint=f"{LOOPBACK}:{_free_port()}",
+        session_id="session-1",
+        deadline=time.monotonic() + 0.05,
+    )
+
+    client._attempt(obligation)
+
+    assert spent and spent[0] <= 50
