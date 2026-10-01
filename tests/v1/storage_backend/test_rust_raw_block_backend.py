@@ -126,6 +126,13 @@ class _FakeRawBlockDevice:
     def wait_iouring(self, batch_id):
         return self._batch_results.pop(batch_id, []), []
 
+    def is_idle(self):
+        """Everything handed to this device was answered for synchronously."""
+        return True
+
+    def is_poisoned(self):
+        return False
+
     def close(self):
         return None
 

@@ -686,6 +686,18 @@ class RawBlockCoreConfig:
     # verifies that, so two nodes given the same string for different
     # devices will read each other's receipts as their own.
     namespace_identity: str = ""
+    # Whether close writes one last checkpoint. The strict shared-storage
+    # lane sets this false: every successful READY already required its own
+    # completed forced publication, so a close-time generation can only
+    # make an unfinished request look complete -- and writing one needs the
+    # device at exactly the moment teardown is trying to settle it.
+    close_writes_final_checkpoint: bool = True
+    # Refuse to run unless the native engine can be asked whether anything
+    # is outstanding. An older build cannot, and the health question it can
+    # answer is a weaker one; accepting that silently in the lane whose
+    # whole point is knowing would qualify a build on a question it never
+    # asked.
+    require_native_idle_capability: bool = False
     # How this engine derives its keys. Required where a namespace is shared,
     # because two engines agreeing on every field above can still derive
     # different keys and read nothing of each other's. Absent elsewhere, and
@@ -808,6 +820,10 @@ class RawBlockCore:
         self.meta_enable_periodic = bool(config.meta_enable_periodic)
         self.load_checkpoint_on_init = bool(config.load_checkpoint_on_init)
         self.meta_verify_on_load = bool(config.meta_verify_on_load)
+        self.close_writes_final_checkpoint = bool(config.close_writes_final_checkpoint)
+        self.require_native_idle_capability = bool(
+            config.require_native_idle_capability
+        )
         self.role = str(getattr(config, "role", "writer") or "writer")
         if self.role not in ("writer", "reader"):
             raise ValueError(
@@ -1160,6 +1176,21 @@ class RawBlockCore:
                 iouring_queue_depth=self.iouring_queue_depth,
                 use_uring_cmd=self.use_uring_cmd,
             )
+            if self.require_native_idle_capability and not hasattr(
+                self._raw, "is_idle"
+            ):
+                # This lane publishes an index for another engine to read,
+                # and what makes that safe is being able to ask whether the
+                # device has answered for everything it was handed. A build
+                # that cannot be asked can only answer the weaker health
+                # question, and accepting that silently would qualify this
+                # engine on a question it never asked.
+                raise RuntimeError(
+                    f"raw-block device {self.device_path} is backed by a "
+                    "native engine that cannot report whether anything is "
+                    "outstanding; rebuild the rust_raw_block_io extension "
+                    "from this tree"
+                )
         return self._raw
 
     def raw_device(self) -> Any:
@@ -2164,7 +2195,18 @@ class RawBlockCore:
         self._poisoned = unknown
 
         checkpointed = False
-        if self.role == "writer" and not unknown:
+        if self.role == "writer" and not self.close_writes_final_checkpoint:
+            # Nothing to do and nothing lost: every published request wrote
+            # its own forced checkpoint when it was published, so the last
+            # generation on the device already names every request that
+            # completed. A close-time checkpoint here could only add a
+            # generation naming a request that did not.
+            logger.info(
+                "RawBlockCore %s: writing no close-time checkpoint; each "
+                "published request already has its own generation.",
+                self.device_path,
+            )
+        elif self.role == "writer" and not unknown:
             # A writer that cannot say what the device holds must not
             # publish an index naming it. publish_request already refuses
             # while running, and shutdown is not an exemption.

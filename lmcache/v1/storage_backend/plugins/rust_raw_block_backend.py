@@ -620,6 +620,14 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             publish_min_interval_ms=0
             if self._storage_pd_mode
             else int(extra.get("rust_raw_block.publish_min_interval_ms", 0)),
+            # Strict P/D publishes a forced checkpoint per request, so the
+            # last generation on the device already names every request that
+            # completed; one more at close could only name a request that
+            # did not. And this lane must be able to ask the native engine
+            # whether anything is outstanding, rather than settle for the
+            # weaker health question an older build can answer.
+            close_writes_final_checkpoint=not self._storage_pd_mode,
+            require_native_idle_capability=self._storage_pd_mode,
             require_dmabuf_registration=bool(
                 extra.get("rust_raw_block.require_dmabuf_registration", False)
             ),

@@ -2625,4 +2625,83 @@ def test_a_closing_core_refuses_to_publish_a_request(tmp_path) -> None:
     assert core.close().quiescence is NativeQuiescence.PROVEN
 
     with pytest.raises(RuntimeError, match="stopped admitting publications"):
-        core.publish_request([key])
+        core.publish_request([key.encoded])
+
+
+def test_strict_publication_writes_no_close_time_checkpoint(tmp_path) -> None:
+    """A close-time generation can only name a request that did not finish.
+
+    Every published request writes its own forced checkpoint, so the last
+    generation on the device already names every request that completed.
+    One more at close adds a generation describing whatever was in the index
+    at shutdown -- including keys from a request that never published -- and
+    needs the device at exactly the moment teardown is trying to settle it.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(
+        make_raw_block_core_config(path),
+        derivation=make_test_derivation(),
+        close_writes_final_checkpoint=False,
+    )
+    core = RawBlockCore(config, key_namespace="object")
+    published = encode_object_key(make_object_key(93))
+    assert core.put_many([published], [make_memory_obj(b"i" * 512)]).results == [True]
+    receipt = core.publish_request([published.encoded])
+    # A key written after the publication, which no request ever published.
+    unpublished = encode_object_key(make_object_key(94))
+    assert core.put_many([unpublished], [make_memory_obj(b"j" * 512)]).results == [True]
+
+    outcome = core.close()
+
+    assert outcome.quiescence is NativeQuiescence.PROVEN
+    assert outcome.final_checkpoint_written is False
+
+    # A fresh reader sees the last published generation and nothing else.
+    reader = RawBlockCore(
+        replace(make_raw_block_core_config(path), role="reader"),
+        key_namespace="object",
+    )
+    try:
+        assert reader.publication_matches(receipt, [published.encoded])
+        assert reader.exists_many([unpublished.encoded], lock=False) == [False]
+    finally:
+        reader.close()
+
+
+def test_a_strict_engine_refuses_a_native_build_it_cannot_ask(tmp_path) -> None:
+    """A build that cannot be asked can only answer a weaker question.
+
+    What makes publishing an index for another engine safe is being able to
+    ask whether the device has answered for everything it was handed.
+    Falling back to the health probe would qualify this engine on a question
+    it never asked.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(
+        make_raw_block_core_config(path),
+        require_native_idle_capability=True,
+    )
+    core = RawBlockCore.__new__(RawBlockCore)
+    core.device_path = str(path)
+    core.require_native_idle_capability = True
+    core._raw = None
+    core.role = "writer"
+    core.use_odirect = config.use_odirect
+    core.block_align = config.block_align
+    core.io_engine = config.io_engine
+    core.iouring_queue_depth = config.iouring_queue_depth
+    core.use_uring_cmd = config.use_uring_cmd
+
+    class _CannotBeAsked:
+        """An older native build: healthy, and unable to say more."""
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def is_poisoned(self) -> bool:
+            return False
+
+    stub = types.SimpleNamespace(RawBlockDevice=_CannotBeAsked)
+    with patch.dict(sys.modules, {"lmcache_rust_raw_block_io": stub}):
+        with pytest.raises(RuntimeError, match="cannot report whether anything"):
+            core._rawdev()
