@@ -1849,6 +1849,7 @@ impl NativeIoPath {
 /// thread, which is nobody's request.
 #[derive(Clone)]
 struct NativeIoEvent {
+    device_instance_id: u64,
     request_tag: Option<Arc<str>>,
     batch_id: u64,
     operation_id: u64,
@@ -1864,6 +1865,7 @@ struct NativeIoEvent {
 /// oldest. One entry is a few words; this bounds the diagnostic at roughly a
 /// megabyte while covering far more operations than any single request.
 const NATIVE_IO_JOURNAL_CAPACITY: usize = 16384;
+static NEXT_RAW_BLOCK_DEVICE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A bounded record of what the device was asked to do, and what it did.
 ///
@@ -1872,6 +1874,7 @@ const NATIVE_IO_JOURNAL_CAPACITY: usize = 16384;
 /// serving run. Dropping is counted, so a reader can see that the record is
 /// incomplete rather than trusting a sum that silently lost rows.
 struct NativeIoJournal {
+    device_instance_id: u64,
     events: Mutex<VecDeque<NativeIoEvent>>,
     capacity: usize,
     dropped: AtomicU64,
@@ -1880,6 +1883,7 @@ struct NativeIoJournal {
 impl NativeIoJournal {
     fn new(capacity: usize) -> Self {
         NativeIoJournal {
+            device_instance_id: NEXT_RAW_BLOCK_DEVICE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             events: Mutex::new(VecDeque::with_capacity(capacity.min(1024))),
             capacity,
             dropped: AtomicU64::new(0),
@@ -1897,6 +1901,7 @@ impl NativeIoJournal {
 
     fn record_submission(&self, sub: &IoSubmission, operation_id: u64) {
         self.record(NativeIoEvent {
+            device_instance_id: self.device_instance_id,
             request_tag: sub.request_tag.clone(),
             batch_id: sub.batch_id,
             operation_id,
@@ -1924,6 +1929,7 @@ impl NativeIoJournal {
             ("completed", result as i64)
         };
         self.record(NativeIoEvent {
+            device_instance_id: self.device_instance_id,
             request_tag: sub.request_tag.clone(),
             batch_id: sub.batch_id,
             operation_id,
@@ -4157,6 +4163,10 @@ impl RawBlockDevice {
             .map(|event| {
                 let mut row: HashMap<String, String> = HashMap::new();
                 row.insert(
+                    "device_instance_id".to_string(),
+                    event.device_instance_id.to_string(),
+                );
+                row.insert(
                     "request_tag".to_string(),
                     event
                         .request_tag
@@ -5475,5 +5485,79 @@ mod io_journal_tests {
         let (events, dropped) = journal.drain();
         assert!(events.is_empty());
         assert_eq!(dropped, 0);
+    }
+}
+
+#[cfg(test)]
+mod encoded_sqe_oracle_tests {
+    use super::{IoSubmission, SqeDescriptor};
+    use io_uring::{opcode, squeue, types::Fd};
+    use std::mem::size_of_val;
+
+    /// Decode the stable first 42 bytes of Linux's encoded 64-byte SQE.
+    ///
+    /// This deliberately does not call `SqeDescriptor::describe`: the point
+    /// is to read back the bytes handed to io_uring and compare the diagnostic
+    /// description against an independently decoded kernel ABI structure.
+    fn encoded_geometry(entry: &squeue::Entry) -> (u8, i32, u64, u64, u32, u64, u16) {
+        let raw = unsafe {
+            std::slice::from_raw_parts(
+                (entry as *const squeue::Entry).cast::<u8>(),
+                size_of_val(entry),
+            )
+        };
+        assert!(raw.len() >= 42);
+        (
+            raw[0],
+            i32::from_ne_bytes(raw[4..8].try_into().unwrap()),
+            u64::from_ne_bytes(raw[8..16].try_into().unwrap()),
+            u64::from_ne_bytes(raw[16..24].try_into().unwrap()),
+            u32::from_ne_bytes(raw[24..28].try_into().unwrap()),
+            u64::from_ne_bytes(raw[32..40].try_into().unwrap()),
+            u16::from_ne_bytes(raw[40..42].try_into().unwrap()),
+        )
+    }
+
+    #[test]
+    fn dma_buf_descriptor_matches_the_independently_decoded_sqe() {
+        let sub = IoSubmission {
+            fd: 17,
+            offset: 8192,
+            len: 4096,
+            is_write: true,
+            fixed_buffer_idx: Some(3),
+            fixed_dmabuf: Some(12288),
+            ..Default::default()
+        };
+        let user_data = 0x1122_3344_5566_7788;
+        let entry = opcode::WriteFixed::new(
+            Fd(sub.fd),
+            sub.fixed_dmabuf.unwrap() as *const u8,
+            sub.len as u32,
+            sub.fixed_buffer_idx.unwrap(),
+        )
+        .offset(sub.offset)
+        .build()
+        .user_data(user_data);
+
+        let (opcode, fd, offset, addr, len, encoded_user_data, fixed_index) =
+            encoded_geometry(&entry);
+        assert_eq!(opcode, 5, "IORING_OP_WRITE_FIXED");
+        assert_eq!(fd, 17);
+        assert_eq!(offset, 8192);
+        assert_eq!(addr, 12288);
+        assert_eq!(len, 4096);
+        assert_eq!(encoded_user_data, user_data);
+        assert_eq!(fixed_index, 3);
+
+        let described = SqeDescriptor::describe(&sub, user_data);
+        assert!(!described.is_cmd);
+        assert!(described.is_write);
+        assert_eq!(described.offset, offset);
+        assert_eq!(described.addr, addr);
+        assert_eq!(described.len, len);
+        assert_eq!(described.user_data, encoded_user_data);
+        assert_eq!(described.fixed_index, fixed_index as i64);
+        assert_eq!(described.dmabuf_offset, addr as i64);
     }
 }

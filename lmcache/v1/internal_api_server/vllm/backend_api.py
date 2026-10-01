@@ -70,6 +70,65 @@ async def list_backends(request: Request):
         )
 
 
+@router.get("/backends/{backend_name}/status")
+async def backend_status(request: Request, backend_name: str):
+    """Return a backend's live diagnostic status when it provides one.
+
+    This endpoint is read-only.  In particular it lets qualification jobs
+    collect an I/O receipt before vLLM tears down its worker process, which
+    can otherwise disappear before the backend's close-time log is emitted.
+    """
+    sm = _get_storage_manager(request)
+    if sm is None:
+        return _unavailable_response("/backends")
+
+    try:
+        # Keep the manager stable while the report is collected.  Closing a
+        # backend concurrently would make a report about a half-closed
+        # device look authoritative when it is not.
+        with sm.manager_lock:
+            backend = sm.storage_backends.get(backend_name)
+            if backend is None:
+                backends = {
+                    name: type(item).__name__
+                    for name, item in sm.storage_backends.items()
+                }
+                return JSONResponse(
+                    content={
+                        "status": "not_found",
+                        "message": "Backend %s not found" % backend_name,
+                        "backends": backends,
+                    },
+                    status_code=404,
+                )
+            reporter = getattr(backend, "report_status", None)
+            if not callable(reporter):
+                return JSONResponse(
+                    content={
+                        "status": "unsupported",
+                        "message": "Backend %s has no status report" % backend_name,
+                    },
+                    status_code=501,
+                )
+            status = reporter()
+        return JSONResponse(
+            content={
+                "backend": backend_name,
+                "backend_class": type(backend).__name__,
+                "status": status,
+            }
+        )
+    except Exception as e:
+        logger.exception("Failed to report backend status: %s", backend_name)
+        return JSONResponse(
+            content={
+                "error": "Failed to report backend status",
+                "message": str(e),
+            },
+            status_code=500,
+        )
+
+
 @router.delete("/backends/{backend_name}")
 async def close_backend(request: Request, backend_name: str):
     """Close and remove a specific storage backend.

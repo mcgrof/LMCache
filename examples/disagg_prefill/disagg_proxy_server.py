@@ -30,9 +30,8 @@ from lmcache.v1.storage_backend.pd_backend import (
     StoragePDStatus,
 )
 from lmcache.v1.storage_backend.storage_pd_ack import (
-    StoragePDAckWire,
-    StoragePDUnreadReply,
-    StoragePDUnreadRequest,
+    StoragePDUnreadClient,
+    StoragePDUnreadObligation,
 )
 from lmcache.v1.storage_backend.storage_pd_protocol import (
     order_storage_pd_ready_statuses,
@@ -182,6 +181,8 @@ async def lifespan(app: FastAPI):
     app.state.total_clients = app.state.prefill_clients + app.state.decode_clients
 
     app.state.zmq_task = asyncio.create_task(zmq_pull_server())
+    if global_args.storage_pd:
+        app.state.storage_pd_unread_client = StoragePDUnreadClient()
 
     global pd_buffer_semaphore
     kv_bytes_per_token = compute_kv_bytes_per_token(global_args.model)
@@ -214,6 +215,10 @@ async def lifespan(app: FastAPI):
         with suppress(asyncio.CancelledError):
             await zmq_task
     finally:
+        unread_client = app.state.storage_pd_unread_client
+        if unread_client is not None:
+            await asyncio.to_thread(unread_client.close, 5.0)
+            app.state.storage_pd_unread_client = None
         for client in app.state.total_clients:
             try:
                 await client.aclose()
@@ -411,6 +416,7 @@ app.state.finished_reqs = defaultdict(int)
 app.state.storage_pd_active = {}
 app.state.storage_pd_statuses = {}
 app.state.storage_pd_failures = {}
+app.state.storage_pd_unread_client = None
 
 pd_buffer_semaphore: Optional[WeightedSemaphore] = None
 
@@ -424,7 +430,7 @@ async def tell_producers_nobody_will_read(
     *,
     reason: str,
     timeout_ms: int = 2000,
-) -> None:
+) -> list[StoragePDUnreadObligation]:
     """Tell each producer rank that its publication has no reader.
 
     The publication is real and durable; what is missing is a decoder, so
@@ -435,56 +441,42 @@ async def tell_producers_nobody_will_read(
     happened. The producer still refuses to release a publication some
     consumer claimed, so being wrong about this costs nothing.
 
-    A failure is logged and nothing else: the extents stay held, which is
-    the same outcome as not asking.
+    The obligation is retained by a bounded background client and retried
+    without needing another serving request. A caller outside the proxy
+    lifespan gets a temporary client and waits for its terminal decisions.
     """
+    client = app.state.storage_pd_unread_client
+    temporary_client = client is None
+    if client is None:
+        client = StoragePDUnreadClient(attempt_timeout_ms=timeout_ms)
+    obligations: list[StoragePDUnreadObligation] = []
     for status in statuses:
         if status.state != "READY" or not status.ack_endpoint:
             continue
-        request = StoragePDUnreadRequest(
-            status=status,
-            session_id=global_args.storage_pd_session,
-            nonce=uuid.uuid4().hex,
-            reason=reason,
-        )
-        socket = zmq_ctx.socket(zmq.REQ)
-        socket.setsockopt(zmq.LINGER, 0)
-        socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
-        socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
-        try:
-            socket.connect(f"tcp://{status.ack_endpoint}")
-            await socket.send(msgspec.msgpack.encode(request))
-            raw = await socket.recv()
-            reply = msgspec.msgpack.decode(raw, type=StoragePDAckWire)
-            if not isinstance(reply, StoragePDUnreadReply):
-                logger.error(
-                    "Storage P/D got a %s answering for the unread publication %s",
-                    type(reply).__name__,
-                    status.req_id,
-                )
-            elif reply.nonce != request.nonce:
-                logger.error(
-                    "Storage P/D got an answer about %s while asking about "
-                    "%s; discarding it",
-                    reply.nonce,
-                    request.nonce,
-                )
-            elif not reply.released:
-                logger.error(
-                    "Storage P/D producer %s kept the unread publication %s: %s",
-                    status.ack_endpoint,
-                    status.req_id,
-                    reply.reason or "no reason given",
-                )
-        except (zmq.ZMQError, msgspec.DecodeError, msgspec.ValidationError):
-            logger.exception(
-                "Storage P/D could not tell %s that %s has no reader; its "
-                "extents stay held",
-                status.ack_endpoint,
-                status.req_id,
+        offer_deadline = time.monotonic() + 60.0
+        while True:
+            obligation = client.offer(
+                status,
+                session_id=global_args.storage_pd_session,
+                reason=reason,
             )
+            if obligation is not None or time.monotonic() >= offer_deadline:
+                break
+            await asyncio.sleep(0.01)
+        if obligation is None:
+            raise RuntimeError(
+                "Storage P/D could not retain the unread publication "
+                f"{status.req_id} before its admission deadline; its "
+                "producer keeps the extents held"
+            )
+        obligations.append(obligation)
+    if temporary_client:
+        try:
+            for obligation in obligations:
+                await asyncio.to_thread(obligation.wait, 60.0)
         finally:
-            socket.close(linger=0)
+            await asyncio.to_thread(client.close, 5.0)
+    return obligations
 
 
 async def zmq_pull_server():
@@ -888,6 +880,9 @@ async def handle_completions(request: Request):
     st = time.time()
     slots = 0  # slots to release on error; set after successful acquire only
     acquired = False
+    observed_pd_statuses: dict[int, StoragePDStatus] = {}
+    ready_statuses: list[StoragePDStatus] = []
+    publication_owned = False
     try:
         req_data = await request.json()
 
@@ -930,6 +925,7 @@ async def handle_completions(request: Request):
         handoff_deadline = _handoff_deadline()
         if global_args.storage_pd:
             _register_pd_request(req_id)
+            observed_pd_statuses = app.state.storage_pd_statuses[req_id]
             prefill_response = await prefill_within_handoff_budget(
                 prefill_client.client, req_data, req_id, handoff_deadline
             )
@@ -960,6 +956,7 @@ async def handle_completions(request: Request):
                 storage_pd=global_args.storage_pd,
                 deadline=handoff_deadline,
             )
+            ready_statuses = statuses
             if statuses and producer_only:
                 # No decoder is going to read these, so nothing would ever
                 # acknowledge them. Say so now, while the statuses that
@@ -971,6 +968,7 @@ async def handle_completions(request: Request):
                         "no decoder was assigned this publication"
                     ),
                 )
+                publication_owned = True
             elif statuses:
                 req_data["kv_transfer_params"] = {
                     "lmcache.storage_pd_request_id": req_id,
@@ -989,33 +987,46 @@ async def handle_completions(request: Request):
 
         # Stream response from decode service
         async def generate_stream():
-            yield (
-                "data: "
-                + json.dumps(
-                    producer_head_chunk(
-                        prefill_output, first_tok_id, final=producer_only
-                    ),
-                    separators=(",", ":"),
-                )
-                + "\n\n"
-            ).encode()
+            decode_finished = False
+            try:
+                yield (
+                    "data: "
+                    + json.dumps(
+                        producer_head_chunk(
+                            prefill_output, first_tok_id, final=producer_only
+                        ),
+                        separators=(",", ":"),
+                    )
+                    + "\n\n"
+                ).encode()
 
-            if producer_only:
-                # The answer is one token: either that is all the caller
-                # asked for, or the producer stopped. The decoder has nothing
-                # to generate, and asking it for zero tokens is a request the
-                # engine refuses. The publication stands and no reader will
-                # claim it, which is the writer's to resolve -- nothing here
-                # fabricates a restore acknowledgement for a read that did
-                # not happen.
-                yield b"data: [DONE]\n\n"
-                return
+                if producer_only:
+                    # The answer is one token: either that is all the caller
+                    # asked for, or the producer stopped. The decoder has nothing
+                    # to generate, and asking it for zero tokens is a request the
+                    # engine refuses. The publication stands and no reader will
+                    # claim it, which is the writer's to resolve -- nothing here
+                    # fabricates a restore acknowledgement for a read that did
+                    # not happen.
+                    yield b"data: [DONE]\n\n"
+                    return
 
-            async for chunk in stream_service_response(
-                decode_client.client, "/v1/completions", req_data
-            ):
-                yield chunk
+                async for chunk in stream_service_response(
+                    decode_client.client, "/v1/completions", req_data
+                ):
+                    yield chunk
+                decode_finished = True
+            finally:
+                if ready_statuses and not producer_only and not decode_finished:
+                    await tell_producers_nobody_will_read(
+                        ready_statuses,
+                        reason=(
+                            "the proxy stream ended before decoder completion; "
+                            "the writer releases only if no consumer claimed it"
+                        ),
+                    )
 
+        publication_owned = True
         return StreamingResponse(generate_stream(), media_type="application/json")
 
     except Exception as e:
@@ -1035,6 +1046,13 @@ async def handle_completions(request: Request):
         # that fails or is cancelled before reaching it never got there, and
         # cancellation is not an Exception so the handler above never saw it.
         # Both actions are idempotent, so this runs exactly once either way.
+        if global_args.storage_pd and not publication_owned:
+            unassigned = ready_statuses or list(observed_pd_statuses.values())
+            if unassigned:
+                await tell_producers_nobody_will_read(
+                    unassigned,
+                    reason="the proxy request ended before decoder assignment",
+                )
         if global_args.storage_pd:
             _clear_pd_request_state(req_id)
         if pd_buffer_semaphore is not None and acquired:
@@ -1051,6 +1069,9 @@ async def handle_chat_completions(request: Request):
     st = time.time()
     slots = 0  # slots to release on error; set after successful acquire only
     acquired = False
+    observed_pd_statuses: dict[int, StoragePDStatus] = {}
+    ready_statuses: list[StoragePDStatus] = []
+    publication_owned = False
     try:
         req_data = await request.json()
 
@@ -1100,6 +1121,7 @@ async def handle_chat_completions(request: Request):
         handoff_deadline = _handoff_deadline()
         if global_args.storage_pd:
             _register_pd_request(req_id)
+            observed_pd_statuses = app.state.storage_pd_statuses[req_id]
             prefill_response = await prefill_within_handoff_budget(
                 prefill_client.client, req_data, req_id, handoff_deadline
             )
@@ -1135,6 +1157,7 @@ async def handle_chat_completions(request: Request):
                 storage_pd=global_args.storage_pd,
                 deadline=handoff_deadline,
             )
+            ready_statuses = statuses
             if statuses and producer_only:
                 # No decoder is going to read these, so nothing would ever
                 # acknowledge them. Say so now, while the statuses that
@@ -1146,6 +1169,7 @@ async def handle_chat_completions(request: Request):
                         "no decoder was assigned this publication"
                     ),
                 )
+                publication_owned = True
             elif statuses:
                 req_data["kv_transfer_params"] = {
                     "lmcache.storage_pd_request_id": req_id,
@@ -1165,7 +1189,7 @@ async def handle_chat_completions(request: Request):
         producer_choice = (prefill_output.get("choices") or [{}])[0]
 
         # Stream response from decode service
-        async def generate_stream():
+        async def generate_stream_body():
             initial_chunk = {
                 "id": prefill_output["id"],
                 "object": "chat.completion.chunk",
@@ -1286,6 +1310,23 @@ async def handle_chat_completions(request: Request):
                 else:
                     yield chunk
 
+        async def generate_stream():
+            decode_finished = False
+            try:
+                async for chunk in generate_stream_body():
+                    yield chunk
+                decode_finished = True
+            finally:
+                if ready_statuses and not producer_only and not decode_finished:
+                    await tell_producers_nobody_will_read(
+                        ready_statuses,
+                        reason=(
+                            "the proxy stream ended before decoder completion; "
+                            "the writer releases only if no consumer claimed it"
+                        ),
+                    )
+
+        publication_owned = True
         return StreamingResponse(generate_stream(), media_type="application/json")
 
     except Exception as e:
@@ -1307,6 +1348,13 @@ async def handle_chat_completions(request: Request):
         # that fails or is cancelled before reaching it never got there, and
         # cancellation is not an Exception so the handler above never saw it.
         # Both actions are idempotent, so this runs exactly once either way.
+        if global_args.storage_pd and not publication_owned:
+            unassigned = ready_statuses or list(observed_pd_statuses.values())
+            if unassigned:
+                await tell_producers_nobody_will_read(
+                    unassigned,
+                    reason="the proxy request ended before decoder assignment",
+                )
         if global_args.storage_pd:
             _clear_pd_request_state(req_id)
         if pd_buffer_semaphore is not None and acquired:

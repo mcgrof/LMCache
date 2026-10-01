@@ -28,6 +28,7 @@ from lmcache.v1.storage_backend.raw_block import (
     NativeQuiescence,
     RawBlockCore,
     RawBlockCoreConfig,
+    RawBlockPublicationReceipt,
     encode_object_key,
     normalize_raw_block_placement_ids,
 )
@@ -772,6 +773,119 @@ def test_raw_block_core_io_uring_put_many_partial_slot_exhaustion(
         load_result = core.load_many_into([spec.encoded for spec in specs[:3]], loaded)
         assert load_result == [True] * 3
     finally:
+        core.close()
+
+
+def test_raw_block_core_bounded_pd_reclaims_only_unlocked_extent(
+    tmp_path: Path,
+) -> None:
+    path = make_raw_block_file(tmp_path)
+    fake = _RecordingRawDevice(size=128 * 1024 * 1024)
+    capacity = RAW_BLOCK_CI_META_TOTAL_BYTES + 2 * RAW_BLOCK_CI_SLOT_BYTES
+    core = _make_core_with_fake(
+        path,
+        fake,
+        io_engine="io_uring",
+        capacity_bytes=capacity,
+    )
+    core.evict_unlocked_on_full = True
+
+    try:
+        first, second, replacement = [
+            encode_object_key(make_object_key(i)) for i in range(3)
+        ]
+        objects = [make_memory_obj(bytes([i + 1]) * 1024) for i in range(3)]
+        assert core.put_many([first, second], objects[:2]).results == [True, True]
+        first_offset = core.entry_offset(first.encoded)
+        second_offset = core.entry_offset(second.encoded)
+        assert len(core.get_metadata_prefix([first.encoded], lock=True)) == 1
+
+        result = core.put_many([replacement], objects[2:])
+
+        assert result.results == [True]
+        assert core.entry_offset(first.encoded) == first_offset
+        assert core.entry_offset(second.encoded) is None
+        assert core.entry_offset(replacement.encoded) == second_offset
+        assert core.report_status()["capacity_evictions"] == 1
+    finally:
+        core.unlock_many([first.encoded])
+        core.close()
+
+
+def test_raw_block_core_bounded_pd_refuses_to_reclaim_leased_extents(
+    tmp_path: Path,
+) -> None:
+    path = make_raw_block_file(tmp_path)
+    fake = _RecordingRawDevice(size=128 * 1024 * 1024)
+    capacity = RAW_BLOCK_CI_META_TOTAL_BYTES + 2 * RAW_BLOCK_CI_SLOT_BYTES
+    core = _make_core_with_fake(
+        path,
+        fake,
+        io_engine="io_uring",
+        capacity_bytes=capacity,
+    )
+    core.evict_unlocked_on_full = True
+
+    try:
+        first, second, blocked = [
+            encode_object_key(make_object_key(i)) for i in range(3)
+        ]
+        objects = [make_memory_obj(bytes([i + 1]) * 1024) for i in range(3)]
+        assert core.put_many([first, second], objects[:2]).results == [True, True]
+        assert (
+            len(
+                core.get_metadata_prefix(
+                    [first.encoded, second.encoded],
+                    lock=True,
+                )
+            )
+            == 2
+        )
+
+        result = core.put_many([blocked], objects[2:])
+
+        assert result.results == [False]
+        assert core.contains_key(first.encoded)
+        assert core.contains_key(second.encoded)
+        assert not core.contains_key(blocked.encoded)
+        assert core.report_status()["capacity_evictions"] == 0
+    finally:
+        core.unlock_many([first.encoded, second.encoded])
+        core.close()
+
+
+def test_raw_block_core_bounded_pd_preserves_prepublication_extents(
+    tmp_path: Path,
+) -> None:
+    path = make_raw_block_file(tmp_path)
+    fake = _RecordingRawDevice(size=128 * 1024 * 1024)
+    capacity = RAW_BLOCK_CI_META_TOTAL_BYTES + RAW_BLOCK_CI_SLOT_BYTES
+    core = _make_core_with_fake(
+        path,
+        fake,
+        io_engine="io_uring",
+        capacity_bytes=capacity,
+    )
+    core.evict_unlocked_on_full = True
+
+    try:
+        protected, blocked = [encode_object_key(make_object_key(i)) for i in range(2)]
+        objects = [make_memory_obj(bytes([i + 1]) * 1024) for i in range(2)]
+        core.protect_publication("request-a", [protected.encoded])
+        assert core.put_many([protected], objects[:1]).results == [True]
+        status = core.report_status()
+        assert status["publication_protected_key_count"] == 1
+
+        assert core.put_many([blocked], objects[1:]).results == [False]
+        assert core.contains_key(protected.encoded)
+        assert core.report_status()["capacity_evictions"] == 0
+
+        core.release_publication_protection("request-a")
+        assert core.put_many([blocked], objects[1:]).results == [True]
+        assert not core.contains_key(protected.encoded)
+        assert core.contains_key(blocked.encoded)
+    finally:
+        core.release_publication_protection("request-a")
         core.close()
 
 
@@ -2904,6 +3018,14 @@ def test_io_is_attributed_to_its_request_and_its_actual_path(tmp_path) -> None:
         assert attribution["unanswered"] == {}
         assert attribution["untagged_operations"] == 0
         assert attribution["dropped_rows"] == 0
+        assert attribution["malformed_rows"] == 0
+        assert attribution["duplicate_rows"] == 0
+        assert attribution["evidence_failures"] == []
+        assert (
+            attribution["contexts"][context.tag()]["request_id"] == context.request_id
+        )
+        assert attribution["operations"]
+        assert all(operation["complete"] for operation in attribution["operations"])
         for counts in mine.values():
             answered = counts["completed"] + counts["short"] + counts["failed"]
             assert counts["submitted"] == answered
@@ -2956,6 +3078,109 @@ def test_an_unanswered_operation_is_a_failed_evidence_gate() -> None:
 
     assert record.unanswered() == {"run/req/r0/epoch/read/dmabuf_fixed": 1}
     assert record.as_payload()["dropped_rows"] == 2
+
+
+def test_operation_join_keeps_overlapping_requests_and_short_remainders_apart() -> None:
+    """Join delayed CQEs by device, operation and attempt, never by timing."""
+    record = RawBlockIoAttribution()
+    first = RawBlockIoContext(
+        run_id="run",
+        request_id="request-a",
+        tp_rank=0,
+        incarnation="writer",
+        restore_attempt_id="restore-a",
+    )
+    second = RawBlockIoContext(
+        run_id="run",
+        request_id="request-b",
+        tp_rank=0,
+        incarnation="writer",
+        restore_attempt_id="restore-b",
+    )
+    first_tag = record.register_context(first)
+    second_tag = record.register_context(second)
+    receipt = RawBlockPublicationReceipt(
+        "writer",
+        7,
+        2,
+        "manifest-a",
+        namespace_identity="namespace-a",
+    )
+    record.link_publication("request-a", receipt)
+
+    def row(tag, operation, attempt, outcome, size, batch):
+        return {
+            "request_tag": tag,
+            "device_instance_id": "device-1",
+            "batch_id": str(batch),
+            "operation_id": str(operation),
+            "attempt": str(attempt),
+            "direction": "read",
+            "path": "regular",
+            "outcome": outcome,
+            "bytes": str(size),
+        }
+
+    # Both requests have a shared logical prefix, distinct suffix operations,
+    # and completions that arrive in the opposite order from submission.
+    record.record(
+        [
+            row(first_tag, 10, 0, "submitted", 4096, 1),
+            row(first_tag, 11, 0, "submitted", 8192, 1),
+            row(second_tag, 20, 0, "submitted", 4096, 2),
+            row(second_tag, 21, 0, "submitted", 4096, 2),
+            row(second_tag, 21, 0, "completed", 4096, 2),
+            row(first_tag, 11, 0, "short", 4096, 1),
+            row(first_tag, 11, 1, "submitted", 4096, 1),
+            row(second_tag, 20, 0, "completed", 4096, 2),
+            row(first_tag, 10, 0, "completed", 4096, 1),
+            row(first_tag, 11, 1, "completed", 4096, 1),
+        ]
+    )
+
+    operations, failures = record.operation_join()
+    assert failures == []
+    assert len(operations) == 4
+    split = next(
+        operation for operation in operations if operation["operation_id"] == 11
+    )
+    assert split["requested_bytes"] == split["completed_bytes"] == 8192
+    assert [attempt["outcome"] for attempt in split["attempts"]] == [
+        "short",
+        "completed",
+    ]
+    assert set(record.contexts()) == {first_tag, second_tag}
+    assert record.contexts()[first_tag]["advertised_checkpoint_seq"] == 7
+    assert record.contexts()[first_tag]["manifest_digest"] == "manifest-a"
+    assert record.contexts()[second_tag]["advertised_checkpoint_seq"] == -1
+
+
+def test_operation_join_exposes_failed_unanswered_and_duplicate_evidence() -> None:
+    """Bad CQE evidence stays an explicit gate instead of becoming a total."""
+    record = RawBlockIoAttribution()
+    context = RawBlockIoContext("run", "request", 0, "writer")
+    tag = record.register_context(context)
+    submitted = {
+        "request_tag": tag,
+        "device_instance_id": "device-1",
+        "batch_id": "1",
+        "operation_id": "7",
+        "attempt": "0",
+        "direction": "read",
+        "path": "dmabuf_fixed",
+        "outcome": "submitted",
+        "bytes": "4096",
+    }
+    short = {**submitted, "outcome": "short", "bytes": "2048"}
+    record.record([submitted, short])
+    # A second drain of the same rows must be visible, not double-credited.
+    record.record([submitted, short])
+
+    operations, failures = record.operation_join()
+    assert len(operations) == 1
+    assert not operations[0]["complete"]
+    assert any("short_dmabuf_is_terminal" in failure for failure in failures)
+    assert any("duplicate_rows=2" == failure for failure in failures)
 
 
 @pytest.mark.parametrize("operation", ["read", "write"])

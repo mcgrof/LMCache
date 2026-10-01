@@ -115,6 +115,15 @@ class UnreadReleaseOutcome:
     reason: str = ""
 
 
+@dataclass(frozen=True)
+class _UnreadReleaseIdentity:
+    """The exact no-reader assertion a writer has already applied."""
+
+    req_id: str
+    session_id: str
+    receipt: "RawBlockPublicationReceipt"
+
+
 @dataclass
 class _Lease:
     """Extents held for one published request until it is acknowledged.
@@ -170,10 +179,12 @@ class RawBlockPDRequestTracker:
         # message with "already applied", which is a false success as soon
         # as a consumer acts on the answer.
         self._released: OrderedDict[str, ReadAckIdentity] = OrderedDict()
+        self._released_unread: OrderedDict[str, _UnreadReleaseIdentity] = OrderedDict()
         # Set once a tombstone is evicted. After that this writer cannot
         # distinguish a retry of something it released from a message about
         # a hold it never had, and it says so rather than guessing.
         self._forgot_released = False
+        self._forgot_released_unread = False
         # Which consumer incarnation may release each session's holds.
         self._bound_consumer: dict[str, str] = {}
         # Told to consumers so they know where to reply. Set by whoever
@@ -855,6 +866,7 @@ class RawBlockPDRequestTracker:
         receipt: "RawBlockPublicationReceipt",
         *,
         expected_writer_epoch: str,
+        session_id: str = "",
         reason: str = "",
     ) -> UnreadReleaseOutcome:
         """Release a publication that was never handed to a reader.
@@ -873,6 +885,7 @@ class RawBlockPDRequestTracker:
         consumer saying it is about to read those extents. Nothing here
         fabricates an acknowledgement for a read that did not happen.
         """
+        identity = _UnreadReleaseIdentity(req_id, session_id, receipt)
         with self._lock:
             if not expected_writer_epoch:
                 return UnreadReleaseOutcome(False, "this engine published nothing")
@@ -888,16 +901,23 @@ class RawBlockPDRequestTracker:
             lease = self._leases.get(req_id)
             if lease is None:
                 if req_id in self._released:
-                    return UnreadReleaseOutcome(False, "already released")
+                    return UnreadReleaseOutcome(False, "a reader already released this")
+                released = self._released_unread.get(req_id)
+                if released is not None:
+                    if released == identity:
+                        return UnreadReleaseOutcome(True, "already released")
+                    return UnreadReleaseOutcome(
+                        False, "a different no-reader assertion released this request"
+                    )
+                if self._forgot_released_unread:
+                    return UnreadReleaseOutcome(
+                        False, "the writer no longer remembers this release"
+                    )
                 return UnreadReleaseOutcome(
                     False, "this writer holds no such publication"
                 )
             held = lease.receipt
-            if (
-                held.writer_epoch != receipt.writer_epoch
-                or held.checkpoint_seq != receipt.checkpoint_seq
-                or held.manifest_digest != receipt.manifest_digest
-            ):
+            if held != receipt:
                 return UnreadReleaseOutcome(
                     False, "this writer published a different manifest"
                 )
@@ -930,6 +950,10 @@ class RawBlockPDRequestTracker:
 
         with self._lock:
             self._leases.pop(req_id, None)
+            self._released_unread[req_id] = identity
+            while len(self._released_unread) > _FINISHED_HISTORY:
+                self._released_unread.popitem(last=False)
+                self._forgot_released_unread = True
         logger.info(
             "Raw-block P/D released %d unread extent(s) for request %s%s",
             len(encoded_keys),
@@ -942,6 +966,28 @@ class RawBlockPDRequestTracker:
         """Count leases still protecting extents from reuse."""
         with self._lock:
             return len(self._leases)
+
+    def report_status(self) -> dict[str, int]:
+        """Summarize logical leases and the physical extents they share."""
+        with self._lock:
+            extent_references = [
+                encoded_key
+                for lease in self._leases.values()
+                for encoded_key in lease.encoded_keys
+            ]
+            return {
+                "live_lease_count": len(self._leases),
+                "live_extent_reference_count": len(extent_references),
+                "live_unique_extent_count": len(set(extent_references)),
+                "claimed_lease_count": sum(
+                    bool(lease.claimed_by) for lease in self._leases.values()
+                ),
+                "releasing_lease_count": sum(
+                    lease.unlock_ran for lease in self._leases.values()
+                ),
+                "inflight_request_count": len(self._requests),
+                "publication_task_count": len(self._publishing),
+            }
 
     def _maybe_start_publication_locked(
         self,
@@ -979,6 +1025,11 @@ class RawBlockPDRequestTracker:
             receipt would be pointed at bytes nobody promised it.
             """
             leased = self._core.get_metadata_prefix(encoded_keys, lock=True)
+            release_protection = getattr(
+                self._core, "release_publication_protection", None
+            )
+            if release_protection is not None:
+                release_protection(req_id)
             if len(leased) != len(encoded_keys):
                 self._core.unlock_many(encoded_keys[: len(leased)])
                 raise RuntimeError(
@@ -1014,6 +1065,9 @@ class RawBlockPDRequestTracker:
             # manifest, and where to reply about it is this tracker's
             # business because it is the thing holding the lease.
             receipt = replace(receipt, ack_endpoint=self.ack_endpoint)
+            link_publication = getattr(self._core, "link_io_publication", None)
+            if link_publication is not None:
+                link_publication(req_id, receipt)
             with self._lock:
                 state = self._requests.get(req_id)
                 owned = (
@@ -1051,6 +1105,9 @@ class RawBlockPDRequestTracker:
         state: _RequestState,
         error: BaseException,
     ) -> None:
+        release_protection = getattr(self._core, "release_publication_protection", None)
+        if release_protection is not None:
+            release_protection(req_id)
         if not state.terminal.done():
             state.terminal.set_exception(error)
         self._retire_locked(req_id, state.terminal)

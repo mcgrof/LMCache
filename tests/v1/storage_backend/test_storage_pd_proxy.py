@@ -487,6 +487,87 @@ async def test_endpoint_releases_its_request_when_cancelled(monkeypatch) -> None
 
 
 @pytest.mark.asyncio
+async def test_cancellation_after_ready_retains_an_unread_release(monkeypatch) -> None:
+    """A READY publication cannot disappear with a cancelled proxy request."""
+    # Standard
+    import asyncio
+
+    receipt = RawBlockPublicationReceipt(
+        "writer",
+        1,
+        1,
+        "digest",
+        ack_endpoint="127.0.0.1:9999",
+    )
+    prefill_response = {
+        "id": "cmpl-1",
+        "created": 0,
+        "model": "probe-model",
+        "kv_transfer_params": {"first_tok": 7},
+    }
+    _endpoint_env(monkeypatch, prefill_response)
+    reported: list[StoragePDStatus] = []
+
+    async def wait(req_id, *_args, **_kwargs):
+        status = StoragePDStatus.ready(req_id, 0, receipt)
+        proxy.app.state.storage_pd_statuses[req_id][0] = status
+        raise asyncio.CancelledError()
+
+    async def report(statuses, **_kwargs):
+        reported.extend(statuses)
+        return []
+
+    monkeypatch.setattr(proxy, "wait_decode_kv_ready", wait)
+    monkeypatch.setattr(proxy, "tell_producers_nobody_will_read", report)
+
+    with pytest.raises(asyncio.CancelledError):
+        await proxy.handle_completions(_fake_request())
+
+    assert len(reported) == 1
+    assert reported[0].publication_receipt() == receipt
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stream_resolves_a_publication_not_claimed_by_decode(
+    monkeypatch,
+) -> None:
+    """The stream owns READY cleanup after the endpoint returns."""
+    receipt = RawBlockPublicationReceipt(
+        "writer",
+        1,
+        1,
+        "digest",
+        ack_endpoint="127.0.0.1:9999",
+    )
+    prefill_response = {
+        "id": "cmpl-1",
+        "created": 0,
+        "model": "probe-model",
+        "kv_transfer_params": {"first_tok": 7},
+    }
+    _endpoint_env(monkeypatch, prefill_response)
+    reported: list[StoragePDStatus] = []
+
+    async def wait(req_id, *_args, **_kwargs):
+        return [StoragePDStatus.ready(req_id, 0, receipt)]
+
+    async def report(statuses, **_kwargs):
+        reported.extend(statuses)
+        return []
+
+    monkeypatch.setattr(proxy, "wait_decode_kv_ready", wait)
+    monkeypatch.setattr(proxy, "tell_producers_nobody_will_read", report)
+
+    response = await proxy.handle_completions(_fake_request())
+    stream = response.body_iterator
+    assert await anext(stream)
+    await stream.aclose()
+
+    assert len(reported) == 1
+    assert reported[0].publication_receipt() == receipt
+
+
+@pytest.mark.asyncio
 async def test_endpoint_releases_its_permit_once_on_the_successful_path(
     monkeypatch,
 ) -> None:

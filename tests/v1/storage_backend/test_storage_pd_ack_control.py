@@ -30,11 +30,14 @@ import zmq
 
 # First Party
 from lmcache.v1.storage_backend import storage_pd_ack as ack_module
+from lmcache.v1.storage_backend.raw_block import RawBlockPublicationReceipt
 from lmcache.v1.storage_backend.storage_pd_ack import (
     ACK_ALREADY_APPLIED,
     ACK_APPLIED,
     ACK_REJECTED,
     ACK_UNRESOLVED,
+    UNREAD_RELEASED,
+    UNREAD_UNRESOLVED,
     StoragePDAckClient,
     StoragePDAckObligation,
     StoragePDAckReply,
@@ -43,9 +46,14 @@ from lmcache.v1.storage_backend.storage_pd_ack import (
     StoragePDClaimAnswer,
     StoragePDClaimRequest,
     StoragePDUnreadAnswer,
+    StoragePDUnreadClient,
+    StoragePDUnreadReply,
     StoragePDUnreadRequest,
 )
-from lmcache.v1.storage_backend.storage_pd_protocol import StoragePDReadAck
+from lmcache.v1.storage_backend.storage_pd_protocol import (
+    StoragePDReadAck,
+    StoragePDStatus,
+)
 
 LOOPBACK = "127.0.0.1"
 
@@ -67,6 +75,122 @@ def _ack(req_id: str = "request-1", **overrides) -> StoragePDReadAck:
     }
     fields.update(overrides)
     return StoragePDReadAck(**fields)  # type: ignore[arg-type]
+
+
+def test_unread_client_retries_the_same_receipt_after_request_loss(monkeypatch) -> None:
+    """Progress does not depend on a later request after one attempt is lost."""
+    client = StoragePDUnreadClient(
+        attempt_timeout_ms=50,
+        retry_interval_s=0.01,
+        poll_interval_s=0.005,
+    )
+    receipt = RawBlockPublicationReceipt(
+        writer_epoch="writer-1",
+        checkpoint_seq=7,
+        key_count=1,
+        manifest_digest="digest",
+        ack_endpoint="127.0.0.1:9999",
+    )
+    status = StoragePDStatus.ready("request-1", 0, receipt)
+    requests: list[StoragePDUnreadRequest] = []
+
+    def exchange(endpoint, request, timeout_ms):
+        assert endpoint == receipt.ack_endpoint
+        assert timeout_ms > 0
+        requests.append(request)
+        if len(requests) == 1:
+            return None
+        return StoragePDUnreadReply(
+            True,
+            request.status.req_id,
+            request.status.writer_epoch,
+            request.nonce,
+            "already released",
+        )
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    try:
+        obligation = client.offer(
+            status,
+            session_id="session-1",
+            reason="no decoder",
+            deadline_s=1.0,
+        )
+        assert obligation is not None
+        assert obligation.wait(timeout=2.0) == UNREAD_RELEASED
+    finally:
+        client.close()
+
+    assert len(requests) == 2
+    assert requests[0].status == requests[1].status == status
+    assert requests[0].session_id == requests[1].session_id == "session-1"
+    assert requests[0].nonce != requests[1].nonce
+
+
+def test_unread_client_reports_an_unavailable_writer_and_stops(monkeypatch) -> None:
+    """A deadline and shutdown both settle retained work as unresolved."""
+    client = StoragePDUnreadClient(
+        attempt_timeout_ms=10,
+        retry_interval_s=0.005,
+        max_live_obligations=1,
+        poll_interval_s=0.002,
+    )
+    status = StoragePDStatus.ready(
+        "request-1",
+        0,
+        RawBlockPublicationReceipt(
+            "writer-1", 7, 1, "digest", ack_endpoint="127.0.0.1:9999"
+        ),
+    )
+    monkeypatch.setattr(client, "_exchange", lambda *_args: None)
+    first = client.offer(
+        status,
+        session_id="session-1",
+        reason="no decoder",
+        deadline_s=0.03,
+    )
+    assert first is not None
+    assert (
+        client.offer(
+            StoragePDStatus.ready(
+                "request-2",
+                0,
+                RawBlockPublicationReceipt(
+                    "writer-1",
+                    8,
+                    1,
+                    "digest-2",
+                    ack_endpoint="127.0.0.1:9999",
+                ),
+            ),
+            session_id="session-1",
+            reason="no decoder",
+        )
+        is None
+    )
+    assert first.wait(timeout=1.0) == UNREAD_UNRESOLVED
+    assert first.attempts > 0
+    assert client.close(timeout_s=1.0)
+
+
+def test_unread_client_shutdown_does_not_claim_unanswered_work(monkeypatch) -> None:
+    client = StoragePDUnreadClient(poll_interval_s=0.002)
+    status = StoragePDStatus.ready(
+        "request-1",
+        0,
+        RawBlockPublicationReceipt(
+            "writer-1", 7, 1, "digest", ack_endpoint="127.0.0.1:9999"
+        ),
+    )
+    monkeypatch.setattr(client, "_exchange", lambda *_args: None)
+    obligation = client.offer(
+        status,
+        session_id="session-1",
+        reason="no decoder",
+    )
+    assert obligation is not None
+    assert client.close(timeout_s=1.0)
+    assert obligation.outcome == UNREAD_UNRESOLVED
 
 
 class _Writer:

@@ -15,6 +15,7 @@ import time
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
 from lmcache.v1.storage_backend.abstract_backend import (
     AllocatorBackendInterface,
     StoragePluginInterface,
@@ -244,6 +245,11 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         )
         self._index_refresh_wait_ms = int(
             extra.get("rust_raw_block.index_refresh_wait_ms", 0)
+        )
+        self._pd_dependency_timeout_s = max(
+            0.001,
+            int(extra.get("rust_raw_block.publication_adopt_timeout_ms", 30000))
+            / 1000.0,
         )
         self._last_refresh_ts = 0.0
         self._refresh_lock = threading.Lock()
@@ -640,6 +646,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             require_dmabuf_registration=bool(
                 extra.get("rust_raw_block.require_dmabuf_registration", False)
             ),
+            evict_unlocked_on_full=self._storage_pd_mode,
             writer_epoch=str(extra.get("rust_raw_block.writer_epoch", "") or ""),
             namespace_identity=str(
                 extra.get("rust_raw_block.namespace_identity", "") or ""
@@ -1024,6 +1031,10 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         req_id = str(getattr(transfer_spec, "req_id", "") or "")
         expected_chunks = int(getattr(transfer_spec, "total_chunks", 0) or 0)
         is_last_batch = bool(getattr(transfer_spec, "is_last_prefill", False))
+        if not req_id:
+            raise ValueError("storage P/D requires a non-empty request id")
+        if expected_chunks <= 0:
+            raise ValueError("storage P/D requires total_chunks > 0")
         specs = [encode_legacy_key(key) for key in keys]
         encoded_keys = [spec.encoded for spec in specs]
         if len(set(encoded_keys)) != len(encoded_keys):
@@ -1041,27 +1052,27 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
 
         pending: list[tuple[CacheEngineKey, RawBlockKeySpec, MemoryObj]] = []
         completed_keys: list[str] = []
-        conflict: str | None = None
-        for key, spec, obj in zip(keys, specs, objs, strict=True):
-            with self._put_lock:
-                already_scheduled = key in self._put_tasks
-                if not already_scheduled:
-                    self._put_tasks.add(key)
-            if already_scheduled or self._core.exists_inflight(spec.encoded):
-                conflict = spec.encoded
-                if not already_scheduled:
+        dependencies: list[RawBlockKeySpec] = []
+        self._core.protect_publication(req_id, encoded_keys)
+        try:
+            for key, spec, obj in zip(keys, specs, objs, strict=True):
+                with self._put_lock:
+                    already_scheduled = key in self._put_tasks
+                    if not already_scheduled:
+                        self._put_tasks.add(key)
+                if already_scheduled or self._core.exists_inflight(spec.encoded):
+                    if not already_scheduled:
+                        with self._put_lock:
+                            self._put_tasks.discard(key)
+                    dependencies.append(spec)
+                    continue
+                if self._core.contains_key(spec.encoded, lock=False):
+                    completed_keys.append(spec.encoded)
                     with self._put_lock:
                         self._put_tasks.discard(key)
-                break
-            if self._core.contains_key(spec.encoded, lock=False):
-                completed_keys.append(spec.encoded)
-                with self._put_lock:
-                    self._put_tasks.discard(key)
-                continue
-            obj.ref_count_up()
-            pending.append((key, spec, obj))
-
-        try:
+                    continue
+                obj.ref_count_up()
+                pending.append((key, spec, obj))
             terminal = self._pd_tracker.register_batch(
                 req_id,
                 encoded_keys,
@@ -1070,19 +1081,12 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                 completed_keys=completed_keys,
             )
         except BaseException:
+            self._core.release_publication_protection(req_id)
             self._release_unscheduled_puts(pending)
             raise
 
-        if conflict is not None or terminal.done():
+        if terminal.done():
             self._release_unscheduled_puts(pending)
-            if conflict is not None:
-                self._pd_tracker.fail_request(
-                    req_id,
-                    RuntimeError(
-                        "storage P/D refuses an in-flight dedup dependency for key "
-                        f"{conflict}"
-                    ),
-                )
             return [terminal]
 
         if on_complete_callback is not None:
@@ -1105,7 +1109,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
 
             terminal.add_done_callback(complete_callbacks)
 
-        if not pending:
+        if not pending and not dependencies:
             return [terminal]
 
         loop = self.loop
@@ -1116,11 +1120,19 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                 RuntimeError("RustRawBlockBackend requires an asyncio event loop"),
             )
             return [terminal]
-        coro = self._submit_pd_put_many(req_id, pending)
+        dependency_admitted = False
+        if dependencies:
+            with self._put_lock:
+                self._active_operations += 1
+            dependency_admitted = True
+        coro = self._submit_pd_request_work(req_id, pending, dependencies)
         try:
             asyncio.run_coroutine_threadsafe(coro, loop)
         except Exception as exc:
             coro.close()
+            if dependency_admitted:
+                with self._put_lock:
+                    self._active_operations -= 1
             self._release_unscheduled_puts(pending)
             self._pd_tracker.fail_request(req_id, exc)
         return [terminal]
@@ -1171,6 +1183,75 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             with self._put_lock:
                 for key, _spec, _obj in pending:
                     self._put_tasks.discard(key)
+
+    async def _submit_pd_request_work(
+        self,
+        req_id: str,
+        pending: Sequence[tuple[CacheEngineKey, RawBlockKeySpec, MemoryObj]],
+        dependencies: Sequence[RawBlockKeySpec],
+    ) -> None:
+        work = []
+        if pending:
+            work.append(self._submit_pd_put_many(req_id, pending))
+        if dependencies:
+            work.append(self._complete_pd_dependencies(req_id, dependencies))
+        await asyncio.gather(*work)
+
+    async def _complete_pd_dependencies(
+        self,
+        req_id: str,
+        dependencies: Sequence[RawBlockKeySpec],
+    ) -> None:
+        """Complete logical shared keys after their physical writer settles."""
+        deadline = time.monotonic() + self._pd_dependency_timeout_s
+        try:
+            while True:
+                with self._put_lock:
+                    pending = {
+                        encode_legacy_key(key).encoded for key in self._put_tasks
+                    }
+                    sealed = self._sealed
+                unsettled = [
+                    spec
+                    for spec in dependencies
+                    if spec.encoded in pending
+                    or self._core.exists_inflight(spec.encoded)
+                ]
+                if not unsettled:
+                    break
+                if sealed:
+                    raise RuntimeError(
+                        "storage P/D backend closed while shared writes were pending"
+                    )
+                if time.monotonic() >= deadline:
+                    raise LMCacheTimeoutError(
+                        "storage P/D timed out waiting for shared physical writes: "
+                        + ", ".join(spec.encoded for spec in unsettled)
+                    )
+                await asyncio.sleep(0.001)
+
+            missing = [
+                spec.encoded
+                for spec in dependencies
+                if not self._core.contains_key(spec.encoded, lock=False)
+            ]
+            if missing:
+                raise RuntimeError(
+                    "storage P/D shared physical writes did not commit: "
+                    + ", ".join(missing)
+                )
+            self._core.record_deduplicated_hits([spec.encoded for spec in dependencies])
+            assert self._pd_tracker is not None
+            self._pd_tracker.complete_batch(
+                req_id,
+                [spec.encoded for spec in dependencies],
+            )
+        except BaseException as exc:
+            assert self._pd_tracker is not None
+            self._pd_tracker.fail_request(req_id, exc)
+        finally:
+            with self._put_lock:
+                self._active_operations -= 1
 
     async def _submit_put_one(
         self,
@@ -1467,6 +1548,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             status.req_id,
             receipt,
             expected_writer_epoch=self._core.writer_epoch,
+            session_id=request.session_id,
             reason=request.reason,
         )
         return StoragePDUnreadAnswer(outcome.released, outcome.reason)
@@ -1490,6 +1572,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             req_id,
             receipt,
             expected_writer_epoch=self._core.writer_epoch,
+            session_id=self._pd_session_id,
             reason=reason,
         ).released
 
@@ -1537,6 +1620,31 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
     def live_lease_count(self) -> int:
         """Count extents held pending acknowledgement."""
         return self._pd_tracker.live_lease_count() if self._pd_tracker else 0
+
+    def report_status(self) -> dict[str, Any]:
+        """Return a live control-plane and device-I/O evidence receipt."""
+        core_status = self._core.report_status()
+        with self._put_lock:
+            pending_put_task_count = len(self._put_tasks)
+            active_operation_count = self._active_operations
+            quarantined_owner_batch_count = len(self._pending_put_owners)
+            sealed = self._sealed
+        return {
+            "type": "RustRawBlockBackend",
+            "role": self._role,
+            "run_id": self._run_id,
+            "pd_session_id": self._pd_session_id,
+            "ack_endpoint": self.ack_endpoint(),
+            "live_lease_count": self.live_lease_count(),
+            "pd_tracker": (
+                self._pd_tracker.report_status() if self._pd_tracker else None
+            ),
+            "pending_put_task_count": pending_put_task_count,
+            "active_operation_count": active_operation_count,
+            "quarantined_owner_batch_count": quarantined_owner_batch_count,
+            "sealed": sealed,
+            "core": core_status,
+        }
 
     def _io_context(self, request_id: str = "") -> RawBlockIoContext:
         """Who this engine's next batch of I/O is for.
@@ -1853,6 +1961,12 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             request_id=context.request_id,
             tp_rank=self._ack_tp_rank,
             incarnation=context.receipt.writer_epoch,
+            consumer_request_id=context.consumer_request_id,
+            restore_attempt_id=context.restore_attempt_id,
+            checkpoint_seq=context.receipt.checkpoint_seq,
+            manifest_digest=context.receipt.manifest_digest,
+            namespace_identity=context.receipt.namespace_identity,
+            adopted_checkpoint_seq=context.adopted_checkpoint_seq,
         )
         loaded = self._batched_get_prefix(keys, io_context=io_context)
         return [*loaded, *([None] * (len(keys) - len(loaded)))]
@@ -1989,6 +2103,24 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             if pending == 0 or time.monotonic() >= deadline:
                 break
             time.sleep(0.01)
+
+        report_status = getattr(self._core, "report_status", None)
+        if pending == 0 and callable(report_status):
+            try:
+                status = report_status()
+                evidence = {
+                    key: status.get(key)
+                    for key in (
+                        "bytes_deduplicated",
+                        "payload_writes",
+                        "payload_reads",
+                        "io_by_kind_and_path",
+                        "io_by_request",
+                    )
+                }
+                logger.info("Raw-block I/O evidence before close: %s", evidence)
+            except Exception:
+                logger.exception("Raw-block I/O evidence could not be collected")
 
         # The control handler reaches the core -- releasing a hold unlocks
         # keys through it -- so it stops first. A timed join that returns is

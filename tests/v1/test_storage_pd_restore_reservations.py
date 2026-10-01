@@ -19,10 +19,45 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorMetadata,
     LMCacheConnectorV1Impl,
     LoadSpec,
+    _extract_storage_pd_request,
 )
 from lmcache.v1.storage_backend.raw_block import RawBlockPublicationReceipt
 from lmcache.v1.storage_backend.storage_pd_ack import StoragePDAckClient
 from lmcache.v1.storage_backend.storage_pd_protocol import StoragePDStatus
+
+
+def test_storage_pd_receipt_survives_vllm_extra_args_only_shape() -> None:
+    """Older NewRequestData omits the direct kv_transfer_params attribute."""
+    statuses = [{"state": "READY", "req_id": "published-request"}]
+    request_configs = {
+        "lmcache.storage_pd_request_id": "published-request",
+        "lmcache.storage_pd_statuses": statuses,
+    }
+
+    extracted_statuses, request_id = _extract_storage_pd_request(
+        None,
+        request_configs,
+    )
+
+    assert extracted_statuses is statuses
+    assert request_id == "published-request"
+
+
+def test_direct_storage_pd_params_override_extra_args_copy() -> None:
+    direct_statuses = [{"state": "READY", "req_id": "direct"}]
+    extracted_statuses, request_id = _extract_storage_pd_request(
+        {
+            "lmcache.storage_pd_request_id": "direct",
+            "lmcache.storage_pd_statuses": direct_statuses,
+        },
+        {
+            "lmcache.storage_pd_request_id": "copy",
+            "lmcache.storage_pd_statuses": [{"state": "READY", "req_id": "copy"}],
+        },
+    )
+
+    assert extracted_statuses is direct_statuses
+    assert request_id == "direct"
 
 
 @pytest.mark.parametrize(

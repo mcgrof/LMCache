@@ -43,20 +43,20 @@ from lmcache.v1.storage_backend.raw_block import (
     RawBlockPDRequestTracker,
     RawBlockPublicationReceipt,
 )
-from lmcache.v1.storage_backend.raw_block.core import RawBlockCore
 from lmcache.v1.storage_backend.storage_pd_ack import (
     ACK_ALREADY_APPLIED,
     ACK_APPLIED,
     ACK_REJECTED,
+    UNREAD_RELEASED,
     StoragePDAckClient,
     StoragePDAckServer,
+    StoragePDUnreadClient,
 )
 from lmcache.v1.storage_backend.storage_pd_protocol import (
     StoragePDReadAck,
     StoragePDStatus,
 )
 
-# First Party
 from lmcache.integration.vllm import vllm_v1_adapter as adapter_module  # isort: skip
 from lmcache.integration.vllm.vllm_v1_adapter import (  # isort: skip
     LMCacheConnectorV1Impl,
@@ -75,13 +75,17 @@ def _free_port() -> int:
 class _InertWriterCore:
     """A writer's identity and lock bookkeeping, with no device behind it."""
 
-    writer_epoch = RawBlockCore.writer_epoch
     role = "writer"
 
     def __init__(self) -> None:
         self._writer_epoch = str(uuid.uuid4())
         self._seq = 0
         self.locked: list[str] = []
+        self.unlock_calls = 0
+
+    @property
+    def writer_epoch(self) -> str:
+        return self._writer_epoch
 
     def publish_request(self, encoded_keys: list[str]) -> RawBlockPublicationReceipt:
         self._seq += 1
@@ -101,6 +105,7 @@ class _InertWriterCore:
         return [object() for _ in encoded_keys]
 
     def unlock_many(self, encoded_keys: list[str]) -> None:
+        self.unlock_calls += 1
         for encoded_key in encoded_keys:
             self.locked.remove(encoded_key)
 
@@ -398,6 +403,41 @@ def test_a_producer_only_publication_is_resolved_over_the_wire(writer) -> None:
 
     assert writer.tracker.live_lease_count() == 0
     assert writer.core.locked == []
+
+
+def test_a_lost_unread_reply_retries_the_applied_tombstone(writer) -> None:
+    """The writer answers a duplicate only for the exact applied release."""
+    status = writer.publish("request-1", ["key-1"])
+    client = StoragePDUnreadClient(
+        attempt_timeout_ms=500,
+        retry_interval_s=0.01,
+        poll_interval_s=0.005,
+    )
+    original_exchange = client._exchange
+    attempts = 0
+
+    def lose_first_reply(endpoint, request, timeout_ms):
+        nonlocal attempts
+        attempts += 1
+        reply = original_exchange(endpoint, request, timeout_ms)
+        return None if attempts == 1 else reply
+
+    client._exchange = lose_first_reply  # type: ignore[method-assign]
+    try:
+        obligation = client.offer(
+            status,
+            session_id=SESSION,
+            reason="no decoder",
+            deadline_s=5.0,
+        )
+        assert obligation is not None
+        assert obligation.wait(timeout=10.0) == UNREAD_RELEASED
+    finally:
+        client.close()
+
+    assert attempts == 2
+    assert writer.core.unlock_calls == 1
+    assert writer.tracker.live_lease_count() == 0
 
 
 def test_a_claimed_publication_is_not_resolved_as_unread(writer, consumer) -> None:

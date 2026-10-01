@@ -72,6 +72,10 @@ ACK_UNRESOLVED = "UNRESOLVED"
 # hold may still stand and the obligation is still owed.
 ACK_TERMINAL_OUTCOMES = frozenset({ACK_APPLIED, ACK_ALREADY_APPLIED, ACK_REJECTED})
 
+UNREAD_RELEASED = "RELEASED"
+UNREAD_REJECTED = "REJECTED"
+UNREAD_UNRESOLVED = "UNRESOLVED"
+
 
 class StoragePDAckRequest(msgspec.Struct, tag=True):
     """One consumer asking one writer to release one hold.
@@ -955,4 +959,289 @@ class StoragePDAckClient:
             and reply.req_id == request.read.req_id
             and reply.writer_epoch == request.read.writer_epoch
             and reply.consumer_instance_id == request.read.consumer_instance_id
+        )
+
+
+class StoragePDUnreadObligation:
+    """One exact producer-only publication owed a no-reader decision."""
+
+    def __init__(
+        self,
+        status: StoragePDStatus,
+        *,
+        endpoint: str,
+        session_id: str,
+        reason: str,
+        deadline: float,
+    ) -> None:
+        self.status = status
+        self.endpoint = endpoint
+        self.session_id = session_id
+        self.reason = reason
+        self.deadline = deadline
+        self.attempts = 0
+        self._settled = threading.Event()
+        self._outcome: Optional[str] = None
+        self._detail = ""
+
+    @property
+    def settled(self) -> bool:
+        return self._settled.is_set()
+
+    @property
+    def outcome(self) -> Optional[str]:
+        return self._outcome
+
+    @property
+    def detail(self) -> str:
+        return self._detail
+
+    def wait(self, timeout: Optional[float] = None) -> Optional[str]:
+        """Wait for the writer's decision when a caller needs the outcome."""
+        self._settled.wait(timeout=timeout)
+        return self._outcome
+
+    def _settle(self, outcome: str, detail: str = "") -> None:
+        if self._settled.is_set():
+            return
+        self._outcome = outcome
+        self._detail = detail
+        self._settled.set()
+
+
+class StoragePDUnreadClient:
+    """Retain and retry producer-only release obligations in the background.
+
+    A response may be lost after the writer has released the hold, so every
+    attempt repeats the same status and session with a fresh nonce. The writer
+    validates the full receipt and remembers an applied no-reader assertion;
+    this client retires nothing until the correlated writer reply arrives.
+    """
+
+    def __init__(
+        self,
+        *,
+        attempt_timeout_ms: int = 2000,
+        retry_interval_s: float = 1.0,
+        max_live_obligations: int = 1024,
+        poll_interval_s: float = 0.05,
+    ) -> None:
+        if attempt_timeout_ms <= 0:
+            raise ValueError("an unread-release attempt needs a timeout")
+        if retry_interval_s < 0:
+            raise ValueError("an unread-release retry interval cannot be negative")
+        if max_live_obligations <= 0:
+            raise ValueError("an unread-release client needs a live bound")
+        self._attempt_timeout_ms = attempt_timeout_ms
+        self._retry_interval_s = retry_interval_s
+        self._max_live = max_live_obligations
+        self._poll_interval_s = poll_interval_s
+        self._lock = threading.Lock()
+        self._owed: dict[tuple[Any, ...], StoragePDUnreadObligation] = {}
+        self._next_attempt: dict[tuple[Any, ...], float] = {}
+        self._context = get_zmq_context(use_asyncio=False)
+        self._stopping = False
+        self._quiesced = threading.Event()
+        self._wake = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="storage-pd-unread-client",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @staticmethod
+    def _key(
+        status: StoragePDStatus,
+        endpoint: str,
+        session_id: str,
+    ) -> tuple[Any, ...]:
+        return (
+            endpoint,
+            session_id,
+            status.req_id,
+            status.tp_rank,
+            status.writer_epoch,
+            status.namespace_identity,
+            status.checkpoint_seq,
+            status.key_count,
+            status.manifest_digest,
+            status.total_logical_bytes,
+            status.total_padded_bytes,
+        )
+
+    def live_count(self) -> int:
+        with self._lock:
+            return sum(not item.settled for item in self._owed.values())
+
+    def offer(
+        self,
+        status: StoragePDStatus,
+        *,
+        session_id: str,
+        reason: str,
+        deadline_s: float = 60.0,
+    ) -> Optional[StoragePDUnreadObligation]:
+        """Retain one exact no-reader assertion, or refuse at the live bound."""
+        if status.state != "READY" or not status.ack_endpoint:
+            return None
+        key = self._key(status, status.ack_endpoint, session_id)
+        with self._lock:
+            if self._stopping:
+                return None
+            existing = self._owed.get(key)
+            if existing is not None and not existing.settled:
+                return existing
+            settled_keys = [
+                item_key for item_key, item in self._owed.items() if item.settled
+            ]
+            for settled_key in settled_keys:
+                self._owed.pop(settled_key, None)
+                self._next_attempt.pop(settled_key, None)
+            if len(self._owed) >= self._max_live:
+                logger.error(
+                    "Storage P/D has %d unanswered unread-release obligations, "
+                    "at its bound of %d; retaining ownership with the caller",
+                    len(self._owed),
+                    self._max_live,
+                )
+                return None
+            obligation = StoragePDUnreadObligation(
+                status,
+                endpoint=status.ack_endpoint,
+                session_id=session_id,
+                reason=reason,
+                deadline=time.monotonic() + deadline_s,
+            )
+            self._owed[key] = obligation
+            self._next_attempt[key] = 0.0
+        self._wake.set()
+        return obligation
+
+    def close(self, timeout_s: float = 5.0) -> bool:
+        """Stop retrying and mark every unanswered obligation unresolved."""
+        with self._lock:
+            self._stopping = True
+        self._wake.set()
+        self._thread.join(timeout=timeout_s)
+        quiesced = self._quiesced.is_set()
+        with self._lock:
+            owed = list(self._owed.values())
+        for obligation in owed:
+            obligation._settle(
+                UNREAD_UNRESOLVED,
+                "the proxy stopped before the writer answered",
+            )
+        if not quiesced:
+            logger.error(
+                "Storage P/D unread-release client did not confirm it stopped "
+                "within %.1fs",
+                timeout_s,
+            )
+        return quiesced
+
+    def _run(self) -> None:
+        try:
+            while True:
+                with self._lock:
+                    if self._stopping:
+                        return
+                    now = time.monotonic()
+                    due = [
+                        (key, obligation)
+                        for key, obligation in self._owed.items()
+                        if not obligation.settled
+                        and self._next_attempt.get(key, 0.0) <= now
+                    ]
+                if not due:
+                    self._wake.wait(timeout=self._poll_interval_s)
+                    self._wake.clear()
+                    continue
+                for key, obligation in due:
+                    with self._lock:
+                        if self._stopping:
+                            return
+                    self._attempt(key, obligation)
+        finally:
+            self._quiesced.set()
+
+    def _attempt(
+        self,
+        key: tuple[Any, ...],
+        obligation: StoragePDUnreadObligation,
+    ) -> None:
+        now = time.monotonic()
+        if now >= obligation.deadline:
+            obligation._settle(
+                UNREAD_UNRESOLVED,
+                "the deadline passed without a writer decision",
+            )
+            return
+        remaining_ms = int((obligation.deadline - now) * 1000)
+        timeout_ms = max(1, min(self._attempt_timeout_ms, remaining_ms))
+        obligation.attempts += 1
+        request = StoragePDUnreadRequest(
+            status=obligation.status,
+            session_id=obligation.session_id,
+            nonce=uuid.uuid4().hex,
+            reason=obligation.reason,
+        )
+        reply = self._exchange(obligation.endpoint, request, timeout_ms)
+        if reply is None or not self._correlates(reply, request):
+            with self._lock:
+                self._next_attempt[key] = now + self._retry_interval_s
+            return
+        if reply.released:
+            obligation._settle(UNREAD_RELEASED, reply.reason)
+        else:
+            obligation._settle(UNREAD_REJECTED, reply.reason)
+
+    def _exchange(
+        self,
+        endpoint: str,
+        request: StoragePDUnreadRequest,
+        timeout_ms: int,
+    ) -> Optional[StoragePDUnreadReply]:
+        """Make one bounded request/reply attempt on a disposable socket."""
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        socket = None
+        try:
+            socket = get_zmq_socket(
+                self._context,
+                endpoint,
+                "tcp",
+                zmq.REQ,
+                "connect",
+            )
+            socket.setsockopt(zmq.LINGER, 0)
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                return None
+            socket.setsockopt(zmq.SNDTIMEO, remaining_ms)
+            socket.send(msgspec.msgpack.encode(request))
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                return None
+            socket.setsockopt(zmq.RCVTIMEO, remaining_ms)
+            raw = socket.recv()
+        except (zmq.Again, zmq.ZMQError):
+            return None
+        finally:
+            if socket is not None:
+                socket.close(linger=0)
+        try:
+            reply = msgspec.msgpack.decode(raw, type=StoragePDAckWire)
+        except (msgspec.DecodeError, msgspec.ValidationError):
+            return None
+        return reply if isinstance(reply, StoragePDUnreadReply) else None
+
+    @staticmethod
+    def _correlates(
+        reply: StoragePDUnreadReply,
+        request: StoragePDUnreadRequest,
+    ) -> bool:
+        return (
+            reply.nonce == request.nonce
+            and reply.req_id == request.status.req_id
+            and reply.writer_epoch == request.status.writer_epoch
         )

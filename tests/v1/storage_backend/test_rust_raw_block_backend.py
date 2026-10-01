@@ -41,6 +41,7 @@ from lmcache.v1.storage_backend.raw_block import (
     RawBlockCoreConfig,
     RawBlockKeySpec,
     RawBlockPutManyResult,
+    encode_legacy_key,
 )
 from tests.v1.storage_backend.raw_block_test_utils import is_skip_safe_io_error
 
@@ -2856,6 +2857,80 @@ def test_storage_pd_backend_publishes_then_reader_adopts(
         for obj in typed_objs:
             obj.ref_count_down()
         reader.close()
+        writer.close()
+
+
+def test_storage_pd_shared_inflight_write_gives_each_request_a_lease(
+    monkeypatch,
+    memory_allocator,
+    loop_in_thread,
+):
+    """One physical write may back two independently released publications."""
+    _pin_the_chain_root(monkeypatch)
+    _install_fake_raw_block_device(monkeypatch, size_bytes=64 * 1024 * 1024)
+    writer = _make_raw_block_backend(
+        "/tmp/raw-block-storage-pd-shared",
+        memory_allocator,
+        loop_in_thread,
+        io_engine="posix",
+        role="writer",
+        storage_pd_mode=True,
+    )
+    allocator = AdHocMemoryAllocator(device="cpu")
+    key = CacheEngineKey("test_model", 1, 0, 9010, torch.bfloat16)
+    objects = [
+        allocator.allocate(
+            [torch.Size([2, 16, 8, 128])],
+            [torch.bfloat16],
+            fmt=MemoryFormat.KV_T2D,
+        )
+        for _ in range(2)
+    ]
+    assert all(obj is not None for obj in objects)
+    typed_objects = [obj for obj in objects if obj is not None]
+    entered = threading.Event()
+    resume = threading.Event()
+    original_put_many = writer._core.put_many
+
+    def delayed_put_many(*args, **kwargs):
+        entered.set()
+        assert resume.wait(5)
+        return original_put_many(*args, **kwargs)
+
+    monkeypatch.setattr(writer._core, "put_many", delayed_put_many)
+    first = types.SimpleNamespace(
+        req_id="shared-first", total_chunks=1, is_last_prefill=True
+    )
+    second = types.SimpleNamespace(
+        req_id="shared-second", total_chunks=1, is_last_prefill=True
+    )
+    try:
+        first_futures = writer.batched_submit_put_task(
+            [key], [typed_objects[0]], transfer_spec=first
+        )
+        assert first_futures is not None
+        assert entered.wait(5)
+        second_futures = writer.batched_submit_put_task(
+            [key], [typed_objects[1]], transfer_spec=second
+        )
+        assert second_futures is not None
+        assert writer.report_status()["active_operation_count"] == 1
+        resume.set()
+        first_receipt = first_futures[0].result(timeout=5)
+        second_receipt = second_futures[0].result(timeout=5)
+        assert writer.report_status()["active_operation_count"] == 0
+
+        encoded_key = encode_legacy_key(key).encoded
+        assert writer._core.lock_refcount(encoded_key) == 2
+        assert writer.release_unread_publication(first.req_id, first_receipt)
+        assert writer._core.lock_refcount(encoded_key) == 1
+        assert writer.release_unread_publication(second.req_id, second_receipt)
+        assert writer._core.lock_refcount(encoded_key) == 0
+        assert writer._core.report_status()["bytes_deduplicated"] > 0
+    finally:
+        resume.set()
+        for obj in typed_objects:
+            obj.ref_count_down()
         writer.close()
 
 

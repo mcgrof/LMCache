@@ -30,6 +30,7 @@ class _FakeCore:
         self.leased: list[str] = []
         self.unlock_calls = 0
         self.unlock_raises = False
+        self.linked_publications: list[tuple[str, RawBlockPublicationReceipt]] = []
 
     def publish_request(self, encoded_keys: list[str]) -> RawBlockPublicationReceipt:
         self.publish_started.set()
@@ -59,6 +60,13 @@ class _FakeCore:
         self.unlock_calls += 1
         for encoded_key in encoded_keys:
             self.leased.remove(encoded_key)
+
+    def link_io_publication(
+        self,
+        req_id: str,
+        receipt: RawBlockPublicationReceipt,
+    ) -> None:
+        self.linked_publications.append((req_id, receipt))
 
 
 def test_tracker_waits_for_every_write_before_publication() -> None:
@@ -92,6 +100,7 @@ def test_tracker_waits_for_every_write_before_publication() -> None:
         assert receipt.checkpoint_seq == 7
         assert core.published == [["key-1", "key-2"]]
         assert core.leased == ["key-1", "key-2"]
+        assert core.linked_publications == [("request-1", receipt)]
     finally:
         core.allow_publish.set()
         tracker.close()
@@ -663,6 +672,47 @@ def test_tracker_refuses_a_read_after_an_unread_release_starts(
         tracker.close()
 
 
+def test_unread_release_retry_matches_the_full_applied_identity() -> None:
+    """A lost reply is idempotent only for the same session and receipt."""
+    core = _FakeCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    try:
+        core.allow_publish.set()
+        receipt = tracker.register_batch(
+            "request-1",
+            ["key-1"],
+            expected_chunks=1,
+            is_last_batch=True,
+            completed_keys=["key-1"],
+        ).result(timeout=1)
+        first = tracker.release_unread(
+            "request-1",
+            receipt,
+            expected_writer_epoch="writer-1",
+            session_id="session-1",
+        )
+        duplicate = tracker.release_unread(
+            "request-1",
+            receipt,
+            expected_writer_epoch="writer-1",
+            session_id="session-1",
+        )
+        mismatch = tracker.release_unread(
+            "request-1",
+            receipt,
+            expected_writer_epoch="writer-1",
+            session_id="session-2",
+        )
+
+        assert first.released
+        assert duplicate.released
+        assert "already" in duplicate.reason
+        assert not mismatch.released
+        assert core.unlock_calls == 1
+    finally:
+        tracker.close()
+
+
 def test_tracker_releases_an_extent_on_a_matching_acknowledgement() -> None:
     """Nothing but an acknowledgement the writer can vouch for frees a lease."""
     core = _FakeCore()
@@ -1016,6 +1066,10 @@ def test_tracker_stops_admitting_before_its_hold_bound_is_exceeded() -> None:
             core.allow_publish.set()
             terminal.result(timeout=1)
         assert tracker.live_lease_count() == 2
+        status = tracker.report_status()
+        assert status["live_lease_count"] == 2
+        assert status["live_extent_reference_count"] == 2
+        assert status["live_unique_extent_count"] == 1
         # Two requests, one key: two independent holds, so the extent is
         # protected until both are acknowledged.
         assert core.leased == ["shared-key", "shared-key"]

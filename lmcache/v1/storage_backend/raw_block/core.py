@@ -348,13 +348,39 @@ class RawBlockIoContext:
     request_id: str = ""
     tp_rank: int = -1
     incarnation: str = ""
+    work_kind: str = IO_KIND_PAYLOAD
+    consumer_request_id: str = ""
+    restore_attempt_id: str = ""
+    checkpoint_seq: int = -1
+    manifest_digest: str = ""
+    namespace_identity: str = ""
+    adopted_checkpoint_seq: int = -1
 
     def tag(self) -> str:
         """One opaque string, stable for the life of this request."""
         if not self.request_id:
             return ""
         rank = "?" if self.tp_rank < 0 else str(self.tp_rank)
-        return f"{self.run_id}/{self.request_id}/r{rank}/{self.incarnation}"
+        tag = f"{self.run_id}/{self.request_id}/r{rank}/{self.incarnation}"
+        if self.restore_attempt_id:
+            tag += f"/a{self.restore_attempt_id}"
+        return tag
+
+    def as_payload(self) -> dict[str, Any]:
+        """Structured identity behind the opaque native request tag."""
+        return {
+            "run_id": self.run_id,
+            "request_id": self.request_id,
+            "tp_rank": self.tp_rank,
+            "writer_epoch": self.incarnation,
+            "work_kind": self.work_kind,
+            "consumer_request_id": self.consumer_request_id,
+            "restore_attempt_id": self.restore_attempt_id,
+            "advertised_checkpoint_seq": self.checkpoint_seq,
+            "manifest_digest": self.manifest_digest,
+            "namespace_identity": self.namespace_identity,
+            "adopted_checkpoint_seq": self.adopted_checkpoint_seq,
+        }
 
 
 class RawBlockIoAttribution:
@@ -385,9 +411,57 @@ class RawBlockIoAttribution:
         self._max_requests = max_requests
         self._rows: OrderedDict[tuple[str, str, str], dict[str, int]] = OrderedDict()
         self._tags: OrderedDict[str, None] = OrderedDict()
+        self._contexts: dict[str, dict[str, Any]] = {}
+        self._events: dict[str, list[dict[str, Any]]] = {}
+        self._seen_events: set[tuple[Any, ...]] = set()
         self.dropped_rows = 0
         self.evicted_requests = 0
         self.untagged_operations = 0
+        self.malformed_rows = 0
+        self.duplicate_rows = 0
+
+    def register_context(self, context: RawBlockIoContext) -> str:
+        """Remember the structured identity carried by one native tag."""
+        tag = context.tag()
+        if not tag:
+            return ""
+        with self._lock:
+            self._contexts[tag] = context.as_payload()
+            self._touch_locked(tag)
+            self._evict_locked()
+        return tag
+
+    def link_publication(
+        self,
+        request_id: str,
+        receipt: "RawBlockPublicationReceipt",
+    ) -> None:
+        """Attach the receipt minted after a writer's payload I/O completed."""
+        with self._lock:
+            for context in self._contexts.values():
+                if (
+                    context["request_id"] == request_id
+                    and context["writer_epoch"] == receipt.writer_epoch
+                ):
+                    context["advertised_checkpoint_seq"] = receipt.checkpoint_seq
+                    context["manifest_digest"] = receipt.manifest_digest
+                    context["namespace_identity"] = receipt.namespace_identity
+
+    def _touch_locked(self, tag: str) -> None:
+        self._tags.pop(tag, None)
+        self._tags[tag] = None
+
+    def _evict_locked(self) -> None:
+        while len(self._tags) > self._max_requests:
+            evicted, _ = self._tags.popitem(last=False)
+            for key in [key for key in self._rows if key[0] == evicted]:
+                del self._rows[key]
+            self._contexts.pop(evicted, None)
+            self._events.pop(evicted, None)
+            self._seen_events = {
+                event for event in self._seen_events if event[0] != evicted
+            }
+            self.evicted_requests += 1
 
     def record(
         self,
@@ -409,6 +483,42 @@ class RawBlockIoAttribution:
                     # avoid.
                     self.untagged_operations += 1
                     continue
+                required = (
+                    "device_instance_id",
+                    "operation_id",
+                    "attempt",
+                    "direction",
+                    "path",
+                )
+                has_identity = all(str(row.get(field, "")) for field in required)
+                if not has_identity:
+                    self.malformed_rows += 1
+                else:
+                    normalized = {
+                        "device_instance_id": str(row["device_instance_id"]),
+                        "batch_id": str(row.get("batch_id", "")),
+                        "operation_id": int(row["operation_id"]),
+                        "attempt": int(row["attempt"]),
+                        "direction": str(row["direction"]),
+                        "path": str(row["path"]),
+                        "outcome": outcome,
+                        "bytes": int(row.get("bytes", 0) or 0),
+                    }
+                    event_key = (
+                        tag,
+                        normalized["device_instance_id"],
+                        normalized["operation_id"],
+                        normalized["attempt"],
+                        normalized["direction"],
+                        normalized["path"],
+                        normalized["outcome"],
+                        normalized["bytes"],
+                    )
+                    if event_key in self._seen_events:
+                        self.duplicate_rows += 1
+                        continue
+                    self._seen_events.add(event_key)
+                    self._events.setdefault(tag, []).append(normalized)
                 key = (tag, str(row.get("direction", "")), str(row.get("path", "")))
                 counts = self._rows.get(key)
                 if counts is None:
@@ -418,13 +528,8 @@ class RawBlockIoAttribution:
                 counts[outcome] += 1
                 if outcome != "submitted":
                     counts["bytes"] += max(0, int(row.get("bytes", 0) or 0))
-                self._tags.pop(tag, None)
-                self._tags[tag] = None
-            while len(self._tags) > self._max_requests:
-                evicted, _ = self._tags.popitem(last=False)
-                for key in [key for key in self._rows if key[0] == evicted]:
-                    del self._rows[key]
-                self.evicted_requests += 1
+                self._touch_locked(tag)
+            self._evict_locked()
 
     def snapshot(self) -> dict[str, dict[str, int]]:
         """Every attributed row, keyed "request/direction/native-path"."""
@@ -454,18 +559,141 @@ class RawBlockIoAttribution:
 
     def as_payload(self) -> dict[str, Any]:
         """Everything a receipt needs, including what makes it incomplete."""
+        operation_join, join_failures = self.operation_join()
         return {
             "rows": self.snapshot(),
             "unanswered": self.unanswered(),
+            "contexts": self.contexts(),
+            "operations": operation_join,
+            "evidence_failures": join_failures,
             "untagged_operations": self.untagged_operations,
             "dropped_rows": self.dropped_rows,
             "evicted_requests": self.evicted_requests,
+            "malformed_rows": self.malformed_rows,
+            "duplicate_rows": self.duplicate_rows,
         }
 
+    def contexts(self) -> dict[str, dict[str, Any]]:
+        """Return the publication and restore identity for each native tag."""
+        with self._lock:
+            return {
+                tag: dict(context) for tag, context in sorted(self._contexts.items())
+            }
 
-def _io_tag(io_context: Optional[RawBlockIoContext]) -> str:
-    """The attribution one batch carries, or nothing when it has none."""
-    return io_context.tag() if io_context is not None else ""
+    def operation_join(self) -> tuple[list[dict[str, Any]], list[str]]:
+        """Join submissions to CQEs without turning short I/O into success."""
+        with self._lock:
+            events = {
+                tag: [dict(event) for event in rows]
+                for tag, rows in self._events.items()
+            }
+            counters = (
+                self.dropped_rows,
+                self.evicted_requests,
+                self.untagged_operations,
+                self.malformed_rows,
+                self.duplicate_rows,
+            )
+        failures: list[str] = []
+        labels = ("dropped", "evicted", "untagged", "malformed", "duplicate")
+        for label, count in zip(labels, counters, strict=True):
+            if count:
+                failures.append(f"{label}_rows={count}")
+        operations: list[dict[str, Any]] = []
+        grouped: dict[tuple[str, str, int, str, str], list[dict[str, Any]]] = {}
+        for tag, rows in events.items():
+            for event in rows:
+                key = (
+                    tag,
+                    event["device_instance_id"],
+                    event["operation_id"],
+                    event["direction"],
+                    event["path"],
+                )
+                grouped.setdefault(key, []).append(event)
+        for key, rows in sorted(grouped.items()):
+            tag, device, operation_id, direction, path = key
+            by_attempt: dict[int, list[dict[str, Any]]] = {}
+            for row in rows:
+                by_attempt.setdefault(row["attempt"], []).append(row)
+            op_failures: list[str] = []
+            completed_bytes = 0
+            requested_bytes = 0
+            attempts: list[dict[str, Any]] = []
+            attempt_numbers = sorted(by_attempt)
+            if attempt_numbers != list(range(len(attempt_numbers))):
+                op_failures.append("attempt_sequence_has_gaps")
+            for number in attempt_numbers:
+                attempt_rows = by_attempt[number]
+                submitted = [
+                    row for row in attempt_rows if row["outcome"] == "submitted"
+                ]
+                terminal = [
+                    row for row in attempt_rows if row["outcome"] != "submitted"
+                ]
+                if len(submitted) != 1:
+                    op_failures.append(
+                        f"attempt_{number}_has_{len(submitted)}_submissions"
+                    )
+                if len(terminal) != 1:
+                    op_failures.append(f"attempt_{number}_has_{len(terminal)}_cqes")
+                submitted_bytes = submitted[0]["bytes"] if len(submitted) == 1 else 0
+                if number == 0:
+                    requested_bytes = submitted_bytes
+                outcome = terminal[0]["outcome"] if len(terminal) == 1 else "unanswered"
+                terminal_bytes = terminal[0]["bytes"] if len(terminal) == 1 else 0
+                completed_bytes += max(0, terminal_bytes)
+                if outcome == "failed":
+                    op_failures.append(f"attempt_{number}_failed")
+                elif outcome == "completed" and terminal_bytes != submitted_bytes:
+                    op_failures.append(f"attempt_{number}_completion_size_mismatch")
+                elif outcome == "short":
+                    if path == "dmabuf_fixed":
+                        op_failures.append(f"attempt_{number}_short_dmabuf_is_terminal")
+                    elif number + 1 not in by_attempt:
+                        op_failures.append(f"attempt_{number}_short_has_no_remainder")
+                    elif len(submitted) == 1:
+                        next_submitted = [
+                            row
+                            for row in by_attempt[number + 1]
+                            if row["outcome"] == "submitted"
+                        ]
+                        remainder = submitted_bytes - max(0, terminal_bytes)
+                        if (
+                            len(next_submitted) != 1
+                            or next_submitted[0]["bytes"] != remainder
+                        ):
+                            op_failures.append(
+                                f"attempt_{number}_remainder_size_mismatch"
+                            )
+                attempts.append(
+                    {
+                        "attempt": number,
+                        "submitted_bytes": submitted_bytes,
+                        "outcome": outcome,
+                        "completed_bytes": max(0, terminal_bytes),
+                    }
+                )
+            if attempts and attempts[-1]["outcome"] != "completed":
+                op_failures.append("operation_has_no_final_completion")
+            if completed_bytes != requested_bytes:
+                op_failures.append("operation_byte_total_mismatch")
+            identity = f"{tag}/{device}/{operation_id}/{direction}/{path}"
+            failures.extend(f"{identity}: {failure}" for failure in op_failures)
+            operations.append(
+                {
+                    "request_tag": tag,
+                    "device_instance_id": device,
+                    "operation_id": operation_id,
+                    "direction": direction,
+                    "path": path,
+                    "requested_bytes": requested_bytes,
+                    "completed_bytes": completed_bytes,
+                    "attempts": attempts,
+                    "complete": not op_failures,
+                }
+            )
+        return operations, failures
 
 
 class RawBlockIoLedger:
@@ -850,6 +1078,11 @@ class RawBlockCoreConfig:
     # dma-buf io_uring path. This is used by correctness runs that must not
     # silently fall back to classic fixed or per-command mapped buffers.
     require_dmabuf_registration: bool = False
+    # Reclaim the oldest unlocked indexed extent when the bounded namespace
+    # is full. Shared-storage P/D enables this because its request leases say
+    # exactly when a reader can no longer be using an extent. Other users keep
+    # the historical explicit-delete behavior.
+    evict_unlocked_on_full: bool = False
     # Unique writer incarnation carried in every checkpoint. An empty value
     # creates a fresh UUID for a writer and is populated from checkpoints by a
     # reader.
@@ -925,6 +1158,9 @@ class RawBlockReadContext:
 
     request_id: str
     receipt: RawBlockPublicationReceipt
+    consumer_request_id: str = ""
+    restore_attempt_id: str = ""
+    adopted_checkpoint_seq: int = -1
 
 
 class RawBlockCore:
@@ -961,7 +1197,9 @@ class RawBlockCore:
     # it reads to validate. Named rather than left unattributed, because an
     # unnamed operation is a gap in a request's accounting and these are not
     # that -- they belong to no request, which is a different statement.
-    _metadata_io_context = RawBlockIoContext(request_id="<engine-metadata>")
+    _metadata_io_context = RawBlockIoContext(
+        request_id="<engine-metadata>", work_kind=IO_KIND_CHECKPOINT
+    )
     # The I/O ledger, declared on the class so it exists however the core
     # was built. Several tests construct one through __new__ without
     # running __init__, and accounting that only exists when the
@@ -1029,6 +1267,9 @@ class RawBlockCore:
         )
         self.require_dmabuf_registration = bool(
             getattr(config, "require_dmabuf_registration", False)
+        )
+        self.evict_unlocked_on_full = bool(
+            getattr(config, "evict_unlocked_on_full", False)
         )
         self._last_publish_ts: float = 0.0
         self._buffer_registration_mode = "none"
@@ -1199,6 +1440,9 @@ class RawBlockCore:
         # Reporting any one of these as "bytes written" overstates or
         # understates a different one.
         self._bytes_deduplicated = 0
+        self._capacity_evictions = 0
+        self._publication_protected_keys: dict[str, set[str]] = {}
+        self._publication_protection_refcnt: dict[str, int] = {}
         self._io_ledger_instance = RawBlockIoLedger()
         self._free_slots_by_placement_id: dict[int, dict[int, None]] = {}
         self._slot_placement_ids: dict[int, int] = {}
@@ -1611,6 +1855,17 @@ class RawBlockCore:
         with self._lock:
             return len(self._index)
 
+    def record_deduplicated_hits(self, encoded_keys: Sequence[str]) -> int:
+        """Count logical stores satisfied by existing physical extents."""
+        with self._lock:
+            reused = sum(
+                int(entry.size)
+                for encoded_key in encoded_keys
+                if (entry := self._index.get(encoded_key)) is not None
+            )
+            self._bytes_deduplicated += reused
+            return reused
+
     def snapshot_indexed_keys(self) -> list[str]:
         """Return a detached snapshot of encoded keys currently in the index."""
         with self._lock:
@@ -1979,6 +2234,35 @@ class RawBlockCore:
                     self._lock_refcnt.pop(encoded_key, None)
                 else:
                     self._lock_refcnt[encoded_key] = refcnt - 1
+
+    def protect_publication(
+        self,
+        request_id: str,
+        encoded_keys: Sequence[str],
+    ) -> None:
+        """Keep request keys out of replacement until publication pins them."""
+        if not request_id:
+            raise ValueError("publication protection requires a request id")
+        with self._lock:
+            protected = self._publication_protected_keys.setdefault(request_id, set())
+            for encoded_key in encoded_keys:
+                if encoded_key in protected:
+                    continue
+                protected.add(encoded_key)
+                self._publication_protection_refcnt[encoded_key] = (
+                    self._publication_protection_refcnt.get(encoded_key, 0) + 1
+                )
+
+    def release_publication_protection(self, request_id: str) -> None:
+        """Release pre-publication replacement protection for one request."""
+        with self._lock:
+            protected = self._publication_protected_keys.pop(request_id, set())
+            for encoded_key in protected:
+                refcnt = self._publication_protection_refcnt.get(encoded_key, 0)
+                if refcnt <= 1:
+                    self._publication_protection_refcnt.pop(encoded_key, None)
+                else:
+                    self._publication_protection_refcnt[encoded_key] = refcnt - 1
 
     def delete_many(
         self,
@@ -2432,6 +2716,20 @@ class RawBlockCore:
         if rows or dropped:
             self._io_attribution.record(rows, dropped)
 
+    def _io_tag(self, io_context: Optional[RawBlockIoContext]) -> str:
+        """Register and return the immutable identity carried to native I/O."""
+        if io_context is None:
+            return ""
+        return self._io_attribution.register_context(io_context)
+
+    def link_io_publication(
+        self,
+        request_id: str,
+        receipt: RawBlockPublicationReceipt,
+    ) -> None:
+        """Join payload operations to the receipt minted after they finish."""
+        self._io_attribution.link_publication(request_id, receipt)
+
     @property
     def _io_ledger(self) -> "RawBlockIoLedger":
         """This core's I/O ledger, created on first use."""
@@ -2471,9 +2769,13 @@ class RawBlockCore:
                 "locked_key_count": sum(
                     1 for refcnt in self._lock_refcnt.values() if refcnt > 0
                 ),
+                "publication_protected_key_count": len(
+                    self._publication_protection_refcnt
+                ),
                 "free_slot_count": len(self._free_slots),
                 "quarantined_slot_count": len(self._quarantined_slots or {}),
                 "bytes_deduplicated": self._bytes_deduplicated,
+                "capacity_evictions": self._capacity_evictions,
                 "payload_writes": payload_writes.as_payload(),
                 "payload_reads": payload_reads.as_payload(),
                 "io_by_kind_and_path": self._io_ledger.snapshot(),
@@ -2981,7 +3283,7 @@ class RawBlockCore:
             chunk_buffers,
             chunk_lens,
             chunk_placement_ids,
-            request_tag=_io_tag(io_context),
+            request_tag=self._io_tag(io_context),
         )
         completed = self._wait_iouring_results(
             raw_dev,
@@ -3093,7 +3395,7 @@ class RawBlockCore:
                 chunk_offsets,
                 chunk_buffers,
                 chunk_lens,
-                request_tag=_io_tag(io_context),
+                request_tag=self._io_tag(io_context),
             )
             chunk_results = self._wait_iouring_results(
                 raw_dev,
@@ -3212,7 +3514,7 @@ class RawBlockCore:
                 list(buffers),
                 [int(total_len) for total_len in total_lens],
                 per_write_placement_ids,
-                request_tag=_io_tag(io_context),
+                request_tag=self._io_tag(io_context),
             )
             completed = self._wait_iouring_results(
                 raw_dev,
@@ -3262,7 +3564,7 @@ class RawBlockCore:
                     int(payload_len),
                     int(total_len),
                     placement_id,
-                    request_tag=_io_tag(io_context),
+                    request_tag=self._io_tag(io_context),
                 )
             except BaseException:
                 self._adopt_native_poison(raw_dev, "io_uring write")
@@ -3348,7 +3650,7 @@ class RawBlockCore:
             [int(offset) for offset in offsets],
             list(buffers),
             [int(total_len) for total_len in total_lens],
-            request_tag=_io_tag(io_context),
+            request_tag=self._io_tag(io_context),
         )
         results = self._wait_iouring_results(
             raw_dev,
@@ -3976,7 +4278,45 @@ class RawBlockCore:
             self._next_slot += 1
             self._set_slot_placement_id_locked(slot, placement_id)
             return self._slot_to_offset(slot)
+        if self.evict_unlocked_on_full and self._reclaim_oldest_unlocked_slot_locked():
+            # Reclamation added exactly one known-safe slot to the normal free
+            # list. Allocate it through the regular path so FDP bookkeeping is
+            # updated in one place.
+            return self._allocate_slot_locked(placement_id)
         raise RuntimeError("No free slots available")
+
+    def _reclaim_oldest_unlocked_slot_locked(self) -> bool:
+        """Recycle one committed extent that no request lease protects.
+
+        Dict insertion order is the writer's commit order, giving bounded
+        FIFO replacement. A P/D request protects keys while it writes and
+        promotes that protection to locks before advertising its publication.
+        A read acknowledgement or exact unread-release message drops those
+        locks, so only an unprotected, unlocked extent may be reused.
+        """
+        victim_key = ""
+        victim_entry: Optional[_Entry] = None
+        for encoded_key, entry in self._index.items():
+            if self._lock_refcnt.get(encoded_key, 0) > 0:
+                continue
+            if self._publication_protection_refcnt.get(encoded_key, 0) > 0:
+                continue
+            if encoded_key in self._inflight:
+                continue
+            victim_key = encoded_key
+            victim_entry = entry
+            break
+        if victim_entry is None:
+            return False
+
+        del self._index[victim_key]
+        self._lock_refcnt.pop(victim_key, None)
+        self._release_submitted_slot_locked(
+            self._offset_to_slot(int(victim_entry.offset))
+        )
+        self._meta_dirty_total += 1
+        self._capacity_evictions += 1
+        return True
 
     def _append_free_slot_locked(self, slot: int) -> None:
         """Add a slot to the free list while ``self._lock`` is held."""

@@ -49,6 +49,9 @@ def _context(request_id: str) -> RawBlockReadContext:
             manifest_digest=request_id,
             namespace_identity="namespace-under-test",
         ),
+        consumer_request_id=f"consumer-{request_id}",
+        restore_attempt_id=f"attempt-{request_id}",
+        adopted_checkpoint_seq=9,
     )
 
 
@@ -155,9 +158,16 @@ def test_overlapping_restores_keep_the_request_that_issued_each_read(
     assert len(gpu_calls) == 2
     assert all("storage_pd_read_context" not in kwargs for kwargs in gpu_calls)
     assert sorted(context.tag() for context in seen) == [
-        "run-under-test/wire-a/r3/published-writer",
-        "run-under-test/wire-b/r3/published-writer",
+        "run-under-test/wire-a/r3/published-writer/aattempt-wire-a",
+        "run-under-test/wire-b/r3/published-writer/aattempt-wire-b",
     ]
+    assert {context.consumer_request_id for context in seen} == {
+        "consumer-wire-a",
+        "consumer-wire-b",
+    }
+    assert {context.checkpoint_seq for context in seen} == {7}
+    assert {context.manifest_digest for context in seen} == {"wire-a", "wire-b"}
+    assert {context.adopted_checkpoint_seq for context in seen} == {9}
 
 
 @pytest.mark.parametrize("context", [None, _context("wire-a")])

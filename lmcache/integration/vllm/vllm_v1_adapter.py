@@ -9,6 +9,7 @@ import math
 import os
 import sys
 import threading
+import uuid
 
 # Third Party
 from vllm.config import (
@@ -128,6 +129,37 @@ def extract_request_configs(sampling_params: SamplingParams) -> Optional[dict]:
     return extract_request_configs_from_sampling_params(sampling_params)
 
 
+def _extract_storage_pd_request(
+    kv_transfer_params: Any,
+    request_configs: Optional[dict],
+) -> tuple[Optional[list[dict[str, Any]]], Optional[str]]:
+    """Read storage-P/D fields across the supported vLLM request shapes.
+
+    Some vLLM releases expose ``kv_transfer_params`` on ``NewRequestData``;
+    others keep it only in ``sampling_params.extra_args``.  LMCache already
+    extracts the ``lmcache.*`` subset of the latter into ``request_configs``,
+    so merge both views instead of silently dropping the publication receipt
+    on versions that do not add the direct attribute.
+    """
+    params: dict[str, Any] = {}
+    if isinstance(request_configs, dict):
+        params.update(request_configs)
+    if isinstance(kv_transfer_params, dict):
+        params.update(kv_transfer_params)
+
+    raw_statuses = params.get("lmcache.storage_pd_statuses")
+    if raw_statuses is None:
+        return None, None
+    if not isinstance(raw_statuses, list) or not all(
+        isinstance(status, dict) for status in raw_statuses
+    ):
+        raise ValueError("lmcache.storage_pd_statuses must be a list of mappings")
+    raw_request_id = params.get("lmcache.storage_pd_request_id")
+    if not isinstance(raw_request_id, str) or not raw_request_id:
+        raise ValueError("lmcache.storage_pd_request_id must be a non-empty string")
+    return raw_statuses, raw_request_id
+
+
 @dataclass
 class RequestTracker:
     # Request id
@@ -218,24 +250,10 @@ class RequestTracker:
         mm_hashes, mm_positions = extract_mm_features(new_request, modify=True)
 
         kv_transfer_params = getattr(new_request, "kv_transfer_params", None)
-        storage_pd_statuses = None
-        storage_pd_request_id = None
-        if isinstance(kv_transfer_params, dict):
-            raw_statuses = kv_transfer_params.get("lmcache.storage_pd_statuses")
-            if raw_statuses is not None:
-                if not isinstance(raw_statuses, list) or not all(
-                    isinstance(status, dict) for status in raw_statuses
-                ):
-                    raise ValueError(
-                        "lmcache.storage_pd_statuses must be a list of mappings"
-                    )
-                storage_pd_statuses = raw_statuses
-                raw_request_id = kv_transfer_params.get("lmcache.storage_pd_request_id")
-                if not isinstance(raw_request_id, str) or not raw_request_id:
-                    raise ValueError(
-                        "lmcache.storage_pd_request_id must be a non-empty string"
-                    )
-                storage_pd_request_id = raw_request_id
+        storage_pd_statuses, storage_pd_request_id = _extract_storage_pd_request(
+            kv_transfer_params,
+            request_configs,
+        )
 
         return RequestTracker(
             req_id=new_request.req_id,
@@ -979,6 +997,8 @@ class LMCacheConnectorV1Impl:
                             RawBlockReadContext(
                                 adopted_publication[0].req_id,
                                 adopted_publication[0].publication_receipt(),
+                                consumer_request_id=request.req_id,
+                                restore_attempt_id=uuid.uuid4().hex,
                             )
                             if adopted_publication is not None
                             else None
