@@ -290,25 +290,38 @@ IO_PATH_IOURING_PER_WRITE = "iouring_per_write"
 
 @dataclass
 class RawBlockIoTally:
-    """One direction, one kind and one path, counted three ways.
+    """One direction, one kind and one path, counted at two granularities.
 
-    ``requested`` is what this engine asked the device for. ``completed``
-    is what the device reported finishing. They are kept apart because the
-    difference between them is the whole question: a submission with no
-    completion is an operation whose outcome nobody established.
+    A logical request is what a caller asked this engine to move. A
+    physical operation is one transfer handed to the device, and a route
+    that splits a request issues several for one of them -- so the two are
+    named apart rather than compared as though they were the same unit. The
+    bytes belong to the logical side, because a split does not move more of
+    them.
+
+    ``submitted`` is what this engine handed over; it is deliberately not
+    called "accepted", because whether the kernel took an entry is the
+    kernel's answer and not this count. ``completed`` is what the device
+    reported finishing successfully. The difference between those two is
+    the whole question: a submission with no completion is an operation
+    whose outcome nobody established.
     """
 
-    requested_operations: int = 0
-    requested_logical_bytes: int = 0
-    requested_padded_bytes: int = 0
+    logical_requests: int = 0
+    logical_bytes: int = 0
+    padded_bytes: int = 0
+    submitted_operations: int = 0
+    submitted_padded_bytes: int = 0
     completed_operations: int = 0
     completed_padded_bytes: int = 0
 
     def as_payload(self) -> dict[str, int]:
         return {
-            "requested_operations": self.requested_operations,
-            "requested_logical_bytes": self.requested_logical_bytes,
-            "requested_padded_bytes": self.requested_padded_bytes,
+            "logical_requests": self.logical_requests,
+            "logical_bytes": self.logical_bytes,
+            "padded_bytes": self.padded_bytes,
+            "submitted_operations": self.submitted_operations,
+            "submitted_padded_bytes": self.submitted_padded_bytes,
             "completed_operations": self.completed_operations,
             "completed_padded_bytes": self.completed_padded_bytes,
         }
@@ -335,7 +348,7 @@ class RawBlockIoLedger:
             self._tallies[key] = tally
         return tally
 
-    def requested(
+    def logical_request(
         self,
         direction: str,
         path: str,
@@ -343,15 +356,34 @@ class RawBlockIoLedger:
         payload_lens: Sequence[int],
         total_lens: Sequence[int],
     ) -> None:
-        """Record operations this engine asked the device to perform."""
+        """Record what a caller asked this engine to move, once per request."""
         with self._lock:
             for kind, payload_len, total_len in zip(
                 kinds, payload_lens, total_lens, strict=True
             ):
                 tally = self._tally_locked((direction, kind, path))
-                tally.requested_operations += 1
-                tally.requested_logical_bytes += int(payload_len)
-                tally.requested_padded_bytes += int(total_len)
+                tally.logical_requests += 1
+                tally.logical_bytes += int(payload_len)
+                tally.padded_bytes += int(total_len)
+
+    def submitted(
+        self,
+        direction: str,
+        path: str,
+        kinds: Sequence[str],
+        total_lens: Sequence[int],
+    ) -> None:
+        """Record physical operations handed to the device, one per transfer.
+
+        Counted at the granularity the device sees, which is what makes it
+        comparable with the completions. It says these were handed over; it
+        does not say the kernel took them, which is the kernel's answer.
+        """
+        with self._lock:
+            for kind, total_len in zip(kinds, total_lens, strict=True):
+                tally = self._tally_locked((direction, kind, path))
+                tally.submitted_operations += 1
+                tally.submitted_padded_bytes += int(total_len)
 
     def completed(
         self,
@@ -387,9 +419,11 @@ class RawBlockIoLedger:
                     continue
                 if kind and row_kind != kind:
                     continue
-                summed.requested_operations += tally.requested_operations
-                summed.requested_logical_bytes += tally.requested_logical_bytes
-                summed.requested_padded_bytes += tally.requested_padded_bytes
+                summed.logical_requests += tally.logical_requests
+                summed.logical_bytes += tally.logical_bytes
+                summed.padded_bytes += tally.padded_bytes
+                summed.submitted_operations += tally.submitted_operations
+                summed.submitted_padded_bytes += tally.submitted_padded_bytes
                 summed.completed_operations += tally.completed_operations
                 summed.completed_padded_bytes += tally.completed_padded_bytes
         return summed
@@ -1039,6 +1073,12 @@ class RawBlockCore:
                 self._load_checkpoint_from_device()
             else:
                 logger.info("RawBlockCore: skipping on-device metadata checkpoint load")
+                # Whether to *use* the index is a performance choice; whether
+                # this engine may write into this namespace at all is not.
+                # Skipping the load would otherwise open a namespace somebody
+                # else is writing, under a derivation whose keys this engine
+                # cannot read, as a fresh empty cache.
+                self._require_namespace_authority()
 
             if self.meta_enable_periodic and self.role == "writer":
                 self._meta_thread = threading.Thread(
@@ -2082,6 +2122,45 @@ class RawBlockCore:
         """
         return self._apply_loaded_state(data)
 
+    def _require_namespace_authority(self) -> None:
+        """Refuse a populated namespace this engine is not entitled to open.
+
+        Only asked where sharing is declared, and asked independently of
+        whether the index is loaded: a namespace that already holds another
+        engine's publication is not an empty cache, whatever this engine
+        intends to do with the index.
+
+        An unreadable or absent checkpoint is not an answer either way, so
+        it is left to the ordinary path: a device with nothing legible on it
+        is the one case that can follow normal initialization.
+        """
+        if self._derivation is None:
+            return
+        try:
+            header, payload = self._select_latest_checkpoint()
+        except Exception:
+            logger.warning(
+                "RawBlockCore could not read %s to establish whether it is "
+                "already in use",
+                self.device_path,
+            )
+            return
+        if header is None or payload is None:
+            return
+        try:
+            data = json.loads(payload.decode("utf-8"))
+        except Exception:
+            logger.warning(
+                "RawBlockCore could not decode the checkpoint on %s to "
+                "establish whether it is already in use",
+                self.device_path,
+            )
+            return
+        if not isinstance(data, dict):
+            return
+        self._require_matching_key_namespace(data.get("key_namespace"))
+        self._require_compatible_derivation(data.get("derivation"))
+
     def is_poisoned(self) -> bool:
         """Whether this core has stopped being able to say what the device did.
 
@@ -2576,7 +2655,7 @@ class RawBlockCore:
             field_name="placement_ids",
         )
         write_kinds = self._normalize_io_kinds(kinds, len(offsets))
-        self._io_ledger.requested(
+        self._io_ledger.logical_request(
             "write",
             IO_PATH_IOURING_BOUNDED,
             write_kinds,
@@ -2622,6 +2701,9 @@ class RawBlockCore:
 
         if not chunk_offsets:
             return
+        self._io_ledger.submitted(
+            "write", IO_PATH_IOURING_BOUNDED, chunk_kinds, chunk_lens
+        )
         batch_id = raw_dev.batched_write(
             chunk_offsets,
             chunk_buffers,
@@ -2676,7 +2758,7 @@ class RawBlockCore:
         copy_back_targets: dict[int, tuple[memoryview, memoryview, int]] = {}
         keepalive: list[Any] = []
         read_kinds = self._normalize_io_kinds(kinds, len(offsets))
-        self._io_ledger.requested(
+        self._io_ledger.logical_request(
             "read",
             IO_PATH_IOURING_BOUNDED,
             read_kinds,
@@ -2727,6 +2809,10 @@ class RawBlockCore:
         if not chunk_offsets:
             return results
 
+        chunk_kinds = [read_kinds[idx] for idx in chunk_logical_indices]
+        self._io_ledger.submitted(
+            "read", IO_PATH_IOURING_BOUNDED, chunk_kinds, chunk_lens
+        )
         try:
             batch_id = raw_dev.batched_read(
                 chunk_offsets,
@@ -2745,7 +2831,7 @@ class RawBlockCore:
         self._io_ledger.completed(
             "read",
             IO_PATH_IOURING_BOUNDED,
-            [read_kinds[idx] for idx in chunk_logical_indices],
+            chunk_kinds,
             chunk_lens,
             chunk_results,
         )
@@ -2799,9 +2885,10 @@ class RawBlockCore:
             # Recorded against the route that is about to run, so the row
             # names what carried the bytes. A synchronous write returning
             # is its completion: there is no separate reported outcome.
-            self._io_ledger.requested(
+            self._io_ledger.logical_request(
                 "write", IO_PATH_SYNC, write_kinds, payload_lens, total_lens
             )
+            self._io_ledger.submitted("write", IO_PATH_SYNC, write_kinds, total_lens)
             for offset, buf, payload_len, total_len, kind in zip(
                 offsets, buffers, payload_lens, total_lens, write_kinds, strict=True
             ):
@@ -2831,12 +2918,15 @@ class RawBlockCore:
         # write_uring, which takes both lengths and lets Rust build the aligned
         # padded transfer.
         if can_batch:
-            self._io_ledger.requested(
+            self._io_ledger.logical_request(
                 "write",
                 IO_PATH_IOURING_BATCHED,
                 write_kinds,
                 payload_lens,
                 total_lens,
+            )
+            self._io_ledger.submitted(
+                "write", IO_PATH_IOURING_BATCHED, write_kinds, total_lens
             )
             batch_id = raw_dev.batched_write(
                 [int(offset) for offset in offsets],
@@ -2866,12 +2956,15 @@ class RawBlockCore:
         # worker's verdict. Without it a padded O_DIRECT write that the
         # worker quarantined leaves the core healthy, and the extent it rolls
         # back is handed to the very next request.
-        self._io_ledger.requested(
+        self._io_ledger.logical_request(
             "write",
             IO_PATH_IOURING_PER_WRITE,
             write_kinds,
             payload_lens,
             total_lens,
+        )
+        self._io_ledger.submitted(
+            "write", IO_PATH_IOURING_PER_WRITE, write_kinds, total_lens
         )
         for offset, buf, payload_len, total_len, placement_id, kind in zip(
             offsets,
@@ -2926,9 +3019,10 @@ class RawBlockCore:
         raw_dev = self._rawdev()
         read_kinds = self._normalize_io_kinds(kinds, len(offsets))
         if self.io_engine != "io_uring":
-            self._io_ledger.requested(
+            self._io_ledger.logical_request(
                 "read", IO_PATH_SYNC, read_kinds, payload_lens, total_lens
             )
+            self._io_ledger.submitted("read", IO_PATH_SYNC, read_kinds, total_lens)
             results: list[bool] = []
             for offset, buf, payload_len, total_len, kind in zip(
                 offsets, buffers, payload_lens, total_lens, read_kinds, strict=True
@@ -2952,12 +3046,15 @@ class RawBlockCore:
                 read_kinds,
             )
 
-        self._io_ledger.requested(
+        self._io_ledger.logical_request(
             "read",
             IO_PATH_IOURING_BATCHED,
             read_kinds,
             payload_lens,
             total_lens,
+        )
+        self._io_ledger.submitted(
+            "read", IO_PATH_IOURING_BATCHED, read_kinds, total_lens
         )
         batch_id = raw_dev.batched_read(
             [int(offset) for offset in offsets],
@@ -3989,6 +4086,17 @@ class RawBlockCore:
             return False
         if int(data.get("version", 0)) != 1:
             return False
+
+        # Before any geometry check, because every one of those treats a
+        # mismatch as "ignore this metadata and start empty" -- which is
+        # right for a layout this engine cannot read and wrong here. A
+        # device someone else is writing with a different derivation, or
+        # under a different key namespace, is not empty: starting empty
+        # means allocating over their live extents while their checkpoint
+        # still advertises them. These raise rather than return False.
+        self._require_matching_key_namespace(data.get("key_namespace"))
+        self._require_compatible_derivation(data.get("derivation"))
+
         writer_epoch = data.get("writer_epoch", "")
         if not isinstance(writer_epoch, str):
             logger.warning("Device metadata writer_epoch is invalid; ignoring metadata")
@@ -4020,15 +4128,6 @@ class RawBlockCore:
         if int(data.get("meta_version", self.meta_version)) != self.meta_version:
             logger.warning("Device metadata meta_version mismatch; ignoring metadata")
             return False
-
-        # Deliberately raises, not "return False". Every check above treats a
-        # mismatch as "ignore this metadata and start empty", which is right
-        # for a geometry this engine cannot read and wrong for both of these:
-        # a device someone else is writing with a different derivation is not
-        # empty, and starting empty means allocating over their live extents
-        # while their checkpoint still advertises them.
-        self._require_matching_key_namespace(data.get("key_namespace"))
-        self._require_compatible_derivation(data.get("derivation"))
 
         try:
             next_slot = int(data.get("next_slot", 0))

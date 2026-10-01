@@ -652,3 +652,61 @@ def test_the_backend_refuses_a_process_whose_chain_root_moves(monkeypatch):
 
     with pytest.raises(ValueError, match="PYTHONHASHSEED"):
         backend._observed_key_derivation("object")
+
+
+def _bare_backend(**config_overrides):
+    """A backend with only what the derivation observer reads."""
+    # First Party
+    from lmcache.v1.storage_backend.plugins.rust_raw_block_backend import (
+        RustRawBlockBackend,
+    )
+
+    backend = RustRawBlockBackend.__new__(RustRawBlockBackend)
+    backend.config = LMCacheEngineConfig.from_defaults(
+        chunk_size=256, **config_overrides
+    )
+    backend.metadata = LMCacheMetadata(
+        model_name="m",
+        world_size=1,
+        local_world_size=1,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=torch.bfloat16,
+        kv_shape=(4, 2, 256, 8, 128),
+    )
+    return backend
+
+
+def test_a_derivation_that_cannot_be_resolved_is_refused(monkeypatch):
+    """Two engines that both failed to resolve anything are not in agreement.
+
+    Recording "unresolved" makes those two descriptors match, and each then
+    reads the other's keys on the strength of it -- which is agreement
+    between two fallbacks, not agreement about how keys are built.
+    """
+    # First Party
+    from lmcache.v1 import token_database as token_database_module
+
+    def _refuses_to_build(self, *args, **kwargs):
+        raise RuntimeError("the installed hash provider is broken")
+
+    monkeypatch.setattr(
+        token_database_module.ChunkedTokenDatabase,
+        "__init__",
+        _refuses_to_build,
+    )
+
+    with pytest.raises(ValueError, match="could not be resolved"):
+        _bare_backend()._observed_key_derivation("object")
+
+
+def test_a_derivation_with_no_named_algorithm_is_refused():
+    """A descriptor has to say what the keys were derived with.
+
+    An empty algorithm matches another engine's empty algorithm, which says
+    only that neither of them was configured.
+    """
+    backend = _bare_backend(pre_caching_hash_algorithm="")
+
+    with pytest.raises(ValueError, match="must name the algorithm"):
+        backend._observed_key_derivation("object")

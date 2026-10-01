@@ -24,6 +24,7 @@ import pytest
 # First Party
 from lmcache.v1.memory_management import MemoryObj, TensorMemoryObj
 from lmcache.v1.storage_backend.raw_block import (
+    IncompatibleKeyDerivation,
     NativeQuiescence,
     RawBlockCore,
     RawBlockCoreConfig,
@@ -2037,19 +2038,19 @@ def test_raw_block_core_counts_payload_apart_from_metadata(tmp_path):
 
         status = core.report_status()
         writes = status["payload_writes"]
-        assert writes["requested_operations"] == 1
-        assert writes["requested_logical_bytes"] == len(payload)
+        assert writes["logical_requests"] == 1
+        assert writes["logical_bytes"] == len(payload)
         # Padding to the block size means more reached the device than the
         # caller handed over, which is why these are separate.
-        assert writes["requested_padded_bytes"] >= len(payload)
+        assert writes["padded_bytes"] >= len(payload)
         assert writes["completed_operations"] == 1
-        assert writes["completed_padded_bytes"] == writes["requested_padded_bytes"]
+        assert writes["completed_padded_bytes"] == writes["padded_bytes"]
 
         rows = status["io_by_kind_and_path"]
         header_rows = [name for name in rows if "slot_header" in name]
         assert header_rows, "the header this put wrote is counted somewhere"
         for name in header_rows:
-            assert rows[name]["requested_operations"] >= 1
+            assert rows[name]["logical_requests"] >= 1
         assert not any("payload" in name and "read" in name for name in rows), (
             "nothing has been read yet"
         )
@@ -2077,8 +2078,8 @@ def test_raw_block_core_counts_a_read_and_says_which_path_ran(tmp_path):
 
         status = core.report_status()
         reads = status["payload_reads"]
-        assert reads["requested_operations"] == 1
-        assert reads["requested_logical_bytes"] == len(payload)
+        assert reads["logical_requests"] == 1
+        assert reads["logical_bytes"] == len(payload)
         assert reads["completed_operations"] == 1
         assert reads["completed_padded_bytes"] > 0
 
@@ -2447,11 +2448,11 @@ def test_raw_block_core_counts_the_padded_write_route_it_actually_took(tmp_path)
         rows = status["io_by_kind_and_path"]
         assert "write/payload/iouring_per_write" in rows, sorted(rows)
         row = rows["write/payload/iouring_per_write"]
-        assert row["requested_operations"] == 1
-        assert row["requested_logical_bytes"] == len(payload)
-        assert row["requested_padded_bytes"] > len(payload), "the write was padded"
+        assert row["logical_requests"] == 1
+        assert row["logical_bytes"] == len(payload)
+        assert row["padded_bytes"] > len(payload), "the write was padded"
         assert row["completed_operations"] == 1
-        assert row["completed_padded_bytes"] == row["requested_padded_bytes"]
+        assert row["completed_padded_bytes"] == row["padded_bytes"]
 
         writes = status["payload_writes"]
         assert writes["completed_padded_bytes"] == row["completed_padded_bytes"]
@@ -2473,7 +2474,10 @@ def test_raw_block_io_ledger_totals_are_exact_under_concurrency():
 
     def _hammer() -> None:
         for _ in range(per_writer):
-            ledger.requested("write", IO_PATH_IOURING_BATCHED, ["payload"], [7], [8])
+            ledger.logical_request(
+                "write", IO_PATH_IOURING_BATCHED, ["payload"], [7], [8]
+            )
+            ledger.submitted("write", IO_PATH_IOURING_BATCHED, ["payload"], [8])
             ledger.completed("write", IO_PATH_IOURING_BATCHED, ["payload"], [8], [True])
 
     threads = [threading.Thread(target=_hammer) for _ in range(writers)]
@@ -2484,9 +2488,11 @@ def test_raw_block_io_ledger_totals_are_exact_under_concurrency():
         assert not thread.is_alive()
 
     total = ledger.totals(direction="write", kind="payload")
-    assert total.requested_operations == writers * per_writer
-    assert total.requested_logical_bytes == writers * per_writer * 7
-    assert total.requested_padded_bytes == writers * per_writer * 8
+    assert total.logical_requests == writers * per_writer
+    assert total.logical_bytes == writers * per_writer * 7
+    assert total.padded_bytes == writers * per_writer * 8
+    assert total.submitted_operations == writers * per_writer
+    assert total.submitted_padded_bytes == writers * per_writer * 8
     assert total.completed_operations == writers * per_writer
     assert total.completed_padded_bytes == writers * per_writer * 8
 
@@ -2705,3 +2711,130 @@ def test_a_strict_engine_refuses_a_native_build_it_cannot_ask(tmp_path) -> None:
     with patch.dict(sys.modules, {"lmcache_rust_raw_block_io": stub}):
         with pytest.raises(RuntimeError, match="cannot report whether anything"):
             core._rawdev()
+
+
+def test_a_populated_namespace_is_refused_before_its_geometry_is_judged(
+    tmp_path,
+) -> None:
+    """A device another engine is writing is not an empty cache.
+
+    Every layout check answers a mismatch with "ignore this metadata and
+    start empty", which is right for a geometry this engine cannot read. It
+    is wrong ahead of the derivation contract: starting empty means
+    allocating over live extents while the other engine's checkpoint still
+    advertises them. So the contract is checked first, and it raises.
+    """
+    path = make_raw_block_file(tmp_path)
+    theirs = replace(
+        make_raw_block_core_config(path),
+        derivation=make_test_derivation(),
+    )
+    writer = RawBlockCore(theirs, key_namespace="object")
+    try:
+        key = encode_object_key(make_object_key(95))
+        assert writer.put_many([key], [make_memory_obj(b"k" * 512)]).results == [True]
+        assert writer.publish_index() is True
+    finally:
+        writer.close()
+
+    # Same device, a different derivation, and a slot geometry this engine
+    # would otherwise reject on its way past the contract.
+    mine = replace(
+        make_raw_block_core_config(path),
+        derivation=replace(
+            make_test_derivation(), hash_implementation="somebody.elses.hash"
+        ),
+        slot_bytes=make_raw_block_core_config(path).slot_bytes * 2,
+    )
+    with pytest.raises(IncompatibleKeyDerivation, match="derives keys differently"):
+        RawBlockCore(mine, key_namespace="object")
+
+
+def test_skipping_the_index_load_does_not_skip_the_namespace_contract(
+    tmp_path,
+) -> None:
+    """Whether to use the index is a choice; whether to write here is not.
+
+    ``load_checkpoint_on_init=false`` says this engine does not need the
+    device's index. It does not say the device is unused, and opening
+    somebody else's populated namespace as a fresh empty cache allocates
+    over extents their checkpoint still advertises.
+    """
+    path = make_raw_block_file(tmp_path)
+    theirs = replace(
+        make_raw_block_core_config(path),
+        derivation=make_test_derivation(),
+    )
+    writer = RawBlockCore(theirs, key_namespace="object")
+    try:
+        key = encode_object_key(make_object_key(96))
+        assert writer.put_many([key], [make_memory_obj(b"l" * 512)]).results == [True]
+        assert writer.publish_index() is True
+    finally:
+        writer.close()
+
+    mine = replace(
+        make_raw_block_core_config(path),
+        derivation=replace(
+            make_test_derivation(), hash_implementation="somebody.elses.hash"
+        ),
+        load_checkpoint_on_init=False,
+    )
+    with pytest.raises(IncompatibleKeyDerivation, match="derives keys differently"):
+        RawBlockCore(mine, key_namespace="object")
+
+
+def test_an_empty_namespace_still_opens_without_its_index(tmp_path) -> None:
+    """The one case that may follow normal initialization.
+
+    A device with nothing legible on it is not somebody else's, so refusing
+    it would refuse every first start.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(
+        make_raw_block_core_config(path),
+        derivation=make_test_derivation(),
+        load_checkpoint_on_init=False,
+    )
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        key = encode_object_key(make_object_key(97))
+        assert core.put_many([key], [make_memory_obj(b"m" * 512)]).results == [True]
+    finally:
+        core.close()
+
+
+def test_the_ledger_counts_logical_requests_apart_from_submissions(tmp_path) -> None:
+    """One request split into two transfers is one request and two transfers.
+
+    Counting both in one field read as duplicate device I/O for a payload
+    that was written once: 1 requested, 2 completed, same bytes. The units
+    are named apart so a reader can see a route that splits without
+    concluding anything about how much moved -- and so a physical operation
+    with no completion is visible as the gap it is.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(
+        make_raw_block_core_config(path),
+        io_engine="io_uring",
+        max_data_transfer_size=4096,
+    )
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        key = encode_object_key(make_object_key(98))
+        payload = b"n" * 8192
+        assert core.put_many([key], [make_memory_obj(payload)]).results == [True]
+
+        rows = core.report_status()["io_by_kind_and_path"]
+        row = rows["write/payload/iouring_bounded"]
+
+        assert row["logical_requests"] == 1
+        assert row["submitted_operations"] == 2
+        assert row["completed_operations"] == 2
+        # And the bytes belong to the logical side: a split moves no more
+        # of them.
+        assert row["logical_bytes"] == len(payload)
+        assert row["submitted_padded_bytes"] == row["padded_bytes"]
+        assert row["completed_padded_bytes"] == row["padded_bytes"]
+    finally:
+        core.close()

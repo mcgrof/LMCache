@@ -1227,14 +1227,17 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         in one process refuse each other. That is refused here, with the
         variable named, rather than written to a device for a reader to
         discover as a mismatch.
+
+        A derivation that cannot be established is refused for the same
+        reason. Recording "unresolved" would let two engines that both
+        failed to resolve anything match each other and read each other's
+        keys, which is agreement between two fallbacks rather than
+        agreement about how keys are built.
         """
         # First Party
         from lmcache.v1 import token_database as token_database_module
 
         requested = str(getattr(self.config, "pre_caching_hash_algorithm", "") or "")
-        implementation = "unresolved"
-        first_root = str(token_database_module.NONE_HASH)
-        second_root = first_root
         try:
             database = token_database_module.ChunkedTokenDatabase(
                 self.config, self.metadata
@@ -1247,11 +1250,20 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             first_root = str(token_database_module.NONE_HASH)
             token_database_module.ChunkedTokenDatabase(self.config, self.metadata)
             second_root = str(token_database_module.NONE_HASH)
-        except Exception:
-            logger.warning(
-                "Raw-block storage P/D could not resolve the effective hash "
-                "function; recording it as unresolved, which will not match "
-                "an engine that did resolve one"
+        except Exception as exc:
+            raise ValueError(
+                "raw-block storage P/D cannot describe this process's key "
+                "derivation: the effective hash function could not be "
+                f"resolved ({exc}). Two engines that both failed to resolve "
+                "one would record the same unresolved marker and read each "
+                "other's keys on the strength of it."
+            ) from exc
+        if not requested:
+            raise ValueError(
+                "raw-block storage P/D publishes keys for another engine to "
+                "read, so it must name the algorithm they are derived with; "
+                "set pre_caching_hash_algorithm (sha256_cbor) on every node "
+                "that shares this namespace"
             )
         if first_root != second_root:
             raise ValueError(
