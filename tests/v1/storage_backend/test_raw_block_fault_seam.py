@@ -749,3 +749,58 @@ def test_a_synchronous_write_owns_its_request_until_it_is_answered(tmp_path) -> 
     assert len(report["owned_while_writing"]) == 1
     assert report["owned_after"] == [], "the answer retired the request"
     assert report["violations"] == []
+
+
+SCRIPTED_WITHHELD_READ = SCRIPTED_PREAMBLE + textwrap.dedent(
+    """
+    dev = device()
+
+    class Destination(bytearray):
+        pass
+
+    # A read's destination is the buffer the device writes *into*. A
+    # completion that never arrives leaves the device possibly still
+    # writing there, which is the same unknown as a write -- and the one
+    # that matters more, because the destination is a pool slice an
+    # allocator would otherwise hand to the next request.
+    destination = Destination(b"\\x00" * 4096)
+    alive = weakref.ref(destination)
+    dev.batched_read([0], [destination], [4096])
+    assert wait_until(lambda: bool(dev.fake_owned()))
+    report = {"owned_before_close": dev.fake_owned()}
+    del destination
+    gc.collect()
+    try:
+        dev.close()
+        report["close"] = "returned"
+    except BaseException as exc:
+        report["close"] = type(exc).__name__
+    report["retained"] = dev.retained_owner_count()
+    report["violations"] = dev.fake_violations()
+    del dev
+    gc.collect()
+    report["destination_alive_after_close_and_drop"] = alive() is not None
+    print(json.dumps(report))
+    """
+)
+
+
+def test_a_read_nobody_answered_for_keeps_its_destination(tmp_path) -> None:
+    """A read's destination is where the device writes, and it is a pool slice.
+
+    A withheld write completion leaves bytes possibly still leaving a
+    buffer; a withheld *read* completion leaves bytes possibly still
+    arriving in one. The second is the worse of the two, because the
+    destination goes back to an allocator that hands it to the next
+    request -- which then reads whatever the device finished writing there.
+    """
+    device = tmp_path / "dev.bin"
+    with open(device, "wb") as handle:
+        handle.truncate(16 * 1024 * 1024)
+    report = _run_scenario(SCRIPTED_WITHHELD_READ, device)
+
+    assert len(report["owned_before_close"]) == 1, report
+    assert report["close"] == "RuntimeError"
+    assert report["retained"] == 1
+    assert report["destination_alive_after_close_and_drop"] is True
+    assert report["violations"] == []
