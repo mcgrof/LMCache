@@ -52,7 +52,6 @@ def _free_port() -> int:
 def _ack(req_id: str = "request-1", **overrides) -> StoragePDReadAck:
     fields = {
         "req_id": req_id,
-        "producer_instance_id": "producer-1",
         "consumer_instance_id": "consumer-1",
         "tp_rank": 0,
         "writer_epoch": "writer-1",
@@ -84,7 +83,7 @@ class _Writer:
             if self.raise_in_handler:
                 raise OSError("the writer could not reach its device")
             ack = request.ack
-            if ack.producer_instance_id != "producer-1":
+            if ack.writer_epoch != "writer-1":
                 return ACK_REJECTED, "not this writer"
             if ack.consumer_instance_id != "consumer-1":
                 return ACK_REJECTED, "not the bound consumer"
@@ -247,7 +246,7 @@ def test_a_writer_that_arrives_late_is_still_reached(client, writer):
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"producer_instance_id": "someone-else"},
+        {"writer_epoch": "someone-else"},
         {"consumer_instance_id": "a-restarted-consumer"},
         {"manifest_digest": "someone-elses-digest"},
         {"req_id": "a-request-that-was-never-published"},
@@ -441,7 +440,7 @@ def test_a_reply_about_something_else_is_not_an_answer(client):
                             StoragePDAckReply(
                                 outcome=ACK_APPLIED,
                                 req_id=request.ack.req_id,
-                                producer_instance_id=(request.ack.producer_instance_id),
+                                writer_epoch=request.ack.writer_epoch,
                                 consumer_instance_id=(request.ack.consumer_instance_id),
                                 nonce="a-nonce-from-another-attempt",
                             )
@@ -454,7 +453,7 @@ def test_a_reply_about_something_else_is_not_an_answer(client):
                         StoragePDAckReply(
                             outcome=ACK_APPLIED,
                             req_id=request.ack.req_id,
-                            producer_instance_id=request.ack.producer_instance_id,
+                            writer_epoch=request.ack.writer_epoch,
                             consumer_instance_id=request.ack.consumer_instance_id,
                             nonce=request.nonce,
                         )

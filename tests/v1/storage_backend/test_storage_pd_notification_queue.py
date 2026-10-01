@@ -79,7 +79,6 @@ class _Clock:
 def _status(req_id: str) -> StoragePDStatus:
     return StoragePDStatus(
         req_id=req_id,
-        producer_instance_id="producer",
         tp_rank=0,
         state="READY",
     )

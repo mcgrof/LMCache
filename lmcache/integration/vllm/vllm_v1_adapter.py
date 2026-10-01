@@ -1086,14 +1086,9 @@ class LMCacheConnectorV1Impl:
                 req_id,
             )
             return
-        ack = StoragePDReadAck(
-            req_id=status.req_id,
-            producer_instance_id=status.producer_instance_id,
+        ack = StoragePDReadAck.for_status(
+            status,
             consumer_instance_id=STORAGE_PD_INCARNATION,
-            tp_rank=self._storage_pd_tp_rank,
-            writer_epoch=status.writer_epoch,
-            checkpoint_seq=status.checkpoint_seq,
-            manifest_digest=status.manifest_digest,
         )
         obligation = client.owe(
             ack,
@@ -1799,9 +1794,11 @@ class LMCacheConnectorV1Impl:
                 if req_id not in self._storage_pd_obligations:
                     wire_req_id = self._storage_pd_wire_req_ids.get(req_id, req_id)
                     if req_id in self._storage_pd_aborted:
+                        # No writer epoch: this request published nothing,
+                        # so there is no producer incarnation holding extents
+                        # for it and nothing an acknowledgement could name.
                         status = StoragePDStatus(
                             req_id=wire_req_id,
-                            producer_instance_id=STORAGE_PD_INCARNATION,
                             tp_rank=self._storage_pd_tp_rank,
                             state=self._storage_pd_terminal_states.get(
                                 req_id, "FAILED"

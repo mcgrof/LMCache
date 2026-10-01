@@ -81,7 +81,6 @@ class ReadAckIdentity:
     """
 
     req_id: str
-    producer_instance_id: str
     consumer_instance_id: str
     tp_rank: int
     writer_epoch: str
@@ -454,7 +453,7 @@ class RawBlockPDRequestTracker:
         self,
         identity: ReadAckIdentity,
         *,
-        expected_producer_instance_id: str,
+        expected_writer_epoch: str,
         expected_tp_rank: int,
         session_id: str = "",
     ) -> ReadAckOutcome:
@@ -465,23 +464,37 @@ class RawBlockPDRequestTracker:
         extent is reclaimable -- a relay may carry an acknowledgement and
         may check it, and neither makes it true.
 
-        ``expected_producer_instance_id`` and ``expected_tp_rank`` are the
-        caller's own identity. Comparing an acknowledgement against fields
-        it supplied itself would check nothing, so they arrive separately
-        from the message.
+        ``expected_writer_epoch`` and ``expected_tp_rank`` are the caller's
+        own identity. Comparing an acknowledgement against fields it
+        supplied itself would check nothing, so they arrive separately from
+        the message. The writer epoch is the producer incarnation: an engine
+        mints one when it is built and never takes another's, so a message
+        naming a different epoch is addressed to a different producer even
+        when it reaches this socket.
 
         ``APPLIED`` is returned only after the release returned. A caller
         may treat it as proof that this hold is gone; it may treat nothing
         else that way.
         """
         with self._lock:
-            if identity.producer_instance_id != expected_producer_instance_id:
+            if not expected_writer_epoch:
+                # An engine with no epoch published nothing, so it holds
+                # nothing an acknowledgement could release. Matching an
+                # empty name against an empty name would accept every
+                # message that arrived with the field unset.
+                logger.error(
+                    "Raw-block P/D read ack for %s reached an engine with "
+                    "no writer epoch; releasing nothing",
+                    identity.req_id,
+                )
+                return ReadAckOutcome.REJECTED
+            if identity.writer_epoch != expected_writer_epoch:
                 logger.error(
                     "Raw-block P/D read ack for %s names producer %s, but "
                     "this writer is %s; releasing nothing",
                     identity.req_id,
-                    identity.producer_instance_id,
-                    expected_producer_instance_id,
+                    identity.writer_epoch,
+                    expected_writer_epoch,
                 )
                 return ReadAckOutcome.REJECTED
             if identity.tp_rank != expected_tp_rank:

@@ -42,9 +42,6 @@ from lmcache.v1.storage_backend.storage_pd_ack import (
     StoragePDAckRequest,
     StoragePDAckServer,
 )
-from lmcache.v1.storage_backend.storage_pd_protocol import (
-    STORAGE_PD_INCARNATION,
-)
 
 if TYPE_CHECKING:
     # Standard
@@ -1313,14 +1310,13 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         outcome = self._pd_tracker.apply_read_ack(
             ReadAckIdentity(
                 req_id=ack.req_id,
-                producer_instance_id=ack.producer_instance_id,
                 consumer_instance_id=ack.consumer_instance_id,
                 tp_rank=ack.tp_rank,
                 writer_epoch=ack.writer_epoch,
                 checkpoint_seq=ack.checkpoint_seq,
                 manifest_digest=ack.manifest_digest,
             ),
-            expected_producer_instance_id=STORAGE_PD_INCARNATION,
+            expected_writer_epoch=self._core.writer_epoch,
             expected_tp_rank=self._ack_tp_rank,
             session_id=request.session_id,
         )

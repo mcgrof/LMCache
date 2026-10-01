@@ -85,7 +85,7 @@ class StoragePDAckReply(msgspec.Struct, tag=True):
 
     outcome: str
     req_id: str
-    producer_instance_id: str
+    writer_epoch: str
     consumer_instance_id: str
     nonce: str
     reason: str = ""
@@ -209,7 +209,7 @@ class StoragePDAckServer:
                 StoragePDAckReply(
                     outcome=ACK_REJECTED,
                     req_id="",
-                    producer_instance_id="",
+                    writer_epoch="",
                     consumer_instance_id="",
                     nonce="",
                     reason="undecodable request",
@@ -221,7 +221,7 @@ class StoragePDAckServer:
                 StoragePDAckReply(
                     outcome=ACK_REJECTED,
                     req_id="",
-                    producer_instance_id="",
+                    writer_epoch="",
                     consumer_instance_id="",
                     nonce="",
                     reason=f"expected a request, got a {type(message).__name__}",
@@ -242,7 +242,7 @@ class StoragePDAckServer:
             StoragePDAckReply(
                 outcome=outcome,
                 req_id=message.ack.req_id,
-                producer_instance_id=message.ack.producer_instance_id,
+                writer_epoch=message.ack.writer_epoch,
                 consumer_instance_id=message.ack.consumer_instance_id,
                 nonce=message.nonce,
                 reason=reason,
@@ -585,6 +585,6 @@ class StoragePDAckClient:
         return (
             reply.nonce == request.nonce
             and reply.req_id == request.ack.req_id
-            and reply.producer_instance_id == request.ack.producer_instance_id
+            and reply.writer_epoch == request.ack.writer_epoch
             and reply.consumer_instance_id == request.ack.consumer_instance_id
         )

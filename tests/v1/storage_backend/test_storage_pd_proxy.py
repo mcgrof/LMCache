@@ -319,7 +319,6 @@ def test_a_status_for_an_unknown_request_is_ignored() -> None:
 
     failure = StoragePDStatus(
         req_id="never-seen",
-        producer_instance_id="pid:1",
         tp_rank=0,
         state="FAILED",
         error_stage="WRITE_OR_PUBLISH",

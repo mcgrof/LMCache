@@ -44,7 +44,6 @@ def test_storage_pd_ready_status_round_trip_through_pd_union() -> None:
 def test_storage_pd_failure_cannot_be_converted_to_a_receipt() -> None:
     status = StoragePDStatus(
         req_id="request",
-        producer_instance_id="producer",
         tp_rank=0,
         state="FAILED",
         error_stage="WRITE",

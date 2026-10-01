@@ -626,7 +626,7 @@ def record_storage_pd_status(msg: StoragePDStatus) -> str:
     if previous is not None and previous != msg:
         app.state.storage_pd_failures[req_id] = StoragePDStatus(
             req_id=req_id,
-            producer_instance_id=msg.producer_instance_id,
+            writer_epoch=msg.writer_epoch,
             tp_rank=msg.tp_rank,
             state="FAILED",
             error_stage="PROXY_BARRIER",

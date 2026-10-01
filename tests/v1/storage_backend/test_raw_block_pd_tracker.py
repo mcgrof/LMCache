@@ -552,7 +552,6 @@ def _ack(
 ) -> ReadAckOutcome:
     fields: dict[str, object] = {
         "req_id": "request-1",
-        "producer_instance_id": "producer-1",
         "consumer_instance_id": "consumer-1",
         "tp_rank": 0,
         "writer_epoch": "writer-1",
@@ -560,14 +559,12 @@ def _ack(
         "manifest_digest": "digest",
     }
     expected_rank = int(overrides.pop("expected_tp_rank", 0))  # type: ignore[call-overload]
-    expected_producer = str(
-        overrides.pop("expected_producer_instance_id", "producer-1")
-    )
+    expected_epoch = str(overrides.pop("expected_writer_epoch", "writer-1"))
     session = str(overrides.pop("session_id", "session-1"))
     fields.update(overrides)
     return tracker.apply_read_ack(
         ReadAckIdentity(**fields),  # type: ignore[arg-type]
-        expected_producer_instance_id=expected_producer,
+        expected_writer_epoch=expected_epoch,
         expected_tp_rank=expected_rank,
         session_id=session,
     )
@@ -670,10 +667,7 @@ def test_tracker_refuses_an_acknowledgement_naming_another_producer() -> None:
     tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
     try:
         _published_lease(core, tracker)
-        assert (
-            _ack(tracker, producer_instance_id="somebody-else")
-            is ReadAckOutcome.REJECTED
-        )
+        assert _ack(tracker, writer_epoch="somebody-else") is ReadAckOutcome.REJECTED
         assert core.leased == ["key-1"]
         assert tracker.live_lease_count() == 1
     finally:

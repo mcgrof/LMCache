@@ -1813,6 +1813,17 @@ class RawBlockCore:
                 self._last_publish_ts = now
             return written
 
+    @property
+    def writer_epoch(self) -> str:
+        """This engine's producer incarnation.
+
+        A writer mints one when it is constructed and keeps it for life; a
+        reader adopts the epoch of the checkpoint it loaded, which names
+        somebody else's publication and so is not an identity this engine
+        can be addressed by. Empty where there is none.
+        """
+        return self._writer_epoch if self.role == "writer" else ""
+
     def publish_request(
         self, encoded_keys: Sequence[str]
     ) -> RawBlockPublicationReceipt:

@@ -29,14 +29,17 @@ logger = init_logger(__name__)
 
 StoragePDState = Literal["READY", "FAILED", "CANCELLED"]
 
-# This process's identity for the storage handoff. A PID alone is not one:
-# the operating system reuses it, so an acknowledgement from a previous
+# This process's identity as a *consumer* of a handoff. A PID alone is not
+# one: the operating system reuses it, so an acknowledgement from a previous
 # occupant of this PID would name a lease the current occupant holds. The
 # random half makes each start distinguishable from every other.
 #
-# It lives here rather than in the vLLM connector because both ends of the
-# handoff need it: the connector puts it on the wire, and the storage
-# backend has to compare an arriving acknowledgement against it.
+# A producer is not named by this. Its identity is the writer epoch of the
+# engine that published, which is what the extents are keyed by and what the
+# writer compares an arriving acknowledgement against. A process identity
+# would be coarser than the thing being released -- two engines in one
+# process share it -- and keeping a second producer name in play is how the
+# two ends came to disagree about what a producer is.
 STORAGE_PD_INCARNATION = f"pid:{os.getpid()}:{uuid.uuid4().hex[:12]}"
 
 
@@ -44,9 +47,13 @@ class StoragePDStatus(msgspec.Struct, tag=True):
     """Terminal producer status for one request and tensor-parallel rank."""
 
     req_id: str
-    producer_instance_id: str
     tp_rank: int
     state: StoragePDState
+    # The producer incarnation that holds the extents this status names, and
+    # the publication generation they belong to: one field, because they are
+    # one thing. A writer mints this when it is constructed and never adopts
+    # another engine's, so an acknowledgement naming it names this writer and
+    # no other. Empty on a status that published nothing.
     writer_epoch: str = ""
     namespace_identity: str = ""
     checkpoint_seq: int = 0
@@ -71,7 +78,6 @@ class StoragePDStatus(msgspec.Struct, tag=True):
         """Build a READY status from a durable publication receipt."""
         return cls(
             req_id=req_id,
-            producer_instance_id=receipt.writer_epoch,
             tp_rank=tp_rank,
             state="READY",
             writer_epoch=receipt.writer_epoch,
@@ -104,12 +110,46 @@ class StoragePDReadAck(msgspec.Struct, tag=True):
     """Consumer acknowledgement after the advertised KV reached GPU memory."""
 
     req_id: str
-    producer_instance_id: str
     consumer_instance_id: str
     tp_rank: int
+    # Which producer this is addressed to. Taken from the adopted status, so
+    # a consumer never invents it, and compared by the writer against its own
+    # epoch before anything is looked up.
     writer_epoch: str
     checkpoint_seq: int
     manifest_digest: str
+
+    @classmethod
+    def for_status(
+        cls,
+        status: "StoragePDStatus",
+        *,
+        consumer_instance_id: str,
+    ) -> "StoragePDReadAck":
+        """Build the acknowledgement an adopted READY status is owed.
+
+        Every correlating field comes from the status the producer sent, so
+        a consumer never names a producer, a generation or a manifest of its
+        own invention -- and the two ends cannot drift into disagreeing about
+        what identifies a producer, because only one of them chooses.
+        """
+        if status.state != "READY":
+            raise ValueError(f"storage P/D status is not READY: {status.state}")
+        if not status.writer_epoch:
+            raise ValueError(
+                "storage P/D READY status names no producer; nothing can "
+                "acknowledge a publication whose writer is unidentified"
+            )
+        if not consumer_instance_id:
+            raise ValueError("storage P/D acknowledgements need a consumer identity")
+        return cls(
+            req_id=status.req_id,
+            consumer_instance_id=consumer_instance_id,
+            tp_rank=status.tp_rank,
+            writer_epoch=status.writer_epoch,
+            checkpoint_seq=status.checkpoint_seq,
+            manifest_digest=status.manifest_digest,
+        )
 
 
 # What travels to the proxy. The acknowledgement does not: it goes straight
