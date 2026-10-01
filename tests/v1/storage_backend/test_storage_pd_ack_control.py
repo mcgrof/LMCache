@@ -17,6 +17,7 @@ question being asked must be discarded rather than accepted as its answer.
 from __future__ import annotations
 
 # Standard
+from types import SimpleNamespace
 from typing import Optional
 import socket as socketlib
 import threading
@@ -28,6 +29,7 @@ import pytest
 import zmq
 
 # First Party
+from lmcache.v1.storage_backend import storage_pd_ack as ack_module
 from lmcache.v1.storage_backend.storage_pd_ack import (
     ACK_ALREADY_APPLIED,
     ACK_APPLIED,
@@ -716,3 +718,46 @@ def test_an_attempt_does_not_outspend_its_obligation(client, monkeypatch):
     client._attempt(obligation)
 
     assert spent and spent[0] <= 50
+
+
+@pytest.mark.parametrize("send_elapsed_s", [0.08, 0.12])
+def test_send_and_receive_share_one_attempt_budget(
+    client: StoragePDAckClient,
+    monkeypatch: pytest.MonkeyPatch,
+    send_elapsed_s: float,
+) -> None:
+    """Spend time waiting to send before computing the receive timeout."""
+    now = [10.0]
+    received_with: list[int] = []
+
+    class Socket:
+        def __init__(self) -> None:
+            self.options: dict[int, int] = {}
+            self.closed = False
+
+        def setsockopt(self, option: int, value: int) -> None:
+            self.options[option] = value
+
+        def send(self, raw: bytes) -> None:
+            now[0] += send_elapsed_s
+
+        def recv(self) -> bytes:
+            received_with.append(self.options[zmq.RCVTIMEO])
+            raise zmq.Again()
+
+        def close(self, *, linger: int) -> None:
+            self.closed = True
+
+    transport = Socket()
+    monkeypatch.setattr(ack_module, "get_zmq_socket", lambda *args: transport)
+    monkeypatch.setattr(ack_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    request = StoragePDAckRequest(_ack(), "session-1", 1, "nonce")
+
+    assert client._exchange("127.0.0.1:5999", request, timeout_ms=100) is None
+
+    assert transport.closed
+    if send_elapsed_s < 0.1:
+        assert len(received_with) == 1
+        assert 0 < received_with[0] <= 20
+    else:
+        assert not received_with, "an expired attempt must not start another wait"

@@ -872,6 +872,7 @@ class StoragePDAckClient:
         )
         attempt = request.attempt if isinstance(request, StoragePDAckRequest) else 1
         budget_ms = self._attempt_timeout_ms if timeout_ms is None else timeout_ms
+        deadline = time.monotonic() + budget_ms / 1000.0
         socket = None
         try:
             socket = get_zmq_socket(
@@ -882,9 +883,15 @@ class StoragePDAckClient:
                 "connect",
             )
             socket.setsockopt(zmq.LINGER, 0)
-            socket.setsockopt(zmq.RCVTIMEO, budget_ms)
-            socket.setsockopt(zmq.SNDTIMEO, budget_ms)
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                return None
+            socket.setsockopt(zmq.SNDTIMEO, remaining_ms)
             socket.send(msgspec.msgpack.encode(request))
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                return None
+            socket.setsockopt(zmq.RCVTIMEO, remaining_ms)
             raw = socket.recv()
         except zmq.Again:
             logger.warning(
