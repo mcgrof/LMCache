@@ -648,3 +648,104 @@ def test_the_scripted_ring_refuses_a_completion_it_does_not_hold(tmp_path) -> No
     assert report["refused"] is True
     assert "does not hold" in report["reason"]
     assert len(report["violations"]) == 1
+
+
+SCRIPTED_RETRYABLE_THEN_WITHHELD = SCRIPTED_PREAMBLE + textwrap.dedent(
+    """
+    dev = device()
+    payload = bytearray(b"x" * 4096)
+
+    # A submit that reports EAGAIN takes nothing, so the entry is still
+    # resident and still the worker's. The worker retries, the retry lands,
+    # and then the completion is withheld -- which is a different thing
+    # again from a submit that failed.
+    dev.fake_submit_fails(11)
+    dev.batched_write([0], [payload], [4096], [None])
+    assert wait_until(lambda: bool(dev.fake_owned())), dev.fake_resident()
+    owned = dev.fake_owned()
+    report = {
+        "owned_after_the_retry": owned,
+        "resident_after_the_retry": dev.fake_resident(),
+        "poisoned_before_close": dev.is_poisoned(),
+    }
+    try:
+        dev.close()
+        report["close"] = "returned"
+    except BaseException as exc:
+        report["close"] = type(exc).__name__
+    report["violations"] = dev.fake_violations()
+    print(json.dumps(report))
+    """
+)
+
+
+SCRIPTED_SYNCHRONOUS_WRITE = SCRIPTED_PREAMBLE + textwrap.dedent(
+    """
+    import threading
+
+    dev = device()
+    payload = bytearray(b"x" * 8192)
+    done = {}
+
+    def answer_it():
+        # The synchronous route waits inside the call, so its completion has
+        # to come from somewhere else.
+        assert wait_until(lambda: bool(dev.fake_owned()))
+        held = dev.fake_owned()
+        done["owned"] = held
+        dev.fake_complete(held[0], 4096)
+
+    answering = threading.Thread(target=answer_it)
+    answering.start()
+    dev.write_uring(0, payload, 4095, 4096, None)
+    answering.join(timeout=10)
+    print(json.dumps({
+        "owned_while_writing": done.get("owned"),
+        "owned_after": dev.fake_owned(),
+        "violations": dev.fake_violations(),
+    }))
+    """
+)
+
+
+def test_a_retryable_submit_leaves_the_entry_ours_and_then_lands(tmp_path) -> None:
+    """Three different states, told apart.
+
+    A submit reporting EAGAIN took nothing, so the entry is resident and
+    still the worker's. The retry hands it to the kernel. The completion
+    then never arrives, which is neither of the first two: the kernel holds
+    it, and the close has to refuse rather than conclude anything.
+    """
+    device = tmp_path / "dev.bin"
+    with open(device, "wb") as handle:
+        handle.truncate(16 * 1024 * 1024)
+    report = _run_scenario(SCRIPTED_RETRYABLE_THEN_WITHHELD, device)
+
+    assert len(report["owned_after_the_retry"]) == 1, report
+    assert report["resident_after_the_retry"] == [], (
+        "the retry handed it over; nothing should still be waiting to go"
+    )
+    assert report["poisoned_before_close"] is False, (
+        "a retryable submit is not an unknown outcome"
+    )
+    assert report["close"] == "RuntimeError"
+    assert report["violations"] == []
+
+
+def test_a_synchronous_write_owns_its_request_until_it_is_answered(tmp_path) -> None:
+    """The route that waits inside the call reaches the ring too.
+
+    A padded O_DIRECT payload cannot be expressed as one batched length, so
+    it goes one write at a time and waits for its own completion. That route
+    has no batch to poll, which is exactly why its ownership had to be
+    checked against a ring that can be asked what it holds.
+    """
+    device = tmp_path / "dev.bin"
+    with open(device, "wb") as handle:
+        handle.truncate(16 * 1024 * 1024)
+    report = _run_scenario(SCRIPTED_SYNCHRONOUS_WRITE, device)
+
+    assert report["owned_while_writing"] is not None, report
+    assert len(report["owned_while_writing"]) == 1
+    assert report["owned_after"] == [], "the answer retired the request"
+    assert report["violations"] == []
