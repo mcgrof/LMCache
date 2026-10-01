@@ -134,6 +134,7 @@ def _make_storage_pd_connector() -> LMCacheConnectorV1Impl:
     connector._storage_pd_receipts = {}
     connector._storage_pd_obligations = {}
     connector._storage_pd_acks_sent = OrderedDict()
+    connector._storage_pd_claims = OrderedDict()
     connector._storage_pd_ack_client = None
     connector._storage_pd_session_id = "session-1"
     connector._storage_pd_ack_deadline_s = 10.0
@@ -480,11 +481,21 @@ def test_storage_pd_read_ack_carries_the_published_request_identity() -> None:
     """
 
     class Client:
+        """A client that grants everything and records what it was asked."""
+
         def __init__(self) -> None:
             self.owed: list[tuple] = []
+            self.claimed: list[tuple] = []
 
-        def owe(self, ack, *, endpoint, session_id, deadline_s):
-            self.owed.append((ack, endpoint, session_id, deadline_s))
+        def reserve(self, *, endpoint):
+            return SimpleNamespace(endpoint=endpoint, release=lambda: None)
+
+        def claim(self, ack, *, endpoint, session_id):
+            self.claimed.append((ack, endpoint, session_id))
+            return True
+
+        def owe(self, ack, *, endpoint, session_id, deadline_s, reservation):
+            self.owed.append((ack, endpoint, session_id, deadline_s, reservation))
             return object()
 
     connector = _make_storage_pd_connector()
@@ -495,10 +506,19 @@ def test_storage_pd_read_ack_carries_the_published_request_identity() -> None:
     )
     status = StoragePDStatus.ready("proxy-uuid", 0, receipt)
 
+    # The claim comes first, and carries the same published identity: it is
+    # what the producer records the reader against, before any bytes move.
+    connector._claim_storage_pd_read(status)
+    assert len(client.claimed) == 1
+    claimed_ack, claimed_endpoint, claimed_session = client.claimed[0]
+    assert claimed_ack.req_id == "proxy-uuid"
+    assert claimed_endpoint == "127.0.0.1:5999"
+    assert claimed_session == "session-1"
+
     connector._ack_storage_pd_restore("cmpl-internal-0", status)
 
     assert len(client.owed) == 1
-    ack, endpoint, session_id, deadline_s = client.owed[0]
+    ack, endpoint, session_id, deadline_s, _reservation = client.owed[0]
     assert ack.req_id == "proxy-uuid"
     assert ack.writer_epoch == "writer-epoch"
     assert ack.checkpoint_seq == 7
@@ -512,21 +532,71 @@ def test_storage_pd_read_ack_carries_the_published_request_identity() -> None:
     connector._ack_storage_pd_restore("cmpl-internal-0", status)
     assert len(client.owed) == 1
 
+    # And the claim is the same identity the acknowledgement carries, so
+    # the producer matches one against the other rather than against two
+    # names it has to keep in step.
+    assert claimed_ack == ack
 
-def test_storage_pd_a_refused_obligation_is_not_recorded_as_owed() -> None:
-    """A consumer that could not take one on has not acknowledged anything.
 
-    Recording it as sent would make the next restore of the same request
-    skip it, so the hold would never be asked about again.
+def test_storage_pd_a_consumer_with_no_room_does_not_read() -> None:
+    """Room to acknowledge is taken before the read, or there is no read.
+
+    Reading first and discovering afterwards that there is no room leaves
+    the producer holding extents for a read that did happen, and nothing
+    guarantees a later restore of the same request will come along to try
+    again. So the refusal lands on the restore.
+    """
+
+    class FullClient:
+        def __init__(self) -> None:
+            self.asked = 0
+            self.claimed = 0
+
+        def reserve(self, *, endpoint):
+            self.asked += 1
+            return None
+
+        def claim(self, ack, *, endpoint, session_id):
+            self.claimed += 1
+            return True
+
+    connector = _make_storage_pd_connector()
+    client = FullClient()
+    connector._storage_pd_ack_client = client  # type: ignore[assignment]
+    receipt = RawBlockPublicationReceipt(
+        "writer-epoch", 7, 1, "digest", ack_endpoint="127.0.0.1:5999"
+    )
+    status = StoragePDStatus.ready("proxy-uuid", 0, receipt)
+
+    with pytest.raises(RuntimeError, match="no room to acknowledge"):
+        connector._claim_storage_pd_read(status)
+
+    # Nothing was claimed, so the producer recorded no reader for it.
+    assert client.asked == 1
+    assert client.claimed == 0
+    assert "proxy-uuid" not in connector._storage_pd_claims
+
+
+def test_storage_pd_a_refused_claim_stops_the_restore() -> None:
+    """A producer that did not grant the read is not read from.
+
+    The extents belong to reads another consumer incarnation made, and the
+    acknowledgement this consumer would owe for them would be refused --
+    so the restore does not happen and the publication is left as it was.
     """
 
     class RefusingClient:
         def __init__(self) -> None:
-            self.asked = 0
+            self.released = 0
 
-        def owe(self, ack, *, endpoint, session_id, deadline_s):
-            self.asked += 1
-            return None
+        def reserve(self, *, endpoint):
+            return SimpleNamespace(endpoint=endpoint, release=self._count_release)
+
+        def _count_release(self) -> None:
+            self.released += 1
+
+        def claim(self, ack, *, endpoint, session_id):
+            return False
 
     connector = _make_storage_pd_connector()
     client = RefusingClient()
@@ -536,11 +606,12 @@ def test_storage_pd_a_refused_obligation_is_not_recorded_as_owed() -> None:
     )
     status = StoragePDStatus.ready("proxy-uuid", 0, receipt)
 
-    connector._ack_storage_pd_restore("cmpl-internal-0", status)
-    assert "cmpl-internal-0" not in connector._storage_pd_acks_sent
+    with pytest.raises(RuntimeError, match="did not grant"):
+        connector._claim_storage_pd_read(status)
 
-    connector._ack_storage_pd_restore("cmpl-internal-0", status)
-    assert client.asked == 2
+    # The room taken for a read that will not happen is given back.
+    assert client.released == 1
+    assert "proxy-uuid" not in connector._storage_pd_claims
 
 
 def test_storage_pd_releasing_a_request_clears_its_state() -> None:
