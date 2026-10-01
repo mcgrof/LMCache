@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 # Standard
+from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from typing import Any
 
@@ -611,6 +612,55 @@ def _claimed_lease(
     else:
         _published_lease_named(core, tracker, req_id)
     assert _claim(tracker, **overrides).granted
+
+
+@pytest.mark.parametrize("release_raises", [False, True])
+def test_tracker_refuses_a_read_after_an_unread_release_starts(
+    release_raises: bool,
+) -> None:
+    """Keep a lease being released unavailable to new readers."""
+    release_started = Event()
+    finish_release = Event()
+
+    class ReleasingCore(_FakeCore):
+        def unlock_many(self, encoded_keys: list[str]) -> None:
+            release_started.set()
+            if not finish_release.wait(timeout=5):
+                raise TimeoutError("test release gate timed out")
+            super().unlock_many(encoded_keys)
+
+    core = ReleasingCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    try:
+        core.allow_publish.set()
+        receipt = tracker.register_batch(
+            "request-1",
+            ["key-1"],
+            expected_chunks=1,
+            is_last_batch=True,
+            completed_keys=["key-1"],
+        ).result(timeout=1)
+        core.unlock_raises = release_raises
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            release = executor.submit(
+                tracker.release_unread,
+                "request-1",
+                receipt,
+                expected_writer_epoch="writer-1",
+            )
+            try:
+                assert release_started.wait(timeout=1)
+                claim = _claim(tracker)
+                assert not claim.granted
+                assert tracker.bound_consumer("session-1") is None
+            finally:
+                finish_release.set()
+            outcome = release.result(timeout=1)
+        assert outcome.released is not release_raises
+        assert not _claim(tracker).granted
+    finally:
+        finish_release.set()
+        tracker.close()
 
 
 def test_tracker_releases_an_extent_on_a_matching_acknowledgement() -> None:

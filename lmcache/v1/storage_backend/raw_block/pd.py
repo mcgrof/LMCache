@@ -577,6 +577,11 @@ class RawBlockPDRequestTracker:
                 return ReadClaimOutcome(
                     False, "this writer published a different manifest"
                 )
+            if lease.unlock_ran:
+                # Release runs outside this lock and can fail after dropping
+                # some holds. Neither an in-progress nor an unanswered
+                # release leaves a publication safe for a new reader.
+                return ReadClaimOutcome(False, "this publication is being released")
 
             bound = self._bound_consumer.get(session_id)
             if bound is None:
