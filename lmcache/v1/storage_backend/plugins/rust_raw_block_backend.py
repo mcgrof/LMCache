@@ -1052,19 +1052,20 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             obj.ref_count_up()
             pending.append((key, spec, obj))
 
-        terminal = self._pd_tracker.register_batch(
-            req_id,
-            encoded_keys,
-            expected_chunks=expected_chunks,
-            is_last_batch=is_last_batch,
-            completed_keys=completed_keys,
-        )
+        try:
+            terminal = self._pd_tracker.register_batch(
+                req_id,
+                encoded_keys,
+                expected_chunks=expected_chunks,
+                is_last_batch=is_last_batch,
+                completed_keys=completed_keys,
+            )
+        except BaseException:
+            self._release_unscheduled_puts(pending)
+            raise
 
         if conflict is not None or terminal.done():
-            for key, _spec, obj in pending:
-                obj.ref_count_down()
-                with self._put_lock:
-                    self._put_tasks.discard(key)
+            self._release_unscheduled_puts(pending)
             if conflict is not None:
                 self._pd_tracker.fail_request(
                     req_id,
@@ -1100,6 +1101,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
 
         loop = self.loop
         if loop is None:
+            self._release_unscheduled_puts(pending)
             self._pd_tracker.fail_request(
                 req_id,
                 RuntimeError("RustRawBlockBackend requires an asyncio event loop"),
@@ -1110,12 +1112,19 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             asyncio.run_coroutine_threadsafe(coro, loop)
         except Exception as exc:
             coro.close()
-            for key, _spec, obj in pending:
-                obj.ref_count_down()
-                with self._put_lock:
-                    self._put_tasks.discard(key)
+            self._release_unscheduled_puts(pending)
             self._pd_tracker.fail_request(req_id, exc)
         return [terminal]
+
+    def _release_unscheduled_puts(
+        self,
+        pending: Sequence[tuple[CacheEngineKey, RawBlockKeySpec, MemoryObj]],
+    ) -> None:
+        """Return references and admission slots for work never scheduled."""
+        for key, _spec, obj in pending:
+            obj.ref_count_down()
+            with self._put_lock:
+                self._put_tasks.discard(key)
 
     async def _submit_pd_put_many(
         self,

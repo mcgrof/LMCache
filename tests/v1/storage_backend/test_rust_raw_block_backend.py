@@ -3207,3 +3207,58 @@ def test_rust_raw_block_backend_sizes_slots_without_a_cpu_tier(
             assert local_cpu.get_full_chunk_size_bytes() == expected_chunk
         finally:
             backend.close()
+
+
+@pytest.mark.parametrize("failure", ["lease_capacity", "missing_loop"])
+def test_storage_pd_refusal_returns_unscheduled_buffers(
+    monkeypatch: pytest.MonkeyPatch,
+    loop_in_thread: asyncio.AbstractEventLoop,
+    failure: str,
+) -> None:
+    """Return staging references when no write can reach the event loop."""
+    # Standard
+    from types import SimpleNamespace
+
+    # First Party
+    from lmcache.v1.storage_backend.raw_block import RawBlockPDRequestTracker
+
+    _install_fake_raw_block_device(monkeypatch, size_bytes=64 * 1024 * 1024)
+    allocator = AdHocMemoryAllocator(device="cpu")
+    backend = _make_raw_block_backend(
+        "/tmp/plugin-pd-refusal", allocator, loop_in_thread
+    )
+    # Exercise the storage-P/D admission path with the ordinary backend's
+    # fake device; key derivation and registration are not used by this test.
+    backend._storage_pd_mode = True
+    backend._pd_tracker = RawBlockPDRequestTracker(backend._core, max_live_leases=1)
+    key = CacheEngineKey("test_model", 1, 0, 2003, torch.bfloat16)
+    obj = allocator.allocate(
+        [torch.Size([2, 16, 8, 128])], [torch.bfloat16], fmt=MemoryFormat.KV_T2D
+    )
+    assert obj is not None
+    before = obj.get_ref_count()
+    transfer = SimpleNamespace(req_id="refused", total_chunks=1, is_last_prefill=True)
+    try:
+        if failure == "lease_capacity":
+            backend._pd_tracker.register_batch(
+                "existing", ["key-existing"], expected_chunks=2, is_last_batch=False
+            )
+            with pytest.raises(RuntimeError, match="at its bound"):
+                backend.batched_submit_put_task([key], [obj], transfer)
+        else:
+            backend.loop = None
+            futures = backend.batched_submit_put_task([key], [obj], transfer)
+            assert futures is not None
+            with pytest.raises(RuntimeError, match="requires an asyncio event loop"):
+                futures[0].result(timeout=5)
+        assert obj.get_ref_count() == before
+        assert not backend.exists_in_put_tasks(key)
+        assert not backend.contains(key)
+    finally:
+        # No I/O was scheduled in either refusal. Release test-owned state
+        # even when a broken implementation leaves its staging hold behind.
+        while obj.get_ref_count() > before:
+            obj.ref_count_down()
+        backend._put_tasks.discard(key)
+        obj.ref_count_down()
+        backend.close()
