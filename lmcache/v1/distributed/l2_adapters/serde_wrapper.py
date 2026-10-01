@@ -70,6 +70,7 @@ from lmcache.v1.distributed.serde import (
 )
 from lmcache.v1.distributed.serde.multi import GroupSlotView, MemoryObjGroup
 from lmcache.v1.distributed.storage_placement import (
+    ComponentKeyScheme,
     SplitTierManifest,
     SplitTierState,
     StoragePlacementMode,
@@ -621,6 +622,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         serde: SerdeProcessor,
         l1_manager: L1Manager,
         placement_mode: StoragePlacementMode = StoragePlacementMode.KV_TOGETHER,
+        component_key_scheme: ComponentKeyScheme = ComponentKeyScheme.COMPUTED_LEGACY,
         split_tier_manifest: SplitTierManifest | None = None,
         v_scratch_max_slots: int = 64,
         k_child_max_slots: int = 256,
@@ -630,6 +632,12 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         self._serde = serde
         self._l1_manager = l1_manager
         self._placement_mode = placement_mode
+        # Per-engine child-key scheme.  Every K/V child-key derivation in
+        # this wrapper (store, load, lookup, unlock, mask, evict) uses this
+        # single constant so all lifecycle ops address the SAME L2 object;
+        # a byte-through (RAW_UNIT) engine tags both children distinctly
+        # from a scale-aware (COMPUTED_LEGACY) engine so they never collide.
+        self._component_key_scheme = component_key_scheme
         # Always constructed; empty + unused when placement is
         # KV_TOGETHER.  When KV_SPLIT_TIER, the wrapper drives the
         # state-machine transitions on this manifest during store
@@ -638,9 +646,25 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         # __len__, so an empty manifest is falsy and `or` would
         # silently mint a fresh local manifest instead of using the
         # caller-provided one.  The bug bit pod testing.
+        # A fallback-minted manifest MUST carry the same scheme, or its
+        # K-child side-set records a different key than the wrapper's.
         self._split_tier_manifest = (
-            SplitTierManifest() if split_tier_manifest is None else split_tier_manifest
+            SplitTierManifest(component_key_scheme=component_key_scheme)
+            if split_tier_manifest is None
+            else split_tier_manifest
         )
+        # A caller-supplied manifest MUST agree with this wrapper's scheme,
+        # or the manifest's is_k_child_key side-set records a different key
+        # than the wrapper allocates -- the K child then leaks to L2.  Fail
+        # closed (ValueError, not assert: -O would strip an assert).
+        if self._split_tier_manifest.component_key_scheme != self._component_key_scheme:
+            raise ValueError(
+                "SerdeL2AdapterWrapper: component_key_scheme "
+                f"{self._component_key_scheme.name} disagrees with the "
+                "supplied split_tier_manifest's scheme "
+                f"{self._split_tier_manifest.component_key_scheme.name}; one "
+                "engine is single-scheme -- both must match."
+            )
 
         # Bounded thread pool for per-key K-byte copies in
         # _alloc_split_tier_children.  torch copy_ releases the GIL, so a
@@ -946,7 +970,10 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         children are addressable.
         """
         if self._placement_mode == StoragePlacementMode.KV_SPLIT_TIER:
-            v_child_keys = [derive_component_key(k, "v") for k in keys]
+            v_child_keys = [
+                derive_component_key(k, "v", scheme=self._component_key_scheme)
+                for k in keys
+            ]
             task_id = self._inner.submit_lookup_and_lock_task(
                 v_child_keys, group_layout_descs
             )
@@ -983,7 +1010,11 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
             if self._split_tier_manifest.is_complete(logical_key):
                 continue
             result.clear(i)
-            masked_v_children.append(derive_component_key(logical_key, "v"))
+            masked_v_children.append(
+                derive_component_key(
+                    logical_key, "v", scheme=self._component_key_scheme
+                )
+            )
         if masked_v_children:
             logger.info(
                 "Serde wrapper split-tier lookup: masked %d V hit(s) "
@@ -1011,7 +1042,12 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
 
     def submit_unlock(self, keys: list[ObjectKey]) -> None:
         if self._placement_mode == StoragePlacementMode.KV_SPLIT_TIER:
-            self._inner.submit_unlock([derive_component_key(k, "v") for k in keys])
+            self._inner.submit_unlock(
+                [
+                    derive_component_key(k, "v", scheme=self._component_key_scheme)
+                    for k in keys
+                ]
+            )
             return
         self._inner.submit_unlock(keys)
 
@@ -1050,8 +1086,14 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
         k_child_keys: list[ObjectKey] = []
         v_child_keys: list[ObjectKey] = []
         if is_split_tier:
-            k_child_keys = [derive_component_key(k, "k") for k in keys]
-            v_child_keys = [derive_component_key(k, "v") for k in keys]
+            k_child_keys = [
+                derive_component_key(k, "k", scheme=self._component_key_scheme)
+                for k in keys
+            ]
+            v_child_keys = [
+                derive_component_key(k, "v", scheme=self._component_key_scheme)
+                for k in keys
+            ]
 
         temp_keys, temp_objs = self._alloc_temp_buffers(keys, objects)
         if temp_objs is None:
@@ -1648,8 +1690,17 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
             )
             return [], [], {}
 
-        k_child_keys = [derive_component_key(k, "k") for k in keys]
-        v_child_keys = [derive_component_key(k, "v") for k in keys]
+        # C path tags BOTH children with the engine scheme: a byte-through
+        # (RAW_UNIT) K child and V child are distinct from a scale-aware
+        # engine's, so B and C never share an L1 K-child or L2 V-child key.
+        k_child_keys = [
+            derive_component_key(k, "k", scheme=self._component_key_scheme)
+            for k in keys
+        ]
+        v_child_keys = [
+            derive_component_key(k, "v", scheme=self._component_key_scheme)
+            for k in keys
+        ]
 
         # K-only layout descriptor (group 0 of the staging object).
         k_layout = MemoryLayoutDesc(
@@ -2058,7 +2109,10 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
             # whose cleanup fence we acquired; a superseding generation is
             # never touched.  Best-effort: adapter failures leave tolerable
             # cold-tier waste, but the manifest still fails closed.
-            v_child_keys = [derive_component_key(k, "v") for k in owned_keys]
+            v_child_keys = [
+                derive_component_key(k, "v", scheme=self._component_key_scheme)
+                for k in owned_keys
+            ]
             try:
                 self._inner.delete(v_child_keys)
             except Exception:
@@ -2076,7 +2130,10 @@ class SerdeL2AdapterWrapper(L2AdapterInterface, EarlyReleaseStoreAdapter):
                     },
                 )
             )
-        owned_k_children = [derive_component_key(k, "k") for k in owned_keys]
+        owned_k_children = [
+            derive_component_key(k, "k", scheme=self._component_key_scheme)
+            for k in owned_keys
+        ]
         self._release_split_tier_k_children(owned_k_children)
         for logical_key in owned_keys:
             generation = state.split_tier_generations.get(logical_key)

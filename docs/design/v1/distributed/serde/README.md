@@ -16,8 +16,9 @@ or controllers — it just defines:
   a thread pool and signaling an eventfd on completion.
 - A factory / registration mechanism so adapters can reference a serde
   by name (`{"type": "fp8", ...}` in JSON config).
-- Built-in serdes including **fp8 quantization** and the two-slot
-  ``asym_k16_v8`` K/V codec.
+- An additive multi-output contract for independently typed K/V slots and
+  split-tier placement.
+- Built-ins for fp8, TurboQuant, AES-GCM, and asymmetric K16/V8 storage.
 
 How the async interface is actually plugged into the L2 path lives in
 [`docs/design/v1/distributed/l2_adapters/serde_wrapper.md`][wrapper-doc]
@@ -39,6 +40,7 @@ lmcache/v1/distributed/serde/
   key_provider.py     # KeyProvider / HkdfKeyProvider for aesgcm
   multi.py            # MultiSerializer / MultiDeserializer (tuple-shaped
                       # extension; see "Multi-output extension" below)
+  asym_k16_v8.py      # scale-aware and byte-through K16/V8 serdes
   utils.py            # serialized_layout_desc, make_temp_key
 ```
 
@@ -149,9 +151,9 @@ Wraps any `(Serializer, Deserializer)` pair. Internal design:
 
 **Why a pool, not an asyncio executor:** the CPU-bound fp8 / encryption
 transforms release the GIL under torch / native calls, so a real
-thread pool is useful. Each factory documents its own default and accepts
-`max_workers`; a larger value increases transform concurrency and should be
-tuned to the host's CPU budget.
+thread pool is useful. `N=1` is a safe default (one in-flight
+transform at a time), and the fp8 factory accepts `max_workers` to
+bump it.
 
 ## Factory / Registration
 
@@ -177,11 +179,32 @@ rejects duplicate names, matching the pattern already used by
 `register_l2_adapter_type`. Omit `size_contract` only when the serializer's
 estimate may exceed its emitted bytes; the safe default is `UPPER_BOUND`.
 
-Each wrapped adapter owns and closes its own `SerdeProcessor` instance.
-Configuration inspection may construct a short-lived processor to derive the
-storage layout, so factories must not return a process-global singleton.
+The factory is called exactly once per `SerdeL2AdapterWrapper`
+construction — each wrapped adapter gets its own `SerdeProcessor`
+instance.
 
-## Built-in fp8
+## Built-in implementations
+
+The registered built-ins are:
+
+- `fp8`: element-wise fp8 quantization for a conventional single tensor.
+- `turboquant`: preset-driven asymmetric quantization.
+- `aesgcm`: authenticated encryption keyed per cache salt.
+- `asym_k16_v8`: native K plus scale-quantized FP8 V in one L2 object.
+- `asym_k16_v8_v_only`: native K retained in L1, scale-quantized V in L2.
+- `asym_bytethrough_k16_v8`: native K plus an already-FP8 V in one L2
+  object, without a scale payload.
+- `asym_bytethrough_k16_v8_v_only`: native K retained in L1 and an
+  already-FP8 V in L2.
+
+The `_v_only` implementations are process-local composites: the K child and
+manifest live in memory, so they are not restart durable. The byte-through
+implementations require unit external V scaling and currently require the
+filesystem adapter's exact-used-length load contract. See the
+[user-facing serde guide](../../../../source/mp/serde.rst) for the support
+matrix and examples.
+
+### `fp8`
 
 `Fp8QuantizationSerializer` / `Fp8QuantizationDeserializer`:
 
@@ -241,20 +264,15 @@ as one combined tensor. It does not work in two cases:
   pair to the tuple interface as a length-1 group; the adapter is
   layout-equivalent (same on-the-wire bytes as a direct call).
 
-The single-tensor ABCs and existing serdes remain compatible. A serde that
-needs multiple tensors implements `MultiSerializer` / `MultiDeserializer`.
-`AsyncSerdeProcessor` forwards each tuple-shaped work item unchanged, while
-`SerdeL2AdapterWrapper` creates zero-copy `GroupSlotView` objects according to
-the serde's slot mapping.
-
-The wrapper requires the mapping to cover every parent group exactly once.
-The built-in `asym_k16_v8` mapping is `(0, 1)`, so it supports exactly one K/V
-pair and fails closed for `[K, V, K, V, ...]` layouts rather than reporting a
-partial cache hit. The `(None, 1)` V-only mapping is intentionally incomplete
-and therefore cannot be used by an ordinary all-in-L2 wrapper.
-`StorageManager` derives split-tier placement for this mapping: the wrapper
-mirrors exact K into an L1 child, stores only V in L2, and composes a hit only
-while both children remain valid.
+The single-tensor `Serializer` / `Deserializer` ABCs and their existing
+implementations remain unchanged. A serde that needs several typed tensors
+implements `MultiSerializer` / `MultiDeserializer`. `AsyncSerdeProcessor`
+detects that interface, exposes its group size and slot mapping, and converts
+the parent layout into per-slot layout descriptors for size estimation.
+`SerdeL2AdapterWrapper` then creates zero-copy `GroupSlotView` objects over
+the parent `MemoryObj` groups and dispatches tuple-shaped serialize and
+deserialize calls. The wrapper rejects mappings that do not cover every
+group in together mode; an explicit `None` slot selects split-tier placement.
 
 ### Per-slot semantics
 
@@ -293,8 +311,8 @@ from lmcache.v1.distributed.serde import (
 
 multi_s = single_to_multi_serializer(existing_serializer)
 multi_d = single_to_multi_deserializer(existing_deserializer)
-n = multi_s.serialize((src,), dst_buffer)         # length-1 group
-multi_d.deserialize(src_buffer, (dst,))           # length-1 group
+n = multi_s.serialize((src,), dst_buffer, key)       # length-1 group
+multi_d.deserialize(src_buffer, (dst,), key)          # length-1 group
 ```
 
 The wrapper rejects non-unit groups with `ValueError`, rejects a

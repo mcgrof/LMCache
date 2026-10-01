@@ -6,7 +6,7 @@ Describes how serialization / deserialization is integrated into the
 L2 path. The serde package itself
 ([`docs/design/v1/distributed/serde/README.md`](../serde/README.md))
 defines the generic `Serializer` / `Deserializer` / `SerdeProcessor`
-interfaces and the fp8 built-in. **This** doc is about the adapter
+interfaces and built-in transforms. **This** doc is about the adapter
 that stitches serde into the distributed storage pipeline.
 
 ## Design Summary
@@ -180,16 +180,19 @@ sequenceDiagram
 
 ## Lookup / Unlock / Eviction
 
-These paths don't involve any transform, so the wrapper delegates
-directly to the inner adapter — including the lookup event fd
-itself, to avoid an unnecessary thread hop per lookup.
+These paths do not run a transform. Together placement delegates logical keys
+directly. Split-tier placement maps logical keys to V-child keys and masks a
+reported hit unless the manifest is `COMPLETE` and the matching K child is
+resident in L1. The lookup event fd remains the inner adapter's fd, avoiding
+an extra thread hop.
 
 | API | Behavior |
 |---|---|
 | `get_lookup_and_lock_event_fd` | Returns the inner adapter's fd (pass-through) |
-| `submit_lookup_and_lock_task` / `query_lookup_and_lock_result` | Delegated directly |
-| `submit_unlock` | Delegated directly |
-| `delete` / `get_usage` / `supports_global_eviction` | Delegated directly |
+| `submit_lookup_and_lock_task` / `query_lookup_and_lock_result` | Direct in together mode; split-tier maps to V children and gates results on manifest + K residency |
+| `submit_unlock` | Direct in together mode; split-tier maps logical keys to V children |
+| `delete` | Delegates the supplied physical keys; higher-level split-tier cleanup supplies fenced child keys |
+| `get_usage` / `supports_global_eviction` | Delegated directly |
 | `register_listener` | Registers on the inner adapter (listeners track real storage state) |
 
 The wrapper does **not** maintain its own byte accounting — it
@@ -206,7 +209,7 @@ sees the temp keys.
 
 **Store path:**
 
-1. `reserve_write(temp_keys, is_temporary=True, layout_desc=ser_layout)`
+1. `reserve_write(temp_keys, is_temporary=True, layout=ser_layout, mode="new")`
    — temps are write-locked and marked temporary so
    `finish_read` will auto-delete them later.
 2. Serialize runs, filling temps.
@@ -215,63 +218,65 @@ sees the temp keys.
    them.
 4. Inner store completes → `finish_read(temp_keys)` — since
    `is_temporary=True`, finish_read also deletes them.
-5. On serialize or inner failure: `finish_write_and_delete(temp_keys)`
-   while temps are still write-locked.
+5. On serialize or pre-admission failure,
+   `finish_write_and_delete(temp_keys)` atomically discards write-locked
+   temps. If inner submission or storage fails after temp admission,
+   `finish_read(temp_keys)` releases the read lock and auto-deletes them.
 
 **Load path:**
 
-1. `reserve_write(temp_keys, is_temporary=True, layout_desc=ser_layout)`
+1. `reserve_write(temp_keys, is_temporary=True, layout=ser_layout, mode="new")`
    — same as store, temps write-locked.
 2. `inner.submit_load_task(keys, temp_objs)` — inner loads serialized
    bytes into temps.
 3. Inner completes → `submit_deserialize(temp_objs, dst_objs)` — note
    temps stay write-locked (the wrapper owns them; only the wrapper
    reads them during deserialize).
-4. Deserialize completes → `finish_write(temp_keys) + delete(temp_keys)`
-   regardless of deserialize success.
+4. Deserialize completes → `finish_write_and_delete(temp_keys)` atomically
+   discards temps regardless of deserialize success.
 
-Every wrapper-owned temp is tagged `BINARY_BUFFER`. Only that explicit format
-may narrow from the estimate-sized allocation to the serializer's actual byte
-count. Fixed-layout FP8/int8 KV objects still require an exact L2 object length,
-so a truncated one-byte tensor is a miss rather than a malformed hit.
+## Split-Tier K/V Lifecycle
 
-## Multi-output dispatch
+An explicit absent K slot (`input_slot_mapping() == (None, 1)`) selects
+`KV_SPLIT_TIER`. The wrapper accepts exactly one K/V pair per logical object.
+It derives distinct K- and V-child keys under an engine-wide key scheme:
+scale-aware objects use `COMPUTED_LEGACY`; byte-through `RAW_UNIT` objects use
+a separate tagged namespace so their wire formats cannot collide.
 
-For a `MultiSerializer` / `MultiDeserializer`, the processor exposes a slot
-mapping and the wrapper builds zero-copy `GroupSlotView` objects over the
-parent's groups. Before allocating a temp or touching L2, the wrapper verifies
-that non-`None` mapping indexes cover every parent group exactly once.
+Store ordering is:
 
-`asym_k16_v8` uses `(0, 1)` and therefore accepts one K/V pair. A parent with
-multiple pairs fails closed until the wire format supports repeated pairs. A
-V-only `(None, 1)` mapping is accepted only when `StorageManager` wires the
-split-tier owner described below.
+1. Allocate and copy the K child into L1.
+2. Register a fresh manifest generation before admitting K, so the store
+   controller never routes the K child back to L2.
+3. Copy V into a scratch pool keyed by exact `(shape, dtype)`.
+4. Return the logical key for early read-lock release; serialization reads
+   only the copied V scratch.
+5. Store the encoded V under its child key and mark the manifest `COMPLETE`.
 
-## V-only split-tier placement
+Load first masks any key not `COMPLETE`, reserves the K child, loads the V
+child, and composes both into the caller's destination. Missing K, missing V,
+truncation, codec mismatch, or deserialize failure is a cache miss.
 
-`KV_SPLIT_TIER` stores one logical K/V object as two derived children:
+The manifest owns a monotonically increasing generation per attempted store.
+Failed stores, eviction, clear, and adapter removal acquire a
+`DELETE_IN_FLIGHT` fence before deleting physical children. Because child
+names do not include the generation, this fence prevents a replacement from
+publishing under the same names until the old blocking delete finishes. The
+filesystem adapter treats its 30-second threshold as an operational warning
+and continues waiting for the unlink to become terminal; returning with a
+pending unlink would let that old operation remove a later generation's file.
+Cleanup operations are generation-guarded and cannot delete a newer entry.
 
-1. copy exact native K into an L1 K-child;
-2. copy V into a shape/dtype-specific scratch pool;
-3. serialize V into the filesystem L2 adapter under the V-child key;
-4. mark the in-memory manifest `COMPLETE` only after L2 acknowledges;
-5. release the original logical entry, leaving K-only pressure in L1.
+The logical staging object is deleted after its final reader exits. Deferred
+deletion is stored on that exact L1 resident, so a later replacement under the
+same logical key does not inherit the marker. K-child and V-scratch pools are
+reported as separate, non-fungible L1 pressure domains; eviction responds to
+the fullest pool instead of diluting a full K slab with unrelated free bytes.
 
-Lookup is the intersection of an L2 V hit, a `COMPLETE` manifest entry, and a
-matching exact-layout K child. Load deserializes V into group 1 and copies K
-into group 0 only when shape and dtype match exactly. Store failure, L1 K
-eviction, `clear`, and runtime adapter removal fence the manifest before
-deleting generation-less child keys, so delayed cleanup cannot delete a
-replacement store. The filesystem adapter treats its 30-second delete
-threshold as an operational warning and continues waiting for the unlink to
-become terminal; returning with a pending unlink would let that old operation
-remove a later generation's file.
-
-The initial support matrix is deliberately narrow: CPU pinned-memory L1, one
-filesystem L2 adapter, one K/V pair per object, LRU without per-adapter L2
-eviction or isolated quotas. Other topologies fail during configuration. The
-manifest is process-local and is not restart-persistent; V-only entries left on
-L2 after restart are unreachable cold-tier data, not cache hits.
+This mode is intentionally not persistent across restart. A V child without
+the process-local manifest and K child is a miss. Configuration validation
+also restricts it to CPU pinned memory, one filesystem adapter, no L2
+eviction/`IsolatedLRU`, and one object group.
 
 ## Failure Policy: All-or-Nothing per Submit
 
@@ -338,7 +343,7 @@ interacts with them only through their documented APIs.
   quartet; `AsyncSerdeProcessor` is a seventh; this wrapper is an
   eighth. An `EventfdTaskQueue` base helper could dedupe this across
   the tree — a separate cleanup PR.
-- **No wrapper-level metrics.** `report_status` delegates to the inner
-  and adds `{"serde_wrapped": True}`. Adding per-serde-step latency
-  histograms would need either new metrics from `AsyncSerdeProcessor`
-  or timing hooks in the wrapper's drains.
+- **No per-step latency histograms.** `report_status` delegates to the inner
+  and adds `{"serde_wrapped": True}`. Split-tier terminal outcomes and
+  manifest-state counts are exported, but serialize/copy/store duration is
+  not yet measured separately.

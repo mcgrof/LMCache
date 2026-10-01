@@ -47,7 +47,7 @@ serde factory.
 
 .. list-table:: Built-in serde types
    :header-rows: 1
-   :widths: 15 40 45
+   :widths: 22 38 40
 
    * - ``type``
      - Description
@@ -58,17 +58,6 @@ serde factory.
      - ``fp8_dtype`` (default ``float8_e4m3fn``; also accepts
        ``float8_e5m2``), ``max_workers`` (thread pool size,
        default 1)
-   * - ``asym_k16_v8``
-     - Store one K/V pair in one object: K stays in its native dtype and V is
-       quantized to FP8 with scales in the encoded header.
-     - ``fp8_dtype`` (default ``float8_e4m3fn``), ``scale_scope`` (default
-       ``PER_TENSOR``), ``scale_dtype`` (default ``float32``), and
-       ``max_workers`` (default 4)
-   * - ``asym_k16_v8_v_only``
-     - Keep exact K in CPU L1 and store only FP8-quantized V in filesystem L2.
-       The composite is process-local and not restart durable.
-     - Same fields as ``asym_k16_v8`` plus ``k_dtype_tag`` (a
-       non-authoritative header placeholder; default ``bfloat16``)
    * - ``turboquant``
      - Compress KV tensors with TurboQuant presets before L2 store and
        reconstruct them on load.
@@ -81,33 +70,100 @@ serde factory.
      - ``key_provider`` (default ``hkdf``), ``master_key_path`` (required
        for ``hkdf``), ``aes_bits`` (``128`` default, or ``256``),
        ``max_workers`` (thread pool size, default 1)
+   * - ``asym_k16_v8``
+     - Store native K and scale-quantized FP8 V together in one durable
+       object.
+     - ``fp8_dtype`` (default ``float8_e4m3fn``), ``scale_scope``
+       (default ``PER_TENSOR``), ``scale_dtype`` (default ``float32``),
+       ``max_workers`` (default 4)
+   * - ``asym_k16_v8_v_only``
+     - Keep native K in L1 and store only scale-quantized FP8 V in L2.
+     - Same fields as ``asym_k16_v8``; ``k_dtype_tag`` is a
+       non-authoritative header placeholder
+   * - ``asym_bytethrough_k16_v8``
+     - Store native K and an already-FP8 V together without quantizing or
+       dequantizing V.
+     - ``fp8_dtype`` (only ``float8_e4m3fn``), ``max_workers`` (default 4),
+       optional ``layout_provenance`` mapping
+   * - ``asym_bytethrough_k16_v8_v_only``
+     - Keep native K in L1 and store an already-FP8 V in L2 without a scale
+       payload.
+     - ``fp8_dtype`` (only ``float8_e4m3fn``), ``k_dtype_tag`` placeholder,
+       ``max_workers`` (default 4)
 
-Both asymmetric modes currently support exactly one K/V pair per object. A layout
-with multiple kernel-group pairs fails closed instead of storing only its first
-pair. ``asym_k16_v8_v_only`` is not a standalone all-L2 configuration: its
-slot mapping omits K and selects the paired split-tier placement.
 
-V-only split-tier configuration
---------------------------------
+Asymmetric K16/V8 serde
+-----------------------
 
-The supported initial deployment uses pinned CPU L1 and exactly one filesystem
-adapter. It rejects GDS/Device-DAX L1, non-filesystem L2, multiple L2 adapters,
-per-adapter L2 eviction, and ``IsolatedLRU`` quotas.
+The asymmetric serdes expose K and V as separate typed groups.  The
+``asym_k16_v8*`` variants accept a native fp16/bf16 V and store an FP8 V plus
+its scale.  The ``asym_bytethrough_k16_v8*`` variants are for a serving engine
+whose V is already ``float8_e4m3fn``; they preserve the raw FP8 code bytes and
+therefore require the producing and restoring attention layers' external
+``_v_scale`` to be exactly ``1.0``.
 
-.. code-block:: bash
+Choose the non-``_v_only`` type for a self-contained L2 object that can be
+reloaded after a process restart.  For example:
 
-    lmcache server \
-        --l1-size-gb 100 \
-        --eviction-policy LRU \
-        --l2-adapter '{
-            "type": "fs",
-            "base_path": "/data/lmcache/l2",
-            "serde": {"type": "asym_k16_v8_v_only"}
-        }'
+.. code-block:: json
 
-The manifest that pairs K and V lives only in the current process. After a
-restart, old V-child files are unreachable and age out through the filesystem
-adapter's normal lifecycle; they are never reported as composite hits.
+    {
+      "type": "fs",
+      "base_path": "/data/lmcache/l2",
+      "serde": {
+        "type": "asym_bytethrough_k16_v8",
+        "fp8_dtype": "float8_e4m3fn",
+        "layout_provenance": {
+          "model_id": "org/model",
+          "model_revision_hash": "sha256:...",
+          "tokenizer_hash": "sha256:...",
+          "rope_config_hash": "sha256:...",
+          "attention_backend": "flashinfer",
+          "kv_layout": "vllm-block16-kbf16-vfp8-e4m3"
+        }
+      }
+    }
+
+``layout_provenance`` is optional, but a deployment that shares stored data
+across engines should set it.  A reader configured with different provenance
+rejects the object as a cache miss rather than interpreting incompatible KV
+bytes.
+
+Choose an ``_v_only`` type only for the split-tier optimization.  It mirrors K
+under an L1 child key and writes V under an L2 child key; an in-memory manifest
+makes the logical key visible only after both sides are ready.  For example:
+
+.. code-block:: json
+
+    {
+      "type": "fs",
+      "base_path": "/data/lmcache/v-only",
+      "serde": {
+        "type": "asym_k16_v8_v_only",
+        "fp8_dtype": "float8_e4m3fn",
+        "scale_scope": "PER_TENSOR"
+      }
+    }
+
+The split-tier path deliberately has a narrow support matrix and fails at
+startup outside it:
+
+- CPU pinned-DRAM L1 only; GDS and Device-DAX L1 are unsupported.
+- Exactly one filesystem L2 adapter.  S3, Valkey, peer adapters, and runtime
+  attachment of a second adapter are unsupported.
+- No per-adapter L2 eviction and no ``IsolatedLRU`` quota policy.
+- A single object group (``object_group_id == 0``).
+
+Split-tier entries are process-local composites, not restart-persistent cache
+objects.  Restarting loses the manifest and L1 K child, so an existing V child
+is treated as a miss.  Eviction, clear, adapter removal, and failed stores use
+paired cleanup so one child is not exposed as a valid logical hit.
+
+The byte-through (``RAW_UNIT``) formats have an additional filesystem-only
+restriction, including together mode. Their decoder rejects trailing bytes,
+and S3 and Valkey remain unsupported until they provide the same used-length
+contract. A truncated fixed-layout FP8 file is also a miss; only explicitly
+marked variable-length byte buffers may narrow their used size.
 
 
 Serialized-size contracts

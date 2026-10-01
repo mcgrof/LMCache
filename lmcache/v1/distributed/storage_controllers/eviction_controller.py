@@ -25,6 +25,7 @@ from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface
 from lmcache.v1.distributed.storage_controller import StorageControllerInterface
 from lmcache.v1.distributed.storage_placement import (
+    ComponentKeyScheme,
     SplitTierManifest,
     SplitTierState,
     derive_component_key,
@@ -125,11 +126,16 @@ class L1EvictionController(EvictionController):
         self._l2_adapters = list(l2_adapters or [])
         self._paired_eviction_condition = threading.Condition()
         self._active_paired_adapter_passes = 0
+        # Per-engine child-key scheme; paired eviction derives the V-child
+        # delete key under it so a RAW_UNIT K victim reclaims the RAW_UNIT
+        # V child (not a legacy one).  Set via set_split_tier_paired_eviction.
+        self._component_key_scheme = ComponentKeyScheme.COMPUTED_LEGACY
 
     def set_split_tier_paired_eviction(
         self,
         manifest: "SplitTierManifest",
         l2_adapters: "list[L2AdapterInterface]",
+        component_key_scheme: ComponentKeyScheme = ComponentKeyScheme.COMPUTED_LEGACY,
         timeout: float | None = None,
     ) -> bool:
         """Wire paired-eviction state post-construction.
@@ -142,9 +148,15 @@ class L1EvictionController(EvictionController):
         previous wiring; passing empty adapters reverts to legacy
         DISCARD-only behavior.
 
+        ``component_key_scheme`` is the per-engine child-key scheme; the
+        paired V-child delete is derived under it so a RAW_UNIT (byte-
+        through) K victim reclaims the RAW_UNIT V child rather than a
+        legacy one.
+
         Args:
             manifest: Manifest shared with the split-tier wrapper.
             l2_adapters: Replacement adapter snapshot for future passes.
+            component_key_scheme: Child-key namespace used by the engine.
             timeout: Maximum seconds to wait for already-started paired
                 passes. ``None`` waits without a deadline.
 
@@ -156,9 +168,11 @@ class L1EvictionController(EvictionController):
         with self._paired_eviction_condition:
             previous_manifest = self._split_tier_manifest
             previous_adapters = self._l2_adapters
+            previous_scheme = self._component_key_scheme
             self._split_tier_manifest = manifest
             # Detach first: a new pass snapshots only the replacement list.
             self._l2_adapters = list(l2_adapters)
+            self._component_key_scheme = component_key_scheme
             while self._active_paired_adapter_passes:
                 remaining = (
                     None if deadline is None else max(0.0, deadline - time.monotonic())
@@ -166,6 +180,7 @@ class L1EvictionController(EvictionController):
                 if remaining == 0.0:
                     self._split_tier_manifest = previous_manifest
                     self._l2_adapters = previous_adapters
+                    self._component_key_scheme = previous_scheme
                     return False
                 self._paired_eviction_condition.wait(timeout=remaining)
             return True
@@ -271,6 +286,7 @@ class L1EvictionController(EvictionController):
         with self._paired_eviction_condition:
             manifest = self._split_tier_manifest
             adapters = list(self._l2_adapters)
+            component_key_scheme = self._component_key_scheme
             if manifest is not None and adapters:
                 self._active_paired_adapter_passes += 1
 
@@ -283,6 +299,7 @@ class L1EvictionController(EvictionController):
                 keys,
                 manifest,
                 adapters,
+                component_key_scheme,
             )
         finally:
             with self._paired_eviction_condition:
@@ -294,6 +311,7 @@ class L1EvictionController(EvictionController):
         keys: "list[ObjectKey]",
         manifest: "SplitTierManifest",
         adapters: "list[L2AdapterInterface]",
+        component_key_scheme: ComponentKeyScheme,
     ) -> None:
         """Discard L1 keys and their paired V children.
 
@@ -401,7 +419,9 @@ class L1EvictionController(EvictionController):
             # DELETE_IN_FLIGHT is held across the delete, so the
             # generation-agnostic V key still names THIS generation's V
             # child.  Delete it against every L2 adapter, then drop.
-            v_child_key = derive_component_key(logical_key, "v")
+            v_child_key = derive_component_key(
+                logical_key, "v", scheme=component_key_scheme
+            )
             for adapter in adapters:
                 try:
                     adapter.delete([v_child_key])

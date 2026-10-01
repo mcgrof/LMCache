@@ -27,7 +27,7 @@ class CorruptEncodedKVError(CodecError):
     check.
 
     Examples: codec_magic does not match, codec_version is unknown,
-    payload_crc32c does not match, the payload is truncated.
+    payload CRC32 does not match, or the payload is truncated.
     """
 
 

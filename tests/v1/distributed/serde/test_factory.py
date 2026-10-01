@@ -131,6 +131,8 @@ def test_register_serde_factory_dispatch() -> None:
         ("turboquant", SerdeSizeContract.EXACT),
         ("asym_k16_v8", SerdeSizeContract.UPPER_BOUND),
         ("asym_k16_v8_v_only", SerdeSizeContract.UPPER_BOUND),
+        ("asym_bytethrough_k16_v8_v_only", SerdeSizeContract.UPPER_BOUND),
+        ("asym_bytethrough_k16_v8", SerdeSizeContract.EXACT),
     ],
 )
 def test_builtin_size_contracts_are_explicit(
