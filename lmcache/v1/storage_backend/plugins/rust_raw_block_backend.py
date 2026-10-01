@@ -133,7 +133,7 @@ def _get_per_tp_device_path(
     return per_tp_devices.get(str(tp_rank), per_tp_devices.get(tp_rank))
 
 
-def _resolve_role(config, extra: dict) -> str:
+def _resolve_role(config: Any, extra: Mapping[str, Any]) -> str:
     """Return which side of a handoff this node runs, writer or reader.
 
     A handoff configured through ``pd_data_path`` already says which side
