@@ -34,6 +34,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import textwrap
 
 # Third Party
@@ -141,6 +142,27 @@ def test_the_artifact_under_test_is_not_the_serving_one() -> None:
     assert serving.RawBlockDevice.has_fault_injection() is False, (
         "the serving build carries the fault seam"
     )
+    # And not the scripted ring either. A capability probe answering false
+    # while the type still carries the control surface would mean the seam
+    # was merely hidden.
+    assert not hasattr(serving.RawBlockDevice, "fake_complete"), (
+        "the serving build carries the scripted ring's control surface"
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        probe = Path(directory) / "probe.bin"
+        with open(probe, "wb") as handle:
+            handle.truncate(1024 * 1024)
+        # Asked for one, it refuses rather than silently serving a real
+        # ring: a caller measuring against a scripted ring that is not
+        # there is measuring nothing.
+        with pytest.raises(ValueError, match="fault-injection"):
+            serving.RawBlockDevice(
+                str(probe),
+                writable=True,
+                use_iouring=True,
+                alignment=4096,
+                fake_ring_capacity=4,
+            )
     print(f"fault build   sha256={fault_digest}")
     print(f"serving build sha256={serving_digest}")
 
@@ -368,3 +390,261 @@ def test_the_seam_refuses_to_state_a_partial_take(tmp_path) -> None:
     assert "reports_zero_taken" in report["raised"]
     assert report["poisoned"] is False
     assert report["quarantined_batches"] == 0
+
+
+# ---------------------------------------------------------------------------
+# The scripted ring.
+#
+# The submit seam above substitutes what one submit *call reports*, before
+# the ring, so it can never deliver a completion -- and the transitions that
+# only a completion produces stay out of reach: a short read, a completion
+# that never arrives, a request the kernel took and never answered for.
+# These drive a ring with no kernel behind it instead, so a completion can
+# be delivered for a chosen request or deliberately withheld.
+#
+# Every one of them also asserts that the ring recorded no ownership
+# violation. That list is how the ring refuses: answering for a request it
+# does not hold is a fabrication, and a test that passes while fabricating
+# one has proved nothing.
+# ---------------------------------------------------------------------------
+
+SCRIPTED_PREAMBLE = """
+import gc, json, os, sys, tempfile, time, weakref
+sys.path.insert(0, sys.argv[1])
+from lmcache_rust_raw_block_io import RawBlockDevice
+
+def device(capacity=8):
+    return RawBlockDevice(
+        sys.argv[2], writable=True, use_iouring=True, use_odirect=False,
+        alignment=4096, iouring_queue_depth=8, fake_ring_capacity=capacity,
+    )
+
+def wait_until(predicate, seconds=10):
+    deadline = time.monotonic() + seconds
+    while not predicate() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    return predicate()
+"""
+
+
+SCRIPTED_SHORT_COMPLETION = SCRIPTED_PREAMBLE + textwrap.dedent(
+    """
+    dev = device()
+    payload = bytearray(b"x" * 4096)
+    batch = dev.batched_write([0], [payload], [4096], [None])
+    assert wait_until(lambda: bool(dev.fake_owned()))
+    first = dev.fake_owned()
+
+    # Half the bytes. A block that is half written is not written.
+    dev.fake_complete(first[0], 2048)
+    assert wait_until(lambda: bool(dev.fake_owned()))
+    remainder = dev.fake_owned()
+    dev.fake_complete(remainder[0], 2048)
+
+    results, errors = dev.wait_iouring(batch)
+    print(json.dumps({
+        "first": first,
+        "remainder": remainder,
+        "results": list(results),
+        "errors": [str(e) for _, e in errors],
+        "violations": dev.fake_violations(),
+    }))
+    """
+)
+
+
+SCRIPTED_UNANSWERED_CLOSE = SCRIPTED_PREAMBLE + textwrap.dedent(
+    """
+    dev = device()
+
+    class Payload(bytearray):
+        pass
+
+    payload = Payload(b"x" * 4096)
+    alive = weakref.ref(payload)
+    dev.batched_write([0], [payload], [4096], [None])
+    assert wait_until(lambda: bool(dev.fake_owned()))
+    report = {"owned_before_close": dev.fake_owned()}
+    del payload
+    gc.collect()
+    try:
+        dev.close()
+        report["close"] = "returned"
+    except BaseException as exc:
+        report["close"] = type(exc).__name__
+    report["retained"] = dev.retained_owner_count()
+    report["violations"] = dev.fake_violations()
+    del dev
+    gc.collect()
+    report["alive_after_close_and_drop"] = alive() is not None
+    print(json.dumps(report))
+    """
+)
+
+
+SCRIPTED_SUBMISSION_QUEUE_FULL = SCRIPTED_PREAMBLE + textwrap.dedent(
+    """
+    # One entry fits. The second push is refused, which is the only way a
+    # real submission queue reports being full.
+    dev = device(capacity=1)
+    a = bytearray(b"a" * 4096)
+    b = bytearray(b"b" * 4096)
+    report = {}
+    try:
+        batch = dev.batched_write([0, 4096], [a, b], [4096, 4096], [None, None])
+        report["submitted"] = True
+        assert wait_until(lambda: bool(dev.fake_owned()))
+        for held in list(dev.fake_owned()):
+            dev.fake_complete(held, 4096)
+        results, errors = dev.wait_iouring(batch)
+        report["results"] = list(results)
+        report["errors"] = [str(e) for _, e in errors]
+    except BaseException as exc:
+        report["submitted"] = False
+        report["raised"] = f"{type(exc).__name__}: {exc}"
+    report["violations"] = dev.fake_violations()
+    report["poisoned"] = dev.is_poisoned()
+    print(json.dumps(report))
+    """
+)
+
+
+SCRIPTED_PARTIAL_TAKE = SCRIPTED_PREAMBLE + textwrap.dedent(
+    """
+    dev = device()
+    a = bytearray(b"a" * 4096)
+    b = bytearray(b"b" * 4096)
+    # The ring really hands over a prefix this time, and the suffix really
+    # stays the worker's.
+    dev.fake_submit_takes(1)
+    batch = dev.batched_write([0, 4096], [a, b], [4096, 4096], [None, None])
+    assert wait_until(lambda: len(dev.fake_owned()) == 2)
+    owned = dev.fake_owned()
+    for held in list(owned):
+        dev.fake_complete(held, 4096)
+    results, errors = dev.wait_iouring(batch)
+    print(json.dumps({
+        "owned": owned,
+        "delivered_once": len(owned) == len(set(owned)),
+        "results": list(results),
+        "errors": [str(e) for _, e in errors],
+        "syncs": dev.fake_syncs(),
+        "violations": dev.fake_violations(),
+    }))
+    """
+)
+
+
+SCRIPTED_INVENTED_COMPLETION = SCRIPTED_PREAMBLE + textwrap.dedent(
+    """
+    # The ring's own refusal, which is what the other cases rest on.
+    dev = device()
+    report = {}
+    try:
+        dev.fake_complete(999, 4096)
+        report["refused"] = False
+    except BaseException as exc:
+        report["refused"] = True
+        report["reason"] = str(exc)
+    report["violations"] = dev.fake_violations()
+    print(json.dumps(report))
+    """
+)
+
+
+def test_a_short_completion_writes_the_remainder(tmp_path) -> None:
+    """A block that is half written is not written.
+
+    Only a completion can say how many bytes moved, so this is the first
+    transition the submit seam could not reach at all. The engine pushes the
+    remainder for the same logical request rather than reporting the write
+    done, and the request is answered for once at each stage.
+    """
+    device = tmp_path / "dev.bin"
+    with open(device, "wb") as handle:
+        handle.truncate(16 * 1024 * 1024)
+    report = _run_scenario(SCRIPTED_SHORT_COMPLETION, device)
+
+    assert report["results"] == [True]
+    assert report["errors"] == []
+    assert report["first"] == report["remainder"], (
+        "the remainder belongs to the same request, not a new one"
+    )
+    assert report["violations"] == []
+
+
+def test_a_request_the_kernel_never_answered_for_blocks_the_close(tmp_path) -> None:
+    """The case the whole retention rule exists for, driven end to end.
+
+    A request the ring has taken and not answered for is memory the device
+    may still be reaching. The close refuses, the owner is retained, and the
+    buffer outlives both the close and the device -- and the ring recorded
+    no attempt to invent the completion that would have made this look fine.
+    """
+    device = tmp_path / "dev.bin"
+    with open(device, "wb") as handle:
+        handle.truncate(16 * 1024 * 1024)
+    report = _run_scenario(SCRIPTED_UNANSWERED_CLOSE, device)
+
+    assert len(report["owned_before_close"]) == 1
+    assert report["close"] == "RuntimeError"
+    assert report["retained"] == 1
+    assert report["alive_after_close_and_drop"] is True
+    assert report["violations"] == []
+
+
+def test_a_full_submission_queue_is_reported_not_panicked_on(tmp_path) -> None:
+    """A push the ring refuses is an error, not a panic.
+
+    The ring has room for one entry and is given two. Whatever the engine
+    does with the second, it must not claim the device accepted it, and it
+    must not take the process down -- the push error on this path used to be
+    an `expect`.
+    """
+    device = tmp_path / "dev.bin"
+    with open(device, "wb") as handle:
+        handle.truncate(16 * 1024 * 1024)
+    report = _run_scenario(SCRIPTED_SUBMISSION_QUEUE_FULL, device)
+
+    assert report["violations"] == []
+    if report["submitted"]:
+        # The entry that did not fit must not be reported as written.
+        assert report["results"].count(True) <= 1, report
+    else:
+        assert "raised" in report
+
+
+def test_a_partial_take_delivers_the_suffix_once(tmp_path) -> None:
+    """An entry the ring did not take is still resident, and still ours.
+
+    Requeuing it would issue the same I/O twice and point the resident copy
+    at a buffer whose owner has been released. So the suffix reaches the
+    kernel on a later submit, as the same request, exactly once.
+    """
+    device = tmp_path / "dev.bin"
+    with open(device, "wb") as handle:
+        handle.truncate(16 * 1024 * 1024)
+    report = _run_scenario(SCRIPTED_PARTIAL_TAKE, device)
+
+    assert report["delivered_once"] is True, report
+    assert len(report["owned"]) == 2
+    assert report["results"] == [True, True]
+    assert report["errors"] == []
+    assert report["syncs"] > 0, "the worker must have flushed the ring"
+    assert report["violations"] == []
+
+
+def test_the_scripted_ring_refuses_a_completion_it_does_not_hold(tmp_path) -> None:
+    """The refusal the other scripted cases rest on.
+
+    If the ring answered for anything it was asked to, the empty violation
+    lists above would mean nothing. It refuses, and records the attempt.
+    """
+    device = tmp_path / "dev.bin"
+    with open(device, "wb") as handle:
+        handle.truncate(16 * 1024 * 1024)
+    report = _run_scenario(SCRIPTED_INVENTED_COMPLETION, device)
+
+    assert report["refused"] is True
+    assert "does not hold" in report["reason"]
+    assert len(report["violations"]) == 1

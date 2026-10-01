@@ -40,6 +40,12 @@ use io_uring::{opcode, IoUring};
 enum IoUringWrapper {
     Standard(Arc<Mutex<IoUring<SqueueEntry, Entry>>>),
     Big(Arc<Mutex<IoUring<Entry128, Entry32>>>),
+    /// A ring with no kernel behind it, for the transitions a real one
+    /// will not produce on demand. Present only in the nondefault
+    /// fault-injection build, and the drain below is a `match`, so adding
+    /// it could not silently skip a completion path.
+    #[cfg(feature = "fault-injection")]
+    Fake(FakeRing),
 }
 
 impl IoUringWrapper {
@@ -56,6 +62,8 @@ impl IoUringWrapper {
                 let len = ring.submission().len();
                 len
             }
+            #[cfg(feature = "fault-injection")]
+            IoUringWrapper::Fake(ring) => ring.submission_len(),
         }
     }
 
@@ -70,6 +78,8 @@ impl IoUringWrapper {
                 let mut ring = ring.lock().unwrap();
                 ring.submission().sync();
             }
+            #[cfg(feature = "fault-injection")]
+            IoUringWrapper::Fake(ring) => ring.sync(),
         }
     }
 
@@ -77,16 +87,26 @@ impl IoUringWrapper {
     ///
     /// Only the big-entry ring can carry one: a 64-byte SQE has no room for
     /// the NVMe command, so a standard ring refuses rather than truncating.
-    fn push_cmd(&self, sqe: &Entry128) -> Result<(), PyErr> {
+    fn push_cmd(&self, sqe: &Entry128, user_data: u64) -> Result<(), PyErr> {
         match self {
             IoUringWrapper::Big(ring) => {
                 let mut ring = ring.lock().unwrap();
                 let pushed = unsafe { ring.submission().push(sqe) };
-                pushed.map_err(|_| PyRuntimeError::new_err("submission queue full"))
+                pushed.map_err(|_| {
+                    PyRuntimeError::new_err(format!(
+                        "submission queue full pushing request {user_data}"
+                    ))
+                })
             }
             IoUringWrapper::Standard(_) => Err(PyRuntimeError::new_err(
                 "io_uring_cmd requires big entries (kernel 5.19+)",
             )),
+            #[cfg(feature = "fault-injection")]
+            IoUringWrapper::Fake(ring) => ring.push(user_data).map_err(|()| {
+                PyRuntimeError::new_err(format!(
+                    "submission queue full pushing request {user_data}"
+                ))
+            }),
         }
     }
 
@@ -94,19 +114,96 @@ impl IoUringWrapper {
     ///
     /// A big-entry ring takes the same operation widened to 128 bytes; the
     /// trailing space is unused for anything but a passthrough command.
-    fn push_regular(&self, sqe: &SqueueEntry) -> Result<(), PyErr> {
+    fn push_regular(&self, sqe: &SqueueEntry, user_data: u64) -> Result<(), PyErr> {
         match self {
             IoUringWrapper::Big(ring) => {
                 let widened: Entry128 = sqe.clone().into();
                 let mut ring = ring.lock().unwrap();
                 let pushed = unsafe { ring.submission().push(&widened) };
-                pushed.map_err(|_| PyRuntimeError::new_err("submission queue full"))
+                pushed.map_err(|_| {
+                    PyRuntimeError::new_err(format!(
+                        "submission queue full pushing request {user_data}"
+                    ))
+                })
             }
             IoUringWrapper::Standard(ring) => {
                 let mut ring = ring.lock().unwrap();
                 let pushed = unsafe { ring.submission().push(sqe) };
-                pushed.map_err(|_| PyRuntimeError::new_err("submission queue full"))
+                pushed.map_err(|_| {
+                    PyRuntimeError::new_err(format!(
+                        "submission queue full pushing request {user_data}"
+                    ))
+                })
             }
+            #[cfg(feature = "fault-injection")]
+            IoUringWrapper::Fake(ring) => ring.push(user_data).map_err(|()| {
+                PyRuntimeError::new_err(format!(
+                    "submission queue full pushing request {user_data}"
+                ))
+            }),
+        }
+    }
+
+    /// The ring's own descriptor, for an operation that needs it directly.
+    ///
+    /// A ring with no kernel behind it has no descriptor, and refuses
+    /// rather than offering one that addresses nothing.
+    fn ring_fd(&self) -> Result<RawFd, PyErr> {
+        match self {
+            IoUringWrapper::Standard(ring) => Ok(ring.lock().unwrap().as_raw_fd()),
+            IoUringWrapper::Big(ring) => Ok(ring.lock().unwrap().as_raw_fd()),
+            #[cfg(feature = "fault-injection")]
+            IoUringWrapper::Fake(_) => Err(PyRuntimeError::new_err(
+                "a fault-injection ring has no descriptor to register against",
+            )),
+        }
+    }
+
+    /// Register host buffers with the kernel as this ring's fixed set.
+    fn register_host_buffers(&self, iovecs: &[libc::iovec]) -> io::Result<()> {
+        match self {
+            IoUringWrapper::Standard(ring) => {
+                let ring = ring.lock().unwrap();
+                unsafe { ring.submitter().register_buffers(iovecs) }
+            }
+            IoUringWrapper::Big(ring) => {
+                let ring = ring.lock().unwrap();
+                unsafe { ring.submitter().register_buffers(iovecs) }
+            }
+            #[cfg(feature = "fault-injection")]
+            IoUringWrapper::Fake(_) => Err(io::Error::from_raw_os_error(libc::ENOTSUP)),
+        }
+    }
+
+    /// Reserve an empty fixed-buffer table of the given size.
+    fn register_sparse_buffers(&self, count: u32) -> io::Result<()> {
+        match self {
+            IoUringWrapper::Standard(ring) => ring
+                .lock()
+                .unwrap()
+                .submitter()
+                .register_buffers_sparse(count),
+            IoUringWrapper::Big(ring) => ring
+                .lock()
+                .unwrap()
+                .submitter()
+                .register_buffers_sparse(count),
+            #[cfg(feature = "fault-injection")]
+            IoUringWrapper::Fake(_) => Err(io::Error::from_raw_os_error(libc::ENOTSUP)),
+        }
+    }
+
+    /// Withdraw whatever this ring has registered.
+    ///
+    /// The one operation whose failure is an unknown outcome rather than a
+    /// refusal: a registration the kernel still holds covers memory this
+    /// process was about to forget.
+    fn unregister_buffers(&self) -> io::Result<()> {
+        match self {
+            IoUringWrapper::Standard(ring) => ring.lock().unwrap().submitter().unregister_buffers(),
+            IoUringWrapper::Big(ring) => ring.lock().unwrap().submitter().unregister_buffers(),
+            #[cfg(feature = "fault-injection")]
+            IoUringWrapper::Fake(_) => Ok(()),
         }
     }
 
@@ -140,6 +237,8 @@ impl IoUringWrapper {
                     result: cqe.result(),
                 })
                 .collect(),
+            #[cfg(feature = "fault-injection")]
+            IoUringWrapper::Fake(ring) => ring.take_completions(),
         }
     }
 }
@@ -149,6 +248,145 @@ impl IoUringWrapper {
 struct RingCompletion {
     user_data: u64,
     result: i32,
+}
+
+/// A submission and completion ring with no kernel behind it.
+///
+/// The submit seam substitutes what one *submit call reports*, before the
+/// ring, so it can never deliver a completion -- which leaves the
+/// transitions that only a completion can produce unreachable: a short
+/// read, a completion arriving after close, a request taken by the kernel
+/// and never answered for. This substitutes the ring itself, so a test can
+/// deliver a completion for a chosen request, or deliberately withhold one.
+///
+/// It is also built to refuse. Every operation checks the ownership rule it
+/// implies and records a violation rather than papering over it, so a test
+/// asserting that the violation list is empty is asserting that the engine
+/// did not take a step a real kernel would not have allowed -- completing a
+/// request the kernel does not hold, most of all.
+#[cfg(feature = "fault-injection")]
+struct FakeRingState {
+    /// How many entries fit before a push is refused, which is the only way
+    /// a real submission queue reports being full.
+    sq_capacity: usize,
+    /// Pushed and not yet taken by a submit. This is what `submission_len`
+    /// reports, and what residency means.
+    resident: Vec<u64>,
+    /// Taken by a submit and not yet answered for. The kernel's, not ours:
+    /// anything still here when the device closes is memory the device may
+    /// still be reaching.
+    owned: Vec<u64>,
+    /// Completions queued for the worker to drain.
+    ready: Vec<RingCompletion>,
+    /// How many resident entries the next submit takes. `None` takes all of
+    /// them, which is what a healthy ring does.
+    take_next: Option<usize>,
+    /// What the next submit reports instead of taking anything.
+    submit_error: Option<i32>,
+    /// Ownership rules this ring saw broken, in the order it saw them.
+    violations: Vec<String>,
+    /// How many times the worker synced the submission queue, which a test
+    /// uses to tell a flush apart from a no-op.
+    syncs: usize,
+}
+
+#[cfg(feature = "fault-injection")]
+#[derive(Clone)]
+struct FakeRing {
+    state: Arc<Mutex<FakeRingState>>,
+    /// The same notifier the real rings register their CQ eventfd with, so
+    /// a completion wakes the worker through the path it actually uses. A
+    /// bare fd here would be a second wake-up mechanism that only the fake
+    /// exercises, which is the opposite of the point.
+    notify: Arc<UringNotify>,
+}
+
+#[cfg(feature = "fault-injection")]
+impl FakeRing {
+    fn new(sq_capacity: usize, notify: Arc<UringNotify>) -> Self {
+        FakeRing {
+            state: Arc::new(Mutex::new(FakeRingState {
+                sq_capacity,
+                resident: Vec::new(),
+                owned: Vec::new(),
+                ready: Vec::new(),
+                take_next: None,
+                submit_error: None,
+                violations: Vec::new(),
+                syncs: 0,
+            })),
+            notify,
+        }
+    }
+
+    fn push(&self, user_data: u64) -> Result<(), ()> {
+        let mut state = self.state.lock().unwrap();
+        if state.resident.len() >= state.sq_capacity {
+            return Err(());
+        }
+        state.resident.push(user_data);
+        Ok(())
+    }
+
+    fn submit(&self) -> io::Result<usize> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(errno) = state.submit_error.take() {
+            // A submit that reports an error took nothing. Leaving the
+            // entries resident is the whole point: whether the worker then
+            // reasons about them correctly is what a test is asking.
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+        let available = state.resident.len();
+        let taking = state.take_next.take().unwrap_or(available).min(available);
+        let taken: Vec<u64> = state.resident.drain(..taking).collect();
+        state.owned.extend(taken);
+        Ok(taking)
+    }
+
+    fn take_completions(&self) -> Vec<RingCompletion> {
+        let mut state = self.state.lock().unwrap();
+        std::mem::take(&mut state.ready)
+    }
+
+    fn submission_len(&self) -> usize {
+        self.state.lock().unwrap().resident.len()
+    }
+
+    fn sync(&self) {
+        self.state.lock().unwrap().syncs += 1;
+    }
+
+    /// Answer for one request the kernel took, and wake the worker.
+    ///
+    /// Refuses, loudly and in the violation list, to answer for a request
+    /// it does not hold. That is the invariant the whole fault seam exists
+    /// to protect: a completion for a request the kernel owns must come
+    /// from the kernel, and one for a request it does not own is a
+    /// fabrication.
+    fn complete(&self, user_data: u64, result: i32) -> Result<(), String> {
+        {
+            let mut state = self.state.lock().unwrap();
+            match state.owned.iter().position(|held| *held == user_data) {
+                Some(at) => {
+                    state.owned.remove(at);
+                    state.ready.push(RingCompletion { user_data, result });
+                }
+                None => {
+                    let resident = state.resident.contains(&user_data);
+                    let complaint = format!(
+                        "completion for request {user_data} which this ring \
+                         does not hold (resident: {resident})"
+                    );
+                    state.violations.push(complaint.clone());
+                    return Err(complaint);
+                }
+            }
+        }
+        // Through the notifier the real rings use, so the worker is woken
+        // the way it is woken in production.
+        self.notify.signal_producer();
+        Ok(())
+    }
 }
 
 // NVMe identify namespace data structure
@@ -420,6 +658,8 @@ fn submit_ring(
             let ring = ring.lock().unwrap();
             ring.submitter().submit()
         }
+        #[cfg(feature = "fault-injection")]
+        IoUringWrapper::Fake(ring) => ring.submit(),
     }
 }
 
@@ -1544,6 +1784,12 @@ struct RawBlockDevice {
     // forgetting the vector, so their count has to be recorded before it
     // becomes unreadable.
     retained_owners: Arc<AtomicUsize>,
+    // The scripted ring's state, held apart from `ring` itself. The
+    // terminal retention takes the ring and forgets it, and a test asking
+    // afterwards whether the engine broke an ownership rule on its way out
+    // must still get an answer.
+    #[cfg(feature = "fault-injection")]
+    fake_state: Option<Arc<Mutex<FakeRingState>>>,
     #[cfg(feature = "fault-injection")]
     fault_plan: Option<Arc<FaultPlan>>,
 }
@@ -1587,6 +1833,27 @@ impl Drop for FdGuard {
 impl RawBlockDevice {
     /// Internal constructor performs all low level setup.
     #[allow(clippy::too_many_arguments)]
+    /// The scripted ring behind this device, or a refusal.
+    #[cfg(feature = "fault-injection")]
+    fn scripted_ring(&self) -> PyResult<&FakeRing> {
+        match &self.ring {
+            Some(IoUringWrapper::Fake(ring)) => Ok(ring),
+            _ => Err(PyRuntimeError::new_err(
+                "this device has no scripted ring to drive (it was not \
+                 built with one, or a refused close has retained it)",
+            )),
+        }
+    }
+
+    /// The scripted ring's state, which outlives the ring.
+    #[cfg(feature = "fault-injection")]
+    fn scripted_state(&self) -> PyResult<&Arc<Mutex<FakeRingState>>> {
+        self.fake_state.as_ref().ok_or_else(|| {
+            PyRuntimeError::new_err("this device was not built with a scripted ring")
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn new_internal(
         path: String,
         writable: bool,
@@ -1596,7 +1863,17 @@ impl RawBlockDevice {
         use_uring_cmd: bool,
         io_engine: Option<String>,
         iouring_queue_depth: usize,
+        fake_ring_capacity: usize,
     ) -> PyResult<Self> {
+        if fake_ring_capacity > 0 && !cfg!(feature = "fault-injection") {
+            // Said rather than ignored: a caller asking for a scripted ring
+            // on a serving build is measuring nothing, and silence would
+            // let it believe otherwise.
+            return Err(PyValueError::new_err(
+                "fake_ring_capacity needs the nondefault fault-injection \
+                 feature; this build does not carry it",
+            ));
+        }
         let use_iouring = parse_use_iouring(io_engine, use_iouring)?;
         let iouring_queue_depth = iouring_queue_depth.max(1);
         // use_uring_cmd requires use_iouring to be enabled
@@ -1686,66 +1963,85 @@ impl RawBlockDevice {
             poisoned_opt,
             quarantined_owners_opt,
         ) = if use_iouring {
-            let notify = UringNotify::new()
-                .map_err(|e| PyRuntimeError::new_err(format!("UringNotify init failed: {}", e)))?;
+            let notify =
+                Arc::new(UringNotify::new().map_err(|e| {
+                    PyRuntimeError::new_err(format!("UringNotify init failed: {}", e))
+                })?);
+            // A scripted ring, when one was asked for. It takes the same
+            // notifier the real rings register their CQ eventfd with, so a
+            // completion wakes the worker through the path production uses.
+            #[cfg(feature = "fault-injection")]
+            let scripted = if fake_ring_capacity > 0 {
+                Some(IoUringWrapper::Fake(FakeRing::new(
+                    fake_ring_capacity,
+                    Arc::clone(&notify),
+                )))
+            } else {
+                None
+            };
+            #[cfg(not(feature = "fault-injection"))]
+            let scripted: Option<IoUringWrapper> = None;
             // Try to create IoUring with big entries (Entry128/Entry32) first
             // This is required for io_uring_cmd support (kernel 5.19+)
             // If that fails, fall back to standard entries (Entry/Entry) for kernel 5.4-5.18
-            let ring = match IoUring::<Entry128, Entry32>::builder()
-                .build(iouring_queue_depth as u32)
-            {
-                Ok(big_ring) => {
-                    // Big entries supported - io_uring_cmd can be used
-                    if use_uring_cmd {
-                        // Validate that device is a character device (required for io_uring_cmd)
-                        let is_char_dev = is_character_device(&path)?;
-                        if !is_char_dev {
-                            return Err(PyValueError::new_err(
+            let ring = match scripted {
+                Some(scripted) => scripted,
+                None => match IoUring::<Entry128, Entry32>::builder()
+                    .build(iouring_queue_depth as u32)
+                {
+                    Ok(big_ring) => {
+                        // Big entries supported - io_uring_cmd can be used
+                        if use_uring_cmd {
+                            // Validate that device is a character device (required for io_uring_cmd)
+                            let is_char_dev = is_character_device(&path)?;
+                            if !is_char_dev {
+                                return Err(PyValueError::new_err(
                                 "use_uring_cmd requires an NVMe namespace character device (e.g., /dev/ng0n1)",
                             ));
+                            }
                         }
+                        // Register the CQ eventfd with the ring so the kernel writes to it
+                        // whenever a CQE is posted. Must happen before the ring is wrapped
+                        // in a Mutex / handed to the worker.
+                        big_ring
+                            .submitter()
+                            .register_eventfd(notify.cq_efd)
+                            .map_err(|e| {
+                                PyRuntimeError::new_err(format!("register_eventfd failed: {}", e))
+                            })?;
+                        let big_ring = Arc::new(Mutex::new(big_ring));
+                        IoUringWrapper::Big(big_ring)
                     }
-                    // Register the CQ eventfd with the ring so the kernel writes to it
-                    // whenever a CQE is posted. Must happen before the ring is wrapped
-                    // in a Mutex / handed to the worker.
-                    big_ring
-                        .submitter()
-                        .register_eventfd(notify.cq_efd)
-                        .map_err(|e| {
-                            PyRuntimeError::new_err(format!("register_eventfd failed: {}", e))
-                        })?;
-                    let big_ring = Arc::new(Mutex::new(big_ring));
-                    IoUringWrapper::Big(big_ring)
-                }
-                Err(_) => {
-                    // Big entries not supported (kernel < 5.19), fall back to standard entries
-                    // io_uring_cmd is not available on these kernels
-                    if use_uring_cmd {
-                        return Err(PyRuntimeError::new_err(
+                    Err(_) => {
+                        // Big entries not supported (kernel < 5.19), fall back to standard entries
+                        // io_uring_cmd is not available on these kernels
+                        if use_uring_cmd {
+                            return Err(PyRuntimeError::new_err(
                             "io_uring_cmd requires kernel 5.19 or later (big SQE/CQE entries not supported)",
                         ));
+                        }
+                        let std_ring = IoUring::<SqueueEntry, Entry>::builder()
+                            .build(iouring_queue_depth as u32)
+                            .map_err(|e| {
+                                PyRuntimeError::new_err(format!("io_uring init failed: {}", e))
+                            })?;
+                        // Register the CQ eventfd with the ring so the kernel writes to it
+                        // whenever a CQE is posted. Must happen before the ring is wrapped
+                        // in a Mutex / handed to the worker.
+                        std_ring
+                            .submitter()
+                            .register_eventfd(notify.cq_efd)
+                            .map_err(|e| {
+                                PyRuntimeError::new_err(format!("register_eventfd failed: {}", e))
+                            })?;
+                        let std_ring = Arc::new(Mutex::new(std_ring));
+                        IoUringWrapper::Standard(std_ring)
                     }
-                    let std_ring = IoUring::<SqueueEntry, Entry>::builder()
-                        .build(iouring_queue_depth as u32)
-                        .map_err(|e| {
-                            PyRuntimeError::new_err(format!("io_uring init failed: {}", e))
-                        })?;
-                    // Register the CQ eventfd with the ring so the kernel writes to it
-                    // whenever a CQE is posted. Must happen before the ring is wrapped
-                    // in a Mutex / handed to the worker.
-                    std_ring
-                        .submitter()
-                        .register_eventfd(notify.cq_efd)
-                        .map_err(|e| {
-                            PyRuntimeError::new_err(format!("register_eventfd failed: {}", e))
-                        })?;
-                    let std_ring = Arc::new(Mutex::new(std_ring));
-                    IoUringWrapper::Standard(std_ring)
-                }
+                },
             };
             let queue = Arc::new(Mutex::new(Vec::<IoSubmission>::new()));
             let shutdown = Arc::new(AtomicBool::new(false));
-            let batch_ready = Arc::new(notify);
+            let batch_ready = notify;
             let in_flight_count = Arc::new(AtomicU64::new(0));
             let in_flight_cvar = Arc::new(Condvar::new());
             let batched_buffer_objs = Arc::new(Mutex::new(HashMap::<u64, Vec<Py<PyAny>>>::new()));
@@ -1918,7 +2214,7 @@ impl RawBlockDevice {
                     }
 
                     let sqe128 = uring_cmd.build().user_data(user_data);
-                    ring.push_cmd(&sqe128)?;
+                    ring.push_cmd(&sqe128, user_data)?;
                 } else {
                     // Regular read/write operations
                     // A dma-buf registered buffer has no user address in the
@@ -1953,7 +2249,7 @@ impl RawBlockDevice {
                             .build()
                     };
                     let sqe = sqe.user_data(user_data);
-                    ring.push_regular(&sqe)?;
+                    ring.push_regular(&sqe, user_data)?;
                 }
                 Ok(())
             }
@@ -2430,22 +2726,13 @@ impl RawBlockDevice {
                             #[cfg(feature = "fault-injection")]
                             &fault_plan_worker,
                         );
-                        let completions: Vec<(u64, i32)> = match &ring_clone {
-                            IoUringWrapper::Standard(ring) => {
-                                let mut ring = ring.lock().unwrap();
-                                ring.completion()
-                                    .map(|cqe| (cqe.user_data(), cqe.result()))
-                                    .collect()
-                            }
-                            IoUringWrapper::Big(ring) => {
-                                let mut ring = ring.lock().unwrap();
-                                ring.completion()
-                                    .map(|cqe| (cqe.user_data(), cqe.result()))
-                                    .collect()
-                            }
-                        };
+                        let completions = ring_clone.take_completions();
                         let reaped = completions.len();
-                        for (user_data, cqe_result) in completions {
+                        for RingCompletion {
+                            user_data,
+                            result: cqe_result,
+                        } in completions
+                        {
                             if let Some(mut sub) = in_flight.remove(&user_data) {
                                 let batch_id = sub.batch_id;
                                 let result = handle_completion_result(&mut sub, cqe_result, true);
@@ -2555,6 +2842,11 @@ impl RawBlockDevice {
             nvme_nsid,
             nvme_lba_shift,
             nvme_lba_size,
+            #[cfg(feature = "fault-injection")]
+            fake_state: match &ring_opt {
+                Some(IoUringWrapper::Fake(ring)) => Some(Arc::clone(&ring.state)),
+                _ => None,
+            },
             ring: ring_opt,
             queue: queue_opt,
             worker: worker_opt,
@@ -2613,7 +2905,8 @@ impl RawBlockDevice {
             use_uring_cmd = false,
             alignment = 4096,
             io_engine = None,
-            iouring_queue_depth = RING_SIZE
+            iouring_queue_depth = RING_SIZE,
+            fake_ring_capacity = 0
         )
     )]
     #[allow(clippy::too_many_arguments)]
@@ -2626,6 +2919,7 @@ impl RawBlockDevice {
         alignment: usize,
         io_engine: Option<String>,
         iouring_queue_depth: usize,
+        fake_ring_capacity: usize,
     ) -> PyResult<Self> {
         Self::new_internal(
             path,
@@ -2636,6 +2930,7 @@ impl RawBlockDevice {
             use_uring_cmd,
             io_engine,
             iouring_queue_depth,
+            fake_ring_capacity,
         )
     }
 
@@ -2726,17 +3021,8 @@ impl RawBlockDevice {
                     iov_len: *size,
                 });
             }
-            unsafe {
-                let result = match ring {
-                    IoUringWrapper::Standard(ring) => {
-                        let ring = ring.lock().unwrap();
-                        ring.submitter().register_buffers(&iovecs)
-                    }
-                    IoUringWrapper::Big(ring) => {
-                        let ring = ring.lock().unwrap();
-                        ring.submitter().register_buffers(&iovecs)
-                    }
-                };
+            {
+                let result = ring.register_host_buffers(&iovecs);
                 match result {
                     Ok(_) => {
                         self.fixed_buffers_registered.store(true, Ordering::Relaxed);
@@ -2882,24 +3168,10 @@ impl RawBlockDevice {
             Some(ring) => ring,
             None => return Err(PyRuntimeError::new_err("io_uring ring not available")),
         };
-        let ring_fd = match ring {
-            IoUringWrapper::Standard(ring) => ring.lock().unwrap().as_raw_fd(),
-            IoUringWrapper::Big(ring) => ring.lock().unwrap().as_raw_fd(),
-        };
+        let ring_fd = ring.ring_fd()?;
 
         // A sparse table of the right size, then one extended update per slot.
-        let sparse = match ring {
-            IoUringWrapper::Standard(ring) => ring
-                .lock()
-                .unwrap()
-                .submitter()
-                .register_buffers_sparse(fds_in_order.len() as u32),
-            IoUringWrapper::Big(ring) => ring
-                .lock()
-                .unwrap()
-                .submitter()
-                .register_buffers_sparse(fds_in_order.len() as u32),
-        };
+        let sparse = ring.register_sparse_buffers(fds_in_order.len() as u32);
         if let Err(e) = sparse {
             return Err(PyRuntimeError::new_err(format!(
                 "register_buffers_sparse failed: {}",
@@ -2910,14 +3182,7 @@ impl RawBlockDevice {
         for (idx, fd) in fds_in_order.iter().enumerate() {
             if let Err(e) = io_uring_register_dmabuf(ring_fd, idx as u32, *fd, self.fd) {
                 // Leave no half-registered table behind.
-                let _ = match ring {
-                    IoUringWrapper::Standard(ring) => {
-                        ring.lock().unwrap().submitter().unregister_buffers()
-                    }
-                    IoUringWrapper::Big(ring) => {
-                        ring.lock().unwrap().submitter().unregister_buffers()
-                    }
-                };
+                let _ = ring.unregister_buffers();
                 return Err(PyRuntimeError::new_err(format!(
                     "dma-buf registration of slot {} (fd {}) failed: {}",
                     idx, fd, e
@@ -3405,6 +3670,67 @@ impl RawBlockDevice {
             };
             submits.insert(ordinal, fault);
         }
+        Ok(())
+    }
+
+    /// Entries pushed and not yet taken by a submit.
+    #[cfg(feature = "fault-injection")]
+    fn fake_resident(&self) -> PyResult<Vec<u64>> {
+        Ok(self.scripted_state()?.lock().unwrap().resident.clone())
+    }
+
+    /// Requests a submit handed over and that have not been answered for.
+    ///
+    /// Anything here when the device closes is memory the device may still
+    /// be reaching, which is the state the whole retention rule exists for.
+    #[cfg(feature = "fault-injection")]
+    fn fake_owned(&self) -> PyResult<Vec<u64>> {
+        Ok(self.scripted_state()?.lock().unwrap().owned.clone())
+    }
+
+    /// Ownership rules this ring saw broken, in order.
+    ///
+    /// A test asserting this is empty is asserting that the engine took no
+    /// step a real kernel would have refused -- answering for a request the
+    /// kernel holds, above all.
+    #[cfg(feature = "fault-injection")]
+    fn fake_violations(&self) -> PyResult<Vec<String>> {
+        Ok(self.scripted_state()?.lock().unwrap().violations.clone())
+    }
+
+    /// How many times the worker synced the submission queue.
+    #[cfg(feature = "fault-injection")]
+    fn fake_syncs(&self) -> PyResult<usize> {
+        Ok(self.scripted_state()?.lock().unwrap().syncs)
+    }
+
+    /// Answer for one request the ring handed to its imaginary kernel.
+    ///
+    /// Refuses a request the ring does not hold, and records the attempt,
+    /// because a completion for a request the kernel owns can only come
+    /// from the kernel and one for a request it does not own is invented.
+    #[cfg(feature = "fault-injection")]
+    fn fake_complete(&self, user_data: u64, result: i32) -> PyResult<()> {
+        self.scripted_ring()?
+            .complete(user_data, result)
+            .map_err(PyValueError::new_err)
+    }
+
+    /// Make the next submit take only the first `count` resident entries.
+    ///
+    /// This is the partial take the submit seam cannot express: the ring
+    /// really does hand over a prefix, and the suffix really does stay
+    /// resident and still belong to the worker.
+    #[cfg(feature = "fault-injection")]
+    fn fake_submit_takes(&self, count: usize) -> PyResult<()> {
+        self.scripted_state()?.lock().unwrap().take_next = Some(count);
+        Ok(())
+    }
+
+    /// Make the next submit report an error and take nothing.
+    #[cfg(feature = "fault-injection")]
+    fn fake_submit_fails(&self, errno: i32) -> PyResult<()> {
+        self.scripted_state()?.lock().unwrap().submit_error = Some(errno);
         Ok(())
     }
 
@@ -4220,14 +4546,7 @@ impl RawBlockDevice {
 
             if self.fixed_buffers_registered.load(Ordering::Relaxed) {
                 let unregistered = match &self.ring {
-                    Some(IoUringWrapper::Standard(ring)) => {
-                        let ring = ring.lock().unwrap();
-                        ring.submitter().unregister_buffers()
-                    }
-                    Some(IoUringWrapper::Big(ring)) => {
-                        let ring = ring.lock().unwrap();
-                        ring.submitter().unregister_buffers()
-                    }
+                    Some(ring) => ring.unregister_buffers(),
                     None => Ok(()),
                 };
                 if let Err(e) = unregistered {
