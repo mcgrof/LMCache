@@ -2248,6 +2248,21 @@ impl Drop for FdGuard {
 }
 
 impl RawBlockDevice {
+    fn ensure_io_available(&self, needs_worker: bool) -> PyResult<()> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(PyRuntimeError::new_err("device is closed"));
+        }
+        if self.outcome_is_unknown() {
+            return Err(PyRuntimeError::new_err(
+                "device has an unknown I/O outcome and cannot accept new work",
+            ));
+        }
+        if needs_worker && self.worker.is_none() {
+            return Err(PyRuntimeError::new_err("io_uring worker has stopped"));
+        }
+        Ok(())
+    }
+
     /// Internal constructor performs all low level setup.
     #[allow(clippy::too_many_arguments)]
     /// The scripted ring behind this device, or a refusal.
@@ -3676,9 +3691,7 @@ impl RawBlockDevice {
         if !self.use_iouring {
             return Err(PyRuntimeError::new_err("io_uring not enabled"));
         }
-        if self.closed.load(Ordering::Relaxed) {
-            return Err(PyRuntimeError::new_err("device is closed"));
-        }
+        self.ensure_io_available(true)?;
 
         let n = offsets.len();
         if n == 0 {
@@ -4382,9 +4395,7 @@ impl RawBlockDevice {
         if !self.use_iouring {
             return Err(PyRuntimeError::new_err("io_uring not enabled"));
         }
-        if self.closed.load(Ordering::Relaxed) {
-            return Err(PyRuntimeError::new_err("device is closed"));
-        }
+        self.ensure_io_available(true)?;
 
         let view = get_buffer(py, data, false)?;
         let ptr = view.ptr as *const u8;
@@ -4581,9 +4592,7 @@ impl RawBlockDevice {
         if !self.use_iouring {
             return Err(PyRuntimeError::new_err("io_uring not enabled"));
         }
-        if self.closed.load(Ordering::Relaxed) {
-            return Err(PyRuntimeError::new_err("device is closed"));
-        }
+        self.ensure_io_available(true)?;
 
         let n = offsets.len();
         if n == 0 {
@@ -4835,9 +4844,7 @@ impl RawBlockDevice {
         payload_len: Option<usize>,
         total_len: Option<usize>,
     ) -> PyResult<()> {
-        if self.closed.load(Ordering::Relaxed) {
-            return Err(PyRuntimeError::new_err("device is closed"));
-        }
+        self.ensure_io_available(false)?;
         let fd = self.fd;
 
         let view = get_buffer(py, data, false)?;
@@ -4978,9 +4985,7 @@ impl RawBlockDevice {
         payload_len: usize,
         total_len: Option<usize>,
     ) -> PyResult<()> {
-        if self.closed.load(Ordering::Relaxed) {
-            return Err(PyRuntimeError::new_err("device is closed"));
-        }
+        self.ensure_io_available(false)?;
         let fd = self.fd;
         let view = get_buffer(py, out, true)?;
         if !view.host_accessible {

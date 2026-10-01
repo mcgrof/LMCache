@@ -1386,3 +1386,69 @@ def test_a_fatal_remainder_submit_keeps_the_owner_and_answers_the_waiter(
     assert report["owner_alive"] is True, report
     assert report["retained"] >= 1, report
     assert report["violations"] == [], report
+
+
+SCRIPTED_TERMINAL_ADMISSION = SCRIPTED_PREAMBLE + textwrap.dedent(
+    """
+    import threading
+
+    dev = device()
+    payload = bytearray(b"x" * 4096)
+    if POISONED:
+        dev.fake_submit_fails(5)
+        batch = dev.batched_write([0], [payload], [4096], [None])
+        assert wait_until(dev.is_poisoned)
+        dev.wait_iouring(batch)
+        try:
+            dev.close()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("an unknown outcome must refuse close")
+    else:
+        dev.drain_worker()
+
+    answers = {}
+    def attempt(name, operation):
+        try:
+            operation()
+            answers[name] = "accepted"
+        except RuntimeError as error:
+            answers[name] = str(error)
+
+    calls = {
+        "batched_write": lambda: dev.batched_write([0], [payload], [4096], [None]),
+        "batched_read": lambda: dev.batched_read([0], [payload], [4096]),
+        "write_uring": lambda: dev.write_uring(0, payload, 4096, 4096, None),
+    }
+    if POISONED:
+        calls.update({
+            "pwrite": lambda: dev.pwrite_from_buffer(0, payload, 4096, 4096),
+            "pread": lambda: dev.pread_into_buffer(0, payload, 4096, 4096),
+        })
+    for name, operation in calls.items():
+        worker = threading.Thread(target=attempt, args=(name, operation), daemon=True)
+        worker.start()
+        worker.join(timeout=2)
+        if worker.is_alive():
+            answers[name] = "blocked"
+    print(json.dumps({"answers": answers}))
+    sys.stdout.flush()
+    os._exit(0)
+    """
+)
+
+
+@pytest.mark.parametrize("poisoned", [False, True], ids=["drained", "refused-close"])
+def test_a_terminal_worker_refuses_new_io(tmp_path: Path, poisoned: bool) -> None:
+    """Do not queue a new request after its only completion worker has left."""
+    device = tmp_path / "dev.bin"
+    device.write_bytes(bytes(8192))
+    report = _run_scenario(
+        SCRIPTED_TERMINAL_ADMISSION.replace("POISONED", str(poisoned)), device
+    )
+
+    expected = "unknown I/O outcome" if poisoned else "worker has stopped"
+    assert report["answers"], report
+    for method, answer in report["answers"].items():
+        assert expected in answer, (method, answer)
