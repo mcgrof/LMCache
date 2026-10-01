@@ -25,8 +25,8 @@ this serde to L2:
 
 * serialize input ``src = (None, V)`` -- the K slot MUST be
   ``None``. Emits an :class:`EncodedKV` with ``k_payload_len = 0``;
-  the ``k_dtype`` tag is still recorded so cross-config gating
-  works on the eventual restore.
+  the required ``k_dtype`` header field is a non-authoritative
+  placeholder because the live L1 K object supplies its real dtype.
 * deserialize output ``dst = (None | K_skip, V_out)`` -- slot 0
   is a no-op regardless of input (K is sourced from L1); slot 1
   is dequantized from the stored FP8.
@@ -292,9 +292,9 @@ class AsymK16V8VOnlyMultiSerializer(MultiSerializer):
     Split-tier path: K stays in L1 (CPU-pinned host memory) and is
     not written to the byte buffer; only the FP8-quantized V plus
     its scales hit L2.  The blob is a regular :class:`EncodedKV`
-    with ``k_payload_len = 0`` and the ``k_dtype`` tag set to
-    whatever dtype K would have been (so cross-config gating still
-    works on the eventual restore).
+    with ``k_payload_len = 0`` and a non-authoritative ``k_dtype``
+    placeholder. V-only entries depend on their live L1 K child and
+    are therefore not restart durable.
 
     Slot semantics:
 
@@ -314,9 +314,8 @@ class AsymK16V8VOnlyMultiSerializer(MultiSerializer):
         fp8_dtype: torch.dtype = torch.float8_e4m3fn,
         scale_scope: ScaleScope = ScaleScope.PER_TENSOR,
         scale_dtype: torch.dtype = torch.float32,
-        # The k_dtype tag is recorded in the header so a future
-        # restore that pairs this V blob with its CPU-resident K can
-        # cross-check dtype agreement.  Defaults to bfloat16.
+        # Non-authoritative header placeholder: K remains in the live L1
+        # child, whose exact layout is checked against the load destination.
         k_dtype_tag: torch.dtype = torch.bfloat16,
     ) -> None:
         # Reuse the same codec instance for header serialization.
@@ -334,7 +333,7 @@ class AsymK16V8VOnlyMultiSerializer(MultiSerializer):
     def group_size(self) -> int:
         return _GROUP_SIZE_V_ONLY
 
-    def input_slot_mapping(self):
+    def input_slot_mapping(self) -> "tuple[int | None, ...]":
         # Split-tier: K stays in L1 / host -- never passed to this
         # serializer.  Slot 0 is always None; slot 1 reads parent
         # group 1 (V).
@@ -479,7 +478,7 @@ class AsymK16V8VOnlyMultiDeserializer(MultiDeserializer):
     def group_size(self) -> int:
         return _GROUP_SIZE_V_ONLY
 
-    def output_slot_mapping(self):
+    def output_slot_mapping(self) -> "tuple[int | None, ...]":
         # Split-tier: K is sourced from L1 / host, not from this blob.
         # Slot 0 is always None on the dst tuple; slot 1 writes parent
         # group 1 (V).
@@ -604,15 +603,9 @@ def _create_asym_k16_v8_serde(kwargs: dict[str, object]) -> SerdeProcessor:
       today.
     * ``scale_dtype`` (str, default ``"float32"``): torch dtype for
       the per-scope scale tensor.
-    * ``max_workers`` (int, default ``4``): thread-pool size for the
-      drainer-side codec.  The asym K16/V8 codec is CPU-bound.  With a
-      single worker the encode and decode run inline on the store path
-      and make stores several times slower than storing without a serde
-      at single-producer load.  Default to four workers so the codec
-      runs off the critical path at realistic multi-producer rates and
-      store latency matches the no-serde path, without oversubscribing
-      cores.  Raise it on hosts with spare CPU; beyond that the
-      producer, not the codec, bounds throughput.
+    * ``max_workers`` (int, default ``4``): bounded drainer-side thread
+      pool. Torch codec operations release the GIL, so multiple submitted
+      chunks can overlap; tune this value to the host's CPU budget.
 
     Returns an :class:`AsyncSerdeProcessor` wrapping the multi-output
     storage-only K16/V8 pair.  The SerdeL2AdapterWrapper consumes the
@@ -645,28 +638,21 @@ def _create_asym_k16_v8_v_only_serde(kwargs: dict[str, object]) -> SerdeProcesso
     Accepted ``kwargs``: same as :func:`_create_asym_k16_v8_serde`,
     plus:
 
-    * ``k_dtype_tag`` (str, default ``"bfloat16"``): torch dtype
-      recorded in the header so cross-config gating works on
-      restoration (K itself is never written to the byte buffer in
-      this mode; the tag identifies what K's dtype would have been).
+    * ``k_dtype_tag`` (str, default ``"bfloat16"``): non-authoritative
+      header placeholder. K itself is never written; the live L1 K object
+      supplies its actual dtype and V-only objects are not restart durable.
 
     Returns an :class:`AsyncSerdeProcessor` wrapping the V-only
     multi-output pair.  ``input_slot_mapping`` returns ``(None, 1)``
-    so the wrapper passes no K to the serializer.  Note that
-    full split-tier placement (routing K to L1 and V to L2 as
-    separate typed child outputs) requires additional wrapper
-    work tracked separately; this factory only enables the V-only
-    codec path -- with the current wrapper, V is encoded and written
-    to L2 as a single blob, and K is expected to be sourced from L1
-    by the caller.
+    so the wrapper passes no K to the serializer. The wrapper keeps K as an
+    L1 child, writes V as an L2 child, and resolves the logical key only while
+    both the in-memory manifest and K child remain present.
     """
     fp8_dtype = _resolve_dtype(str(kwargs.get("fp8_dtype", "float8_e4m3fn")))
     scale_scope = _resolve_scale_scope(str(kwargs.get("scale_scope", "PER_TENSOR")))
     scale_dtype = _resolve_dtype(str(kwargs.get("scale_dtype", "float32")))
     k_dtype_tag = _resolve_dtype(str(kwargs.get("k_dtype_tag", "bfloat16")))
-    # See _create_asym_k16_v8_serde for the max_workers=4 rationale
-    # (CPU-bound codec; a single worker runs it inline on the store
-    # path and is markedly slower than the no-serde path).
+    # Keep the bounded default shared by the other asymmetric codecs.
     max_workers = int(kwargs.get("max_workers", 4))  # type: ignore[call-overload]
     return AsyncSerdeProcessor(
         AsymK16V8VOnlyMultiSerializer(  # type: ignore[arg-type]

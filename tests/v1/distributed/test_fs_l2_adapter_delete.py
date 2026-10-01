@@ -11,6 +11,8 @@ accounting and feed the coordinator's cache-event stream.
 from collections.abc import Iterator
 from pathlib import Path
 from typing import cast
+import asyncio
+import threading
 import time
 
 # Third Party
@@ -18,9 +20,15 @@ import pytest
 
 # First Party
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+from lmcache.v1.distributed.l2_adapters import fs_l2_adapter as fs_adapter_module
 from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import (
     FSL2Adapter,
     FSL2AdapterConfig,
+)
+from lmcache.v1.distributed.storage_placement import (
+    SplitTierManifest,
+    SplitTierState,
+    derive_component_key,
 )
 from lmcache.v1.memory_management import MemoryObj
 
@@ -198,6 +206,103 @@ class TestDelete:
         assert bitmap is not None, "load task did not complete within 5s"
         assert bitmap.popcount() == 0
         assert listener.accessed == []
+
+    def test_delete_waits_for_delayed_unlink_before_replacement(
+        self,
+        adapter: AdapterFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A timed warning cannot release a same-key generation fence.
+
+        Exercise the real filesystem adapter through its public ``delete``
+        method while delaying the actual ``aiofiles`` unlink. The caller keeps
+        the manifest in ``DELETE_IN_FLIGHT`` until ``delete`` returns, so a
+        replacement must remain blocked beyond the warning threshold and can
+        be stored only after the old physical operation is terminal.
+        """
+        adp, _listener = adapter
+        logical_key = _key(b"\x03" * 4)
+        v_child_key = derive_component_key(logical_key, "v")
+        _store_and_wait(adp, [v_child_key], [b"old-v"])
+
+        manifest = SplitTierManifest()
+        generation = manifest.register_pending(logical_key)
+        manifest.mark_complete(logical_key, generation)
+        previous = manifest.begin_physical_cleanup(
+            logical_key,
+            generation,
+            (SplitTierState.COMPLETE,),
+        )
+        assert previous == SplitTierState.COMPLETE
+
+        unlink_entered = threading.Event()
+        release_unlink = threading.Event()
+        original_unlink = fs_adapter_module.aiofiles.os.unlink
+
+        async def delayed_unlink(path: str | Path) -> None:
+            unlink_entered.set()
+            await asyncio.to_thread(release_unlink.wait)
+            await original_unlink(path)
+
+        monkeypatch.setattr(fs_adapter_module.aiofiles.os, "unlink", delayed_unlink)
+        monkeypatch.setattr(fs_adapter_module, "_DELETE_COMPLETION_WARNING_S", 0.01)
+
+        cleanup_errors: list[BaseException] = []
+
+        def cleanup() -> None:
+            try:
+                adp.delete([v_child_key])
+                manifest.drop(logical_key, generation)
+            except BaseException as error:  # pragma: no cover - surfaced below
+                cleanup_errors.append(error)
+
+        worker = threading.Thread(target=cleanup)
+        worker.start()
+        try:
+            assert unlink_entered.wait(timeout=5.0)
+            time.sleep(0.05)
+            assert worker.is_alive(), (
+                "delete returned while physical unlink was pending"
+            )
+            with pytest.raises(ValueError, match="DELETE_IN_FLIGHT"):
+                manifest.register_pending(logical_key)
+        finally:
+            release_unlink.set()
+            worker.join(timeout=5.0)
+
+        assert not worker.is_alive()
+        assert cleanup_errors == []
+        replacement_generation = manifest.register_pending(logical_key)
+        _store_and_wait(adp, [v_child_key], [b"replacement-v"])
+        manifest.mark_complete(logical_key, replacement_generation)
+        assert _lookup_and_wait(adp, [v_child_key]) == [True]
+
+    def test_terminal_unlink_failure_is_not_reported_deleted(
+        self,
+        adapter: AdapterFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A terminal failure is distinct from a still-pending unlink.
+
+        Once the filesystem operation has raised, ``delete`` may return, but
+        it must not notify listeners or decrement byte accounting. The intact
+        object remains addressable rather than becoming an untracked deletion.
+        """
+        adp, listener = adapter
+        key = _key(b"\x04" * 4)
+        payload = b"survives-terminal-delete-failure"
+        _store_and_wait(adp, [key], [payload])
+
+        async def failing_unlink(_path: str | Path) -> None:
+            raise OSError("injected terminal unlink failure")
+
+        monkeypatch.setattr(fs_adapter_module.aiofiles.os, "unlink", failing_unlink)
+
+        adp.delete([key])
+
+        assert listener.deleted == []
+        assert adp.get_usage().total_bytes_used == len(payload)
+        assert _lookup_and_wait(adp, [key]) == [True]
 
 
 class TestStoreLoadNotifications:

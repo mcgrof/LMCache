@@ -244,8 +244,34 @@ that non-`None` mapping indexes cover every parent group exactly once.
 
 `asym_k16_v8` uses `(0, 1)` and therefore accepts one K/V pair. A parent with
 multiple pairs fails closed until the wire format supports repeated pairs. A
-V-only `(None, 1)` mapping is also rejected by this ordinary wrapper path;
-deployments need a split-tier owner that preserves and restores K separately.
+V-only `(None, 1)` mapping is accepted only when `StorageManager` wires the
+split-tier owner described below.
+
+## V-only split-tier placement
+
+`KV_SPLIT_TIER` stores one logical K/V object as two derived children:
+
+1. copy exact native K into an L1 K-child;
+2. copy V into a shape/dtype-specific scratch pool;
+3. serialize V into the filesystem L2 adapter under the V-child key;
+4. mark the in-memory manifest `COMPLETE` only after L2 acknowledges;
+5. release the original logical entry, leaving K-only pressure in L1.
+
+Lookup is the intersection of an L2 V hit, a `COMPLETE` manifest entry, and a
+matching exact-layout K child. Load deserializes V into group 1 and copies K
+into group 0 only when shape and dtype match exactly. Store failure, L1 K
+eviction, `clear`, and runtime adapter removal fence the manifest before
+deleting generation-less child keys, so delayed cleanup cannot delete a
+replacement store. The filesystem adapter treats its 30-second delete
+threshold as an operational warning and continues waiting for the unlink to
+become terminal; returning with a pending unlink would let that old operation
+remove a later generation's file.
+
+The initial support matrix is deliberately narrow: CPU pinned-memory L1, one
+filesystem L2 adapter, one K/V pair per object, LRU without per-adapter L2
+eviction or isolated quotas. Other topologies fail during configuration. The
+manifest is process-local and is not restart-persistent; V-only entries left on
+L2 after restart are unreachable cold-tier data, not cache hits.
 
 ## Failure Policy: All-or-Nothing per Submit
 

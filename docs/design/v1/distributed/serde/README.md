@@ -251,8 +251,10 @@ The wrapper requires the mapping to cover every parent group exactly once.
 The built-in `asym_k16_v8` mapping is `(0, 1)`, so it supports exactly one K/V
 pair and fails closed for `[K, V, K, V, ...]` layouts rather than reporting a
 partial cache hit. The `(None, 1)` V-only mapping is intentionally incomplete
-and therefore cannot be used by an ordinary all-in-L2 wrapper; it requires the
-paired split-tier placement that supplies K independently.
+and therefore cannot be used by an ordinary all-in-L2 wrapper.
+`StorageManager` derives split-tier placement for this mapping: the wrapper
+mirrors exact K into an L1 child, stores only V in L2, and composes a hit only
+while both children remain valid.
 
 ### Per-slot semantics
 

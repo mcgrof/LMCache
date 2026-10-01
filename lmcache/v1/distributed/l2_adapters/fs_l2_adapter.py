@@ -11,6 +11,7 @@ name encodes all key fields so it can be reversed on startup.
 from __future__ import annotations
 
 # Standard
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Union
 import asyncio
@@ -56,6 +57,7 @@ _KEY_SEP = "@"
 # csrc/storage_backends/fs/connector.cpp.
 _PATH_SLASH_REPLACEMENT = "-SEP-"
 _FILE_EXT = ".data"
+_DELETE_COMPLETION_WARNING_S = 30.0
 
 
 def _readinto_full(
@@ -432,16 +434,40 @@ class FSL2Adapter(L2AdapterInterface):
         Note:
             No per-key locks: a delete racing a load turns that load
             into a miss; racing a store of the same key may leave the
-            key re-stored.
+            key re-stored. The method does not return while an unlink is
+            pending. Callers may therefore use its return as the physical
+            completion boundary before permitting a same-key replacement.
         """
         if not keys:
             return
+        delete_coro = self._execute_delete(keys)
         try:
-            fut = asyncio.run_coroutine_threadsafe(
-                self._execute_delete(keys),
-                self._loop,
-            )
-            deleted_keys, deleted_sizes = fut.result(timeout=30.0)
+            try:
+                fut = asyncio.run_coroutine_threadsafe(delete_coro, self._loop)
+            except Exception:
+                # ``run_coroutine_threadsafe`` does not take ownership when
+                # the loop has already closed.  Close the never-submitted
+                # coroutine explicitly so the no-op-after-close contract is
+                # warning-clean.
+                delete_coro.close()
+                raise
+            try:
+                deleted_keys, deleted_sizes = fut.result(
+                    timeout=_DELETE_COMPLETION_WARNING_S
+                )
+            except FutureTimeoutError:
+                # Child keys do not carry a storage generation. Returning
+                # while this future can still unlink would let a caller reuse
+                # the same path and have the delayed old operation remove the
+                # replacement. Keep waiting for terminal physical completion;
+                # the timeout is an observability threshold, not a correctness
+                # boundary.
+                logger.warning(
+                    "FSL2Adapter delete still pending after %.1f seconds; "
+                    "waiting for physical completion",
+                    _DELETE_COMPLETION_WARNING_S,
+                )
+                deleted_keys, deleted_sizes = fut.result()
         except Exception as e:
             logger.warning("FSL2Adapter delete failed: %s", e)
             return

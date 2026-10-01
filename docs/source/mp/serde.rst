@@ -64,6 +64,11 @@ serde factory.
      - ``fp8_dtype`` (default ``float8_e4m3fn``), ``scale_scope`` (default
        ``PER_TENSOR``), ``scale_dtype`` (default ``float32``), and
        ``max_workers`` (default 4)
+   * - ``asym_k16_v8_v_only``
+     - Keep exact K in CPU L1 and store only FP8-quantized V in filesystem L2.
+       The composite is process-local and not restart durable.
+     - Same fields as ``asym_k16_v8`` plus ``k_dtype_tag`` (a
+       non-authoritative header placeholder; default ``bfloat16``)
    * - ``turboquant``
      - Compress KV tensors with TurboQuant presets before L2 store and
        reconstruct them on load.
@@ -77,11 +82,32 @@ serde factory.
        for ``hkdf``), ``aes_bits`` (``128`` default, or ``256``),
        ``max_workers`` (thread pool size, default 1)
 
-``asym_k16_v8`` currently supports exactly one K/V pair per object. A layout
+Both asymmetric modes currently support exactly one K/V pair per object. A layout
 with multiple kernel-group pairs fails closed instead of storing only its first
-pair. The registered ``asym_k16_v8_v_only`` codec is not a standalone all-L2
-configuration: its slot mapping omits K and is accepted only by the paired
-split-tier placement that retains K separately.
+pair. ``asym_k16_v8_v_only`` is not a standalone all-L2 configuration: its
+slot mapping omits K and selects the paired split-tier placement.
+
+V-only split-tier configuration
+--------------------------------
+
+The supported initial deployment uses pinned CPU L1 and exactly one filesystem
+adapter. It rejects GDS/Device-DAX L1, non-filesystem L2, multiple L2 adapters,
+per-adapter L2 eviction, and ``IsolatedLRU`` quotas.
+
+.. code-block:: bash
+
+    lmcache server \
+        --l1-size-gb 100 \
+        --eviction-policy LRU \
+        --l2-adapter '{
+            "type": "fs",
+            "base_path": "/data/lmcache/l2",
+            "serde": {"type": "asym_k16_v8_v_only"}
+        }'
+
+The manifest that pairs K and V lives only in the current process. After a
+restart, old V-child files are unreachable and age out through the filesystem
+adapter's normal lifecycle; they are never reported as composite hits.
 
 
 Serialized-size contracts

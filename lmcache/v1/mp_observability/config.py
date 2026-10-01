@@ -430,6 +430,7 @@ def init_observability(
             LookupMetricsSubscriber,
             MPTransferCountersSubscriber,
             SMLifecycleSubscriber,
+            SplitTierMetricsSubscriber,
             TimeoutMetricsSubscriber,
             TransferPhaseMetricsSubscriber,
         )
@@ -447,6 +448,7 @@ def init_observability(
         bus.register_subscriber(L2ThroughputSubscriber())
         bus.register_subscriber(LookupMetricsSubscriber())
         bus.register_subscriber(SMLifecycleSubscriber(sample_rate=sample_rate))
+        bus.register_subscriber(SplitTierMetricsSubscriber())
         bus.register_subscriber(BlendMetricsSubscriber())
         bus.register_subscriber(EngineMetricsSubscriber())
         bus.register_subscriber(EventBusSelfMetricsSubscriber(bus))

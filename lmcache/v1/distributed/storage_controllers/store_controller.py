@@ -11,7 +11,7 @@ The controller runs a background thread with an event-driven loop that:
 
 # Standard
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import enum
 import select
 import threading
@@ -22,7 +22,11 @@ from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L1ManagerListener
 from lmcache.v1.distributed.l1_manager import L1Manager
-from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
+from lmcache.v1.distributed.l2_adapters.base import (
+    EarlyReleaseStoreAdapter,
+    L2AdapterInterface,
+    L2TaskId,
+)
 from lmcache.v1.distributed.storage_controller import StorageControllerInterface
 from lmcache.v1.distributed.storage_controllers.adapter_lifecycle import (
     AddAdapterOp,
@@ -32,6 +36,7 @@ from lmcache.v1.distributed.storage_controllers.store_policy import (
     StorePolicy,
 )
 from lmcache.v1.distributed.storage_controllers.utils import L2AdapterDescriptor
+from lmcache.v1.distributed.storage_placement import SplitTierManifest  # noqa: F401
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
 from lmcache.v1.mp_observability.otel_init import register_gauge
@@ -52,15 +57,17 @@ def _group_keys_by_shape(
     """Group ``keys`` by the fields that determine their KV cache shape.
 
     Each bucket shares a single ``(shape, dtype)``, so each bucket can be
-    submitted as one ``submit_store_task`` call. Today the shape is pinned
-    by ``(model_name, kv_rank)`` — ``kv_rank`` packs ``world_size`` and
-    parallelism config, so different TP/PP setups land in different
-    buckets. Extend the grouping tuple when a new shape-affecting field is
-    added to ``ObjectKey``.
+    submitted as one ``submit_store_task`` call. The shape is pinned by
+    ``(model_name, kv_rank, object_group_id)`` — ``kv_rank`` packs
+    ``world_size`` and parallelism config, so different TP/PP setups land
+    in different buckets, and ``object_group_id`` separates the KV cache
+    groups of hybrid / sliding-window models, whose layer shapes differ
+    per group. Extend the grouping tuple when a new shape-affecting field
+    is added to ``ObjectKey``.
     """
     groups: dict[tuple, list[ObjectKey]] = defaultdict(list)
     for key in keys:
-        groups[(key.model_name, key.kv_rank)].append(key)
+        groups[(key.model_name, key.kv_rank, key.object_group_id)].append(key)
     return groups
 
 
@@ -183,6 +190,21 @@ class InFlightStoreTask:
     """The subset of keys for which reserve_read succeeded
     (i.e., keys holding an L1 read lock that must be released)."""
 
+    early_released_logicals: list[ObjectKey] = field(default_factory=list)
+    """Logical keys whose read locks + L1 entries were released
+    immediately after ``submit_store_task`` returned, via the
+    :class:`EarlyReleaseStoreAdapter` protocol.  Used to skip the
+    redundant split-tier logical-delete on ``_finalize_store``
+    (those entries are gone already)."""
+
+    adapter_is_split_tier: bool = False
+    """Whether this task's adapter is the split-tier wrapper (an
+    :class:`EarlyReleaseStoreAdapter`).  Only ITS completion may
+    trigger the split-tier logical-L1 deletion in
+    ``_finalize_store`` -- another adapter's success (e.g. a peer
+    adapter acknowledging instantly) says nothing about whether K
+    and V have actually been mirrored out of the staging entry."""
+
     l2_store_result: bool | None = None
     """L2 outcome (True=success, False=failure, None=still in flight)."""
 
@@ -229,6 +251,7 @@ class StoreController(StorageControllerInterface):
         l2_adapters: list[L2AdapterInterface],
         adapter_descriptors: list[L2AdapterDescriptor],
         policy: StorePolicy,
+        split_tier_manifest: "SplitTierManifest | None" = None,
     ) -> None:
         self._l1_manager = l1_manager
         self._l2_adapters: dict[int, L2AdapterInterface] = {
@@ -239,6 +262,14 @@ class StoreController(StorageControllerInterface):
             desc.index: desc for desc in adapter_descriptors
         }
         self._policy = policy
+        # Optional split-tier manifest.  When set, K-child write
+        # completions in the listener queue are filtered out before
+        # the policy sees them -- K children are L1-canonical and
+        # must never be routed to L2 (the wrapper's
+        # submit_store_task would re-enter with a single-shape
+        # K-only object).  None preserves the legacy behavior
+        # (every write_finished key is a store candidate).
+        self._split_tier_manifest = split_tier_manifest
 
         # Adapters that are being drained and will be removed after all
         # the in-flight operations are done.
@@ -467,6 +498,18 @@ class StoreController(StorageControllerInterface):
                 try:
                     if fd == listener_efd:
                         keys = self._listener.pop_pending_keys()
+                        # Filter K-child writes: they are L1-only.
+                        # The wrapper writes them as part of the
+                        # split-tier store transition and they MUST
+                        # NOT trigger an L2 store (re-entry would
+                        # fail the multi-group sanity check on a
+                        # single-shape K-only buffer).
+                        if keys and self._split_tier_manifest is not None:
+                            keys = [
+                                k
+                                for k in keys
+                                if not self._split_tier_manifest.is_k_child_key(k)
+                            ]
                         if keys:
                             self._process_new_keys(keys)
                     else:
@@ -664,10 +707,75 @@ class StoreController(StorageControllerInterface):
                 l1_mgr.finish_read(successful_keys)
                 continue
 
+            # Adapters that have already extracted everything they need
+            # from the caller-side ``successful_objs`` (split-tier via
+            # SerdeL2AdapterWrapper today) hand back the subset of keys
+            # whose read locks should drop *now* instead of at L2
+            # completion.  Releasing earlier removes the per-chunk K+V
+            # logical from L1 immediately, leaving only the K-child as
+            # the L1 resident -- the steady-state L1 footprint per
+            # split-tier chunk drops from ~1.5× (logical + K-child) to
+            # ~0.5× (K-child only).
+            early_release: list[ObjectKey] = []
+            if isinstance(adapter, EarlyReleaseStoreAdapter):
+                try:
+                    early_release = adapter.claim_early_release_keys(task_id)
+                except Exception:
+                    logger.exception(
+                        "Adapter %d claim_early_release_keys raised "
+                        "for task %d; falling back to default lifecycle",
+                        adapter_index,
+                        task_id,
+                    )
+                    early_release = []
+
+            remaining_read_locked = list(successful_keys)
+            if early_release:
+                early_set = set(early_release)
+                remaining_read_locked = [
+                    k for k in successful_keys if k not in early_set
+                ]
+                released = [k for k in successful_keys if k in early_set]
+                if released:
+                    # Split-tier additionally deletes the original
+                    # logical L1 entry now that K is mirrored to the
+                    # K-child and V is on its way to L2.  Outside split-
+                    # tier the policy decides (today nothing else uses
+                    # early-release).
+                    if self._split_tier_manifest is not None:
+                        split_tier_logicals = [
+                            k
+                            for k in released
+                            if self._split_tier_manifest.lookup(k) is not None
+                        ]
+                        if split_tier_logicals:
+                            try:
+                                self._l1_manager.finish_read(
+                                    split_tier_logicals,
+                                    delete_when_unlocked=True,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Early-release split-tier logical "
+                                    "delete raised for task %d (%d keys)",
+                                    task_id,
+                                    len(split_tier_logicals),
+                                )
+                        split_tier_set = set(split_tier_logicals)
+                        ordinary_released = [
+                            key for key in released if key not in split_tier_set
+                        ]
+                        if ordinary_released:
+                            self._l1_manager.finish_read(ordinary_released)
+                    else:
+                        self._l1_manager.finish_read(released)
+
             self._in_flight_tasks[(adapter_index, task_id)] = InFlightStoreTask(
                 adapter_index=adapter_index,
                 keys=successful_keys,
-                read_locked_keys=list(successful_keys),
+                read_locked_keys=remaining_read_locked,
+                early_released_logicals=list(early_release),
+                adapter_is_split_tier=isinstance(adapter, EarlyReleaseStoreAdapter),
             )
             self._status_in_flight_count += 1
 
@@ -739,7 +847,28 @@ class StoreController(StorageControllerInterface):
         l1_mgr = self._l1_manager
         success = task.l2_store_result
 
-        l1_mgr.finish_read(task.read_locked_keys)
+        split_tier_logicals: list[ObjectKey] = []
+        if (
+            success
+            and self._split_tier_manifest is not None
+            and task.adapter_is_split_tier
+        ):
+            split_tier_logicals = [
+                key
+                for key in task.read_locked_keys
+                if self._split_tier_manifest.lookup(key) is not None
+            ]
+        split_tier_set = set(split_tier_logicals)
+        ordinary_read_locked = [
+            key for key in task.read_locked_keys if key not in split_tier_set
+        ]
+        if ordinary_read_locked:
+            l1_mgr.finish_read(ordinary_read_locked)
+        if split_tier_logicals:
+            l1_mgr.finish_read(
+                split_tier_logicals,
+                delete_when_unlocked=True,
+            )
         del self._in_flight_tasks[task_key]
         self._status_in_flight_count -= 1
 
@@ -769,6 +898,19 @@ class StoreController(StorageControllerInterface):
                 len(task.keys),
             )
             delete_keys = self._policy.select_l1_deletions(task.keys)
+            # Split-tier additionally deleted/armed the original logical L1
+            # entries atomically with releasing this task's read locks above.
+            # K bytes are preserved under the K-child key; V is on L2
+            # under the V-child key; the original staging is now
+            # redundant and deleting it is what drops the L1 footprint
+            # per cached chunk to K-only (the core L1 win for V-only).
+            # Gated on THIS task's adapter being the split-tier wrapper:
+            # only its completion proves K and V were mirrored out of
+            # the staging entry -- another adapter's success (e.g. a
+            # peer adapter's instant 0-byte acknowledgment) must not
+            # trigger the deletion.
+            if split_tier_logicals:
+                delete_keys = [key for key in delete_keys if key not in split_tier_set]
             if delete_keys:
                 l1_mgr.delete(delete_keys)
         else:

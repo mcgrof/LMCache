@@ -76,6 +76,14 @@ from lmcache.v1.distributed.storage_layout import (
 from lmcache.v1.distributed.storage_layout import (
     derive_storage_layout_mode,
 )
+from lmcache.v1.distributed.storage_placement import (
+    SplitTierConfigError,
+    SplitTierManifest,
+    SplitTierState,
+    StoragePlacementMode,
+    derive_component_key,
+    derive_storage_placement_mode,
+)
 from lmcache.v1.memory_allocators.devdax_memory_allocator import (
     DevDaxArenaState,
     DevDaxArenaStatus,
@@ -98,6 +106,95 @@ logger = init_logger(__name__)
 # L1 write tag for every object reserved through this manager. Sharing one
 # tag makes concurrent stores of the same key exclude each other.
 _L1_WRITE_TAG = "storage_manager"
+
+
+def _reject_unsupported_split_tier_config(config: StorageManagerConfig) -> None:
+    """Enforce the KV_SPLIT_TIER (V-only) support matrix at config time.
+
+    The split-tier path composes an L1-resident exact-K child with an
+    L2-resident compressed-V child under one logical key.  It is only
+    correct for the narrow initial matrix documented in
+    ``docs/design/v1/distributed/`` -- CPU pinned-DRAM L1, exactly one
+    split-tier L2 adapter, no L2 eviction/quota driving the V child out
+    from under a live composite.  Configurations outside that matrix are
+    rejected here, before any resource is built, so they fail closed at
+    startup rather than silently mis-serving.
+
+    Only call this when the derived placement mode is
+    :attr:`StoragePlacementMode.KV_SPLIT_TIER`; KV_TOGETHER configs are
+    unrestricted.
+
+    Args:
+        config: The fully-normalized storage manager configuration.
+
+    Raises:
+        SplitTierConfigError: naming every unsupported combination
+            present, so an operator sees all matrix violations at once.
+    """
+    reasons: list[str] = []
+
+    l1 = config.l1_manager_config
+    if l1.gds_l1_config is not None:
+        reasons.append(
+            "GDS L1 (gds-l1-path): split-tier requires a CPU pinned-DRAM "
+            "L1 tier to retain the exact-K child"
+        )
+    if l1.memory_config.devdax_path:
+        reasons.append(
+            "Device-DAX L1 (l1-devdax-path): split-tier requires a CPU "
+            "pinned-DRAM L1 tier to retain the exact-K child"
+        )
+
+    adapters = config.l2_adapter_config.adapters
+    non_fs = [
+        get_type_name_for_config(unwrap_l2_adapter_config(ac))
+        for ac in adapters
+        if get_type_name_for_config(unwrap_l2_adapter_config(ac)) != "fs"
+    ]
+    if non_fs:
+        reasons.append(
+            f"L2 backend ({', '.join(non_fs)}): split-tier variable-length "
+            "V blobs are currently validated only with the filesystem "
+            "adapter's actual-used-length load contract"
+        )
+    if len(adapters) > 1:
+        names = ", ".join(get_type_name_for_config(ac) for ac in adapters)
+        reasons.append(
+            f"multiple L2 adapters ({names}): split-tier supports exactly "
+            "one L2 adapter for the V child"
+        )
+
+    evicting = [
+        get_type_name_for_config(ac)
+        for ac in adapters
+        if ac.eviction_config is not None
+    ]
+    if evicting:
+        reasons.append(
+            f"per-adapter L2 eviction ({', '.join(evicting)}): L2 eviction "
+            "can delete a V child out from under a live composite"
+        )
+
+    quota_sources: list[str] = []
+    if config.eviction_config.eviction_policy == "IsolatedLRU":
+        quota_sources.append("L1 eviction policy")
+    quota_sources.extend(
+        get_type_name_for_config(ac)
+        for ac in adapters
+        if ac.eviction_config is not None
+        and ac.eviction_config.eviction_policy == "IsolatedLRU"
+    )
+    if quota_sources:
+        reasons.append(
+            f"IsolatedLRU per-cache_salt quota ({', '.join(quota_sources)}): "
+            "quota accounting does not yet model the split K/V children"
+        )
+
+    if reasons:
+        raise SplitTierConfigError(
+            "Unsupported configuration for KV_SPLIT_TIER (V-only) storage "
+            "placement:\n  - " + "\n  - ".join(reasons)
+        )
 
 
 def _reject_unsupported_serde_size_contracts(
@@ -138,6 +235,19 @@ def _reject_unsupported_serde_size_contracts(
 
 class StorageManager:
     def __init__(self, config: StorageManagerConfig):
+        # Canonical L1 placement / lifecycle mode, derived from the
+        # configured L2 adapters' serdes.  Determines whether the wrapper
+        # packs K + V into one stored blob (KV_TOGETHER) or splits them
+        # into separately keyed children with K retained in L1 and V
+        # routed to L2 (KV_SPLIT_TIER, the Mode 2 V-only path).  Mixed
+        # configurations are rejected.  Derived FIRST -- it is pure config
+        # inspection -- so the split-tier support matrix can fail closed
+        # before any hardware-backed resource (the L1 memory manager, the
+        # adapters) is constructed.
+        self._storage_placement_mode = derive_storage_placement_mode(
+            config.l2_adapter_config.adapters
+        )
+
         # Layout is also a pure config decision and may reject mixed
         # single-/multi-output adapter sets.  Derive it before constructing
         # L1 or starting controller threads so every invalid configuration
@@ -146,6 +256,15 @@ class StorageManager:
             config.l2_adapter_config.adapters
         )
         _reject_unsupported_serde_size_contracts(config.l2_adapter_config.adapters)
+
+        # Support matrix: the V-only split-tier path is only
+        # correct for a narrow, documented configuration.  Reject the
+        # unsupported combinations before any resource is built so a bad
+        # config fails closed at startup instead of silently mis-serving.
+        # KV_TOGETHER is unaffected (the check is gated on the mode).
+        if self._storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER:
+            _reject_unsupported_split_tier_config(config)
+
         self._l1_manager = L1Manager(config.l1_manager_config)
         self._event_bus = get_event_bus()
 
@@ -155,6 +274,12 @@ class StorageManager:
             eviction_config=config.eviction_config,
         )
         self._eviction_controller.start()
+
+        # Per-logical-key state machine for KV_SPLIT_TIER.  Always
+        # constructed (cheap; empty when placement is KV_TOGETHER).
+        # The wrapper queries and mutates this manifest as part of
+        # the V-only store / load composition.
+        self._split_tier_manifest = SplitTierManifest()
 
         # L2 adapters and store controller. When an adapter config carries
         # a ``serde_config``, the adapter is wrapped with
@@ -182,6 +307,25 @@ class StorageManager:
             interval_ms=config.periodic_notifier_interval_ms,
             use_eventfd=HAS_EVENTFD,
         )
+
+        # Paired-eviction wire-up: attach the manifest + L2 adapters to the L1
+        # eviction controller (constructed earlier so its L1 listener
+        # was registered before any allocate event).  When placement
+        # is KV_SPLIT_TIER, this lets the controller drive paired
+        # cleanup (mark INVALIDATED, enqueue V child delete to L2)
+        # for K-child evictions.  Safe to call always: KV_TOGETHER
+        # mode skips the paired path because no K-child keys are in
+        # the eviction-candidate set.
+        if self._storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER:
+            self._eviction_controller.set_split_tier_paired_eviction(
+                self._split_tier_manifest,
+                list(self._l2_adapters.values()),
+            )
+            # Also wire the manifest into L1Manager so its
+            # ``is_key_evictable`` gates K-child eviction on manifest
+            # state — STORE_IN_FLIGHT K-children stay pinned across
+            # the V codec + L2 write window.
+            self._l1_manager.set_split_tier_manifest(self._split_tier_manifest)
 
         # Per-cache_salt quota registry. Shared across the L2 eviction
         # controller (reads quotas each cycle) and the HTTP quota
@@ -225,6 +369,7 @@ class StorageManager:
             l2_adapters=list(self._l2_adapters.values()),
             adapter_descriptors=list(self._adapter_descriptors.values()),
             policy=create_store_policy(config.store_policy),
+            split_tier_manifest=self._split_tier_manifest,
         )
         self._store_controller.start()
 
@@ -253,7 +398,56 @@ class StorageManager:
             self.get_l2_usages,
         )
 
+        # Split-tier manifest state gauge — one observation per
+        # SplitTierState, tagged by ``state``.  Registered only under
+        # KV_SPLIT_TIER (the manifest is inert / empty otherwise).  The
+        # event-driven ``lmcache_mp.split_tier_store_*`` counters report
+        # the store lifecycle rate; this gauge reports the live
+        # state-machine distribution (a stuck-transition / leak signal).
+        if self._storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER:
+            register_gauge(
+                "lmcache.split_tier",
+                "lmcache_mp.split_tier_manifest_entries",
+                (
+                    "Number of split-tier logical keys tracked in the "
+                    "manifest, tagged by ``state`` (store_in_flight | "
+                    "complete | invalidated | delete_in_flight). One "
+                    "observation per state."
+                ),
+                self.get_split_tier_state_counts,
+            )
+
     # External APIs for serving engine integration code to call
+
+    @property
+    def split_tier_manifest(self) -> SplitTierManifest:
+        """The per-logical-key state machine for KV_SPLIT_TIER mode.
+
+        Always present (empty when placement is :attr:`KV_TOGETHER`).
+        The wrapper drives transitions during store / load; the
+        eviction controller drives invalidation + delete-in-flight
+        transitions during paired cleanup.
+
+        Exposed as a property so the wrapper can hold a reference
+        without needing the whole StorageManager.
+        """
+        return self._split_tier_manifest
+
+    @property
+    def storage_placement_mode(self) -> StoragePlacementMode:
+        """The canonical placement / lifecycle mode for this
+        StorageManager.
+
+        :attr:`StoragePlacementMode.KV_TOGETHER` packs K + V into one
+        stored blob (the default for ``fp8`` and asym Mode 1 K16/V8).
+        :attr:`StoragePlacementMode.KV_SPLIT_TIER` drives the V-only
+        state machine: K child retained in L1, V child stored to L2,
+        original logical staging object deleted in L1.  Derived once
+        at construction from the configured serdes; orthogonal to
+        :attr:`storage_layout_mode` (which decides the L1 *shape*,
+        not the lifecycle).
+        """
+        return self._storage_placement_mode
 
     @property
     def storage_layout_mode(self) -> StorageLayoutMode:
@@ -311,7 +505,27 @@ class StorageManager:
             dict[ObjectKey, MemoryObj]: A dictionary mapping object keys to their
                 reserved memory objects. Note that not all requested keys could be
                 reserved (e.g., out of memory or write conflict)
+
+        Raises:
+            ValueError: under KV_SPLIT_TIER, if any key carries a non-zero
+                ``object_group_id`` -- a fact invisible at config time.
+                Multiple object groups (hybrid / sliding-window / MLA
+                models emit one key per KV cache group) are outside the
+                split-tier support matrix; failing closed here surfaces
+                the mismatch to the producer instead of silently building
+                independent, untested per-group composites.
         """
+        if self._storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER:
+            multi_group = [k for k in keys if k.object_group_id != 0]
+            if multi_group:
+                raise ValueError(
+                    "KV_SPLIT_TIER (V-only) placement supports a single "
+                    f"object group, but {len(multi_group)} of {len(keys)} "
+                    "key(s) carry object_group_id != 0 (hybrid / "
+                    "sliding-window / MLA models emit multiple object "
+                    "groups). This model topology is outside the "
+                    "split-tier support matrix."
+                )
         # Apply the L1 storage-layout policy exactly once, at this choke
         # point, so every store path reserves the canonical L1 shape
         # without each caller re-deriving it.  For the default PACKED
@@ -550,7 +764,27 @@ class StorageManager:
 
         Returns:
             PrefetchHandle to track the task.
+
+        Raises:
+            ValueError: Under KV_SPLIT_TIER, if a row or key carries a
+                non-zero ``object_group_id``. Multi-group model topologies
+                are outside the split-tier support matrix.
         """
+        if self._storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER:
+            multi_group_rows = [
+                row
+                for row in spec.key_groups
+                if row.object_group_id != 0
+                or any(key.object_group_id != 0 for key in row.keys)
+            ]
+            if multi_group_rows:
+                raise ValueError(
+                    "KV_SPLIT_TIER (V-only) placement supports a single "
+                    f"object group, but {len(multi_group_rows)} of "
+                    f"{len(spec.key_groups)} prefetch row(s) carry "
+                    "object_group_id != 0. This model topology is outside "
+                    "the split-tier support matrix."
+                )
         # Apply the L1 storage-layout policy once here (the prefetch choke
         # point), before the controller handles the request, so every caller
         # prefetches into the canonical L1 shape. PACKED is an identity
@@ -680,6 +914,21 @@ class StorageManager:
         deleted = sum(1 for err in results.values() if err == L1Error.SUCCESS)
         skipped = sum(1 for err in results.values() if err == L1Error.KEY_IS_LOCKED)
         return deleted, skipped
+
+    def contains_l1_key(self, key: ObjectKey) -> bool:
+        """Whether ``key`` currently has an L1 catalog entry.
+
+        Pure introspection for diagnostics and tests: reports presence
+        regardless of lock state and does not lock, touch, or
+        otherwise perturb the entry.
+
+        Args:
+            key (ObjectKey): The key to probe.
+
+        Returns:
+            bool: True if the key has an L1 entry (any lock state).
+        """
+        return self._l1_manager.get_object_state(key) is not None
 
     def unsafe_read(
         self, keys: list[ObjectKey]
@@ -945,6 +1194,27 @@ class StorageManager:
             return False
         return status.state is DevDaxArenaState.ACTIVE
 
+    def get_split_tier_state_counts(
+        self,
+    ) -> list[tuple[int | float, dict[str, object]]]:
+        """Split-tier manifest state distribution in OTel-observation shape.
+
+        Backing data for the ``lmcache_mp.split_tier_manifest_entries``
+        observable gauge.  One entry per :class:`SplitTierState`, so the
+        gauge always emits the full set of series (zero for empty states).
+        A rising ``store_in_flight`` / ``delete_in_flight`` count or a
+        monotonically growing total is the operator's signal for a stuck
+        transition or an entry leak.
+
+        Returns:
+            A list of ``(count, {"state": <state_value>})`` tuples, one per
+            split-tier state.
+        """
+        return [
+            (count, {"state": state.value})
+            for state, count in self._split_tier_manifest.state_counts().items()
+        ]
+
     def get_usage_bytes_by_cache_salt(self) -> dict[str, int]:
         """Aggregate ``cache_salt`` byte usage across every L2 adapter.
 
@@ -1066,19 +1336,54 @@ class StorageManager:
             ValueError: If the adapter registers a single L1 memory region
                 while L1 spans more than one (hybrid DRAM + Device-DAX, or
                 more than one Device-DAX arena), or a DAX device is already
-                mapped by L1 or another L2 adapter, or its serde requires a
-                storage layout incompatible with this manager.
+                mapped by L1 or another L2 adapter.
+            SplitTierConfigError: if adding this adapter would change the
+                frozen placement mode (a mode cannot flip at runtime --
+                the manifest / paired-eviction wiring is set up once at
+                construction), mix incompatible placement/layout modes
+                (this closes the P2P auto-add bypass), or exceed the
+                KV_SPLIT_TIER single-adapter limit.
         """
         with self._lifecycle_lock:
-            adapter_layout_mode = derive_storage_layout_mode([config])
-            if adapter_layout_mode is not self._storage_layout_mode:
-                raise ValueError(
-                    "L2 adapter storage layout mode "
-                    f"{adapter_layout_mode.value!r} is incompatible with this "
-                    "StorageManager's canonical mode "
-                    f"{self._storage_layout_mode.value!r}"
+            # Runtime support-matrix guard: re-derive the
+            # placement + layout modes over the existing adapters plus
+            # the candidate and reject any config that would change the
+            # frozen mode or break the split-tier single-adapter rule.
+            # A KV_TOGETHER peer adapter attaching to a KV_SPLIT_TIER
+            # manager produces a mixed set that the derive rejects.
+            with self._adapters_lock:
+                candidate_configs = [
+                    d.config for d in self._adapter_descriptors.values()
+                ] + [config]
+            try:
+                candidate_placement = derive_storage_placement_mode(candidate_configs)
+                candidate_layout = derive_storage_layout_mode(candidate_configs)
+            except ValueError as e:
+                raise SplitTierConfigError(
+                    f"runtime add_l2_adapter rejected: incompatible "
+                    f"placement/layout with the existing adapters: {e}"
+                ) from e
+            if candidate_placement != self._storage_placement_mode:
+                raise SplitTierConfigError(
+                    "runtime add_l2_adapter would change the storage "
+                    f"placement mode from {self._storage_placement_mode.value} "
+                    f"to {candidate_placement.value}; the mode is frozen at "
+                    "construction and cannot flip at runtime"
                 )
-            _reject_unsupported_serde_size_contracts([config])
+            if candidate_layout != self._storage_layout_mode:
+                raise SplitTierConfigError(
+                    "runtime add_l2_adapter would change the storage "
+                    f"layout mode from {self._storage_layout_mode.value} "
+                    f"to {candidate_layout.value}; the mode is frozen at "
+                    "construction and cannot flip at runtime"
+                )
+            _reject_unsupported_serde_size_contracts(candidate_configs)
+            if self._storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER:
+                raise SplitTierConfigError(
+                    "KV_SPLIT_TIER (V-only) placement supports exactly one "
+                    "L2 adapter; cannot add another at runtime"
+                )
+
             # Mirror of the check in add_l1_devdax_device: a single-region
             # adapter may only be added while L1 is exactly one memory region.
             adapter_name = requires_single_l1_memory_region(config)
@@ -1100,6 +1405,7 @@ class StorageManager:
                             f"device {device.device_path} is already mapped by "
                             f"{', '.join(owners)}"
                         )
+
             adapter_id, adapter, descriptor = self._build_l2_adapter(config)
             for listener in self._registered_l2_listeners:
                 adapter.register_listener(listener)
@@ -1157,11 +1463,58 @@ class StorageManager:
 
             self._l2_eviction_controller.remove_adapter_state(adapter_id)
             with self._adapters_lock:
-                adapter = self._l2_adapters.pop(adapter_id)
+                adapter = self._l2_adapters[adapter_id]
+                remaining = [
+                    existing
+                    for existing_id, existing in self._l2_adapters.items()
+                    if existing_id != adapter_id
+                ]
+            if self._storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER:
+                # Detach the adapter from future paired passes and wait for
+                # passes that already snapshotted it before closing it.
+                drained = self._eviction_controller.set_split_tier_paired_eviction(
+                    self._split_tier_manifest,
+                    remaining,
+                    timeout=max(0.0, deadline - time.monotonic()),
+                )
+                if not drained:
+                    raise LMCacheTimeoutError(
+                        f"Timed out draining adapter {adapter_id} from paired "
+                        "L1 eviction"
+                    )
+            with self._adapters_lock:
+                self._l2_adapters.pop(adapter_id)
                 self._adapter_descriptors.pop(adapter_id, None)
             adapter.close()
+            if self._storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER:
+                # When the last split-tier adapter is gone,
+                # sweep the manifest: its V children are unreachable, so
+                # leaving COMPLETE entries would return phantom lookup
+                # hits that can never load.
+                if not remaining:
+                    self._sweep_manifest_no_adapters()
             logger.info("Deleted L2 adapter %d", adapter_id)
             self._publish_capacity_changed()
+
+    def _sweep_manifest_no_adapters(self) -> None:
+        """Invalidate + drop every split-tier manifest entry after the
+        last split-tier L2 adapter has been removed.
+
+        The V children are unreachable (their adapter is closed), so no
+        L2 delete is issued -- unlike :meth:`clear`'s sweep, the point
+        here is purely to stop lookups from returning phantom COMPLETE
+        composite hits that can never load.  The K children in L1 become
+        ordinary orphans (evictable).  Each transition is generation-
+        guarded so a concurrent re-store under a fresh generation is left
+        untouched.  Caller holds ``_lifecycle_lock``.
+        """
+        for logical_key in self._split_tier_manifest.tracked_keys():
+            entry = self._split_tier_manifest.lookup_entry(logical_key)
+            if entry is None:
+                continue
+            _state, generation = entry
+            if self._split_tier_manifest.mark_invalidated(logical_key, generation):
+                self._split_tier_manifest.drop(logical_key, generation)
 
     def l2_adapters(self) -> list[tuple[L2AdapterDescriptor, L2AdapterInterface]]:
         """Return all active L2 adapters paired with descriptors, in
@@ -1182,13 +1535,105 @@ class StorageManager:
         """
         Clear data in the storage manager.
 
+        Under :attr:`StoragePlacementMode.KV_SPLIT_TIER`, additionally
+        sweep the split-tier manifest: any tracked logical key whose
+        K child was just removed from L1 can never compose again (the
+        composite requires the L1-resident K child), so its entry is
+        invalidated and its V child is deleted from every L2 adapter before
+        the generation fence is dropped. Without the sweep, cleared keys stay
+        ``COMPLETE`` in the manifest -- phantom lookup hits that fail
+        at load, orphaned V children on L2, and (before manifest
+        generations) a permanent refusal to re-store those keys.
+
+        With ``force=False`` the underlying L1 clear now preserves
+        STORE_IN_FLIGHT K children (see :meth:`L1Manager.clear`), so an
+        in-flight split-tier store survives a non-forced clear intact:
+        its K child stays resident, the sweep skips its still-present
+        entry, and the store completes normally.
+
+        Restart / persistence (Option C): the split-tier manifest is
+        purely in-memory and is NOT persisted across process restarts.
+        A restart yields an empty manifest; any V children left on L2 by
+        a prior process are stale and age out via that adapter's own
+        lifecycle (they can never be composed without their L1 K child,
+        which did not survive the restart). This is the documented,
+        single-process, non-restart-persistent contract.
+
         Args:
-            force: If True, clear ALL objects including locked ones.
-                This may corrupt in-flight store/prefetch operations.
-                If False (default), only clear unlocked objects, keeping
-                write-locked and read-locked objects intact.
+            force: If True, clear ALL objects including locked and
+                in-flight ones. This is a hard reset that can abort an
+                in-flight store/prefetch (the operator explicitly wiped
+                the cache); the manifest sweep still invalidates the
+                affected entries so no phantom ``COMPLETE`` remains.
+                If False (default), only clear objects eviction itself
+                would remove -- unlocked objects that are not pinned by
+                an in-flight operation -- so a live composite is never
+                torn out from under a store that is still writing it.
         """
         self._l1_manager.clear(force=force)
+        if self._storage_placement_mode != StoragePlacementMode.KV_SPLIT_TIER:
+            return
+        orphaned_v_children: list[ObjectKey] = []
+        # (logical_key, generation) pairs held in DELETE_IN_FLIGHT across
+        # the batched physical delete below; dropped only after it
+        # completes so the reclaim fence covers the whole purge.
+        pending_drops: list[tuple[ObjectKey, int]] = []
+        for logical_key in self._split_tier_manifest.tracked_keys():
+            entry = self._split_tier_manifest.lookup_entry(logical_key)
+            if entry is None:
+                # Dropped between the snapshot and here; nothing to do.
+                continue
+            _state, generation = entry
+            k_child = derive_component_key(logical_key, "k")
+            if self._l1_manager.has_object_or_staging(k_child):
+                # K child survived as a resident or a write-reserved staging
+                # object (locked under force=False / still in flight): the
+                # composite is still intact -- leave the entry alone.
+                continue
+            # Atomically claim physical cleanup before queuing the
+            # generation-blind V-child key. A replacement cannot register
+            # until the delete finishes and this fence is dropped.
+            previous = self._split_tier_manifest.begin_physical_cleanup(
+                logical_key,
+                generation,
+                (
+                    SplitTierState.STORE_IN_FLIGHT,
+                    SplitTierState.COMPLETE,
+                    SplitTierState.INVALIDATED,
+                ),
+            )
+            if previous is None:
+                continue
+            orphaned_v_children.append(derive_component_key(logical_key, "v"))
+            pending_drops.append((logical_key, generation))
+        if not orphaned_v_children:
+            return
+        with self._adapters_lock:
+            adapters = list(self._l2_adapters.values())
+        for adapter in adapters:
+            try:
+                adapter.delete(orphaned_v_children)
+            except Exception:
+                logger.exception(
+                    "clear: L2 adapter %s delete raised for %d orphaned "
+                    "split-tier V children",
+                    type(adapter).__name__,
+                    len(orphaned_v_children),
+                )
+        # Every physical delete attempt is terminal; release the reclaim
+        # fence. A failed unlink may leave cold-tier waste, but cannot execute
+        # later against a replacement generation.
+        for logical_key, generation in pending_drops:
+            self._split_tier_manifest.drop(logical_key, generation)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.SPLIT_TIER_V_CHILD_DELETED,
+                metadata={
+                    "count": len(orphaned_v_children),
+                    "trigger": "clear",
+                },
+            )
+        )
 
     def close(self):
         """
@@ -1293,6 +1738,8 @@ class StorageManager:
                 inner=adapter,
                 serde=create_serde_processor(config.serde_config),
                 l1_manager=self._l1_manager,
+                placement_mode=self._storage_placement_mode,
+                split_tier_manifest=self._split_tier_manifest,
             )
         descriptor = L2AdapterDescriptor(index=adapter_id, config=config)
         # Stamp the registered type name so the adapter's cache events on
