@@ -952,6 +952,9 @@ class RawBlockPDRequestTracker:
         if state.completed_keys != state.seen_keys:
             return None
         state.publication_started = True
+        # Account for the handoff before dropping the admission lock. Close
+        # must also see a publication whose submitter has not run yet.
+        self._publishing.add(req_id)
         return req_id, list(state.keys), state.terminal
 
     def _submit_publication(
@@ -960,11 +963,6 @@ class RawBlockPDRequestTracker:
         encoded_keys: list[str],
         terminal: Future[RawBlockPublicationReceipt],
     ) -> None:
-        with self._lock:
-            # Recorded before the handoff, so a caller joining publication
-            # cannot miss a job that has been accepted and not yet started.
-            self._publishing.add(req_id)
-
         def pin_then_publish() -> RawBlockPublicationReceipt:
             """Hold the extents, then describe them.
 
@@ -987,14 +985,21 @@ class RawBlockPDRequestTracker:
                 self._core.unlock_many(encoded_keys)
                 raise
 
-        publication = self._publisher.submit(pin_then_publish)
-
-        def finish(done: Future[RawBlockPublicationReceipt]) -> None:
-            # Runs for every submitted job -- completed, failed or cancelled
-            # -- which is what makes the record below reliable as the thing
-            # shutdown waits on.
+        try:
             with self._lock:
-                self._publishing.discard(req_id)
+                if self._closed:
+                    self._publishing.discard(req_id)
+                    return
+                publication = self._publisher.submit(pin_then_publish)
+        except BaseException as exc:
+            try:
+                self.fail_request(req_id, exc)
+            finally:
+                with self._lock:
+                    self._publishing.discard(req_id)
+            return
+
+        def settle(done: Future[RawBlockPublicationReceipt]) -> None:
             try:
                 receipt = done.result()
             except BaseException as exc:
@@ -1023,6 +1028,15 @@ class RawBlockPDRequestTracker:
                 # will ever release these extents by name. Let them go
                 # rather than hold them for the life of the writer.
                 self._core.unlock_many(encoded_keys)
+
+        def finish(done: Future[RawBlockPublicationReceipt]) -> None:
+            try:
+                settle(done)
+            finally:
+                # Settlement may still release holds through the core.
+                # Do not authorize its teardown until that work returns.
+                with self._lock:
+                    self._publishing.discard(req_id)
 
         publication.add_done_callback(finish)
 

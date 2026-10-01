@@ -6,6 +6,7 @@ from __future__ import annotations
 
 # Standard
 from threading import Event
+from typing import Any
 
 # Third Party
 import pytest
@@ -998,3 +999,106 @@ def test_tracker_stops_admitting_before_its_hold_bound_is_exceeded() -> None:
     finally:
         core.allow_publish.set()
         tracker.close()
+
+
+def test_close_waits_for_publication_cleanup() -> None:
+    """Keep the core alive until an abandoned publication releases its holds."""
+    core = _MappingCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    unlock_started = Event()
+    allow_unlock = Event()
+    unlock = core.unlock_many
+
+    def gated_unlock(encoded_keys: list[str]) -> None:
+        unlock_started.set()
+        assert allow_unlock.wait(5), "publication cleanup did not resume"
+        unlock(encoded_keys)
+
+    core.unlock_many = gated_unlock  # type: ignore[method-assign]
+    try:
+        terminal = _publish_one(tracker, core)
+        tracker.fail_request("request-1", RuntimeError("request abandoned"))
+        core.allow_publish.set()
+        assert unlock_started.wait(5), "publication never reached cleanup"
+        assert tracker.close(timeout_s=0.01) is False
+        assert core.held == {"key-1": 1, "key-2": 1}
+        with pytest.raises(RuntimeError, match="request abandoned"):
+            terminal.result(timeout=5)
+        allow_unlock.set()
+        assert _wait_until(lambda: tracker.close(timeout_s=0.01))
+        assert core.held == {}
+    finally:
+        core.allow_publish.set()
+        allow_unlock.set()
+        tracker.close()
+
+
+def test_rejected_publication_submission_settles_the_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Report executor refusal without leaving a phantom publication active."""
+    core = _MappingCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+
+    def refuse(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("publisher unavailable")
+
+    monkeypatch.setattr(tracker._publisher, "submit", refuse)
+    try:
+        terminal = tracker.register_batch(
+            "request-1",
+            ["key-1"],
+            expected_chunks=1,
+            is_last_batch=True,
+            completed_keys=["key-1"],
+        )
+        with pytest.raises(RuntimeError, match="publisher unavailable"):
+            terminal.result(timeout=5)
+        assert tracker.close(timeout_s=0.01) is True
+        assert core.held == {}
+        assert not core.publish_started.is_set()
+    finally:
+        tracker.close()
+
+
+def test_close_accounts_for_a_publication_waiting_to_submit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Seal publication before executor handoff and refuse a late submitter."""
+    # Standard
+    from concurrent.futures import ThreadPoolExecutor
+
+    core = _MappingCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    submit_started = Event()
+    allow_submit = Event()
+    submit = tracker._submit_publication
+
+    def gated_submit(*args: Any, **kwargs: Any) -> None:
+        submit_started.set()
+        assert allow_submit.wait(5), "publication handoff did not resume"
+        submit(*args, **kwargs)
+
+    monkeypatch.setattr(tracker, "_submit_publication", gated_submit)
+    with ThreadPoolExecutor(max_workers=1) as caller:
+        registration = caller.submit(
+            tracker.register_batch,
+            "request-1",
+            ["key-1"],
+            expected_chunks=1,
+            is_last_batch=True,
+            completed_keys=["key-1"],
+        )
+        try:
+            assert submit_started.wait(5)
+            assert tracker.close(timeout_s=0.01) is False
+            allow_submit.set()
+            terminal = registration.result(timeout=5)
+            with pytest.raises(RuntimeError, match="aborted during shutdown"):
+                terminal.result(timeout=5)
+            assert tracker.close(timeout_s=0.01) is True
+            assert core.held == {}
+            assert not core.publish_started.is_set()
+        finally:
+            allow_submit.set()
+            tracker.close()
