@@ -606,3 +606,115 @@ def test_a_publication_inside_the_core_blocks_every_release(backend):
     while tracker._publishing and time.monotonic() < deadline:
         time.sleep(0.005)
     assert not tracker._publishing
+
+
+def _staging_object():
+    """One staging buffer, the way the engine hands them to the device."""
+    allocator = AdHocMemoryAllocator(device="cpu")
+    memory_obj = allocator.allocate(
+        [torch.Size([2, 16, 8, 128])], [torch.bfloat16], fmt=MemoryFormat.KV_T2D
+    )
+    assert memory_obj is not None
+    return memory_obj
+
+
+@pytest.fixture
+def iouring_backend(loop_in_thread, monkeypatch):
+    """A backend whose core really goes through the io_uring path.
+
+    The default fixture runs synchronous writes, where a worker that has
+    given up is never consulted -- and an unknown outcome is something only
+    the worker can report.
+    """
+    monkeypatch.setattr(
+        RustRawBlockBackend,
+        "_build_gpu_allocator",
+        lambda self, size_bytes, device: _CountingAllocator(),
+    )
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(64 * 1024 * 1024)
+        config = _config(dev_path)
+        config.extra_config["rust_raw_block.io_engine"] = "io_uring"
+        instance = RustRawBlockBackend(
+            config=config,
+            metadata=_METADATA,
+            local_cpu_backend=None,
+            loop=loop_in_thread,
+            dst_device="cpu",
+        )
+        yield instance
+        if not instance._closed_once:
+            instance.close()
+
+
+def test_an_unknown_outcome_withholds_the_extent_and_the_buffer(iouring_backend):
+    """One unknown outcome, two things that must not be handed back.
+
+    A weakref proving a Python object is still alive says a staging buffer
+    was not released. It says nothing about the device extent that buffer
+    was being written into: an extent returned to the free list goes to the
+    next request, which then gets storage an earlier write may still be
+    landing in -- and the slot header would name one key over another key's
+    bytes, validating clean because the header belongs to the later,
+    successful writer.
+
+    So the extent and the memory behind the device are asserted together,
+    from the same failure: the allocator cannot reach the extent by any
+    route, and the arena the staging buffers were exported from is not
+    closed. Owner-level retention inside the native engine is a separate
+    statement, made against a ring that can be asked what it holds.
+    """
+    core = iouring_backend._core
+    raw = core.raw_device()
+    settled = CacheEngineKey("test_model", 1, 0, 7001, torch.bfloat16)
+    assert core.put_many(
+        [encode_legacy_key(settled)],
+        [_staging_object()],
+    ).results == [True]
+    free_before = set(core._free_slots)
+    next_slot_before = core._next_slot
+
+    class _Unknown:
+        """A worker that has given up, and whose writes now fail."""
+
+        def __getattr__(self, item):
+            return getattr(raw, item)
+
+        def is_poisoned(self):
+            return True
+
+        def quarantined_batch_count(self):
+            return 1
+
+        def wait_iouring(self, batch_id):
+            results, errors = raw.wait_iouring(batch_id)
+            return [False] * len(results), errors
+
+    core.set_raw_device_for_testing(_Unknown())
+    try:
+        unprovable = CacheEngineKey("test_model", 1, 0, 7002, torch.bfloat16)
+        assert core.put_many(
+            [encode_legacy_key(unprovable)], [_staging_object()]
+        ).results == [False]
+
+        # The extent did not go back where it could be handed out again,
+        # and the allocator cannot reach it by any route.
+        assert set(core._free_slots) == free_before
+        assert set(core._quarantined_slots or {}) == {next_slot_before}
+        with core._lock:
+            handed_out = {
+                core._offset_to_slot(core._allocate_slot_locked(None)) for _ in range(4)
+            }
+        assert next_slot_before not in handed_out
+    finally:
+        core.set_raw_device_for_testing(raw)
+
+    # And the teardown that follows releases nothing behind the device.
+    before = len(plugin._RETAINED_AFTER_UNKNOWN_OUTCOME)
+    allocator = iouring_backend._gpu_allocator
+    iouring_backend.close()
+
+    assert allocator.close_calls == 0
+    assert len(_retained_now(before)) == 1
