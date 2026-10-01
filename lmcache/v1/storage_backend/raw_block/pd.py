@@ -407,15 +407,19 @@ class RawBlockPDRequestTracker:
                     ),
                 )
 
-    def close(self, release_leases: bool = True) -> None:
-        """Fail unfinished requests, stop publication, and release leases.
+    def close(self) -> None:
+        """Fail unfinished requests, stop publication, and keep every lease.
 
-        ``release_leases`` false keeps every lease held. Unlocking a key lets
-        its entry be deleted and its extent returned to the free list, so a
-        caller that cannot establish what the device is still doing passes
-        false: the leases are what keep those extents from being handed to
-        the next writer, and shutdown is not proof that a reader has stopped
-        reading them either.
+        This writer going away is not news about a reader. A lease is what
+        keeps an extent from being handed to the next writer, and the only
+        thing that establishes a consumer is finished with one is that
+        consumer's own acknowledgement -- or, for a publication nobody was
+        ever given, the terminal release in :meth:`release_unread`. A local
+        shutdown is neither, so it releases nothing and says what it kept.
+
+        Releasing a whole group's holds after the whole group has stopped is
+        a separate decision with a separate authority, and lives in
+        :meth:`release_quiesced_leases`.
         """
         with self._lock:
             if self._closed:
@@ -430,22 +434,65 @@ class RawBlockPDRequestTracker:
                     RuntimeError(f"request {req_id} aborted during shutdown"),
                 )
         self._publisher.shutdown(wait=True, cancel_futures=False)
-        if not release_leases:
-            with self._lock:
-                held = len(self._leases)
-            if held:
-                logger.error(
-                    "RawBlockPDTracker retaining %d lease(s) at shutdown: "
-                    "their extents must not be reused while what the device "
-                    "is doing with them cannot be established.",
-                    held,
-                )
-            return
         with self._lock:
-            leased_keys = [lease.encoded_keys for lease in self._leases.values()]
-            self._leases.clear()
-        for encoded_keys in leased_keys:
-            self._core.unlock_many(encoded_keys)
+            held = len(self._leases)
+            unresolved = sum(1 for lease in self._leases.values() if lease.unlock_ran)
+        if held:
+            logger.warning(
+                "RawBlockPDTracker retaining %d lease(s) at shutdown, %d of "
+                "them with a release that did not report back: nothing here "
+                "establishes that a consumer has stopped reading those "
+                "extents.",
+                held,
+                unresolved,
+            )
+
+    def release_quiesced_leases(self) -> int:
+        """Release the holds of a group that has stopped, and count them.
+
+        This is the only authority besides a consumer's acknowledgement and
+        the unread-publication release that frees a hold, and it is an
+        operator's assertion rather than something observed here: every
+        engine that could be reading this namespace has stopped. Nothing in
+        this process can see that, which is why it is not what
+        :meth:`close` does.
+
+        A lease whose release was started and did not report back is kept
+        even so. Running it again could decrement a reference this writer
+        does not own, and a quiesced group does not make an unknown outcome
+        known.
+        """
+        with self._lock:
+            releasable = [
+                (req_id, list(lease.encoded_keys))
+                for req_id, lease in self._leases.items()
+                if not lease.unlock_ran
+            ]
+            for req_id, _ in releasable:
+                self._leases[req_id].unlock_ran = True
+        released = 0
+        for req_id, encoded_keys in releasable:
+            try:
+                self._core.unlock_many(encoded_keys)
+            except Exception:
+                logger.exception(
+                    "Raw-block P/D could not release the quiesced extents for %s",
+                    req_id,
+                )
+                continue
+            with self._lock:
+                self._leases.pop(req_id, None)
+            released += 1
+        with self._lock:
+            kept = len(self._leases)
+        if kept:
+            logger.error(
+                "RawBlockPDTracker kept %d lease(s) through a quiesced "
+                "teardown: their releases did not report back, so running "
+                "them again could drop a reference this writer does not own.",
+                kept,
+            )
+        return released
 
     def claim_read(
         self,

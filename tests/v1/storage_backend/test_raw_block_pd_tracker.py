@@ -93,7 +93,10 @@ def test_tracker_waits_for_every_write_before_publication() -> None:
     finally:
         core.allow_publish.set()
         tracker.close()
-    assert core.leased == []
+    # Shutdown released nothing: the hold is what protects these extents
+    # from the next writer, and nothing here says a reader is done with
+    # them.
+    assert core.leased == ["key-1", "key-2"]
 
 
 def test_tracker_failure_never_publishes() -> None:
@@ -679,19 +682,59 @@ def test_tracker_rejects_an_acknowledgement_it_cannot_match(
         tracker.close()
 
 
-def test_tracker_can_be_told_to_keep_its_leases_at_shutdown() -> None:
-    """Shutdown does not prove a reader stopped reading.
+def test_tracker_keeps_every_lease_at_shutdown() -> None:
+    """This writer going away is not news about a reader.
 
-    A caller that cannot establish what the device is doing passes
-    ``release_leases=False``: unlocking a key lets its entry be deleted and
-    its extent handed to the next writer.
+    Unlocking a key lets its entry be deleted and its extent handed to the
+    next writer. A consumer elsewhere may still be reading those bytes, and
+    nothing a local shutdown can see says otherwise.
     """
     core = _FakeCore()
     tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
-    _published_lease(core, tracker)
-    tracker.close(release_leases=False)
+    _claimed_lease(core, tracker)
+    tracker.close()
     assert core.leased == ["key-1"]
     assert tracker.live_lease_count() == 1
+    assert core.unlock_calls == 0
+
+
+def test_a_quiesced_group_releases_its_holds_on_a_separate_decision() -> None:
+    """Releasing a stopped group's holds is an assertion, not a shutdown.
+
+    The operator says every engine that could read this namespace has
+    stopped, which is a statement about other machines that this process
+    cannot make for itself. So it is asked for separately, after close.
+    """
+    core = _FakeCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    _claimed_lease(core, tracker)
+    tracker.close()
+    assert core.leased == ["key-1"]
+
+    assert tracker.release_quiesced_leases() == 1
+    assert core.leased == []
+    assert tracker.live_lease_count() == 0
+
+
+def test_a_quiesced_teardown_keeps_a_release_that_never_reported_back() -> None:
+    """A stopped group does not make an unknown outcome known.
+
+    A release that was started and did not return may or may not have
+    dropped its reference. Running it again could drop one this writer does
+    not own, which hands a live extent to a later request -- and the whole
+    group having stopped says nothing about that.
+    """
+    core = _FakeCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    _claimed_lease(core, tracker)
+    core.unlock_raises = True
+    assert _ack(tracker) is ReadAckOutcome.UNRESOLVED
+    core.unlock_raises = False
+    tracker.close()
+
+    assert tracker.release_quiesced_leases() == 0
+    assert tracker.live_lease_count() == 1
+    assert core.unlock_calls == 0
 
 
 def test_tracker_refuses_an_acknowledgement_naming_another_producer() -> None:

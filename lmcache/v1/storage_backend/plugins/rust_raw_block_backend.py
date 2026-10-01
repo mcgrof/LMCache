@@ -356,6 +356,15 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             extra.get("rust_raw_block.pd_session_id", "")
             or os.environ.get("LMCACHE_STORAGE_PD_SESSION", "")
         )
+        # An operator's assertion that this engine's shutdown is part of a
+        # whole-group stop: every engine that could read this namespace is
+        # going away too, so holds kept for readers have nobody left to
+        # protect. Nothing in this process can observe that, which is why
+        # it is configured rather than inferred, and why it is off by
+        # default -- a local shutdown says nothing about another machine.
+        self._pd_group_quiesced_teardown = bool(
+            extra.get("rust_raw_block.pd_group_quiesced_teardown", False)
+        )
         if self._pd_tracker is not None:
             self._ack_receiver = self._build_ack_receiver(extra)
             self._pd_tracker.ack_endpoint = self.ack_endpoint()
@@ -1846,11 +1855,22 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
 
         if self._pd_tracker is not None:
             # Two different decisions, and only the first is ours to make
-            # here: local quiescence says the memory is free, and says
-            # nothing about a reader elsewhere still holding a lease. A
-            # healthy close is not release authority over a lease, so the
-            # tracker keeps them unless this engine never published any.
-            self._pd_tracker.close(release_leases=not unknown)
+            # here: local quiescence says the memory behind this device is
+            # free, and says nothing about a reader elsewhere still holding
+            # a lease. So close keeps every hold, and releasing them needs
+            # the operator's assertion that the whole group has stopped --
+            # which is a statement about other machines that nothing in this
+            # process can observe.
+            self._pd_tracker.close()
+            if self._pd_group_quiesced_teardown and not unknown:
+                released = self._pd_tracker.release_quiesced_leases()
+                logger.warning(
+                    "Raw-block storage P/D released %d lease(s) on an "
+                    "operator-declared quiesced teardown; this is correct "
+                    "only if every engine that could read this namespace "
+                    "has stopped.",
+                    released,
+                )
 
         if self._gpu_allocator is None:
             return

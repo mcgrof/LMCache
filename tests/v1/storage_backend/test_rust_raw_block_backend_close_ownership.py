@@ -19,7 +19,7 @@ alive is.
 from __future__ import annotations
 
 # Standard
-from typing import Any, Optional
+from typing import Any
 import asyncio
 import gc
 import os
@@ -78,12 +78,15 @@ class _RecordingTracker:
     """Stands in for the P/D obligation tracker."""
 
     def __init__(self) -> None:
-        self.release_leases: Optional[bool] = None
         self.close_calls = 0
+        self.quiesced_release_calls = 0
 
-    def close(self, release_leases: bool = True) -> None:
+    def close(self) -> None:
         self.close_calls += 1
-        self.release_leases = release_leases
+
+    def release_quiesced_leases(self) -> int:
+        self.quiesced_release_calls += 1
+        return 0
 
 
 class _BackingOwner:
@@ -189,7 +192,8 @@ def test_a_close_that_failed_releases_nothing_it_was_holding(backend):
 
     assert allocator.close_calls == 0
     assert tracker.close_calls == 1
-    assert tracker.release_leases is False
+    assert tracker.close_calls == 1
+    assert tracker.quiesced_release_calls == 0
     assert len(_retained_now(before)) == 1
 
     # Dropping the backend object is the second way the same release can
@@ -226,7 +230,8 @@ def test_a_close_that_could_not_prove_quiescence_releases_nothing(backend):
     backend.close()
 
     assert allocator.close_calls == 0
-    assert tracker.release_leases is False
+    assert tracker.close_calls == 1
+    assert tracker.quiesced_release_calls == 0
     assert len(_retained_now(before)) == 1
 
     ref = weakref.ref(allocator)
@@ -285,7 +290,10 @@ def test_a_proven_close_does_release_what_it_holds(backend):
     backend.close()
 
     assert allocator.close_calls == 1
-    assert tracker.release_leases is True
+    # A healthy local close is still not release authority over a reader's
+    # hold, and no operator declared the group stopped.
+    assert tracker.close_calls == 1
+    assert tracker.quiesced_release_calls == 0
     assert _retained_now(before) == []
 
 
@@ -407,7 +415,8 @@ def test_a_control_handler_that_did_not_stop_blocks_every_release(backend):
 
     assert server.close_calls == 1
     assert allocator.close_calls == 0
-    assert tracker.release_leases is False
+    assert tracker.close_calls == 1
+    assert tracker.quiesced_release_calls == 0
     assert len(_retained_now(before)) == 1
 
 
@@ -434,5 +443,51 @@ def test_a_control_handler_that_stopped_does_not_block_release(backend):
 
     assert server.close_calls == 1
     assert allocator.close_calls == 1
-    assert tracker.release_leases is True
+    # A healthy local close is still not release authority over a reader's
+    # hold, and no operator declared the group stopped.
+    assert tracker.close_calls == 1
+    assert tracker.quiesced_release_calls == 0
     assert _retained_now(before) == []
+
+
+def test_an_operator_declared_quiesced_teardown_releases_the_holds(backend):
+    """The one close that may release a reader's hold, and only on a say-so.
+
+    Nothing in this process can see that every engine able to read this
+    namespace has stopped. The operator asserts it in configuration, and
+    only then does teardown release holds that a consumer would otherwise
+    be the only one able to free.
+    """
+    allocator = backend._gpu_allocator
+    tracker = _RecordingTracker()
+    backend._pd_tracker = tracker
+    backend._pd_group_quiesced_teardown = True
+
+    before = len(plugin._RETAINED_AFTER_UNKNOWN_OUTCOME)
+    backend.close()
+
+    assert tracker.close_calls == 1
+    assert tracker.quiesced_release_calls == 1
+    assert allocator.close_calls == 1
+    assert _retained_now(before) == []
+
+
+def test_a_quiesced_declaration_does_not_survive_an_unknown_outcome(backend):
+    """A group that stopped is not a device whose state is known.
+
+    The holds a reader would free are one question; what the device is
+    still doing with these extents is another, and the declaration answers
+    only the first.
+    """
+    tracker = _RecordingTracker()
+    backend._pd_tracker = tracker
+    backend._pd_group_quiesced_teardown = True
+    backend._pending_put_owners.append([_BackingOwner()])
+
+    before = len(plugin._RETAINED_AFTER_UNKNOWN_OUTCOME)
+    backend.close()
+
+    assert tracker.close_calls == 1
+    assert tracker.quiesced_release_calls == 0
+    assert backend._gpu_allocator.close_calls == 0
+    assert len(_retained_now(before)) == 1

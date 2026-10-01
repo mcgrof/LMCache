@@ -171,7 +171,7 @@ class _Producer:
         return ack
 
     def close(self) -> None:
-        self.tracker.close(release_leases=False)
+        self.tracker.close()
 
 
 @pytest.fixture
