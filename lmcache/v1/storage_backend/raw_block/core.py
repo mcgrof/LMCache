@@ -1687,10 +1687,9 @@ class RawBlockCore:
 
         for i, (key, obj) in enumerate(zip(keys, objs, strict=False)):
             placement_id = per_key_placement_ids[i]
-            if self._closed or self._poisoned:
-                break
-
             with self._lock:
+                if self._closed or self._poisoned:
+                    break
                 if key.encoded in self._index:
                     # Already here: a hit, not a write. Counting these as
                     # bytes stored would report device traffic that never
@@ -1823,6 +1822,8 @@ class RawBlockCore:
             return [False] * len(encoded_keys)
 
         with self._lock:
+            if self._closed or self._poisoned:
+                return [False] * len(encoded_keys)
             items = [
                 (encoded_key, self._index.get(encoded_key))
                 for encoded_key in encoded_keys
@@ -2509,11 +2510,18 @@ class RawBlockCore:
                     quarantined_slots=len(self._quarantined_slots or {}),
                 )
             self._closed = True
+            # Native idleness does not cover a caller still preparing a
+            # submission. Admission shares this lock, so these counts cannot
+            # grow after the seal and include reads as well as reserved puts.
+            active_callers = bool(self._inflight or self._inflight_io_count)
 
         self._meta_stop_evt.set()
+        checkpoint_stopped = True
         if self._meta_thread is not None:
             self._meta_thread.join(timeout=5)
-            self._meta_thread = None
+            checkpoint_stopped = not self._meta_thread.is_alive()
+            if checkpoint_stopped:
+                self._meta_thread = None
 
         # Asked of the device this core actually has: the accessor below
         # reopens a fresh one when the reference is dropped, and a fresh
@@ -2522,7 +2530,7 @@ class RawBlockCore:
         # And answered by the device, not by the absence of a complaint:
         # a writer about to publish its last index needs to know that
         # everything it handed over has been answered for.
-        unknown = self._poisoned
+        unknown = self._poisoned or active_callers or not checkpoint_stopped
         if not unknown and self._raw is not None:
             unknown = not device_has_nothing_outstanding(self._raw)
         self._poisoned = unknown

@@ -2956,3 +2956,109 @@ def test_an_unanswered_operation_is_a_failed_evidence_gate() -> None:
 
     assert record.unanswered() == {"run/req/r0/epoch/read/dmabuf_fixed": 1}
     assert record.as_payload()["dropped_rows"] == 2
+
+
+@pytest.mark.parametrize("operation", ["read", "write"])
+def test_close_retains_a_device_with_a_submission_still_being_prepared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    """Keep a device whose admitted caller has not reached native submission."""
+    # Standard
+    from concurrent.futures import Future, ThreadPoolExecutor
+
+    path = make_raw_block_file(tmp_path)
+    core = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    key = encode_object_key(make_object_key(98))
+    obj = make_memory_obj(b"x" * 512)
+    if operation == "read":
+        assert core.put_many([key], [obj]).results == [True]
+    raw = core.raw_device()
+    entered = threading.Event()
+    resume = threading.Event()
+    method_name = "_read_buffers" if operation == "read" else "_write_one"
+    original = getattr(core, method_name)
+
+    def delayed(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        assert resume.wait(5), "submission preparation did not resume"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(core, method_name, delayed)
+    with ThreadPoolExecutor(max_workers=1) as caller:
+        pending: Future[Any]
+        if operation == "read":
+            pending = caller.submit(core.load_many_into, [key.encoded], [obj])
+        else:
+            pending = caller.submit(core.put_many, [key], [obj])
+        try:
+            assert entered.wait(5), "the operation was not admitted"
+            assert raw.is_idle(), "the gated operation unexpectedly reached native I/O"
+            outcome = core.close()
+            assert outcome.quiescence is NativeQuiescence.RETAINED
+            assert outcome.may_release_backing_resources is False
+            assert outcome.final_checkpoint_written is False
+            resume.set()
+            result = pending.result(timeout=5)
+            assert (result if operation == "read" else result.results) == [False]
+        finally:
+            resume.set()
+    # This test gated before native submission; after joining that caller,
+    # no command can use the retained device. Production cannot assert this.
+    raw.close()
+
+
+def test_closed_core_refuses_read_admission(tmp_path: Path) -> None:
+    """Reject reads before examining a destination after shutdown."""
+    path = make_raw_block_file(tmp_path)
+    core = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    key = encode_object_key(make_object_key(99))
+    assert core.put_many([key], [make_memory_obj(b"x" * 512)]).results == [True]
+    assert core.close().may_release_backing_resources
+
+    class Destination:
+        accesses = 0
+
+        @property
+        def byte_array(self) -> bytes:
+            self.accesses += 1
+            raise RuntimeError("the destination must not be examined")
+
+    destination: Any = Destination()
+    assert core.load_many_into([key.encoded], [destination]) == [False]
+    assert destination.accesses == 0
+
+
+def test_close_retains_a_checkpoint_thread_that_did_not_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Treat an expired checkpoint join as a live device caller."""
+    path = make_raw_block_file(tmp_path)
+    core = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    raw = core.raw_device()
+    entered = threading.Event()
+    resume = threading.Event()
+
+    def checkpoint() -> None:
+        entered.set()
+        assert resume.wait(5), "checkpoint thread did not resume"
+
+    worker = threading.Thread(target=checkpoint)
+    join = worker.join
+    worker.start()
+    assert entered.wait(5)
+    core._meta_thread = worker
+
+    def expired_join(timeout: float) -> None:
+        join(timeout=0)
+
+    monkeypatch.setattr(worker, "join", expired_join)
+    try:
+        outcome = core.close()
+        assert outcome.quiescence is NativeQuiescence.RETAINED
+        assert outcome.may_release_backing_resources is False
+        assert core._meta_thread is worker
+    finally:
+        resume.set()
+        join(timeout=5)
+        assert not worker.is_alive()
+        raw.close()
