@@ -382,6 +382,10 @@ struct FakeRingState {
     owned: Vec<SqeDescriptor>,
     /// Completions queued for the worker to drain.
     ready: Vec<RingCompletion>,
+    /// Completions held until the worker enters its shutdown drain.
+    shutdown_completions: Vec<RingCompletion>,
+    shutdown_started: bool,
+    shutdown_delivered: usize,
     /// How many resident entries the next submit takes. `None` takes all of
     /// them, which is what a healthy ring does.
     take_next: Option<usize>,
@@ -395,6 +399,7 @@ struct FakeRingState {
     hold_submits: bool,
     /// What the next submit reports instead of taking anything.
     submit_error: Option<i32>,
+    submit_errors: Vec<i32>,
     /// Ownership rules this ring saw broken, in the order it saw them.
     violations: Vec<String>,
     /// How many times the worker synced the submission queue, which a test
@@ -458,9 +463,13 @@ impl FakeRing {
                 resident: Vec::new(),
                 owned: Vec::new(),
                 ready: Vec::new(),
+                shutdown_completions: Vec::new(),
+                shutdown_started: false,
+                shutdown_delivered: 0,
                 take_next: None,
                 hold_submits: false,
                 submit_error: None,
+                submit_errors: Vec::new(),
                 violations: Vec::new(),
                 syncs: 0,
                 dmabuf_extent: 1 << 30,
@@ -482,6 +491,7 @@ impl FakeRing {
     fn submit(&self) -> io::Result<usize> {
         let mut state = self.state.lock().unwrap();
         if let Some(errno) = state.submit_error.take() {
+            state.submit_errors.push(errno);
             // A submit that reports an error took nothing. Leaving the
             // entries resident is the whole point: whether the worker then
             // reasons about them correctly is what a test is asking.
@@ -534,6 +544,41 @@ impl FakeRing {
             offset,
         });
         Ok(())
+    }
+
+    fn complete_at_shutdown(&self, user_data: u64, result: i32) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap();
+        if state.shutdown_started
+            || !state.owned.iter().any(|entry| entry.user_data == user_data)
+            || state
+                .shutdown_completions
+                .iter()
+                .any(|entry| entry.user_data == user_data)
+        {
+            let complaint = format!("cannot schedule shutdown completion for request {user_data}");
+            state.violations.push(complaint.clone());
+            return Err(complaint);
+        }
+        state
+            .shutdown_completions
+            .push(RingCompletion { user_data, result });
+        Ok(())
+    }
+
+    fn begin_shutdown(&self) {
+        let planned = {
+            let mut state = self.state.lock().unwrap();
+            state.shutdown_started = true;
+            std::mem::take(&mut state.shutdown_completions)
+        };
+        for completion in planned {
+            if self
+                .complete(completion.user_data, completion.result)
+                .is_ok()
+            {
+                self.state.lock().unwrap().shutdown_delivered += 1;
+            }
+        }
     }
 
     fn take_completions(&self) -> Vec<RingCompletion> {
@@ -3096,6 +3141,10 @@ impl RawBlockDevice {
                     // a duration. A submitted request points the device at this
                     // process's memory, so releasing that memory on a timer can
                     // let a late completion land in a buffer already reused.
+                    #[cfg(feature = "fault-injection")]
+                    if let IoUringWrapper::Fake(ring) = &ring_clone {
+                        ring.begin_shutdown();
+                    }
                     let drain_deadline = Instant::now() + Duration::from_secs(5);
                     loop {
                         // Deliver any SQE still resident so it can complete or
@@ -4218,6 +4267,24 @@ impl RawBlockDevice {
             .map_err(PyValueError::new_err)
     }
 
+    /// Deliver a held request's completion when the worker starts draining.
+    ///
+    /// Schedule it before calling close: close holds the device's mutable
+    /// Python borrow, so another Python thread cannot inject a completion
+    /// while it runs. Delivery uses the same ownership check as fake_complete.
+    #[cfg(feature = "fault-injection")]
+    fn fake_complete_at_shutdown(&self, user_data: u64, result: i32) -> PyResult<()> {
+        self.scripted_ring()?
+            .complete_at_shutdown(user_data, result)
+            .map_err(PyValueError::new_err)
+    }
+
+    /// Count scheduled completions delivered inside the shutdown drain.
+    #[cfg(feature = "fault-injection")]
+    fn fake_shutdown_delivered(&self) -> PyResult<usize> {
+        Ok(self.scripted_state()?.lock().unwrap().shutdown_delivered)
+    }
+
     /// Make the next submit take only the first `count` resident entries.
     ///
     /// This is the partial take the submit seam cannot express: the ring
@@ -4234,6 +4301,12 @@ impl RawBlockDevice {
     fn fake_submit_fails(&self, errno: i32) -> PyResult<()> {
         self.scripted_state()?.lock().unwrap().submit_error = Some(errno);
         Ok(())
+    }
+
+    /// Errors actually returned by the scripted ring's submit calls.
+    #[cfg(feature = "fault-injection")]
+    fn fake_submit_errors(&self) -> PyResult<Vec<i32>> {
+        Ok(self.scripted_state()?.lock().unwrap().submit_errors.clone())
     }
 
     /// How many submit calls the worker has made, for a test to key a plan on.

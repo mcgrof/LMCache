@@ -1153,10 +1153,12 @@ SCRIPTED_SHORT_REMAINDER_RETRIED = SCRIPTED_PREAMBLE + textwrap.dedent(
     dev.fake_submit_fails(11)
     dev.fake_complete(first[0]["user_data"], 4096)
     assert wait_until(lambda: bool(dev.fake_resident()))
+    assert wait_until(lambda: dev.fake_submit_errors() == [11])
     resident_after_refusal = dev.fake_resident_sqes()
     report = {
         "first": first,
         "resident_after_refusal": resident_after_refusal,
+        "submit_errors": dev.fake_submit_errors(),
         "poisoned_after_refusal": dev.is_poisoned(),
     }
 
@@ -1201,6 +1203,7 @@ def test_a_refused_remainder_submit_is_retried_and_lands(tmp_path) -> None:
     pending = report["resident_after_refusal"][0]
     assert pending["offset"] == 4096, report
     assert pending["len"] == 4096, report
+    assert report["submit_errors"] == [11], report
     # A retryable submit error is not an unknown outcome.
     assert report["poisoned_after_refusal"] is False, report
     assert report["remainder"] == report["resident_after_refusal"], report
@@ -1209,3 +1212,142 @@ def test_a_refused_remainder_submit_is_retried_and_lands(tmp_path) -> None:
     assert report["errors"] == [], report
     assert report["poisoned"] is False, report
     assert report["quarantined_owners"] == 0, report
+
+
+SCRIPTED_COMPLETION_DURING_CLOSE = SCRIPTED_PREAMBLE + textwrap.dedent(
+    """
+    class Buffer(bytearray):
+        pass
+
+    dev = device()
+    payload = Buffer(b"x" * 4096)
+    owner = weakref.ref(payload)
+    batch = dev.batched_write([0], [payload], [4096], [None])
+    del payload
+    assert wait_until(lambda: len(dev.fake_owned()) == 1)
+    held = dev.fake_owned()[0]
+    dev.fake_complete_at_shutdown(held, COMPLETION_RESULT)
+    gc.collect()
+    before = {
+        "owned": dev.fake_owned(),
+        "delivered": dev.fake_shutdown_delivered(),
+        "owner_alive": owner() is not None,
+    }
+    dev.close()
+    results, errors = dev.wait_iouring(batch)
+    gc.collect()
+    print(json.dumps({
+        "before": before,
+        "delivered": dev.fake_shutdown_delivered(),
+        "owned": dev.fake_owned(),
+        "resident": dev.fake_resident(),
+        "results": list(results),
+        "errors": [str(e) for _, e in errors],
+        "poisoned": dev.is_poisoned(),
+        "retained": dev.retained_owner_count(),
+        "owner_alive_after_poll": owner() is not None,
+        "violations": dev.fake_violations(),
+    }))
+    """
+)
+
+
+@pytest.mark.parametrize("result", [4096, 2048, -5], ids=["full", "short", "error"])
+def test_a_completion_during_close_is_reaped_before_releasing_its_owner(
+    tmp_path: Path, result: int
+) -> None:
+    """Drain a known completion after shutdown begins without a timing race."""
+    device = tmp_path / "dev.bin"
+    device.write_bytes(bytes(8192))
+    report = _run_scenario(
+        SCRIPTED_COMPLETION_DURING_CLOSE.replace("COMPLETION_RESULT", str(result)),
+        device,
+    )
+
+    assert len(report["before"]["owned"]) == 1, report
+    assert report["before"]["delivered"] == 0, report
+    assert report["before"]["owner_alive"] is True, report
+    assert report["delivered"] == 1, report
+    assert report["owned"] == report["resident"] == [], report
+    assert report["results"] == [result == 4096], report
+    assert bool(report["errors"]) == (result != 4096), report
+    assert report["poisoned"] is False, report
+    assert report["retained"] == 0, report
+    assert report["owner_alive_after_poll"] is False, report
+    assert report["violations"] == [], report
+
+
+SCRIPTED_FATAL_SHORT_REMAINDER = SCRIPTED_PREAMBLE + textwrap.dedent(
+    """
+    import threading
+
+    class Buffer(bytearray):
+        pass
+
+    dev = device()
+    payload = Buffer(b"x" * 8192)
+    owner = weakref.ref(payload)
+    batch = dev.batched_write([0], [payload], [8192], [None])
+    del payload
+    assert wait_until(lambda: len(dev.fake_owned()) == 1)
+    first = dev.fake_owned_sqes()[0]
+    dev.fake_submit_fails(5)
+    dev.fake_complete(first["user_data"], 4096)
+
+    outcome = {}
+    def collect():
+        results, errors = dev.wait_iouring(batch)
+        outcome["results"] = list(results)
+        outcome["errors"] = [str(e) for _, e in errors]
+
+    waiting = threading.Thread(target=collect, daemon=True)
+    waiting.start()
+    waiting.join(timeout=10)
+    report = {
+        "answered": not waiting.is_alive(),
+        "outcome": outcome,
+        "first": first,
+        "submit_errors": dev.fake_submit_errors(),
+        "resident": dev.fake_resident_sqes(),
+        "owned": dev.fake_owned(),
+        "poisoned": dev.is_poisoned(),
+    }
+    try:
+        dev.close()
+        report["close"] = "returned"
+    except RuntimeError:
+        report["close"] = "refused"
+    gc.collect()
+    report["owner_alive"] = owner() is not None
+    report["retained"] = dev.retained_owner_count()
+    report["violations"] = dev.fake_violations()
+    print(json.dumps(report))
+    sys.stdout.flush()
+    os._exit(0)
+    """
+)
+
+
+def test_a_fatal_remainder_submit_keeps_the_owner_and_answers_the_waiter(
+    tmp_path: Path,
+) -> None:
+    """A CQE for the prefix does not authorize reuse of an unknown suffix."""
+    device = tmp_path / "dev.bin"
+    device.write_bytes(bytes(16384))
+    report = _run_scenario(SCRIPTED_FATAL_SHORT_REMAINDER, device)
+
+    assert report["answered"] is True, report
+    assert report["submit_errors"] == [5], report
+    assert report["outcome"]["results"] == [False], report
+    assert report["outcome"]["errors"], report
+    assert report["owned"] == [], report
+    assert len(report["resident"]) == 1, report
+    remainder = report["resident"][0]
+    assert remainder["offset"] == report["first"]["offset"] + 4096, report
+    assert remainder["addr"] == report["first"]["addr"] + 4096, report
+    assert remainder["len"] == 4096, report
+    assert report["poisoned"] is True, report
+    assert report["close"] == "refused", report
+    assert report["owner_alive"] is True, report
+    assert report["retained"] >= 1, report
+    assert report["violations"] == [], report
