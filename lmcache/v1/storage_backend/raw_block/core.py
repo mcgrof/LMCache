@@ -2282,43 +2282,104 @@ class RawBlockCore:
         return self._apply_loaded_state(data)
 
     def _require_namespace_authority(self) -> None:
-        """Refuse a populated namespace this engine is not entitled to open.
-
-        Only asked where sharing is declared, and asked independently of
-        whether the index is loaded: a namespace that already holds another
-        engine's publication is not an empty cache, whatever this engine
-        intends to do with the index.
-
-        An unreadable or absent checkpoint is not an answer either way, so
-        it is left to the ordinary path: a device with nothing legible on it
-        is the one case that can follow normal initialization.
-        """
+        """Validate a strict namespace even when its index load is deferred."""
         if self._derivation is None:
             return
-        try:
-            header, payload = self._select_latest_checkpoint()
-        except Exception:
-            logger.warning(
-                "RawBlockCore could not read %s to establish whether it is "
-                "already in use",
-                self.device_path,
-            )
-            return
+        header, payload = self._select_latest_checkpoint()
         if header is None or payload is None:
             return
         try:
             data = json.loads(payload.decode("utf-8"))
-        except Exception:
-            logger.warning(
-                "RawBlockCore could not decode the checkpoint on %s to "
-                "establish whether it is already in use",
-                self.device_path,
+        except (ValueError, UnicodeError) as exc:
+            raise RuntimeError("strict raw-block checkpoint is not valid JSON") from exc
+        self._require_strict_checkpoint_layout(data)
+        if self.role == "writer":
+            raise RuntimeError(
+                "strict raw-block writer cannot skip a populated checkpoint; "
+                "load its index to preserve existing extents"
             )
+
+    def _require_strict_checkpoint_layout(self, data: Any) -> None:
+        """Refuse incompatible persisted state before it can look empty."""
+        if self._derivation is None:
             return
         if not isinstance(data, dict):
-            return
+            raise RuntimeError("strict raw-block checkpoint must be an object")
         self._require_matching_key_namespace(data.get("key_namespace"))
         self._require_compatible_derivation(data.get("derivation"))
+        expected = {
+            "version": 1,
+            "key_namespace": self.key_namespace,
+            "block_align": self.block_align,
+            "header_bytes": self.header_bytes,
+            "slot_bytes": self.slot_bytes,
+            "meta_total_bytes": self.meta_total_bytes,
+            "meta_magic": self.meta_magic_text,
+            "meta_version": self.meta_version,
+            "data_base_offset": self._data_base_offset,
+        }
+        for name, value in expected.items():
+            if data.get(name) != value:
+                raise RuntimeError(
+                    f"strict raw-block checkpoint {name} mismatch: "
+                    f"{data.get(name)!r} != {value!r}"
+                )
+        if data.get("device_path") != self.device_path:
+            raise RuntimeError("strict raw-block checkpoint device_path mismatch")
+        if not isinstance(data.get("writer_epoch"), str):
+            raise RuntimeError("strict raw-block checkpoint writer_epoch is invalid")
+        next_slot = data.get("next_slot")
+        if type(next_slot) is not int or not 0 <= next_slot <= self._max_slots:
+            raise RuntimeError("strict raw-block checkpoint next_slot is invalid")
+        if not isinstance(data.get("entries"), dict):
+            raise RuntimeError("strict raw-block checkpoint entries must be an object")
+        tensor_integer = torch.iinfo(torch.int64)
+        used_offsets: set[int] = set()
+        for key, entry in data["entries"].items():
+            if not isinstance(entry, dict):
+                raise RuntimeError("strict raw-block checkpoint entry is invalid")
+            offset, size = entry.get("offset"), entry.get("size")
+            if (
+                type(offset) is not int
+                or type(size) is not int
+                or not self._is_valid_checkpoint_entry(offset, size)
+                or self._offset_to_slot(offset) >= next_slot
+                or offset in used_offsets
+            ):
+                raise RuntimeError("strict raw-block checkpoint extent is invalid")
+            shape = entry.get("shape")
+            positions = entry.get("cached_positions")
+            if (
+                shape is not None
+                and (
+                    not isinstance(shape, list)
+                    or any(
+                        type(size) is not int or not 0 <= size <= tensor_integer.max
+                        for size in shape
+                    )
+                )
+            ) or (
+                positions is not None
+                and (
+                    not isinstance(positions, list)
+                    or any(
+                        type(position) is not int
+                        or not tensor_integer.min <= position <= tensor_integer.max
+                        for position in positions
+                    )
+                )
+            ):
+                raise RuntimeError(
+                    "strict raw-block checkpoint tensor metadata is invalid"
+                )
+            if self._recover_checkpoint_dtype(str(key), entry.get("dtype")) is None:
+                raise RuntimeError("strict raw-block checkpoint dtype is invalid")
+            fmt = entry.get("fmt")
+            if fmt is not None and (
+                not isinstance(fmt, str) or fmt not in MemoryFormat.__members__
+            ):
+                raise RuntimeError("strict raw-block checkpoint format is invalid")
+            used_offsets.add(offset)
 
     def is_poisoned(self) -> bool:
         """Whether this core has stopped being able to say what the device did.
@@ -3990,7 +4051,9 @@ class RawBlockCore:
             idx * self._meta_container_bytes for idx in range(self._meta_copy_count)
         ]
 
-    def _read_meta_header(self, container_offset: int) -> Optional[dict[str, int]]:
+    def _read_meta_header(
+        self, container_offset: int, errors: Optional[list[str]] = None
+    ) -> Optional[dict[str, int]]:
         """Read and validate a metadata checkpoint header."""
         buf = bytearray(self.block_align)
         try:
@@ -4004,17 +4067,27 @@ class RawBlockCore:
                     io_context=self._metadata_io_context,
                 )
             ):
+                if errors is not None:
+                    errors.append("checkpoint header read failed")
                 return None
         except Exception:
+            if errors is not None:
+                errors.append("checkpoint header read failed")
             return None
 
+        if not any(buf):
+            return None
         hdr = bytes(buf[: _META_HEADER_STRUCT.size])
         magic, version, seq, payload_len, crc = _META_HEADER_STRUCT.unpack(hdr)
         if magic != self.meta_magic or version != self.meta_version:
+            if errors is not None:
+                errors.append("checkpoint header is nonblank and incompatible")
             return None
 
         payload_cap = self._meta_payload_capacity()
         if payload_len <= 0 or payload_len > payload_cap:
+            if errors is not None:
+                errors.append("checkpoint payload length is invalid")
             return None
         return {
             "seq": int(seq),
@@ -4023,7 +4096,9 @@ class RawBlockCore:
             "container_offset": int(container_offset),
         }
 
-    def _load_meta_payload(self, header: dict[str, int]) -> Optional[bytes]:
+    def _load_meta_payload(
+        self, header: dict[str, int], errors: Optional[list[str]] = None
+    ) -> Optional[bytes]:
         """Load and CRC-validate a checkpoint payload for a metadata header."""
         payload_len = int(header["payload_len"])
         payload_off = int(header["container_offset"]) + self.block_align
@@ -4040,13 +4115,19 @@ class RawBlockCore:
                     io_context=self._metadata_io_context,
                 )
             ):
+                if errors is not None:
+                    errors.append("checkpoint payload read failed")
                 return None
         except Exception:
+            if errors is not None:
+                errors.append("checkpoint payload read failed")
             return None
 
         payload = bytes(buf[:payload_len])
         crc = zlib.crc32(payload) & 0xFFFFFFFF
         if crc != int(header["crc"]):
+            if errors is not None:
+                errors.append("checkpoint payload checksum mismatch")
             return None
         return payload
 
@@ -4056,16 +4137,22 @@ class RawBlockCore:
         """Return the newest valid checkpoint header and payload."""
         best_header: Optional[dict[str, int]] = None
         best_payload: Optional[bytes] = None
+        errors: Optional[list[str]] = [] if self._derivation is not None else None
         for offset in self._meta_container_offsets():
-            header = self._read_meta_header(offset)
+            header = self._read_meta_header(offset, errors)
             if header is None:
                 continue
-            payload = self._load_meta_payload(header)
+            payload = self._load_meta_payload(header, errors)
             if payload is None:
                 continue
             if best_header is None or int(header["seq"]) > int(best_header["seq"]):
                 best_header = header
                 best_payload = payload
+        if best_header is None and errors:
+            raise RuntimeError(
+                "strict raw-block checkpoint cannot establish an empty namespace: "
+                + "; ".join(errors)
+            )
         return best_header, best_payload
 
     def _snapshot_state(self) -> tuple[dict[str, Any], int]:
@@ -4315,6 +4402,7 @@ class RawBlockCore:
 
         ``verify`` overrides ``meta_verify_on_load`` for this call.
         """
+        self._require_strict_checkpoint_layout(data)
         if not isinstance(data, dict):
             return False
         if int(data.get("version", 0)) != 1:
@@ -4578,7 +4666,11 @@ class RawBlockCore:
             return
         try:
             data = json.loads(payload.decode("utf-8"))
-        except Exception:
+        except Exception as exc:
+            if self._derivation is not None:
+                raise RuntimeError(
+                    "strict raw-block checkpoint is not valid JSON"
+                ) from exc
             logger.warning("RawBlockCore: failed to decode metadata payload")
             return
         if not self.apply_loaded_state(data):

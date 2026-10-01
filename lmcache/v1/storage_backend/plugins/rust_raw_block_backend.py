@@ -1278,10 +1278,11 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                 self.config, self.metadata
             )
             resolved = getattr(database, "hash_func", None)
-            implementation = (
-                f"{getattr(resolved, '__module__', '?')}."
-                f"{getattr(resolved, '__name__', repr(resolved))}"
-            )
+            module = getattr(resolved, "__module__", None)
+            name = getattr(resolved, "__name__", None)
+            if not callable(resolved) or not module or not name:
+                raise ValueError("the token database has no identifiable hash function")
+            implementation = f"{module}.{name}"
             first_root = str(token_database_module.NONE_HASH)
             token_database_module.ChunkedTokenDatabase(self.config, self.metadata)
             second_root = str(token_database_module.NONE_HASH)

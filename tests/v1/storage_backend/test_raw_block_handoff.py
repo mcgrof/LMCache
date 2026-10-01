@@ -165,48 +165,27 @@ def test_reader_rejects_slot_the_writer_reused(tmp_path):
 
 @requires_rust_raw_block_io
 @pytest.mark.skipif(sys.platform != "linux", reason="raw-block is Linux only")
-def test_reader_follows_a_writer_that_restarted_empty(tmp_path):
+def test_reader_keeps_its_publication_when_a_writer_tries_to_restart_empty(tmp_path):
     path = make_raw_block_file(tmp_path)
-    writer = RawBlockCore(
-        make_raw_block_core_config(path, derivation=make_test_derivation()),
-        key_namespace="object",
-    )
+    config = make_raw_block_core_config(path, derivation=make_test_derivation())
+    writer = RawBlockCore(config, key_namespace="object")
     first = encode_object_key(make_object_key(1))
-    second = encode_object_key(make_object_key(2))
-    # Publish several times so the device holds a high sequence number.
-    for i in range(3):
-        spec = encode_object_key(make_object_key(100 + i))
-        writer.put_many([spec], [make_memory_obj(b"o" * 512)])
-        assert writer.publish_index()
     assert writer.put_many([first], [make_memory_obj(b"a" * 1024)]).results == [True]
     assert writer.publish_index()
     writer.close()
 
     reader = RawBlockCore(_reader_config(path), key_namespace="object")
-    fresh = None
     try:
-        assert reader.exists_many([first.encoded]) == [True]
-        # The writer comes back without loading its old index.
-        fresh = RawBlockCore(
-            replace(
-                make_raw_block_core_config(path, derivation=make_test_derivation()),
-                load_checkpoint_on_init=False,
-            ),
-            key_namespace="object",
-        )
-        assert fresh.put_many([second], [make_memory_obj(b"b" * 1024)]).results == [
-            True
-        ]
-        assert fresh.publish_index()
-        assert reader.refresh_index_from_device() is True
-        assert reader.exists_many([first.encoded, second.encoded]) == [False, True]
+        with pytest.raises(RuntimeError, match="cannot skip a populated checkpoint"):
+            RawBlockCore(
+                replace(config, load_checkpoint_on_init=False),
+                key_namespace="object",
+            )
         loaded = make_empty_memory_obj(1024)
-        assert reader.load_many_into([second.encoded], [loaded]) == [True]
-        assert memory_obj_bytes(loaded) == b"b" * 1024
+        assert reader.load_many_into([first.encoded], [loaded]) == [True]
+        assert memory_obj_bytes(loaded) == b"a" * 1024
     finally:
         reader.close()
-        if fresh is not None:
-            fresh.close()
 
 
 @requires_rust_raw_block_io
@@ -710,3 +689,20 @@ def test_a_derivation_with_no_named_algorithm_is_refused():
 
     with pytest.raises(ValueError, match="must name the algorithm"):
         backend._observed_key_derivation("object")
+
+
+@pytest.mark.parametrize("hash_function", [None, "sha256_cbor", object()])
+def test_a_derivation_without_an_identifiable_callable_is_refused(
+    monkeypatch, hash_function
+):
+    # First Party
+    from lmcache.v1 import token_database as token_database_module
+
+    def unresolved_database(self, *args, **kwargs):
+        self.hash_func = hash_function
+
+    monkeypatch.setattr(
+        token_database_module.ChunkedTokenDatabase, "__init__", unresolved_database
+    )
+    with pytest.raises(ValueError, match="no identifiable hash function"):
+        _bare_backend()._observed_key_derivation("object")
