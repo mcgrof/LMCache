@@ -5,6 +5,7 @@ Distributed multi-tier storage manager for MP mode
 
 # Standard
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from typing import Any, Iterator, Optional, cast
 import threading
 import time
@@ -44,7 +45,11 @@ from lmcache.v1.distributed.l2_adapters.reconfiguration import (
 )
 from lmcache.v1.distributed.l2_adapters.serde_wrapper import SerdeL2AdapterWrapper
 from lmcache.v1.distributed.quota_manager import QuotaManager
-from lmcache.v1.distributed.serde import create_serde_processor
+from lmcache.v1.distributed.serde import (
+    SerdeSizeContract,
+    create_serde_processor,
+    get_serde_size_contract,
+)
 from lmcache.v1.distributed.storage_controllers import (
     L1EvictionController,
     L2AdapterEvictionState,
@@ -61,6 +66,15 @@ from lmcache.v1.distributed.storage_controllers.store_policy import (
 from lmcache.v1.distributed.storage_controllers.utils import (
     L1ManagerDescriptor,
     L2AdapterDescriptor,
+)
+from lmcache.v1.distributed.storage_layout import (
+    StorageLayoutMode,
+)
+from lmcache.v1.distributed.storage_layout import (
+    apply_layout_policy as _apply_layout_policy,
+)
+from lmcache.v1.distributed.storage_layout import (
+    derive_storage_layout_mode,
 )
 from lmcache.v1.memory_allocators.devdax_memory_allocator import (
     DevDaxArenaState,
@@ -86,8 +100,52 @@ logger = init_logger(__name__)
 _L1_WRITE_TAG = "storage_manager"
 
 
+def _reject_unsupported_serde_size_contracts(
+    adapters: list[L2AdapterConfigBase],
+) -> None:
+    """Reject upper-bound serdes on backends without used-length loads.
+
+    The serde wrapper allocates load buffers from
+    ``estimate_serialized_size``. An ``UPPER_BOUND`` serializer may store fewer
+    bytes than that capacity, so the backend must report the actual loaded
+    length before deserialization. The filesystem adapter supplies that
+    contract; the other current backends do not.
+
+    Args:
+        adapters: Normalized L2 adapter configurations.
+
+    Raises:
+        ValueError: If an upper-bound serde is paired with a backend that
+            cannot restore the object's actual used length.
+    """
+    unsupported: list[str] = []
+    for adapter in adapters:
+        serde_config = adapter.serde_config
+        if serde_config is None:
+            continue
+        if get_serde_size_contract(serde_config.type) == SerdeSizeContract.EXACT:
+            continue
+        backend = get_type_name_for_config(unwrap_l2_adapter_config(adapter))
+        if backend != "fs":
+            unsupported.append(f"{serde_config.type} on {backend}")
+    if unsupported:
+        raise ValueError(
+            "Upper-bound serde output requires the filesystem adapter's "
+            "actual-used-length load contract; unsupported pairing(s): "
+            + ", ".join(unsupported)
+        )
+
+
 class StorageManager:
     def __init__(self, config: StorageManagerConfig):
+        # Layout is also a pure config decision and may reject mixed
+        # single-/multi-output adapter sets.  Derive it before constructing
+        # L1 or starting controller threads so every invalid configuration
+        # fails without leaking resources.
+        self._storage_layout_mode = derive_storage_layout_mode(
+            config.l2_adapter_config.adapters
+        )
+        _reject_unsupported_serde_size_contracts(config.l2_adapter_config.adapters)
         self._l1_manager = L1Manager(config.l1_manager_config)
         self._event_bus = get_event_bus()
 
@@ -196,6 +254,42 @@ class StorageManager:
         )
 
     # External APIs for serving engine integration code to call
+
+    @property
+    def storage_layout_mode(self) -> StorageLayoutMode:
+        """The canonical L1 ``MemoryObj`` shape this StorageManager uses.
+
+        Derived once at construction from the configured L2 adapters'
+        serdes.  Callers hand the transfer-side packed layout straight to
+        :meth:`reserve_write` and :meth:`submit_prefetch_task`, which
+        apply the policy once at their choke point; integration layers
+        (vLLM / SGLang connectors, MP server) do not pre-apply it.
+        """
+        return self._storage_layout_mode
+
+    def apply_layout_policy(self, layout_desc: MemoryLayoutDesc) -> MemoryLayoutDesc:
+        """Adapt a transfer-side packed layout to this StorageManager's
+        canonical L1 shape.
+
+        For the default ``PACKED`` mode this is a no-op pass-through;
+        for ``KV_COMPONENT_GROUPS`` (selected when a multi-output serde
+        is configured) this splits each input group's leading-``2`` K|V
+        dim into separate K and V component groups so multi-output
+        serdes see K and V as distinct typed sub-objects via
+        ``TensorMemoryObj.get_tensor(0)`` / ``get_tensor(1)``.
+
+        Total bytes are unchanged.  The transfer kernel writes K bytes
+        followed by V bytes either way; only the typed view changes.
+
+        Args:
+            layout_desc: Packed layout as produced by the transfer side
+                (each input group has leading dim 2 for the K|V pair).
+
+        Returns:
+            Layout to pass to :meth:`reserve_write`.
+        """
+        return _apply_layout_policy(layout_desc, self._storage_layout_mode)
+
     @enable_tracing()
     def reserve_write(
         self,
@@ -207,13 +301,27 @@ class StorageManager:
 
         Args:
             keys (list[ObjectKey]): List of object keys to reserve for writing.
-            layout_desc (MemoryLayoutDesc): Description of the memory layout
-                for the objects to be reserved.
+            layout_desc (MemoryLayoutDesc): Transfer-side (packed) memory
+                layout for the objects to be reserved.  The L1 storage-layout
+                policy is applied to it internally (see
+                :meth:`apply_layout_policy`); callers pass the packed layout
+                and MUST NOT pre-apply the policy (the transform is not
+                idempotent).
         Returns:
             dict[ObjectKey, MemoryObj]: A dictionary mapping object keys to their
                 reserved memory objects. Note that not all requested keys could be
                 reserved (e.g., out of memory or write conflict)
         """
+        # Apply the L1 storage-layout policy exactly once, at this choke
+        # point, so every store path reserves the canonical L1 shape
+        # without each caller re-deriving it.  For the default PACKED
+        # layout this is a pure identity pass-through (KV_TOGETHER traffic
+        # is byte-unchanged); for a multi-output serde
+        # (KV_COMPONENT_GROUPS) it splits each [2, ...] group into K and V
+        # component groups.  Must run BEFORE the L1 reservation so the
+        # reserved object's shape matches what will be stored.  The
+        # transform is not idempotent -- callers must NOT pre-apply it.
+        layout_desc = self.apply_layout_policy(layout_desc)
         reserve_result = self._l1_manager.reserve_write(
             keys=keys,
             is_temporary=[False] * len(keys),
@@ -432,7 +540,10 @@ class StorageManager:
         """Prefetch objects into L1 asynchronously.
 
         Args:
-            spec: The request (see :class:`PrefetchTaskSpec`).
+            spec: The request (see :class:`PrefetchTaskSpec`). Each key-group
+                layout in ``spec.key_groups`` is passed
+                through the L1 storage-layout policy here; callers MUST NOT
+                pre-apply it (not idempotent).
             external_request_id: Caller id for end-to-end log tracing.
             skip_l2: If True, serve from L1 only. The result is available
                 as soon as this returns.
@@ -440,6 +551,22 @@ class StorageManager:
         Returns:
             PrefetchHandle to track the task.
         """
+        # Apply the L1 storage-layout policy once here (the prefetch choke
+        # point), before the controller handles the request, so every caller
+        # prefetches into the canonical L1 shape. PACKED is an identity
+        # no-op; a multi-output serde (KV_COMPONENT_GROUPS) splits each
+        # [2, ...] group into K/V components. Not idempotent -- callers must
+        # not pre-apply.
+        spec = replace(
+            spec,
+            key_groups=[
+                replace(
+                    row,
+                    layout_desc=self.apply_layout_policy(row.layout_desc),
+                )
+                for row in spec.key_groups
+            ],
+        )
         prefetch_request_id = self._prefetch_controller.submit_prefetch_request(
             spec, skip_l2=skip_l2
         )
@@ -939,9 +1066,19 @@ class StorageManager:
             ValueError: If the adapter registers a single L1 memory region
                 while L1 spans more than one (hybrid DRAM + Device-DAX, or
                 more than one Device-DAX arena), or a DAX device is already
-                mapped by L1 or another L2 adapter.
+                mapped by L1 or another L2 adapter, or its serde requires a
+                storage layout incompatible with this manager.
         """
         with self._lifecycle_lock:
+            adapter_layout_mode = derive_storage_layout_mode([config])
+            if adapter_layout_mode is not self._storage_layout_mode:
+                raise ValueError(
+                    "L2 adapter storage layout mode "
+                    f"{adapter_layout_mode.value!r} is incompatible with this "
+                    "StorageManager's canonical mode "
+                    f"{self._storage_layout_mode.value!r}"
+                )
+            _reject_unsupported_serde_size_contracts([config])
             # Mirror of the check in add_l1_devdax_device: a single-region
             # adapter may only be added while L1 is exactly one memory region.
             adapter_name = requires_single_l1_memory_region(config)

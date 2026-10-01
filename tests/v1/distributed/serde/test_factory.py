@@ -24,8 +24,10 @@ from lmcache.v1.distributed.serde import (
     AsyncSerdeProcessor,
     SerdeConfig,
     SerdeProcessor,
+    SerdeSizeContract,
     create_serde_processor,
     get_registered_serde_types,
+    get_serde_size_contract,
     register_serde_factory,
 )
 
@@ -115,6 +117,33 @@ def test_register_serde_factory_dispatch() -> None:
     assert isinstance(processor, _DummyProcessor)
     # Factory only receives the type-specific kwargs, not the wrapping type.
     assert seen["kwargs"] == {"foo": "bar"}
+    assert (
+        get_serde_size_contract("test-dummy-ser-de-xyz")
+        == SerdeSizeContract.UPPER_BOUND
+    )
+
+
+@pytest.mark.parametrize(
+    ("serde_type", "expected"),
+    [
+        ("fp8", SerdeSizeContract.EXACT),
+        ("aesgcm", SerdeSizeContract.EXACT),
+        ("turboquant", SerdeSizeContract.EXACT),
+        ("asym_k16_v8", SerdeSizeContract.UPPER_BOUND),
+        ("asym_k16_v8_v_only", SerdeSizeContract.UPPER_BOUND),
+    ],
+)
+def test_builtin_size_contracts_are_explicit(
+    serde_type: str,
+    expected: SerdeSizeContract,
+) -> None:
+    """Every built-in declares whether its estimate is exact."""
+    assert get_serde_size_contract(serde_type) == expected
+
+
+def test_get_size_contract_unknown_type_raises() -> None:
+    with pytest.raises(ValueError, match="Unknown serde type"):
+        get_serde_size_contract("does-not-exist")
 
 
 def test_register_serde_factory_duplicate_raises() -> None:
@@ -176,3 +205,130 @@ def test_adapter_config_rejects_serde_without_type() -> None:
                 "serde": {"fp8_dtype": "float8_e4m3fn"},
             }
         )
+
+
+# =============================================================================
+# Asym K16/V8 multi-output serde factory registration
+# =============================================================================
+
+
+def test_asym_k16_v8_storage_only_is_registered() -> None:
+    """Storage-only Mode 1 is selectable from YAML by name."""
+    assert "asym_k16_v8" in get_registered_serde_types()
+
+
+def test_asym_k16_v8_v_only_is_registered() -> None:
+    """V-only Mode 2 is selectable from YAML by name."""
+    assert "asym_k16_v8_v_only" in get_registered_serde_types()
+
+
+def test_create_asym_k16_v8_returns_async_processor_with_identity_mapping() -> None:
+    """Storage-only Mode 1: identity slot mapping (0, 1) — slot 0 reads
+    parent group 0 (K), slot 1 reads parent group 1 (V)."""
+    processor = create_serde_processor(SerdeConfig(type="asym_k16_v8"))
+    try:
+        assert isinstance(processor, AsyncSerdeProcessor)
+        assert processor.serializer_group_size() == 2
+        assert processor.deserializer_group_size() == 2
+        assert processor.input_slot_mapping() == (0, 1)
+        assert processor.output_slot_mapping() == (0, 1)
+        s_fd = processor.get_serialize_event_fd()
+        d_fd = processor.get_deserialize_event_fd()
+        assert s_fd != d_fd
+    finally:
+        processor.close()
+
+
+def test_create_asym_k16_v8_v_only_returns_async_processor_with_skip_k_mapping() -> (
+    None
+):
+    """V-only Mode 2: (None, 1) slot mapping — slot 0 is absent (K stays
+    in L1), slot 1 reads parent group 1 (V)."""
+    processor = create_serde_processor(SerdeConfig(type="asym_k16_v8_v_only"))
+    try:
+        assert isinstance(processor, AsyncSerdeProcessor)
+        assert processor.serializer_group_size() == 2
+        assert processor.input_slot_mapping() == (None, 1)
+        assert processor.output_slot_mapping() == (None, 1)
+    finally:
+        processor.close()
+
+
+def test_create_asym_k16_v8_honors_custom_kwargs() -> None:
+    """fp8_dtype, scale_scope, scale_dtype, max_workers kwargs round-trip
+    through the factory without raising."""
+    processor = create_serde_processor(
+        SerdeConfig(
+            type="asym_k16_v8",
+            kwargs={
+                "fp8_dtype": "float8_e4m3fn",
+                "scale_scope": "PER_TENSOR",
+                "scale_dtype": "float32",
+                "max_workers": 2,
+            },
+        )
+    )
+    try:
+        assert isinstance(processor, AsyncSerdeProcessor)
+    finally:
+        processor.close()
+
+
+def test_create_asym_k16_v8_defaults_max_workers_to_4() -> None:
+    """Default the asym factory to four codec workers.
+
+    The codec is CPU-bound, so a single worker runs encode and decode
+    inline on the store path and is several times slower than storing
+    without a serde at single-producer load.  Default to four workers
+    so enabling asym keeps the codec off the critical path instead of
+    silently landing on the slow single-worker path."""
+    processor = create_serde_processor(SerdeConfig(type="asym_k16_v8"))
+    try:
+        assert isinstance(processor, AsyncSerdeProcessor)
+        # ThreadPoolExecutor exposes _max_workers; pin the contract so a
+        # future refactor doesn't silently flip back to 1.
+        assert processor._pool._max_workers == 4  # type: ignore[attr-defined]
+    finally:
+        processor.close()
+
+
+def test_create_asym_k16_v8_v_only_defaults_max_workers_to_4() -> None:
+    """V-only carries the same single-thread-drainer footgun as the
+    storage-only variant, so the factory default is 4 there too."""
+    processor = create_serde_processor(SerdeConfig(type="asym_k16_v8_v_only"))
+    try:
+        assert isinstance(processor, AsyncSerdeProcessor)
+        assert processor._pool._max_workers == 4  # type: ignore[attr-defined]
+    finally:
+        processor.close()
+
+
+def test_create_asym_k16_v8_rejects_unknown_fp8_dtype() -> None:
+    """A typo'd fp8 dtype is rejected at factory time with a clear
+    error, not deferred to first use."""
+    with pytest.raises(ValueError, match="Unknown torch dtype"):
+        create_serde_processor(
+            SerdeConfig(type="asym_k16_v8", kwargs={"fp8_dtype": "float8_TYPO"})
+        )
+
+
+def test_create_asym_k16_v8_rejects_unknown_scale_scope() -> None:
+    """A typo'd scale_scope is rejected at factory time."""
+    with pytest.raises(ValueError, match="Unknown ScaleScope"):
+        create_serde_processor(
+            SerdeConfig(type="asym_k16_v8", kwargs={"scale_scope": "PER_BANANA"})
+        )
+
+
+def test_single_tensor_processor_returns_none_slot_mapping() -> None:
+    """Default base-class slot mapping accessors return None for
+    single-tensor serdes (the wrapper uses None to take the
+    pass-through dispatch path)."""
+    processor = create_serde_processor(SerdeConfig(type="fp8"))
+    try:
+        assert processor.input_slot_mapping() is None
+        assert processor.output_slot_mapping() is None
+        assert processor.serializer_group_size() is None
+        assert processor.deserializer_group_size() is None
+    finally:
+        processor.close()

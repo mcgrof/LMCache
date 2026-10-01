@@ -16,7 +16,8 @@ or controllers — it just defines:
   a thread pool and signaling an eventfd on completion.
 - A factory / registration mechanism so adapters can reference a serde
   by name (`{"type": "fp8", ...}` in JSON config).
-- One built-in serde: **fp8 quantization**.
+- Built-in serdes including **fp8 quantization** and the two-slot
+  ``asym_k16_v8`` K/V codec.
 
 How the async interface is actually plugged into the L2 path lives in
 [`docs/design/v1/distributed/l2_adapters/serde_wrapper.md`][wrapper-doc]
@@ -98,11 +99,15 @@ classes and register a factory.
 
 - Called once per batch to size the temp buffer **before** any work.
 - Must be an **upper bound** on the actual serialized output. Include
-  any safety margin inside this method (the fp8 serializer returns
-  `1.5 × num_elements` for exactly this reason).
+  any safety margin inside this method. The built-in fp8 serializer has
+  an exact one-byte-per-element result and therefore needs no margin.
 - Must only depend on `layout_desc` (shapes + dtypes). The wrapper
   uses the first object's layout to size temps for the whole batch,
   so a data-dependent estimate would break all-or-nothing allocation.
+- Registration must declare `SerdeSizeContract.EXACT` when every successful
+  serialization writes exactly the estimate, or `UPPER_BOUND` otherwise.
+  Upper-bound serdes require a backend that reports the actual loaded length;
+  custom registrations default to `UPPER_BOUND` so unsafe pairings fail closed.
 
 ### `Deserializer.deserialize(src, dst, key) -> None`
 
@@ -144,32 +149,37 @@ Wraps any `(Serializer, Deserializer)` pair. Internal design:
 
 **Why a pool, not an asyncio executor:** the CPU-bound fp8 / encryption
 transforms release the GIL under torch / native calls, so a real
-thread pool is useful. `N=1` is a safe default (one in-flight
-transform at a time), and the fp8 factory accepts `max_workers` to
-bump it.
+thread pool is useful. Each factory documents its own default and accepts
+`max_workers`; a larger value increases transform concurrency and should be
+tuned to the host's CPU budget.
 
 ## Factory / Registration
 
 ```python
 from lmcache.v1.distributed.serde import (
-    AsyncSerdeProcessor, Deserializer, Serializer,
+    AsyncSerdeProcessor, Deserializer, SerdeSizeContract, Serializer,
     register_serde_factory,
 )
 
 def _create_my_serde(kwargs: dict[str, object]) -> SerdeProcessor:
     return AsyncSerdeProcessor(MySerializer(...), MyDeserializer(...))
 
-register_serde_factory("mine", _create_my_serde)
+register_serde_factory(
+    "mine",
+    _create_my_serde,
+    size_contract=SerdeSizeContract.EXACT,
+)
 ```
 
 The factory receives the type-specific kwargs from the JSON config
 (everything except `"type"`). The registry is process-global and
 rejects duplicate names, matching the pattern already used by
-`register_l2_adapter_type`.
+`register_l2_adapter_type`. Omit `size_contract` only when the serializer's
+estimate may exceed its emitted bytes; the safe default is `UPPER_BOUND`.
 
-The factory is called exactly once per `SerdeL2AdapterWrapper`
-construction — each wrapped adapter gets its own `SerdeProcessor`
-instance.
+Each wrapped adapter owns and closes its own `SerdeProcessor` instance.
+Configuration inspection may construct a short-lived processor to derive the
+storage layout, so factories must not return a process-global singleton.
 
 ## Built-in fp8
 
@@ -181,9 +191,8 @@ instance.
 - Deserialize reinterprets the `uint8` bytes as the chosen fp8 dtype,
   reshapes back to the original KV shape, and casts to the destination
   tensor's dtype.
-- `estimate_serialized_size` returns `int(total_elements × 1.5)` — the
-  exact fp8 size is `num_elements × 1 byte`, and the 1.5× headroom
-  absorbs future format changes or alignment padding.
+- `estimate_serialized_size` returns the exact fp8 size:
+  `num_elements × 1 byte`.
 
 ## Extension Guide
 
@@ -232,15 +241,18 @@ as one combined tensor. It does not work in two cases:
   pair to the tuple interface as a length-1 group; the adapter is
   layout-equivalent (same on-the-wire bytes as a direct call).
 
-The single-tensor `Serializer` / `Deserializer` ABCs and all their
-existing callers — `AsyncSerdeProcessor`, the factory registry, the
-L2 adapter wrapper, the built-in `fp8` serde — are unchanged. A
-serde implementation that needs multiple tensors at an endpoint
-implements `MultiSerializer` / `MultiDeserializer` instead of (or in
-addition to) the single-tensor ABCs. The async wiring around the
-multi interface — a tuple-aware `AsyncSerdeProcessor` analog and a
-tuple-aware `submit_*` shape on the wrapper — is added in a follow-up
-once a concrete multi-output serde lands.
+The single-tensor ABCs and existing serdes remain compatible. A serde that
+needs multiple tensors implements `MultiSerializer` / `MultiDeserializer`.
+`AsyncSerdeProcessor` forwards each tuple-shaped work item unchanged, while
+`SerdeL2AdapterWrapper` creates zero-copy `GroupSlotView` objects according to
+the serde's slot mapping.
+
+The wrapper requires the mapping to cover every parent group exactly once.
+The built-in `asym_k16_v8` mapping is `(0, 1)`, so it supports exactly one K/V
+pair and fails closed for `[K, V, K, V, ...]` layouts rather than reporting a
+partial cache hit. The `(None, 1)` V-only mapping is intentionally incomplete
+and therefore cannot be used by an ordinary all-in-L2 wrapper; it requires the
+paired split-tier placement that supplies K independently.
 
 ### Per-slot semantics
 

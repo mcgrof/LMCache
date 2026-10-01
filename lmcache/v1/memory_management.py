@@ -700,31 +700,111 @@ class TensorMemoryObj(MemoryObj):
     def set_used_size(self, n: int) -> None:
         """Narrow the logical size to ``n`` bytes after a write.
 
-        After this call, ``get_size()`` returns ``n`` and ``byte_array``
-        exposes exactly ``n`` bytes from the start of ``raw_data``.  The
-        physical allocation (``get_physical_size``) and ``raw_data``
-        buffer are unchanged.  Allocator reuse resets this override to
-        ``None`` so a recycled block returns to its layout-derived size.
+        After this call, ``get_size()`` returns ``n``, ``byte_array``
+        exposes exactly ``n`` bytes from the start of ``raw_data``,
+        and the ``tensor`` property reshapes coherently (the underlying
+        ``meta.shape`` / ``meta.shapes`` / ``group_prefix_sum`` are all
+        updated to match the narrower view).  The physical allocation
+        (``get_physical_size``) and the ``raw_data`` buffer itself are
+        unchanged.  Allocator reuse resets this override to ``None`` so
+        a recycled block returns to its layout-derived size.
 
-        Note: the ``tensor`` property still derives its shape from
-        ``meta.shape``, so accessing ``.tensor`` on a buffer narrowed
-        below its layout size will fail to reshape.  Use ``byte_array``
-        (or read ``raw_data[: get_size()]`` directly) for downstream
-        I/O that must honor the narrowed size.
+        Narrowing (``n`` smaller than the current logical size) is
+        supported only on flat ``uint8`` objects explicitly tagged
+        :attr:`MemoryFormat.BINARY_BUFFER` -- the serde temp buffers the
+        async processor narrows.  A one-byte dtype alone is not enough:
+        FP8 and int8 KV objects are fixed-layout tensors and accepting a
+        short read for them would turn truncated storage into a cache hit.
+        Multi-byte dtypes or multi-group layouts would need a non-trivial
+        reinterpretation and are rejected explicitly; the caller can fall
+        back to ``byte_array`` for raw byte access.  When ``n`` equals the
+        current logical size the call is a no-op for every layout: the
+        buffer already exposes exactly ``n`` bytes, so a full-size read
+        into a fixed-layout KV object (the plain, no-serde L2 load
+        path) passes through without triggering the narrowing checks.
 
         Args:
             n: bytes actually written.  Must satisfy
                 ``0 <= n <= get_physical_size()``.
 
         Raises:
-            ValueError: if ``n`` is outside the allowed range.
+            ValueError: if ``n`` is outside the allowed range, or the
+                call would narrow (``n != get_size()``) and the buffer
+                is multi-group or its dtype is not ``torch.uint8``.
         """
-        if n < 0 or n > self.meta.phy_size:
-            raise ValueError(
-                f"set_used_size: n={n} out of range [0, {self.meta.phy_size}]"
-            )
         with self.lock:
+            if n == self.get_size():
+                # Nothing to narrow: the logical view already exposes
+                # exactly n bytes.  This is the common case for plain
+                # (no-serde) L2 loads, where the on-disk object is
+                # exactly the size of the fixed-layout destination
+                # buffer -- which must NOT be rejected by the
+                # narrowing-only validation below.  Checked before the
+                # range check because ad-hoc allocations carry
+                # phy_size=0, which would spuriously reject a
+                # full-size report.
+                return
+            if n < 0 or n > self.meta.phy_size:
+                raise ValueError(
+                    f"set_used_size: n={n} out of range [0, {self.meta.phy_size}]"
+                )
+            if self.meta.shapes is not None and len(self.meta.shapes) > 1:
+                raise ValueError(
+                    "set_used_size is only valid on single-group buffers; "
+                    f"this buffer has {len(self.meta.shapes)} groups"
+                )
+            if (
+                self.meta.fmt != MemoryFormat.BINARY_BUFFER
+                or self.meta.dtype != torch.uint8
+            ):
+                raise ValueError(
+                    "set_used_size: narrowing requires an explicit flat "
+                    "uint8 BINARY_BUFFER; this object has "
+                    f"dtype={self.meta.dtype}, format={self.meta.fmt.name}"
+                )
             self._used_size_override = n
+            # Keep meta.shape / shapes / group_prefix_sum coherent so the
+            # ``tensor`` property (which does
+            # raw_data[:get_size()].view(dtype).view(shape)) reshapes
+            # correctly into the narrowed view.
+            new_shape = torch.Size((n,))
+            self.meta.shape = new_shape
+            if self.meta.shapes is not None:
+                self.meta.shapes = [new_shape]
+            self.group_prefix_sum = [0, n]
+
+    def reset_used_size(self) -> None:
+        """Restore the logical size derived from the current metadata.
+
+        For allocator / pool reuse paths that recycle a buffer for a
+        new allocation (e.g. a paged serde buffer or the wrapper's
+        K-child slab).  The allocator must restore ``meta.shape`` /
+        ``meta.shapes`` / ``meta.dtypes`` before calling this method;
+        this method then rebuilds the derived group byte offsets and
+        clears the narrowing override atomically.
+
+        Raises:
+            ValueError: If the current metadata has mismatched shape and
+                dtype group counts.
+        """
+        with self.lock:
+            if self.meta.shapes is not None and self.meta.dtypes is not None:
+                if len(self.meta.shapes) != len(self.meta.dtypes):
+                    raise ValueError(
+                        "reset_used_size: metadata shape/dtype group counts "
+                        "do not match"
+                    )
+                size_in_bytes = 0
+                group_prefix_sum = [0]
+                for shape, dtype in zip(
+                    self.meta.shapes, self.meta.dtypes, strict=True
+                ):
+                    size_in_bytes += shape.numel() * dtype.itemsize
+                    group_prefix_sum.append(size_in_bytes)
+                self.group_prefix_sum = group_prefix_sum
+            else:
+                self.group_prefix_sum = [0, self.meta.get_size()]
+            self._used_size_override = None
 
     # TODO(chunxiaozheng): use get_shapes and get_dtypes to replace
     #  get_shape and get_dtype

@@ -58,6 +58,12 @@ serde factory.
      - ``fp8_dtype`` (default ``float8_e4m3fn``; also accepts
        ``float8_e5m2``), ``max_workers`` (thread pool size,
        default 1)
+   * - ``asym_k16_v8``
+     - Store one K/V pair in one object: K stays in its native dtype and V is
+       quantized to FP8 with scales in the encoded header.
+     - ``fp8_dtype`` (default ``float8_e4m3fn``), ``scale_scope`` (default
+       ``PER_TENSOR``), ``scale_dtype`` (default ``float32``), and
+       ``max_workers`` (default 4)
    * - ``turboquant``
      - Compress KV tensors with TurboQuant presets before L2 store and
        reconstruct them on load.
@@ -70,6 +76,24 @@ serde factory.
      - ``key_provider`` (default ``hkdf``), ``master_key_path`` (required
        for ``hkdf``), ``aes_bits`` (``128`` default, or ``256``),
        ``max_workers`` (thread pool size, default 1)
+
+``asym_k16_v8`` currently supports exactly one K/V pair per object. A layout
+with multiple kernel-group pairs fails closed instead of storing only its first
+pair. The registered ``asym_k16_v8_v_only`` codec is not a standalone all-L2
+configuration: its slot mapping omits K and is accepted only by the paired
+split-tier placement that retains K separately.
+
+
+Serialized-size contracts
+-------------------------
+
+Every registered serde declares whether ``estimate_serialized_size`` is exact
+or only an upper bound. Upper-bound formats currently require the filesystem
+adapter because it reports the object's actual loaded length before
+deserialization. This includes the scale-aware ``asym_k16_v8`` formats, whose
+self-describing headers are shorter than their allocation allowance. S3 and
+Valkey pairings fail during configuration instead of turning every valid object
+into a load miss.
 
 
 TurboQuant serde
@@ -166,6 +190,7 @@ transform logic, then register a factory keyed on a name you pick:
     from lmcache.v1.distributed.serde import (
         AsyncSerdeProcessor,
         Deserializer,
+        SerdeSizeContract,
         Serializer,
         register_serde_factory,
     )
@@ -191,7 +216,11 @@ transform logic, then register a factory keyed on a name you pick:
     def _create_mine(config: dict):
         return AsyncSerdeProcessor(MySerializer(), MyDeserializer())
 
-    register_serde_factory("mine", _create_mine)
+    register_serde_factory(
+        "mine",
+        _create_mine,
+        size_contract=SerdeSizeContract.EXACT,
+    )
 
 Reference it from your adapter config:
 
@@ -204,9 +233,11 @@ Notes
 -----
 
 - **Buffer size.** ``estimate_serialized_size(layout)`` must return an
-  upper bound on the actual serialized output — include any safety
-  margin directly in the estimate (e.g., the built-in fp8 serializer
-  returns ``1.5 * num_elements``).
+  upper bound on the actual serialized output. Register
+  ``SerdeSizeContract.EXACT`` only when every successful serialization writes
+  exactly that estimate. Otherwise omit the argument and use the safe
+  ``UPPER_BOUND`` default; such serdes currently require the filesystem
+  backend's actual-used-length load contract.
 - **Raw-byte output.** If your serde writes bytes directly (rather than
   through ``MemoryObj.tensor`` like the quantizers), reach the buffer via
   ``MemoryObj.byte_array`` and **cast it to the native format first**:

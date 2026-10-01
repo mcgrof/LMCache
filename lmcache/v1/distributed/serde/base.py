@@ -14,6 +14,7 @@ interface automatically.
 
 # Standard
 from dataclasses import dataclass, field
+from enum import Enum
 import abc
 
 # First Party
@@ -21,6 +22,20 @@ from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.memory_management import MemoryObj
 
 SerdeTaskId = int
+
+
+class SerdeSizeContract(Enum):
+    """Relationship between a serde's size estimate and emitted bytes.
+
+    ``EXACT`` means every successful serialization writes exactly the size
+    returned by ``estimate_serialized_size`` for the same layout.
+    ``UPPER_BOUND`` means the estimate is only a capacity bound and the actual
+    object may be shorter. Backends that reload into estimate-sized buffers
+    must know the object's used length before deserialization.
+    """
+
+    EXACT = "exact"
+    UPPER_BOUND = "upper_bound"
 
 
 @dataclass
@@ -216,6 +231,46 @@ class SerdeProcessor(abc.ABC):
         any safety margin. See :meth:`Serializer.estimate_serialized_size`.
         """
         raise NotImplementedError
+
+    # ----- Multi-output dispatch hooks (None for single-tensor) -----
+
+    def input_slot_mapping(self) -> "tuple[int | None, ...] | None":
+        """Mapping from a multi-output serializer's slots to the parent
+        grouped-``MemoryObj``'s group indexes, or ``None`` for
+        single-tensor serializers.
+
+        Used by :class:`SerdeL2AdapterWrapper` to decide whether to
+        build per-slot views over the source ``MemoryObj`` before
+        invoking the serializer.  Default returns ``None``
+        (single-tensor path).  Multi-output processors override to
+        delegate to their wrapped serializer's
+        :meth:`MultiSerializer.input_slot_mapping`.
+        """
+        return None
+
+    def output_slot_mapping(self) -> "tuple[int | None, ...] | None":
+        """Mapping from a multi-output deserializer's slots to the
+        destination grouped-``MemoryObj``'s group indexes, or ``None``
+        for single-tensor deserializers.
+
+        Symmetric to :meth:`input_slot_mapping` for the load path.
+        """
+        return None
+
+    def serializer_group_size(self) -> "int | None":
+        """Group length expected by the underlying multi-output
+        serializer, or ``None`` for single-tensor serializers.
+
+        Cheap accessor that callers can use to validate per-key input
+        shape before submitting a batch.
+        """
+        return None
+
+    def deserializer_group_size(self) -> "int | None":
+        """Group length expected by the underlying multi-output
+        deserializer, or ``None`` for single-tensor deserializers.
+        """
+        return None
 
     # ----- Lifecycle -----
 

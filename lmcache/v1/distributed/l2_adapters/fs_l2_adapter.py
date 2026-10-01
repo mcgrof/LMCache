@@ -44,6 +44,7 @@ from lmcache.v1.distributed.l2_adapters.config import (
 from lmcache.v1.distributed.l2_adapters.factory import (
     register_l2_adapter_factory,
 )
+from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.platform import create_event_notifier
 
 logger = init_logger(__name__)
@@ -705,25 +706,79 @@ class FSL2Adapter(L2AdapterInterface):
             file_path = self._key_to_path(key)
             try:
                 dst_buf = objects[i].byte_array
-                expected = len(dst_buf)
+                # Destination buffer capacity (upper bound from
+                # estimate_serialized_size).  The actual on-disk file
+                # may be smaller -- e.g. when a serde over-estimates
+                # its header allowance and AsyncSerdeProcessor narrowed
+                # the write via set_used_size.  Read whatever the file
+                # actually contains and narrow the dst's logical view
+                # to match so downstream deserialize sees only valid
+                # bytes via byte_array / tensor.
+                capacity = len(dst_buf)
+                file_size = await self._loop.run_in_executor(
+                    None, os.path.getsize, str(file_path)
+                )
+                if file_size > capacity:
+                    logger.warning(
+                        "File %s size %d exceeds dst buffer capacity %d; "
+                        "skipping (file likely from a different layout)",
+                        file_path.name,
+                        file_size,
+                        capacity,
+                    )
+                    continue
+                if file_size == 0:
+                    logger.warning("Empty file %s; skipping", file_path.name)
+                    continue
+                if (
+                    file_size != capacity
+                    and objects[i].get_memory_format() != MemoryFormat.BINARY_BUFFER
+                ):
+                    logger.warning(
+                        "File %s size %d does not match fixed-layout dst "
+                        "size %d; skipping (truncated or incompatible object)",
+                        file_path.name,
+                        file_size,
+                        capacity,
+                    )
+                    continue
                 num_read: Optional[int] = None
 
-                # O_DIRECT path (sync, via executor)
-                if self._use_odirect:
+                # O_DIRECT path (sync, via executor).  The store path falls
+                # back to buffered I/O for an unaligned serialized length;
+                # mirror that decision here.  Otherwise a valid unaligned
+                # serde object written through the fallback path is later
+                # read with O_DIRECT and fails with EINVAL.
+                do_odirect = self._use_odirect
+                if do_odirect:
+                    aligned = self._os_disk_bs > 0 and file_size % self._os_disk_bs == 0
+                    if not aligned:
+                        logger.warning(
+                            "Cannot use O_DIRECT for reading size %d, not "
+                            "aligned to block size %d; falling back to "
+                            "buffered I/O.",
+                            file_size,
+                            self._os_disk_bs,
+                        )
+                        do_odirect = False
+                if do_odirect:
                     num_read = await self._loop.run_in_executor(
                         None,
                         self._read_with_odirect,
                         file_path,
-                        dst_buf,
+                        dst_buf[:file_size]
+                        if isinstance(dst_buf, memoryview)
+                        else memoryview(dst_buf)[:file_size],
                     )
-                    if num_read != expected:
+                    if num_read != file_size:
                         logger.warning(
                             "Incomplete O_DIRECT read for %s: expected %d, got %d",
                             file_path.name,
-                            expected,
+                            file_size,
                             num_read or 0,
                         )
                     else:
+                        objects[i].set_used_size(num_read)
                         bitmap.set(i)
                         logger.debug(
                             "FSL2Adapter loaded key %s (%d bytes, O_DIRECT)",
@@ -733,33 +788,40 @@ class FSL2Adapter(L2AdapterInterface):
                     continue
 
                 # Standard async path with optional
-                # read-ahead
-                expected = len(dst_buf)
+                # read-ahead.  Cap the destination view at file_size
+                # so the read returns exactly file_size bytes (treating
+                # capacity > file_size as a normal case rather than an
+                # "incomplete" warning).
+                if not isinstance(dst_buf, memoryview):
+                    dst_buf = memoryview(dst_buf)
+                target = dst_buf[:file_size]
                 async with aiofiles.open(file_path, "rb") as f:
                     if self._read_ahead_size is None:
-                        num_read = await _async_readinto_full(f, dst_buf)
+                        num_read = await _async_readinto_full(f, target)
                     else:
-                        if not isinstance(dst_buf, memoryview):
-                            dst_buf = memoryview(dst_buf)
-                        # Trigger readahead with a
-                        # small initial read
-                        ra = self._read_ahead_size
-                        n_head = await _async_readinto_full(f, dst_buf[:ra])
-                        if n_head == ra:
-                            n_tail = await _async_readinto_full(f, dst_buf[ra:])
+                        ra = min(self._read_ahead_size, file_size)
+                        n_head = await _async_readinto_full(f, target[:ra])
+                        if n_head == ra and ra < file_size:
+                            n_tail = await _async_readinto_full(f, target[ra:])
                             num_read = n_head + n_tail
                         else:
                             num_read = n_head
 
-                    if num_read != expected:
+                    if num_read != file_size:
                         logger.warning(
                             "Incomplete read for %s: expected %d, got %d",
                             file_path.name,
-                            expected,
+                            file_size,
                             num_read,
                         )
                         continue
 
+                    # Full file read (partial reads ``continue`` above).  For
+                    # an estimate-sized serde temp this narrows the logical
+                    # view to ``file_size``; for an exact-size plain KV object
+                    # it is a no-op.  Guard duck-typed buffer fakes.
+                    if hasattr(objects[i], "set_used_size"):
+                        objects[i].set_used_size(num_read)
                     bitmap.set(i)
                     logger.debug(
                         "FSL2Adapter loaded key %s (%d bytes)",

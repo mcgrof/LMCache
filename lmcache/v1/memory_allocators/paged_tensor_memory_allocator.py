@@ -150,10 +150,10 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
         free_block.meta.dtypes = dtypes
         free_block.meta.fmt = fmt
         free_block.meta.ref_count = 1
-        # Reset any narrowed-size override left over from the previous
-        # owner of this block, so get_size() returns the layout-derived
-        # size for the fresh allocation.
-        free_block._used_size_override = None
+        # Restore the layout-derived size and byte offsets after replacing
+        # the previous owner's metadata. ``set_used_size`` may have narrowed
+        # both the override and the derived group map.
+        free_block.reset_used_size()
 
         if shapes != self.shapes:
             size_in_bytes = get_size_bytes(shapes, dtypes)
@@ -206,8 +206,9 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
             free_block.meta.dtypes = dtypes
             free_block.meta.fmt = fmt
             free_block.meta.ref_count = 1
-            # Reset narrowed-size override (see notes in ``allocate``).
-            free_block._used_size_override = None
+            # Restore the layout-derived size and byte offsets (see
+            # ``allocate`` above).
+            free_block.reset_used_size()
 
             if shapes != self.shapes:
                 size_in_bytes = get_size_bytes(shapes, dtypes)

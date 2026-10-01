@@ -21,7 +21,12 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.serde.async_processor import AsyncSerdeProcessor
-from lmcache.v1.distributed.serde.base import Deserializer, SerdeProcessor, Serializer
+from lmcache.v1.distributed.serde.base import (
+    Deserializer,
+    SerdeProcessor,
+    SerdeSizeContract,
+    Serializer,
+)
 from lmcache.v1.distributed.serde.factory import register_serde_factory
 from lmcache.v1.distributed.serde.key_provider import HkdfKeyProvider, KeyProvider
 from lmcache.v1.memory_management import MemoryObj
@@ -177,4 +182,6 @@ def _create_aesgcm_serde(kwargs: dict[str, object]) -> SerdeProcessor:
     )
 
 
-register_serde_factory("aesgcm", _create_aesgcm_serde)
+register_serde_factory(
+    "aesgcm", _create_aesgcm_serde, size_contract=SerdeSizeContract.EXACT
+)

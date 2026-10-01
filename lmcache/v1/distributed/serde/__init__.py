@@ -1,5 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # First Party
+# Import for side effect: registers ``asym_k16_v8`` and
+# ``asym_k16_v8_v_only`` in the serde factory so they are selectable
+# from YAML configs alongside ``fp8``.  No symbols re-exported here
+# (the public asym types are reachable via the submodule path).
+# First Party
+from lmcache.v1.distributed.serde import (  # noqa: F401
+    asym_k16_v8 as _register_asym_k16_v8,
+)
 from lmcache.v1.distributed.serde.aesgcm import (
     AesGcmDeserializer,
     AesGcmSerializer,
@@ -9,12 +17,14 @@ from lmcache.v1.distributed.serde.base import (
     Deserializer,
     SerdeConfig,
     SerdeProcessor,
+    SerdeSizeContract,
     SerdeTaskId,
     Serializer,
 )
 from lmcache.v1.distributed.serde.factory import (
     create_serde_processor,
     get_registered_serde_types,
+    get_serde_size_contract,
     register_serde_factory,
 )
 from lmcache.v1.distributed.serde.fp8 import (
@@ -59,10 +69,12 @@ __all__ = [
     "MultiSerializer",
     "SerdeConfig",
     "SerdeProcessor",
+    "SerdeSizeContract",
     "SerdeTaskId",
     "Serializer",
     "create_serde_processor",
     "get_registered_serde_types",
+    "get_serde_size_contract",
     "make_temp_key",
     "register_serde_factory",
     "serialized_layout_desc",
