@@ -1134,3 +1134,78 @@ def test_a_short_registered_dmabuf_transfer_ends_there(tmp_path) -> None:
     # this request, so nothing is withheld on its account.
     assert report["poisoned"] is False, report
     assert report["quarantined_owners"] == 0, report
+
+
+SCRIPTED_SHORT_REMAINDER_RETRIED = SCRIPTED_PREAMBLE + textwrap.dedent(
+    """
+    dev = device()
+    payload = bytearray(b"x" * 8192)
+    batch = dev.batched_write([0], [payload], [8192], [None])
+    assert wait_until(lambda: bool(dev.fake_owned()))
+    first = dev.fake_owned_sqes()
+
+    # Half the bytes. The engine resubmits the rest, and that submit is
+    # refused with EAGAIN -- which took nothing, so the remainder is still
+    # resident and still the worker's. The hold keeps it there long enough
+    # to be looked at; without it the retry lands before anything can see
+    # which geometry was pending.
+    dev.fake_hold_submits(True)
+    dev.fake_submit_fails(11)
+    dev.fake_complete(first[0]["user_data"], 4096)
+    assert wait_until(lambda: bool(dev.fake_resident()))
+    resident_after_refusal = dev.fake_resident_sqes()
+    report = {
+        "first": first,
+        "resident_after_refusal": resident_after_refusal,
+        "poisoned_after_refusal": dev.is_poisoned(),
+    }
+
+    # The retry hands the same remainder over, and it lands.
+    dev.fake_hold_submits(False)
+    assert wait_until(lambda: bool(dev.fake_owned()))
+    remainder = dev.fake_owned_sqes()
+    dev.fake_complete(remainder[0]["user_data"], 4096)
+    results, errors = dev.wait_iouring(batch)
+    report.update({
+        "remainder": remainder,
+        "results": list(results),
+        "errors": [str(e) for _, e in errors],
+        "poisoned": dev.is_poisoned(),
+        "quarantined_owners": dev.quarantined_owner_count(),
+        "violations": dev.fake_violations(),
+    })
+    print(json.dumps(report))
+    sys.stdout.flush()
+    os._exit(0)
+    """
+)
+
+
+def test_a_refused_remainder_submit_is_retried_and_lands(tmp_path) -> None:
+    """A short write's remainder meets a submit that took nothing.
+
+    Two transitions the inherited matrix names, in the order they happen:
+    the remainder the engine builds from a positive short completion, and a
+    retryable submit error on *that* submission rather than on an initial
+    one. A retryable error consumed nothing, so the remainder is resident
+    and still this engine's, and the retry delivers the same geometry.
+    """
+    device = tmp_path / "dev.bin"
+    with open(device, "wb") as handle:
+        handle.truncate(16 * 1024 * 1024)
+    report = _run_scenario(SCRIPTED_SHORT_REMAINDER_RETRIED, device)
+
+    assert report["violations"] == []
+    # The remainder names the second half, at the offset it belongs at.
+    assert len(report["resident_after_refusal"]) == 1, report
+    pending = report["resident_after_refusal"][0]
+    assert pending["offset"] == 4096, report
+    assert pending["len"] == 4096, report
+    # A retryable submit error is not an unknown outcome.
+    assert report["poisoned_after_refusal"] is False, report
+    assert report["remainder"] == report["resident_after_refusal"], report
+
+    assert report["results"] == [True], report
+    assert report["errors"] == [], report
+    assert report["poisoned"] is False, report
+    assert report["quarantined_owners"] == 0, report
