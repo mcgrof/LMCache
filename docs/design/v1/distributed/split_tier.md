@@ -37,3 +37,11 @@ it has copied all source bytes. StoreController releases those read locks once
 and arms redundant logical residents for deletion after their final reader.
 The deletion marker belongs to that exact resident, not a key-only side table.
 An unrelated adapter's completion cannot authorize split-tier deletion.
+
+## Paired eviction
+
+L1 eviction claims the manifest generation before deleting K or V. If a reader
+wins the K lock, it cancels the cleanup claim and preserves the composite.
+Otherwise it waits for physical V deletion to terminate before dropping the
+claim. Adapter removal detaches future paired passes and drains prior passes
+before closing the adapter they captured.
