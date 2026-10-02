@@ -45,6 +45,9 @@ from lmcache.v1.mp_observability.subscribers.metrics.phase_timing import (
 from lmcache.v1.mp_observability.subscribers.metrics.sm_lifecycle import (
     SMLifecycleSubscriber,
 )
+from lmcache.v1.mp_observability.subscribers.metrics.split_tier import (
+    SplitTierMetricsSubscriber,
+)
 from lmcache.v1.mp_observability.subscribers.metrics.timeout import (
     TimeoutMetricsSubscriber,
 )
@@ -65,6 +68,7 @@ __all__ = [
     "LookupMetricsSubscriber",
     "MPTransferCountersSubscriber",
     "SMLifecycleSubscriber",
+    "SplitTierMetricsSubscriber",
     "TimeoutMetricsSubscriber",
     "TransferPhaseMetricsSubscriber",
 ]
