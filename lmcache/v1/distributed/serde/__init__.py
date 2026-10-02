@@ -9,12 +9,14 @@ from lmcache.v1.distributed.serde.base import (
     Deserializer,
     SerdeConfig,
     SerdeProcessor,
+    SerdeSizeContract,
     SerdeTaskId,
     Serializer,
 )
 from lmcache.v1.distributed.serde.factory import (
     create_serde_processor,
     get_registered_serde_types,
+    get_serde_size_contract,
     register_serde_factory,
 )
 from lmcache.v1.distributed.serde.fp8 import (
@@ -59,10 +61,12 @@ __all__ = [
     "MultiSerializer",
     "SerdeConfig",
     "SerdeProcessor",
+    "SerdeSizeContract",
     "SerdeTaskId",
     "Serializer",
     "create_serde_processor",
     "get_registered_serde_types",
+    "get_serde_size_contract",
     "make_temp_key",
     "register_serde_factory",
     "serialized_layout_desc",

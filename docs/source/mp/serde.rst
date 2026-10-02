@@ -71,6 +71,15 @@ serde factory.
        for ``hkdf``), ``aes_bits`` (``128`` default, or ``256``),
        ``max_workers`` (thread pool size, default 1)
 
+Serialized-size contracts
+-------------------------
+
+Every registered serde declares whether ``estimate_serialized_size`` is exact
+or only an upper bound. Upper-bound formats currently require the filesystem
+adapter because it reports the object's actual loaded length before
+deserialization. S3 and Valkey pairings fail during configuration instead of
+turning every valid object into a load miss.
+
 
 TurboQuant serde
 ----------------
@@ -166,6 +175,7 @@ transform logic, then register a factory keyed on a name you pick:
     from lmcache.v1.distributed.serde import (
         AsyncSerdeProcessor,
         Deserializer,
+        SerdeSizeContract,
         Serializer,
         register_serde_factory,
     )
@@ -191,7 +201,11 @@ transform logic, then register a factory keyed on a name you pick:
     def _create_mine(config: dict):
         return AsyncSerdeProcessor(MySerializer(), MyDeserializer())
 
-    register_serde_factory("mine", _create_mine)
+    register_serde_factory(
+        "mine",
+        _create_mine,
+        size_contract=SerdeSizeContract.EXACT,
+    )
 
 Reference it from your adapter config:
 
@@ -204,9 +218,11 @@ Notes
 -----
 
 - **Buffer size.** ``estimate_serialized_size(layout)`` must return an
-  upper bound on the actual serialized output — include any safety
-  margin directly in the estimate (e.g., the built-in fp8 serializer
-  returns ``1.5 * num_elements``).
+  upper bound on the actual serialized output. Register
+  ``SerdeSizeContract.EXACT`` only when every successful serialization writes
+  exactly that estimate. Otherwise omit the argument and use the safe
+  ``UPPER_BOUND`` default; such serdes currently require the filesystem
+  backend's actual-used-length load contract.
 - **Raw-byte output.** If your serde writes bytes directly (rather than
   through ``MemoryObj.tensor`` like the quantizers), reach the buffer via
   ``MemoryObj.byte_array`` and **cast it to the native format first**:

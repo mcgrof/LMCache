@@ -28,7 +28,12 @@ import torch
 from lmcache import torch_dev, torch_device_type
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.serde.async_processor import AsyncSerdeProcessor
-from lmcache.v1.distributed.serde.base import Deserializer, SerdeProcessor, Serializer
+from lmcache.v1.distributed.serde.base import (
+    Deserializer,
+    SerdeProcessor,
+    SerdeSizeContract,
+    Serializer,
+)
 from lmcache.v1.distributed.serde.factory import register_serde_factory
 from lmcache.v1.memory_management import MemoryObj
 
@@ -897,4 +902,6 @@ def _create_turboquant_serde(kwargs: dict[str, object]) -> SerdeProcessor:
     )
 
 
-register_serde_factory("turboquant", _create_turboquant_serde)
+register_serde_factory(
+    "turboquant", _create_turboquant_serde, size_contract=SerdeSizeContract.EXACT
+)

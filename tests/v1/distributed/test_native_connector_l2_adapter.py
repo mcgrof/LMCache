@@ -1448,7 +1448,10 @@ class RecordingNativeConnector(MockNativeConnector):
 
 
 def create_unaligned_memory_obj(
-    logical_size: int = 4000, phy_size: int = 4096, fill: int = 7
+    logical_size: int = 4000,
+    phy_size: int = 4096,
+    fill: int = 7,
+    fmt: MemoryFormat = MemoryFormat.KV_2LTD,
 ) -> tuple[TensorMemoryObj, torch.Tensor]:
     """Build an arena-backed TensorMemoryObj with alignment padding.
 
@@ -1456,6 +1459,15 @@ def create_unaligned_memory_obj(
     not a multiple of the alignment: a logical view of ``logical_size`` bytes
     at the start of a ``phy_size``-byte physical slot. Returns the object and
     the backing arena (kept alive and inspected by round-trip tests).
+
+    Args:
+        logical_size: Number of bytes exposed by the object's logical view.
+        phy_size: Number of bytes in the aligned backing slot.
+        fill: Initial byte value for the arena.
+        fmt: Object format; use BINARY_BUFFER for a variable-length byte object.
+
+    Returns:
+        The memory object and its backing arena.
     """
     arena = torch.full((phy_size,), fill, dtype=torch.uint8)
     raw_data = arena[:logical_size]
@@ -1464,7 +1476,7 @@ def create_unaligned_memory_obj(
         dtype=torch.uint8,
         address=0,
         phy_size=phy_size,
-        fmt=MemoryFormat.KV_2LTD,
+        fmt=fmt,
         ref_count=1,
     )
     return TensorMemoryObj(raw_data, metadata, parent_allocator=None), arena
@@ -1556,13 +1568,13 @@ class TestPadBuffersToAlignment:
 
     def test_set_used_size_interplay(self, recording_adapter, padded_adapter):
         """Padding spans phy_size even after the logical size is narrowed."""
-        obj_plain, _ = create_unaligned_memory_obj()
+        obj_plain, _ = create_unaligned_memory_obj(fmt=MemoryFormat.BINARY_BUFFER)
         obj_plain.set_used_size(2000)
         adp_plain, mock_plain = recording_adapter
         adp_plain.submit_store_task([create_object_key(1)], [obj_plain])
         assert mock_plain.set_lengths == [2000]
 
-        obj_padded, _ = create_unaligned_memory_obj()
+        obj_padded, _ = create_unaligned_memory_obj(fmt=MemoryFormat.BINARY_BUFFER)
         obj_padded.set_used_size(2000)
         adp_padded, mock_padded = padded_adapter
         adp_padded.submit_store_task([create_object_key(1)], [obj_padded])

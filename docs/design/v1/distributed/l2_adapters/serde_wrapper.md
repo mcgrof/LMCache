@@ -206,7 +206,7 @@ sees the temp keys.
 
 **Store path:**
 
-1. `reserve_write(temp_keys, is_temporary=True, layout=ser_layout, mode="new")`
+1. `reserve_write(temp_keys, is_temporary=True, layout_desc=ser_layout)`
    — temps are write-locked and marked temporary so
    `finish_read` will auto-delete them later.
 2. Serialize runs, filling temps.
@@ -215,12 +215,12 @@ sees the temp keys.
    them.
 4. Inner store completes → `finish_read(temp_keys)` — since
    `is_temporary=True`, finish_read also deletes them.
-5. On serialize or inner failure: `finish_write(temp_keys) + delete(temp_keys)`
+5. On serialize or inner failure: `finish_write_and_delete(temp_keys)`
    while temps are still write-locked.
 
 **Load path:**
 
-1. `reserve_write(temp_keys, is_temporary=True, layout=ser_layout, mode="new")`
+1. `reserve_write(temp_keys, is_temporary=True, layout_desc=ser_layout)`
    — same as store, temps write-locked.
 2. `inner.submit_load_task(keys, temp_objs)` — inner loads serialized
    bytes into temps.
@@ -229,6 +229,11 @@ sees the temp keys.
    reads them during deserialize).
 4. Deserialize completes → `finish_write(temp_keys) + delete(temp_keys)`
    regardless of deserialize success.
+
+Every wrapper-owned temp is tagged `BINARY_BUFFER`. Only that explicit format
+may narrow from the estimate-sized allocation to the serializer's actual byte
+count. Fixed-layout FP8/int8 KV objects still require an exact L2 object length,
+so a truncated one-byte tensor is a miss rather than a malformed hit.
 
 ## Failure Policy: All-or-Nothing per Submit
 

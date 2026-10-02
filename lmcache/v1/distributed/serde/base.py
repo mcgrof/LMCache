@@ -14,6 +14,7 @@ interface automatically.
 
 # Standard
 from dataclasses import dataclass, field
+from enum import Enum
 import abc
 
 # First Party
@@ -21,6 +22,20 @@ from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.memory_management import MemoryObj
 
 SerdeTaskId = int
+
+
+class SerdeSizeContract(Enum):
+    """Relationship between a serde's size estimate and emitted bytes.
+
+    ``EXACT`` means every successful serialization writes exactly the size
+    returned by ``estimate_serialized_size`` for the same layout.
+    ``UPPER_BOUND`` means the estimate is only a capacity bound and the actual
+    object may be shorter. Backends that reload into estimate-sized buffers
+    must know the object's used length before deserialization.
+    """
+
+    EXACT = "exact"
+    UPPER_BOUND = "upper_bound"
 
 
 @dataclass

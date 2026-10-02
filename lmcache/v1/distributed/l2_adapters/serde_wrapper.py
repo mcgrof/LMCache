@@ -53,7 +53,7 @@ from lmcache.v1.distributed.serde import (
     make_temp_key,
     serialized_layout_desc,
 )
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.platform import consume_fd, create_event_notifier
 
 logger = init_logger(__name__)
@@ -632,6 +632,12 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
             self._release_write_temps(successful_temp_keys)
             return temp_keys, None
         temp_objs = [results[tk][1] for tk in temp_keys]
+        # Only serde-owned temporary objects may be narrowed from the
+        # estimate-sized allocation to the serializer's actual byte count.
+        # Fixed-layout one-byte KV tensors (FP8/int8) must reject short reads.
+        for obj in temp_objs:
+            if hasattr(obj, "metadata"):
+                obj.metadata.fmt = MemoryFormat.BINARY_BUFFER
         return temp_keys, temp_objs
 
     def _release_write_temps(self, temp_keys: list[ObjectKey]) -> None:

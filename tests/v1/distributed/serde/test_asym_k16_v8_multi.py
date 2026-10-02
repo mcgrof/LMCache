@@ -183,7 +183,7 @@ def test_estimate_serialized_size_is_non_decreasing_in_chunk_size() -> None:
 
 
 def test_estimate_serialized_size_meets_actual_blob_length() -> None:
-    """estimate_serialized_size must be an upper bound on the produced blob."""
+    """The computed format uses a strict upper bound, not an exact size."""
     s = AsymK16V8MultiSerializer()
     k = _bf16_tensor(2, 4, 8, 64, seed=5)
     v = _bf16_tensor(2, 4, 8, 64, seed=6)
@@ -196,7 +196,7 @@ def test_estimate_serialized_size_meets_actual_blob_length() -> None:
     n = s.serialize(
         _grp(_FakeMemoryObj(tensor=k), _FakeMemoryObj(tensor=v)), buf, _TEST_KEY
     )
-    assert n <= capacity, (
-        f"actual blob {n} bytes exceeded estimate {capacity}; "
-        f"estimate must be a true upper bound"
+    assert n < capacity, (
+        f"actual blob {n} bytes was not shorter than estimate {capacity}; "
+        f"backend compatibility relies on this being an upper-bound format"
     )
