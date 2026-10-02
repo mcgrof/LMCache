@@ -38,6 +38,12 @@ class CodecVersion(IntEnum):
     """
 
     V1 = 1
+    # V2 activates the scale_scheme field (formerly a reserved, always-zero
+    # uint16).  A V1-only reader rejects V2 blobs, so a RAW_UNIT (byte-through)
+    # blob can never be silently misread as a legacy scale-aware blob.  RAW_UNIT
+    # is only ever written as V2; COMPUTED_PER_TENSOR blobs stay V1 and remain
+    # byte-identical to the pre-existing format.
+    V2 = 2
 
 
 class ScaleScope(IntEnum):
@@ -53,12 +59,39 @@ class ScaleScope(IntEnum):
                      V-byte volume.
     `external`       scales not stored in this blob; expected to be
                      attached out-of-band by the caller.
+    `none`           there are no scales, in this blob or out of band.
+                     The V bytes are the true values at implicit unit
+                     scale.  This is the scope a ``RAW_UNIT`` blob
+                     advertises (byte-through fp8): unlike ``external``
+                     it does NOT invite a caller to attach a scalar, and
+                     unlike ``per_tensor`` it does NOT imply a stored
+                     scalar exists.  ``scale_scheme`` remains the
+                     authoritative field; this scope just refuses to lie
+                     about a scalar that is not there.
     """
 
     PER_TENSOR = 0
     PER_LAYER_HEAD = 1
     PER_PAGE_HEAD = 2
     EXTERNAL = 3
+    NONE = 4
+
+
+class ScaleScheme(IntEnum):
+    """How the stored V bytes relate to the true V magnitudes.
+
+    ``COMPUTED_PER_TENSOR``  V was quantized at store time with scales
+        computed from the full-precision V and written into the blob
+        (``scale_payload_len`` > 0).  Legacy behaviour; MUST stay index
+        0 so that pre-existing blobs (which wrote 0 into this header
+        slot) decode as this scheme.
+    ``RAW_UNIT``  V was already FP8 in HBM (live-asymmetric K16/V8) and
+        its raw e4m3 codes were copied byte-through with no scales
+        stored (``scale_payload_len`` == 0); the implicit scale is 1.0.
+    """
+
+    COMPUTED_PER_TENSOR = 0
+    RAW_UNIT = 1
 
 
 # Header packing: little-endian throughout regardless of host.
@@ -69,7 +102,7 @@ class ScaleScope(IntEnum):
 #   2 B  k_dtype_id   (DTYPE_TO_INT)
 #   2 B  v_dtype_id   (DTYPE_TO_INT)
 #   2 B  scale_dtype_id (DTYPE_TO_INT, typically float32 or float16)
-#   2 B  reserved (zero)
+#   2 B  scale_scheme (ScaleScheme; legacy blobs wrote 0 = COMPUTED_PER_TENSOR)
 #   8 B  layer_id  (int64; signed sentinel value -1 means unset)
 #   8 B  chunk_id  (int64; -1 unset)
 #   8 B  chunk_size (int64; tokens per chunk for paged caches)
@@ -85,7 +118,14 @@ class ScaleScope(IntEnum):
 #   For each str pair: 2-byte key_len, key, 2-byte val_len, val.
 #     Currently used keys: model_id, model_revision_hash,
 #     tokenizer_hash, rope_config_hash, attention_backend, kv_layout.
-#   4 B  payload_crc32c        (CRC of the K + V + scales payload)
+#   4 B  header_or_payload_crc32
+#     V1: CRC of the K + V + scales payload only (byte-identical to legacy).
+#     V2: CRC of the entire header-up-to-this-field ‖ payload, so an
+#         intra-header bit-flip (dtype, scale_scheme, page_size, payload
+#         lengths, ...) is caught by the CRC and not only by the schema
+#         invariants.  V2 is the byte-through/RAW_UNIT path that is durably
+#         shared across engines, where a silent header corruption would
+#         mis-restore V; V1 keeps payload-only coverage for back-compat.
 #
 # Followed by: K_payload (k_payload_len bytes), V_payload, scales.
 #
@@ -153,6 +193,18 @@ class CodecHashes:
         "kv_layout",
     )
 
+    @classmethod
+    def field_names(cls) -> tuple[str, ...]:
+        """Return provenance fields in their stable wire/check order.
+
+        Callers use this public schema accessor instead of reaching into
+        the class's private ordering constant.
+
+        Returns:
+            Provenance field names in encoded-header order.
+        """
+        return cls._CHECK_ORDER
+
 
 @dataclass
 class EncodedKV:
@@ -169,6 +221,7 @@ class EncodedKV:
     v_dtype: torch.dtype
     scale_dtype: torch.dtype = torch.float32
     scale_scope: ScaleScope = ScaleScope.PER_PAGE_HEAD
+    scale_scheme: ScaleScheme = ScaleScheme.COMPUTED_PER_TENSOR
 
     # Identity / cache-poisoning gates
     hashes: CodecHashes = field(default_factory=CodecHashes)
@@ -258,15 +311,21 @@ def serialize_header(enc: EncodedKV) -> bytes:
             f"+ scales({enc.scale_payload_len})"
         )
 
+    # RAW_UNIT (byte-through) blobs are written as V2 so a V1-only reader
+    # rejects them rather than silently reading the raw fp8 bytes as a
+    # scale-aware blob.  Scale-aware blobs stay V1 (byte-identical to legacy).
+    version = (
+        CodecVersion.V2 if enc.scale_scheme == ScaleScheme.RAW_UNIT else CodecVersion.V1
+    )
     fixed = struct.pack(
         _FIXED_HEADER_FMT,
         CODEC_MAGIC,
-        int(CodecVersion.V1),
+        int(version),
         int(enc.scale_scope),
         _dtype_to_int(enc.k_dtype),
         _dtype_to_int(enc.v_dtype),
         _dtype_to_int(enc.scale_dtype),
-        0,  # reserved
+        int(enc.scale_scheme),  # scale_scheme (repurposed former reserved slot)
         enc.layer_id,
         enc.chunk_id,
         enc.chunk_size,
@@ -280,18 +339,61 @@ def serialize_header(enc: EncodedKV) -> bytes:
         "<qqq", enc.k_payload_len, enc.v_payload_len, enc.scale_payload_len
     )
     # Hash strings
-    hash_keys = list(CodecHashes._CHECK_ORDER)
+    hash_keys = list(CodecHashes.field_names())
     hash_blob = struct.pack("<H", len(hash_keys))
     for k in hash_keys:
         hash_blob += _pack_str(k) + _pack_str(getattr(enc.hashes, k))
 
-    # CRC over the actual payload bytes (the K+V+scales blob), not
-    # over the header itself.  zlib.crc32 is CRC32/IEEE; if a future
-    # reader needs CRC32C specifically we bump CodecVersion.
-    crc = zlib.crc32(enc.payload) & 0xFFFFFFFF
+    header_wo_crc = fixed + scale_shape_bytes + payload_lens + hash_blob
+
+    # CRC coverage depends on the header version.  zlib.crc32 is CRC32/IEEE;
+    # if a future reader needs CRC32C specifically we bump CodecVersion.
+    #   V1: payload only (byte-identical to legacy blobs).
+    #   V2: the header-up-to-this-field followed by the payload, so an
+    #       intra-header bit-flip (dtype, scale_scheme, page_size, payload
+    #       lengths, ...) is caught by the CRC.  The byte-through/RAW_UNIT
+    #       path is V2 and is durably shared across engines, where a silent
+    #       header corruption would mis-restore V.  The streaming form
+    #       (crc32(payload, seed)) avoids concatenating a header+payload copy.
+    if version == CodecVersion.V2:
+        crc = zlib.crc32(header_wo_crc)
+        crc = zlib.crc32(enc.payload, crc) & 0xFFFFFFFF
+    else:
+        crc = zlib.crc32(enc.payload) & 0xFFFFFFFF
     crc_bytes = struct.pack("<I", crc)
 
-    return fixed + scale_shape_bytes + payload_lens + hash_blob + crc_bytes
+    return header_wo_crc + crc_bytes
+
+
+def encoded_kv_header_size(enc: EncodedKV) -> int:
+    """Return the exact encoded header size without materializing payload.
+
+    The calculation shares the string encoder's validation, including the
+    16-bit UTF-8 byte-length limit.  It is therefore safe for serde capacity
+    estimates that must upper-bound every configuration accepted at runtime.
+
+    Args:
+        enc: Encoded metadata whose scale shape and provenance determine
+            the variable header fields.  Payload contents are ignored.
+
+    Returns:
+        Exact number of bytes :func:`serialize_header` will emit.
+
+    Raises:
+        UnsupportedConfigError: If a provenance key or value exceeds the
+            wire format's 16-bit UTF-8 length.
+    """
+    hash_keys = CodecHashes.field_names()
+    hash_size = 2
+    for key in hash_keys:
+        hash_size += len(_pack_str(key)) + len(_pack_str(getattr(enc.hashes, key)))
+    return (
+        _FIXED_HEADER_LEN
+        + len(enc.scale_shape) * struct.calcsize("<q")
+        + struct.calcsize("<qqq")
+        + hash_size
+        + struct.calcsize("<I")
+    )
 
 
 def deserialize_header(buf: bytes) -> EncodedKV:
@@ -318,7 +420,7 @@ def deserialize_header(buf: bytes) -> EncodedKV:
         k_dtype_id,
         v_dtype_id,
         scale_dtype_id,
-        _reserved,
+        scale_scheme_id,
         layer_id,
         chunk_id,
         chunk_size,
@@ -331,10 +433,10 @@ def deserialize_header(buf: bytes) -> EncodedKV:
         raise CorruptEncodedKVError(
             f"bad magic: got {magic!r}, expected {CODEC_MAGIC!r}"
         )
-    if version != int(CodecVersion.V1):
+    if version not in (int(CodecVersion.V1), int(CodecVersion.V2)):
         raise CorruptEncodedKVError(
             f"unsupported codec version {version}; this build supports "
-            f"{int(CodecVersion.V1)}"
+            f"{int(CodecVersion.V1)}, {int(CodecVersion.V2)}"
         )
     if scale_shape_n < 0 or scale_shape_n > 8:
         raise CorruptEncodedKVError(f"implausible scale_shape_n: {scale_shape_n}")
@@ -363,7 +465,7 @@ def deserialize_header(buf: bytes) -> EncodedKV:
     off += 2
 
     hashes = CodecHashes()
-    expected_keys = set(CodecHashes._CHECK_ORDER)
+    expected_keys = set(CodecHashes.field_names())
     for _ in range(n_hashes):
         key, off = _unpack_str(mv, off)
         val, off = _unpack_str(mv, off)
@@ -372,6 +474,7 @@ def deserialize_header(buf: bytes) -> EncodedKV:
 
     if off + 4 > len(mv):
         raise CorruptEncodedKVError("truncated CRC field")
+    crc_offset = off  # start of the CRC field; header-up-to-here is CRC input for V2
     (crc_declared,) = struct.unpack_from("<I", mv, off)
     off += 4
 
@@ -382,9 +485,20 @@ def deserialize_header(buf: bytes) -> EncodedKV:
             f"declared payload = {expected_payload}, buffer total "
             f"= {len(mv)}"
         )
+    if version == int(CodecVersion.V2) and off + expected_payload != len(mv):
+        raise CorruptEncodedKVError(
+            "V2 buffer has trailing bytes outside the declared payload: "
+            f"declared end={off + expected_payload}, buffer total={len(mv)}"
+        )
 
     payload = mv[off : off + expected_payload]
-    crc_computed = zlib.crc32(payload) & 0xFFFFFFFF
+    # CRC coverage must match serialize_header: V2 folds the header (up to the
+    # CRC field) into the CRC so a header bit-flip is caught; V1 is payload-only.
+    if version == int(CodecVersion.V2):
+        crc_computed = zlib.crc32(mv[:crc_offset])
+        crc_computed = zlib.crc32(payload, crc_computed) & 0xFFFFFFFF
+    else:
+        crc_computed = zlib.crc32(payload) & 0xFFFFFFFF
     if crc_computed != crc_declared:
         raise CorruptEncodedKVError(
             f"payload CRC mismatch: declared {crc_declared:#x}, "
@@ -397,11 +511,28 @@ def deserialize_header(buf: bytes) -> EncodedKV:
         raise CorruptEncodedKVError(
             f"unknown scale_scope index {scale_scope} in encoded header"
         ) from None
+    if version == int(CodecVersion.V1):
+        # In V1 this slot is the legacy always-zero reserved field; a non-zero
+        # value is a corrupt or forged V1 blob (a real RAW_UNIT blob is V2).
+        if scale_scheme_id != 0:
+            raise CorruptEncodedKVError(
+                f"V1 header carries a non-zero reserved/scale_scheme slot "
+                f"({scale_scheme_id}); refusing to interpret it"
+            )
+        scheme_enum = ScaleScheme.COMPUTED_PER_TENSOR
+    else:
+        try:
+            scheme_enum = ScaleScheme(scale_scheme_id)
+        except ValueError:
+            raise CorruptEncodedKVError(
+                f"unknown scale_scheme index {scale_scheme_id} in encoded header"
+            ) from None
     enc = EncodedKV(
         k_dtype=_int_to_dtype(k_dtype_id),
         v_dtype=_int_to_dtype(v_dtype_id),
         scale_dtype=_int_to_dtype(scale_dtype_id),
         scale_scope=scope_enum,
+        scale_scheme=scheme_enum,
         hashes=hashes,
         layer_id=layer_id,
         chunk_id=chunk_id,
