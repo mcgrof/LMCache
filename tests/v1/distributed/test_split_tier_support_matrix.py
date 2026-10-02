@@ -28,12 +28,14 @@ from lmcache.v1.distributed.config import (
 )
 from lmcache.v1.distributed.l2_adapters.config import L2AdaptersConfig
 from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import FSL2AdapterConfig
+from lmcache.v1.distributed.l2_adapters.s3_l2_adapter import S3L2AdapterConfig
 from lmcache.v1.distributed.l2_adapters.valkey_l2_adapter import (
     ValkeyL2AdapterConfig,
 )
 from lmcache.v1.distributed.serde import SerdeConfig
 from lmcache.v1.distributed.storage_manager import (
     StorageManager,
+    _reject_unsupported_raw_unit_backends,
     _reject_unsupported_split_tier_config,
 )
 
@@ -131,6 +133,32 @@ def test_matrix_rejects_non_filesystem_split_tier_backend() -> None:
         _reject_unsupported_split_tier_config(
             _cfg(adapters=[adapter])  # type: ignore[list-item]
         )
+
+
+@pytest.mark.parametrize(
+    "adapter",
+    [
+        S3L2AdapterConfig(
+            s3_endpoint="s3://test-bucket",
+            s3_region="us-east-1",
+        ),
+        ValkeyL2AdapterConfig(startup_nodes=[("localhost", 6379)]),
+    ],
+    ids=["s3", "valkey"],
+)
+def test_raw_unit_rejects_backends_without_used_length_before_resources(
+    adapter,
+) -> None:
+    """A RAW_UNIT config fails before an S3/Valkey client is constructed."""
+    adapter.serde_config = SerdeConfig(type="asym_bytethrough_k16_v8")
+    with pytest.raises(ValueError, match="actual-used-length"):
+        StorageManager(_cfg(adapters=[adapter]))  # type: ignore[list-item]
+
+
+def test_raw_unit_accepts_filesystem_used_length_contract(tmp_path) -> None:
+    adapter = _plain_fs_adapter(str(tmp_path))
+    adapter.serde_config = SerdeConfig(type="asym_bytethrough_k16_v8")
+    _reject_unsupported_raw_unit_backends([adapter])
 
 
 def test_matrix_rejects_per_adapter_l2_eviction() -> None:
