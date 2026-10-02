@@ -50,6 +50,7 @@ from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import FSL2AdapterConfig
 from lmcache.v1.distributed.serde import SerdeConfig
 from lmcache.v1.distributed.storage_layout import StorageLayoutMode
 from lmcache.v1.distributed.storage_manager import StorageManager
+from lmcache.v1.distributed.storage_placement import StoragePlacementMode
 
 # =============================================================================
 # Helpers (mirror test_serde_fs_e2e.py)
@@ -86,13 +87,119 @@ def wait_for_prefetch_status(sm, handle, timeout=15.0, poll_interval=0.1):
 
 
 # =============================================================================
-# Asym K16/V8 storage-only Mode 1 round-trip
+# Asym K16/V8 storage-only round-trip
 # =============================================================================
 
 
 class TestAsymK16V8SerdeFsRoundTrip:
     """Full disk-backed asym K16/V8 serde round-trip through StorageManager
     with the KV-component-groups layout policy."""
+
+    def test_storage_placement_mode_resolves_to_kv_together(self) -> None:
+        """asym_k16_v8 packs K + V into one stored blob; the
+        placement mode is KV_TOGETHER (orthogonal to the layout mode
+        which is KV_COMPONENT_GROUPS)."""
+        disk_path = tempfile.mkdtemp(prefix="lmcache_asym_placement_test_")
+        try:
+            fs_cfg = FSL2AdapterConfig(
+                base_path=disk_path,
+                relative_tmp_dir=None,
+                read_ahead_size=None,
+                use_odirect=False,
+            )
+            fs_cfg.serde_config = SerdeConfig(type="asym_k16_v8")
+            sm_cfg = StorageManagerConfig(
+                l1_manager_config=L1ManagerConfig(
+                    memory_config=L1MemoryManagerConfig(
+                        size_in_bytes=4 << 30,
+                        use_lazy=True,
+                        init_size_in_bytes=1 << 30,
+                    ),
+                ),
+                eviction_config=EvictionConfig(eviction_policy="LRU"),
+                l2_adapter_config=L2AdaptersConfig(adapters=[fs_cfg]),  # type: ignore[list-item]
+            )
+            sm = StorageManager(sm_cfg)
+            try:
+                assert sm.storage_placement_mode == StoragePlacementMode.KV_TOGETHER
+            finally:
+                sm.close()
+        finally:
+            shutil.rmtree(disk_path, ignore_errors=True)
+
+    def test_v_only_placement_mode_resolves_to_kv_split_tier(self) -> None:
+        """asym_k16_v8_v_only's (None, 1) slot mapping marks K absent
+        from the L2 path, so the StorageManager resolves placement to
+        KV_SPLIT_TIER (split-tier placement drives the state machine)."""
+        disk_path = tempfile.mkdtemp(prefix="lmcache_vonly_placement_test_")
+        try:
+            fs_cfg = FSL2AdapterConfig(
+                base_path=disk_path,
+                relative_tmp_dir=None,
+                read_ahead_size=None,
+                use_odirect=False,
+            )
+            fs_cfg.serde_config = SerdeConfig(type="asym_k16_v8_v_only")
+            sm_cfg = StorageManagerConfig(
+                l1_manager_config=L1ManagerConfig(
+                    memory_config=L1MemoryManagerConfig(
+                        size_in_bytes=4 << 30,
+                        use_lazy=True,
+                        init_size_in_bytes=1 << 30,
+                    ),
+                ),
+                eviction_config=EvictionConfig(eviction_policy="LRU"),
+                l2_adapter_config=L2AdaptersConfig(adapters=[fs_cfg]),  # type: ignore[list-item]
+            )
+            sm = StorageManager(sm_cfg)
+            try:
+                assert sm.storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER
+            finally:
+                sm.close()
+        finally:
+            shutil.rmtree(disk_path, ignore_errors=True)
+
+    def test_runtime_adapter_rejects_incompatible_placement(self) -> None:
+        """A runtime adapter cannot change the manager's placement mode."""
+        mode1_path = tempfile.mkdtemp(prefix="lmcache_mode1_placement_test_")
+        v_only_path = tempfile.mkdtemp(prefix="lmcache_vonly_placement_test_")
+        try:
+            mode1_cfg = FSL2AdapterConfig(
+                base_path=mode1_path,
+                relative_tmp_dir=None,
+                read_ahead_size=None,
+                use_odirect=False,
+            )
+            mode1_cfg.serde_config = SerdeConfig(type="asym_k16_v8")
+            sm_cfg = StorageManagerConfig(
+                l1_manager_config=L1ManagerConfig(
+                    memory_config=L1MemoryManagerConfig(
+                        size_in_bytes=4 << 30,
+                        use_lazy=True,
+                        init_size_in_bytes=1 << 30,
+                    ),
+                ),
+                eviction_config=EvictionConfig(eviction_policy="LRU"),
+                l2_adapter_config=L2AdaptersConfig(
+                    adapters=[mode1_cfg]  # type: ignore[list-item]
+                ),
+            )
+            sm = StorageManager(sm_cfg)
+            try:
+                v_only_cfg = FSL2AdapterConfig(
+                    base_path=v_only_path,
+                    relative_tmp_dir=None,
+                    read_ahead_size=None,
+                    use_odirect=False,
+                )
+                v_only_cfg.serde_config = SerdeConfig(type="asym_k16_v8_v_only")
+                with pytest.raises(ValueError, match="storage placement mode"):
+                    sm.add_l2_adapter(v_only_cfg)  # type: ignore[arg-type]
+            finally:
+                sm.close()
+        finally:
+            shutil.rmtree(mode1_path, ignore_errors=True)
+            shutil.rmtree(v_only_path, ignore_errors=True)
 
     def test_storage_layout_mode_resolved_to_kv_component_groups(self) -> None:
         """An asym_k16_v8 serde_config on the L2 adapter must resolve to
@@ -207,9 +314,13 @@ class TestAsymK16V8SerdeFsRoundTrip:
         kv_shape = torch.Size([2, 4, 256, 128])
         kv_dtype = torch.bfloat16
         packed_layout = MemoryLayoutDesc(shapes=[kv_shape], dtypes=[kv_dtype])
-        # Canonical L1 layout: K and V as separate component groups.
-        layout = sm.apply_layout_policy(packed_layout)
-        assert len(layout.shapes) == 2, "policy did not split into K/V groups"
+        # reserve_write / submit_prefetch_task apply the layout policy
+        # internally (the layout choke point), so we pass the PACKED layout
+        # and let them split it into K/V component groups.  Sanity-check
+        # the policy does split (it must not be pre-applied by the caller).
+        assert len(sm.apply_layout_policy(packed_layout).shapes) == 2, (
+            "policy did not split into K/V groups"
+        )
 
         keys = [
             _make_key(b"\x00" * 31 + b"\x01"),
@@ -317,6 +428,225 @@ class TestAsymK16V8SerdeFsRoundTrip:
 # =============================================================================
 # Mixed-mode rejection (fp8 + asym_k16_v8 on the same StorageManager)
 # =============================================================================
+
+
+# =============================================================================
+# V-only split-tier (KV_SPLIT_TIER placement) round-trip
+# =============================================================================
+
+
+class TestAsymK16V8VOnlySplitTierRoundTrip:
+    """Full V-only split-tier round-trip:
+
+      * Store a grouped (K, V) MemoryObj under a logical key.
+      * Verify that on store completion, L1 contains the K child (under
+        derive_component_key(logical, "k")), L2 has the V child blob,
+        the original logical key is DELETED from L1, and the manifest
+        is COMPLETE.
+      * Submit prefetch under the logical key, verify the load
+        reassembles K from L1 + V from L2 into a fresh full grouped
+        MemoryObj with K bit-exact and V within FP8 noise.
+
+    This is the empirical proof that the split-tier series
+    work end-to-end (the xfail target ``test_split_policy_routes_k_to_cpu_v_to_nvme``
+    is the contract version of this; this test is the integration
+    version through StorageManager + a real file_l2)."""
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason="StorageManager full E2E requires CUDA-backed L1 allocator",
+    )
+    def test_store_split_tier_drops_original_keeps_k_child(self) -> None:
+        """Store path: after the V L2 write completes, L1 holds only
+        the K child (and the original logical key is gone)."""
+        disk_path = tempfile.mkdtemp(prefix="lmcache_vonly_store_test_")
+        try:
+            self._run_store_only(disk_path)
+        finally:
+            shutil.rmtree(disk_path, ignore_errors=True)
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason="StorageManager full E2E requires CUDA-backed L1 allocator",
+    )
+    def test_split_tier_full_round_trip(self) -> None:
+        """Store + load round-trip with K bit-exact + V FP8 noise."""
+        disk_path = tempfile.mkdtemp(prefix="lmcache_vonly_round_trip_")
+        try:
+            self._run_full_round_trip(disk_path)
+        finally:
+            shutil.rmtree(disk_path, ignore_errors=True)
+
+    # ------------------------------------------------------------------
+    # Implementation
+    # ------------------------------------------------------------------
+
+    def _build_sm(self, disk_path: str) -> StorageManager:
+        fs_cfg = FSL2AdapterConfig(
+            base_path=disk_path,
+            relative_tmp_dir=None,
+            read_ahead_size=None,
+            use_odirect=False,
+        )
+        fs_cfg.serde_config = SerdeConfig(type="asym_k16_v8_v_only")
+        sm_cfg = StorageManagerConfig(
+            l1_manager_config=L1ManagerConfig(
+                memory_config=L1MemoryManagerConfig(
+                    size_in_bytes=4 << 30,
+                    use_lazy=True,
+                    init_size_in_bytes=1 << 30,
+                ),
+            ),
+            eviction_config=EvictionConfig(eviction_policy="LRU"),
+            l2_adapter_config=L2AdaptersConfig(adapters=[fs_cfg]),  # type: ignore[list-item]
+        )
+        sm = StorageManager(sm_cfg)
+        assert sm.storage_placement_mode == StoragePlacementMode.KV_SPLIT_TIER
+        return sm
+
+    def _store(self, sm: StorageManager, keys, originals):
+        kv_shape = torch.Size([2, 4, 256, 128])
+        kv_dtype = torch.bfloat16
+        packed_layout = MemoryLayoutDesc(shapes=[kv_shape], dtypes=[kv_dtype])
+        # reserve_write applies the layout policy internally (the layout choke
+        # point); pass the PACKED layout and let it split into K/V groups.
+        assert len(sm.apply_layout_policy(packed_layout).shapes) == 2
+        reserved = sm.reserve_write(keys, packed_layout)
+        assert len(reserved) == len(keys)
+        for k, (k_orig, v_orig) in zip(keys, originals, strict=True):
+            mem_obj = reserved[k]
+            k_view = mem_obj.get_tensor(0)
+            v_view = mem_obj.get_tensor(1)
+            assert k_view is not None and v_view is not None
+            k_view.copy_(k_orig)
+            v_view.copy_(v_orig)
+        sm.finish_write(keys)
+        # Return the PACKED layout; submit_prefetch_task applies the policy.
+        return packed_layout
+
+    def _wait_for_l2_drain(self, sm: StorageManager, disk_path: str):
+        # Files must appear on disk under the *V child* keys.  Since
+        # we don't peek the key derivation here, just wait for any
+        # file + drainer completion.
+        # First Party
+        # Standard
+        import os
+
+        ok = wait_for_condition(
+            lambda: any(e.is_file() for e in os.scandir(disk_path)),
+            timeout=10.0,
+        )
+        assert ok, f"No V child files appeared under {disk_path}"
+        ok = wait_for_condition(
+            lambda: sm.report_status()["store_controller"]["in_flight_task_count"] == 0,
+            timeout=10.0,
+        )
+        assert ok, "Store controller did not finish in time"
+
+    def _run_store_only(self, disk_path: str) -> None:
+        # First Party
+        from lmcache.v1.distributed.storage_placement import (
+            derive_component_key,
+        )
+
+        sm = self._build_sm(disk_path)
+        try:
+            kv_shape = torch.Size([4, 256, 128])
+            kv_dtype = torch.bfloat16
+            keys = [
+                _make_key(b"\x10" * 31 + b"\x01"),
+                _make_key(b"\x10" * 31 + b"\x02"),
+            ]
+            torch.manual_seed(0)
+            originals = [
+                (
+                    torch.randn(kv_shape, dtype=kv_dtype),
+                    torch.randn(kv_shape, dtype=kv_dtype),
+                )
+                for _ in keys
+            ]
+            self._store(sm, keys, originals)
+            self._wait_for_l2_drain(sm, disk_path)
+
+            # Each logical key must be COMPLETE in the manifest.
+            for k in keys:
+                assert sm.split_tier_manifest.is_complete(k), (
+                    f"manifest for {k!r} is not COMPLETE: "
+                    f"{sm.split_tier_manifest.lookup(k)}"
+                )
+                # The K child must be in L1; the original logical key
+                # must NOT (the wrapper deletes it after V-store ack).
+                k_child = derive_component_key(k, "k")
+                assert sm.contains_l1_key(k_child), (
+                    "K child missing from L1 after V-only store"
+                )
+                assert not sm.contains_l1_key(k), (
+                    "original logical entry still in L1 after split-tier store; "
+                    "the L1 footprint win did not materialize"
+                )
+        finally:
+            sm.close()
+
+    def _run_full_round_trip(self, disk_path: str) -> None:
+        sm = self._build_sm(disk_path)
+        try:
+            kv_shape = torch.Size([4, 256, 128])
+            kv_dtype = torch.bfloat16
+            keys = [_make_key(b"\x20" * 31 + b"\x01")]
+            torch.manual_seed(1)
+            originals = [
+                (
+                    torch.randn(kv_shape, dtype=kv_dtype),
+                    torch.randn(kv_shape, dtype=kv_dtype),
+                )
+                for _ in keys
+            ]
+            layout = self._store(sm, keys, originals)
+            self._wait_for_l2_drain(sm, disk_path)
+
+            # ---- Submit prefetch under the LOGICAL key ----
+            handle = sm.submit_prefetch_task(
+                PrefetchTaskSpec(
+                    key_groups=[
+                        GroupedObjectKeys(
+                            keys=keys,
+                            object_group_id=0,
+                            layout_desc=layout,
+                        )
+                    ]
+                )
+            )
+            prefix_hits = wait_for_prefetch_status(sm, handle)
+            assert prefix_hits == len(keys), (
+                f"split-tier prefetch failed: expected {len(keys)} hits, "
+                f"got {prefix_hits}"
+            )
+
+            # ---- Verify K bit-exact + V FP8 noise via reassembled MemoryObj ----
+            with sm.read_prefetched_results(keys) as mem_objs:
+                assert mem_objs is not None
+                assert len(mem_objs) == len(keys)
+                for (k_orig, v_orig), mem_obj in zip(originals, mem_objs, strict=True):
+                    k_got = mem_obj.get_tensor(0)
+                    v_got = mem_obj.get_tensor(1)
+                    assert k_got is not None and v_got is not None
+                    assert torch.equal(k_got, k_orig), (
+                        "K is NOT bit-exact through split-tier load"
+                    )
+                    v_rel = (
+                        (
+                            (v_got.float() - v_orig.float()).abs()
+                            / (v_orig.float().abs() + 1e-6)
+                        )
+                        .mean()
+                        .item()
+                    )
+                    assert v_rel < 0.05, (
+                        f"V FP8 round-trip relative error too high: {v_rel:.4f}"
+                    )
+            sm.finish_read_prefetched(keys)
+        finally:
+            sm.close()
 
 
 def test_mixed_single_and_multi_output_serdes_rejected() -> None:
