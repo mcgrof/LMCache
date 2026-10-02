@@ -44,7 +44,11 @@ from lmcache.v1.distributed.l2_adapters.reconfiguration import (
 )
 from lmcache.v1.distributed.l2_adapters.serde_wrapper import SerdeL2AdapterWrapper
 from lmcache.v1.distributed.quota_manager import QuotaManager
-from lmcache.v1.distributed.serde import create_serde_processor
+from lmcache.v1.distributed.serde import (
+    SerdeSizeContract,
+    create_serde_processor,
+    get_serde_size_contract,
+)
 from lmcache.v1.distributed.storage_controllers import (
     L1EvictionController,
     L2AdapterEvictionState,
@@ -90,6 +94,42 @@ _L1_WRITE_TAG = "storage_manager"
 L1WriteCompletion = list[tuple[int, list[ObjectKey]]]
 
 
+def _reject_unsupported_serde_size_contracts(
+    adapters: list[L2AdapterConfigBase],
+) -> None:
+    """Reject upper-bound serdes on backends without used-length loads.
+
+    The serde wrapper allocates load buffers from
+    ``estimate_serialized_size``. An ``UPPER_BOUND`` serializer may store fewer
+    bytes than that capacity, so the backend must report the actual loaded
+    length before deserialization. The filesystem adapter supplies that
+    contract; the other current backends do not.
+
+    Args:
+        adapters: Normalized L2 adapter configurations.
+
+    Raises:
+        ValueError: If an upper-bound serde is paired with a backend that
+            cannot restore the object's actual used length.
+    """
+    unsupported: list[str] = []
+    for adapter in adapters:
+        serde_config = adapter.serde_config
+        if serde_config is None:
+            continue
+        if get_serde_size_contract(serde_config.type) == SerdeSizeContract.EXACT:
+            continue
+        backend = get_type_name_for_config(unwrap_l2_adapter_config(adapter))
+        if backend != "fs":
+            unsupported.append(f"{serde_config.type} on {backend}")
+    if unsupported:
+        raise ValueError(
+            "Upper-bound serde output requires the filesystem adapter's "
+            "actual-used-length load contract; unsupported pairing(s): "
+            + ", ".join(unsupported)
+        )
+
+
 class StorageManager:
     def __init__(
         self,
@@ -116,6 +156,7 @@ class StorageManager:
                 combined with L2 adapters or eviction, or the policy names
                 repeated or unregistered managers.
         """
+        _reject_unsupported_serde_size_contracts(config.l2_adapter_config.adapters)
         if _l1_managers is not None:
             if not _l1_managers or len({m.l1_manager_id for m in _l1_managers}) != len(
                 _l1_managers
@@ -1093,6 +1134,7 @@ class StorageManager:
                 mapped by L1 or another L2 adapter.
         """
         with self._lifecycle_lock:
+            _reject_unsupported_serde_size_contracts([config])
             # Mirror of the check in add_l1_devdax_device: a single-region
             # adapter may only be added while L1 is exactly one memory region.
             adapter_name = requires_single_l1_memory_region(config)

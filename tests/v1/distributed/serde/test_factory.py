@@ -24,8 +24,10 @@ from lmcache.v1.distributed.serde import (
     AsyncSerdeProcessor,
     SerdeConfig,
     SerdeProcessor,
+    SerdeSizeContract,
     create_serde_processor,
     get_registered_serde_types,
+    get_serde_size_contract,
     register_serde_factory,
 )
 
@@ -115,6 +117,31 @@ def test_register_serde_factory_dispatch() -> None:
     assert isinstance(processor, _DummyProcessor)
     # Factory only receives the type-specific kwargs, not the wrapping type.
     assert seen["kwargs"] == {"foo": "bar"}
+    assert (
+        get_serde_size_contract("test-dummy-ser-de-xyz")
+        == SerdeSizeContract.UPPER_BOUND
+    )
+
+
+@pytest.mark.parametrize(
+    ("serde_type", "expected"),
+    [
+        ("fp8", SerdeSizeContract.EXACT),
+        ("aesgcm", SerdeSizeContract.EXACT),
+        ("turboquant", SerdeSizeContract.EXACT),
+    ],
+)
+def test_builtin_size_contracts_are_explicit(
+    serde_type: str,
+    expected: SerdeSizeContract,
+) -> None:
+    """Every built-in declares whether its estimate is exact."""
+    assert get_serde_size_contract(serde_type) == expected
+
+
+def test_get_size_contract_unknown_type_raises() -> None:
+    with pytest.raises(ValueError, match="Unknown serde type"):
+        get_serde_size_contract("does-not-exist")
 
 
 def test_register_serde_factory_duplicate_raises() -> None:

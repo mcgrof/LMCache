@@ -136,7 +136,9 @@ def test_v_only_round_trip_v_within_fp8_noise() -> None:
     capacity = s.estimate_serialized_size(layout)
     buf = _byte_buffer(capacity)
     n = s.serialize(_grp(None, _FakeMemoryObj(tensor=v)), buf, _TEST_KEY)
-    assert 0 < n <= capacity
+    assert 0 < n < capacity, (
+        "V-only computed serialization must remain classified as an upper-bound format"
+    )
 
     v_out = _FakeMemoryObj(tensor=torch.zeros_like(v))
     d.deserialize(buf, _grp(None, v_out), _TEST_KEY)
