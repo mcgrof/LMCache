@@ -16,8 +16,8 @@ or controllers — it just defines:
   a thread pool and signaling an eventfd on completion.
 - A factory / registration mechanism so adapters can reference a serde
   by name (`{"type": "fp8", ...}` in JSON config).
-- Built-in serdes including **fp8 quantization** and the two-slot
-  ``asym_k16_v8`` K/V codec.
+- Built-in serdes including **fp8 quantization** and two-slot asymmetric
+  K16/V8 codecs with scale-quantized or byte-through V storage.
 
 How the async interface is actually plugged into the L2 path lives in
 [`docs/design/v1/distributed/l2_adapters/serde_wrapper.md`][wrapper-doc]
@@ -39,6 +39,7 @@ lmcache/v1/distributed/serde/
   key_provider.py     # KeyProvider / HkdfKeyProvider for aesgcm
   multi.py            # MultiSerializer / MultiDeserializer (tuple-shaped
                       # extension; see "Multi-output extension" below)
+  asym_k16_v8.py      # scale-aware and byte-through K16/V8 serdes
   utils.py            # serialized_layout_desc, make_temp_key
 ```
 
@@ -181,7 +182,28 @@ Each wrapped adapter owns and closes its own `SerdeProcessor` instance.
 Configuration inspection may construct a short-lived processor to derive the
 storage layout, so factories must not return a process-global singleton.
 
-## Built-in fp8
+## Built-in implementations
+
+The registered built-ins are:
+
+- `fp8`: element-wise fp8 quantization for a conventional single tensor.
+- `turboquant`: preset-driven asymmetric quantization.
+- `aesgcm`: authenticated encryption keyed per cache salt.
+- `asym_k16_v8`: native K plus scale-quantized FP8 V in one L2 object.
+- `asym_k16_v8_v_only`: native K retained in L1, scale-quantized V in L2.
+- `asym_bytethrough_k16_v8`: native K plus an already-FP8 V in one L2
+  object, without a scale payload.
+- `asym_bytethrough_k16_v8_v_only`: native K retained in L1 and an
+  already-FP8 V in L2.
+
+The `_v_only` implementations are process-local composites: the K child and
+manifest live in memory, so they are not restart durable. The byte-through
+implementations require unit external V scaling and currently require the
+filesystem adapter's exact-used-length load contract. See the
+[user-facing serde guide](../../../../source/mp/serde.rst) for the support
+matrix and examples.
+
+### `fp8`
 
 `Fp8QuantizationSerializer` / `Fp8QuantizationDeserializer`:
 
