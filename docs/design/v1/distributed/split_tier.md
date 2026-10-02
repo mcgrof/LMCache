@@ -29,3 +29,11 @@ Ordinary L1 allocation and external pools cannot satisfy each other's requests.
 Eviction therefore uses the maximum individual pool utilization. Summed bytes
 remain useful for observability. Pool slot limits bound retained free buffers,
 not peak concurrent allocations; overflow uses temporary allocations.
+
+## Early release of the producer's allocation
+
+An adapter implementing `EarlyReleaseStoreAdapter` can claim source keys once
+it has copied all source bytes. StoreController releases those read locks once
+and arms redundant logical residents for deletion after their final reader.
+The deletion marker belongs to that exact resident, not a key-only side table.
+An unrelated adapter's completion cannot authorize split-tier deletion.
