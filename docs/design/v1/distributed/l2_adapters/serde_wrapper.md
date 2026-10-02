@@ -252,7 +252,13 @@ split-tier owner described below.
 
 ## V-only split-tier placement
 
-`KV_SPLIT_TIER` stores one logical K/V object as two derived children:
+`KV_SPLIT_TIER` stores one logical K/V object as two derived children.
+Both child keys use the manager's fixed component-key scheme. Scale-quantized
+objects retain the legacy role suffix; raw FP8 objects use a tagged suffix so
+the two formats cannot collide. Store, load, lookup, and paired eviction all
+use that same scheme.
+
+Store proceeds in this order:
 
 1. copy exact native K into an L1 K-child;
 2. copy V into a shape/dtype-specific scratch pool;

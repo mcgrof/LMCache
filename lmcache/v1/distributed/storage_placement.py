@@ -131,8 +131,71 @@ class StoragePlacementMode(Enum):
 _K_CHILD_MARKER = b"\x01"
 _V_CHILD_MARKER = b"\x02"
 
+# Codec-scheme discriminator woven into the child key so a scale-aware
+# (COMPUTED) V blob and a byte-through (RAW_UNIT) V blob for the
+# SAME logical chunk cannot collide on one L2 key and silently overwrite
+# or mis-serve each other.  The legacy format (role byte only) is
+# retained verbatim for COMPUTED so every already-stored object and
+# every existing caller stays byte-identical; a non-legacy scheme gets a
+# magic-tagged suffix instead.
+#
+# Versioned suffix layout (RAW_UNIT and any future non-legacy scheme):
+#     chunk_hash = logical_hash + MAGIC + scheme_byte + role_byte
+# The role byte is kept LAST so a reader that predates this format (its
+# ``reverse`` strips only the trailing role byte) yields
+# ``logical_hash + MAGIC + scheme_byte`` as the "logical" key -- which
+# matches no same-width logical key, so it fails closed rather than aliasing a
+# genuine object. ``SplitTierManifest`` provides the authoritative membership
+# check; this structural suffix is used only after a caller already knows it
+# has a component key. ``chunk_hash`` is hex-encoded into FS filenames, so
+# arbitrary marker bytes are transport-safe.
+_SCHEME_MARKER_MAGIC = b"\xffKVSCHM\xff"
 
-def derive_component_key(logical_key: ObjectKey, role: str) -> ObjectKey:
+
+class ComponentKeyScheme(Enum):
+    """Which V-plane codec scheme a child key belongs to.
+
+    Mirrors :class:`lmcache.v1.kv_codec.ScaleScheme` at the storage-key
+    layer; the two MUST stay in correspondence
+    (``COMPUTED_LEGACY`` <-> ``COMPUTED_PER_TENSOR``,
+    ``RAW_UNIT`` <-> ``RAW_UNIT``).  Kept as a separate key-layer enum so
+    the placement module does not import the codec module.
+
+    ``COMPUTED_LEGACY`` uses the pre-existing role-only key format (no
+    magic) -- byte-identical to every key written before this
+    discriminator existed.  ``RAW_UNIT`` uses the magic-tagged format and
+    therefore can never reuse a legacy key.
+    """
+
+    COMPUTED_LEGACY = 0
+    RAW_UNIT = 1
+
+
+# Scheme <-> byte map used only inside the versioned (magic) suffix.
+# COMPUTED_LEGACY is byte 0 for correspondence with ScaleScheme, but it
+# is never emitted in the magic form (it is the legacy role-only key);
+# a magic suffix that claims byte 0 is therefore malformed.
+_SCHEME_TO_BYTE = {
+    ComponentKeyScheme.COMPUTED_LEGACY: b"\x00",
+    ComponentKeyScheme.RAW_UNIT: b"\x01",
+}
+_BYTE_TO_SCHEME = {v: k for k, v in _SCHEME_TO_BYTE.items()}
+
+
+def _role_from_marker(marker: bytes) -> Optional[str]:
+    """Map a 1-byte role marker to ``"k"`` / ``"v"`` (or ``None``)."""
+    if marker == _K_CHILD_MARKER:
+        return "k"
+    if marker == _V_CHILD_MARKER:
+        return "v"
+    return None
+
+
+def derive_component_key(
+    logical_key: ObjectKey,
+    role: str,
+    scheme: ComponentKeyScheme = ComponentKeyScheme.COMPUTED_LEGACY,
+) -> ObjectKey:
     """Derive a child :class:`ObjectKey` from a logical key + role.
 
     Preserves every identity field of the logical key --
@@ -140,19 +203,26 @@ def derive_component_key(logical_key: ObjectKey, role: str) -> ObjectKey:
     ``cache_salt`` (per-tenant adapter accounting and quotas depend
     on ``cache_salt``; multi-object-group models depend on
     ``object_group_id`` -- do NOT drop either).  Domain-separates via
-    the ``chunk_hash`` field by appending a 1-byte role marker.
+    the ``chunk_hash`` field.
 
     Args:
         logical_key: The original logical chunk key.
         role: ``"k"`` or ``"v"`` -- selects which child key is
             derived.
+        scheme: which codec scheme owns this child.
+            ``COMPUTED_LEGACY`` (default) reproduces the historical
+            role-only key exactly, so existing callers and stored
+            objects are unaffected.  ``RAW_UNIT`` emits the
+            magic-tagged key so byte-through V blobs never collide with
+            scale-aware V blobs on L2.
 
     Returns:
-        A new :class:`ObjectKey` whose ``chunk_hash`` is
-        ``logical_key.chunk_hash + role_marker``. The owning
-        :class:`SplitTierManifest` enforces a fixed logical-hash width,
-        which keeps this derived namespace disjoint from its live
-        logical-key namespace.
+        A new :class:`ObjectKey` whose ``chunk_hash`` is the logical
+        hash plus a role marker (legacy scheme) or plus
+        ``MAGIC + scheme_byte + role_marker`` (non-legacy scheme). The
+        owning :class:`SplitTierManifest` enforces a fixed logical-hash
+        width, which keeps both derived namespaces disjoint from its
+        live logical-key namespace.
 
     Raises:
         ValueError: if ``role`` is not ``"k"`` or ``"v"``.
@@ -163,8 +233,16 @@ def derive_component_key(logical_key: ObjectKey, role: str) -> ObjectKey:
         marker = _V_CHILD_MARKER
     else:
         raise ValueError(f"derive_component_key: role must be 'k' or 'v', got {role!r}")
+
+    if scheme == ComponentKeyScheme.COMPUTED_LEGACY:
+        suffix = marker
+    else:
+        # role kept LAST (see _SCHEME_MARKER_MAGIC note): old readers
+        # fail closed instead of aliasing a real logical key.
+        suffix = _SCHEME_MARKER_MAGIC + _SCHEME_TO_BYTE[scheme] + marker
+
     return ObjectKey(
-        chunk_hash=logical_key.chunk_hash + marker,
+        chunk_hash=logical_key.chunk_hash + suffix,
         model_name=logical_key.model_name,
         kv_rank=logical_key.kv_rank,
         object_group_id=logical_key.object_group_id,
@@ -172,39 +250,66 @@ def derive_component_key(logical_key: ObjectKey, role: str) -> ObjectKey:
     )
 
 
-def reverse_component_key(
+def decode_component_key(
     child_key: ObjectKey,
-) -> Optional[tuple[ObjectKey, str]]:
-    """Inverse of :func:`derive_component_key`.
-
-    Given a possibly-child :class:`ObjectKey`, return
-    ``(logical_key, role)`` if its trailing byte matches a known
-    role marker, otherwise return ``None``.  Used by the L1
-    eviction controller to identify K-child victims and look up
-    the matching V child for paired cleanup.
+) -> Optional[tuple[ObjectKey, str, ComponentKeyScheme]]:
+    """Full inverse of :func:`derive_component_key`, scheme included.
 
     This is a structural decoder for keys already known to be children;
     it must not be used to classify arbitrary keys. A logical hash may
     itself end in a role marker. Operational callers classify K children
     through :meth:`SplitTierManifest.logical_for_k_child`, which uses
     explicit membership instead of suffix inspection.
+    It recognizes both the versioned (magic-tagged) key and the legacy
+    role-only key. A key that matches neither structure returns ``None``.
 
     Args:
         child_key: A key that may or may not be a derived child.
 
     Returns:
-        ``(logical, role)`` if ``child_key`` is a recognizable
-        K or V child; otherwise ``None``.
+        ``(logical, role, scheme)`` for a recognizable child;
+        ``None`` for a logical key, an unknown marker, or a magic
+        suffix that is present but malformed (fail closed).
     """
     h = child_key.chunk_hash
+    magic = _SCHEME_MARKER_MAGIC
+    versioned_suffix_len = len(magic) + 2  # MAGIC + scheme_byte + role_byte
+
+    # Versioned form: if the magic is present at the suffix offset, this
+    # is (or claims to be) a versioned key -- decode it or fail closed;
+    # never fall back to the legacy interpretation, which would alias a
+    # bogus logical key. Operational classification uses manifest membership,
+    # not this suffix parser.
+    if len(h) >= versioned_suffix_len:
+        window = h[-versioned_suffix_len:]
+        if window[: len(magic)] == magic:
+            logical_hash = h[:-versioned_suffix_len]
+            scheme = _BYTE_TO_SCHEME.get(window[len(magic) : len(magic) + 1])
+            role = _role_from_marker(window[-1:])
+            # Fail closed on: empty logical hash, malformed scheme/role,
+            # or a magic suffix claiming the legacy scheme (legacy never
+            # uses the magic form).
+            if (
+                len(logical_hash) < 1
+                or role is None
+                or scheme is None
+                or scheme == ComponentKeyScheme.COMPUTED_LEGACY
+            ):
+                return None
+            logical = ObjectKey(
+                chunk_hash=logical_hash,
+                model_name=child_key.model_name,
+                kv_rank=child_key.kv_rank,
+                object_group_id=child_key.object_group_id,
+                cache_salt=child_key.cache_salt,
+            )
+            return logical, role, scheme
+
+    # Legacy role-only form.
     if len(h) < 2:
         return None
-    marker = h[-1:]
-    if marker == _K_CHILD_MARKER:
-        role = "k"
-    elif marker == _V_CHILD_MARKER:
-        role = "v"
-    else:
+    role = _role_from_marker(h[-1:])
+    if role is None:
         return None
     logical = ObjectKey(
         chunk_hash=h[:-1],
@@ -213,6 +318,32 @@ def reverse_component_key(
         object_group_id=child_key.object_group_id,
         cache_salt=child_key.cache_salt,
     )
+    return logical, role, ComponentKeyScheme.COMPUTED_LEGACY
+
+
+def reverse_component_key(
+    child_key: ObjectKey,
+) -> Optional[tuple[ObjectKey, str]]:
+    """Inverse of :func:`derive_component_key` (role only).
+
+    Back-compat 2-tuple view over :func:`decode_component_key` for the
+    L1 eviction controller and other callers that only need the
+    logical key + role.  Recognizes both the legacy role-only key and
+    the versioned magic-tagged key; the scheme is dropped.  Callers
+    that need the scheme (to re-derive the matching child key) must use
+    :func:`decode_component_key`.
+
+    Args:
+        child_key: A key that may or may not be a derived child.
+
+    Returns:
+        ``(logical, role)`` if ``child_key`` is a recognizable
+        K or V child; otherwise ``None``.
+    """
+    decoded = decode_component_key(child_key)
+    if decoded is None:
+        return None
+    logical, role, _scheme = decoded
     return logical, role
 
 
@@ -274,7 +405,10 @@ class SplitTierManifest:
     does not exist).
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        component_key_scheme: ComponentKeyScheme = ComponentKeyScheme.COMPUTED_LEGACY,
+    ) -> None:
         self._lock = threading.Lock()
         self._entries: dict[ObjectKey, _ManifestEntry] = {}
         # Monotonic, manifest-instance-local generation counter.  Never reset
@@ -287,7 +421,13 @@ class SplitTierManifest:
         # arbitrary bytes; enforcing the invariant here prevents logical
         # ``H + marker`` from aliasing the child derived from ``H``.
         self._logical_hash_length: Optional[int] = None
-        # Side map of currently-tracked K child keys, populated when
+        # Per-engine child-key scheme.  MUST match the scheme the
+        # wrapper allocates the K child under, or the K-child side map
+        # below records a different key than the one that actually lands
+        # in L1 -- then is_k_child_key misses the real K child and the
+        # StoreController wrongly routes it to L2.
+        self._component_key_scheme = component_key_scheme
+        # Side maps of currently tracked component keys, populated when
         # the wrapper registers a logical key as STORE_IN_FLIGHT.  The
         # StoreController consults this set to skip K_child write
         # completions (K_child is L1-only by design; it must never be
@@ -298,6 +438,16 @@ class SplitTierManifest:
         # hash ending in a role byte from being mistaken for a child.
         self._k_child_owners: dict[ObjectKey, ObjectKey] = {}
         self._v_child_owners: dict[ObjectKey, ObjectKey] = {}
+
+    @property
+    def component_key_scheme(self) -> ComponentKeyScheme:
+        """The child-key scheme this manifest derives K children under.
+
+        A consumer that also derives child keys (the wrapper) MUST match
+        this, or its K key and this manifest's ``is_k_child_key`` side-set
+        disagree.
+        """
+        return self._component_key_scheme
 
     def register_pending(self, logical_key: ObjectKey) -> int:
         """Mark a logical key as ``STORE_IN_FLIGHT`` under a fresh
@@ -362,7 +512,9 @@ class SplitTierManifest:
                 generation=generation,
             )
             self._logical_hash_length = hash_length
-            k_child = derive_component_key(logical_key, "k")
+            k_child = derive_component_key(
+                logical_key, "k", scheme=self._component_key_scheme
+            )
             owner = self._k_child_owners.get(k_child)
             if owner is not None and owner != logical_key:
                 self._entries.pop(logical_key, None)
@@ -373,7 +525,11 @@ class SplitTierManifest:
                     "collides with another logical key"
                 )
             self._k_child_owners[k_child] = logical_key
-            self._v_child_owners[derive_component_key(logical_key, "v")] = logical_key
+            self._v_child_owners[
+                derive_component_key(
+                    logical_key, "v", scheme=self._component_key_scheme
+                )
+            ] = logical_key
             return generation
 
     def mark_complete(self, logical_key: ObjectKey, generation: int) -> None:
@@ -570,8 +726,18 @@ class SplitTierManifest:
             if cur is None or cur.generation != generation:
                 return
             self._entries.pop(logical_key, None)
-            self._k_child_owners.pop(derive_component_key(logical_key, "k"), None)
-            self._v_child_owners.pop(derive_component_key(logical_key, "v"), None)
+            self._k_child_owners.pop(
+                derive_component_key(
+                    logical_key, "k", scheme=self._component_key_scheme
+                ),
+                None,
+            )
+            self._v_child_owners.pop(
+                derive_component_key(
+                    logical_key, "v", scheme=self._component_key_scheme
+                ),
+                None,
+            )
             if not self._entries:
                 self._logical_hash_length = None
 
@@ -786,3 +952,74 @@ def derive_storage_placement_mode(
             f"on the same StorageManager."
         )
     return modes.pop()
+
+
+# Serde factory type names whose V blobs are byte-through RAW_UNIT fp8
+# codes (implicit unit scale, no stored scales).  MUST stay in sync with
+# the RAW_UNIT factory registrations in
+# ``lmcache/v1/distributed/serde/asym_k16_v8.py``.  Any serde not listed
+# here is treated as scale-aware (COMPUTED_LEGACY), which keeps every
+# pre-existing config on the legacy (role-only) child key.
+_RAW_UNIT_SERDE_TYPES = frozenset(
+    {
+        # V-only byte-through -> KV_SPLIT_TIER (K in L1, single-process).
+        "asym_bytethrough_k16_v8_v_only",
+        # Both-plane byte-through -> KV_TOGETHER (K+V in one durable L2
+        # object, cross-process/restart reusable).  RAW_UNIT here drives
+        # the fp8 V-component dtype + the heterogeneous pre-split layout
+        # pass-through; the KV_TOGETHER placement (from its (0,1) input
+        # slot mapping) keeps the split-tier manifest inert.
+        "asym_bytethrough_k16_v8",
+    }
+)
+
+
+def derive_component_key_scheme(
+    adapter_configs: list["L2AdapterConfigBase"],
+) -> ComponentKeyScheme:
+    """Derive the per-engine :class:`ComponentKeyScheme` from L2 adapters.
+
+    The scheme domain-separates byte-through (``RAW_UNIT``) V blobs from
+    scale-aware (``COMPUTED_LEGACY``) ones at the storage-key layer so the
+    two cannot collide on one L2 key (see :func:`derive_component_key`).
+    It keys off each adapter's ``serde_config.type``: a byte-through serde
+    (see :data:`_RAW_UNIT_SERDE_TYPES`) yields
+    :attr:`ComponentKeyScheme.RAW_UNIT`; everything else -- no serde, a
+    single-tensor serde, or a scale-aware multi-output serde -- yields
+    :attr:`ComponentKeyScheme.COMPUTED_LEGACY`.
+
+    One StorageManager is a single-scheme engine: the child-key domain,
+    the lifecycle, and the manifest K-child side-set are all keyed on one
+    scheme.  A mixed adapter set is rejected, mirroring
+    :func:`derive_storage_placement_mode`.
+
+    Args:
+        adapter_configs: Sequence of L2 adapter configurations.  Empty
+            list returns :attr:`ComponentKeyScheme.COMPUTED_LEGACY`.
+
+    Returns:
+        The single canonical :class:`ComponentKeyScheme`.
+
+    Raises:
+        ValueError: if adapters demand different schemes.
+    """
+    schemes: set[ComponentKeyScheme] = set()
+    for ac in adapter_configs:
+        sc = getattr(ac, "serde_config", None)
+        serde_type = getattr(sc, "type", None) if sc is not None else None
+        if serde_type in _RAW_UNIT_SERDE_TYPES:
+            schemes.add(ComponentKeyScheme.RAW_UNIT)
+        else:
+            schemes.add(ComponentKeyScheme.COMPUTED_LEGACY)
+
+    if not schemes:
+        return ComponentKeyScheme.COMPUTED_LEGACY
+    if len(schemes) > 1:
+        names = sorted(s.name for s in schemes)
+        raise ValueError(
+            f"Incompatible L2 adapter component-key schemes: {names}. "
+            f"One StorageManager is a single-scheme engine; a byte-through "
+            f"(RAW_UNIT) serde cannot coexist with a scale-aware "
+            f"(COMPUTED_LEGACY) serde on the same StorageManager."
+        )
+    return schemes.pop()
