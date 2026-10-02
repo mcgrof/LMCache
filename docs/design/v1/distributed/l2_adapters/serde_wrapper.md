@@ -235,6 +235,18 @@ may narrow from the estimate-sized allocation to the serializer's actual byte
 count. Fixed-layout FP8/int8 KV objects still require an exact L2 object length,
 so a truncated one-byte tensor is a miss rather than a malformed hit.
 
+## Multi-output dispatch
+
+For a `MultiSerializer` / `MultiDeserializer`, the processor exposes a slot
+mapping and the wrapper builds zero-copy `GroupSlotView` objects over the
+parent's groups. Before allocating a temp or touching L2, the wrapper verifies
+that non-`None` mapping indexes cover every parent group exactly once.
+
+A codec with the mapping `(0, 1)` accepts one K/V pair. A parent with
+multiple pairs fails closed until the wire format supports repeated pairs. A
+V-only `(None, 1)` mapping is also rejected by this ordinary wrapper path;
+deployments need a split-tier owner that preserves and restores K separately.
+
 ## Failure Policy: All-or-Nothing per Submit
 
 If **any** key's temp allocation fails or `submit_serialize` /

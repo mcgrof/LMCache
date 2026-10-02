@@ -238,15 +238,17 @@ as one combined tensor. It does not work in two cases:
   pair to the tuple interface as a length-1 group; the adapter is
   layout-equivalent (same on-the-wire bytes as a direct call).
 
-The single-tensor `Serializer` / `Deserializer` ABCs and all their
-existing callers — `AsyncSerdeProcessor`, the factory registry, the
-L2 adapter wrapper, the built-in `fp8` serde — are unchanged. A
-serde implementation that needs multiple tensors at an endpoint
-implements `MultiSerializer` / `MultiDeserializer` instead of (or in
-addition to) the single-tensor ABCs. The async wiring around the
-multi interface — a tuple-aware `AsyncSerdeProcessor` analog and a
-tuple-aware `submit_*` shape on the wrapper — is added in a follow-up
-once a concrete multi-output serde lands.
+The single-tensor ABCs and existing serdes remain compatible. A serde that
+needs multiple tensors implements `MultiSerializer` / `MultiDeserializer`.
+`AsyncSerdeProcessor` forwards each tuple-shaped work item unchanged, while
+`SerdeL2AdapterWrapper` creates zero-copy `GroupSlotView` objects according to
+the serde's slot mapping.
+
+The wrapper requires the mapping to cover every parent group exactly once.
+A `(0, 1)` mapping supports exactly one K/V pair and fails closed for `[K, V, K, V, ...]` layouts rather than reporting a
+partial cache hit. The `(None, 1)` V-only mapping is intentionally incomplete
+and therefore cannot be used by an ordinary all-in-L2 wrapper; it requires the
+paired split-tier placement that supplies K independently.
 
 ### Per-slot semantics
 
@@ -285,8 +287,8 @@ from lmcache.v1.distributed.serde import (
 
 multi_s = single_to_multi_serializer(existing_serializer)
 multi_d = single_to_multi_deserializer(existing_deserializer)
-n = multi_s.serialize((src,), dst_buffer)         # length-1 group
-multi_d.deserialize(src_buffer, (dst,))           # length-1 group
+n = multi_s.serialize((src,), dst_buffer, key)         # length-1 group
+multi_d.deserialize(src_buffer, (dst,), key)           # length-1 group
 ```
 
 The wrapper rejects non-unit groups with `ValueError`, rejects a
