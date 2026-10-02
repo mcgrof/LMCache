@@ -1266,6 +1266,43 @@ class TestDelete:
 
         manager.close()
 
+    def test_finish_read_delete_when_unlocked_targets_only_current_resident(
+        self, basic_l1_config, basic_layout
+    ):
+        """Atomic deferred deletion cannot land on a later replacement."""
+        manager = L1Manager(basic_l1_config)
+        key = make_object_key(12345)
+
+        manager.reserve_write([key], [False], basic_layout)
+        manager.finish_write([key])
+        manager.reserve_read([key], read_locks=2)
+
+        manager.finish_read([key], delete_when_unlocked=True)
+        assert manager.get_object_state(key) is not None
+        manager.finish_read([key])
+        assert manager.get_object_state(key) is None
+
+        # A later object under the same key gets a fresh state and must not
+        # inherit the old resident's deferred-delete marker.
+        manager.reserve_write([key], [False], basic_layout)
+        manager.finish_write([key])
+        assert manager.get_object_state(key) is not None
+
+        manager.close()
+
+    def test_finish_read_delete_when_unlocked_missing_key_returns_key_not_exist(
+        self, basic_l1_config, basic_layout
+    ):
+        """Atomic deferred deletion reports a missing resident."""
+        manager = L1Manager(basic_l1_config)
+        key = make_object_key(12345)
+
+        assert manager.finish_read([key], delete_when_unlocked=True) == {
+            key: L1Error.KEY_NOT_EXIST
+        }
+
+        manager.close()
+
     def test_force_delete_removes_write_locked_key(self, basic_l1_config, basic_layout):
         """force=True deletes a write-locked key that non-force refuses."""
         manager = L1Manager(basic_l1_config)

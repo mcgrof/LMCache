@@ -16,3 +16,16 @@ stored. Readers accept only `COMPLETE`. Physical cleanup must first claim
 `DELETE_IN_FLIGHT`; a replacement cannot reuse the child names until cleanup
 ends. If K was locked and nothing was deleted, cleanup can restore the prior
 state. A stale generation cannot complete or remove a replacement's entry.
+
+## External L1 objects and private tensor pools
+
+The K-child pool allocates separate CPU buffers; it does not narrow or alias
+the producer's full K/V allocation. L1 owns the catalog entry and read/write
+locks, stamps its manager identity, and returns the buffer to its external
+allocator when the entry is removed. V scratch pools hold private tensors for
+the codec and are selected by shape and dtype.
+
+Ordinary L1 allocation and external pools cannot satisfy each other's requests.
+Eviction therefore uses the maximum individual pool utilization. Summed bytes
+remain useful for observability. Pool slot limits bound retained free buffers,
+not peak concurrent allocations; overflow uses temporary allocations.
