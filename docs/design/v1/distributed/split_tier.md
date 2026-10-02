@@ -67,3 +67,11 @@ stores unless explicitly forced, invalidates orphaned composites, and retains
 the cleanup claim through physical deletion. Shutdown waits for active clear.
 A process restart loses K and the manifest; remaining V files cannot form hits.
 The filesystem adapter must not return or close while an unlink remains live.
+
+## Observability
+
+Manifest-state counts expose outstanding stores and cleanup. Store outcome and
+latency metrics come from wrapper events. The V-child cleanup event counts
+terminal delete attempts; an individual filesystem unlink can still fail, in
+which case the filesystem adapter retains its byte accounting. This event is
+not proof that disk space was reclaimed.
