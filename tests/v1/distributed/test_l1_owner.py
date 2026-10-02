@@ -122,3 +122,31 @@ def test_recycled_page_starts_without_previous_owner(batched: bool) -> None:
     allocator.free(recycled)
     assert allocator.memcheck()
     recycled.invalidate()
+
+
+@pytest.mark.no_shared_allocator
+def test_external_reservation_stamps_and_preserves_l1_owner(
+    managers: tuple[L1Manager, L1Manager],
+) -> None:
+    """Externally allocated residents follow the same owner contract."""
+    first, second = managers
+    key = ObjectKey(ObjectKey.IntHash2Bytes(2), "external-owner", 0)
+    shapes, dtypes = [torch.Size([64])], [torch.uint8]
+    allocator = PagedTensorMemoryAllocator(
+        torch.empty(64, dtype=torch.uint8), shapes, dtypes
+    )
+    obj = allocator.allocate(shapes, dtypes)
+    assert obj is not None
+    assert first.reserve_external_writes([key], [obj], tag="external")[key] == (
+        L1Error.SUCCESS,
+        obj,
+    )
+    assert obj.get_l1_manager() == first.l1_manager_id
+    with pytest.raises(ValueError, match="another L1 manager"):
+        second.reserve_external_writes([key], [obj], tag="external")
+    assert first.finish_write([key], tag="external")[key] == L1Error.SUCCESS
+    assert first.reserve_read([key])[key] == (L1Error.SUCCESS, obj)
+    assert obj.get_l1_manager() == first.l1_manager_id
+    assert first.finish_read([key])[key] == L1Error.SUCCESS
+    assert first.delete([key])[key] == L1Error.SUCCESS
+    assert allocator.memcheck()

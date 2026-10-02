@@ -19,9 +19,14 @@ from lmcache.v1.distributed.memory_manager import (
     GDSL1MemoryManager,
     L1ManagerProtocol,
     L1MemoryManager,
+    L1MemoryUsageProvider,
 )
 from lmcache.v1.distributed.memory_manager.devdax_l1_memory_manager import (
     DevDaxL1MemoryManager,
+)
+from lmcache.v1.distributed.storage_placement import (
+    SplitTierManifest,
+    SplitTierState,
 )
 from lmcache.v1.memory_allocators.devdax_memory_allocator import (
     DevDaxArenaState,
@@ -55,6 +60,21 @@ class L1ObjectState:
 
     is_temporary: bool
     """ Whether the object is temporary (need to be deleted after read). """
+
+    is_external: bool = False
+    """ Whether the backing buffer came from an external pool
+    (registered via ``reserve_external_writes``).  External objects
+    are freed through their own ``parent_allocator`` -- handing their
+    raw address to the L1 memory manager's allocator would corrupt
+    its free list. """
+
+    delete_when_unlocked: bool = False
+    """Delete this exact resident entry when its final reader exits.
+
+    Split-tier early release uses this when another request still holds a
+    logical read lock.  The flag lives on the entry rather than in a key-only
+    side table, so it cannot delete a later replacement generation.
+    """
 
 
 def l1_mgr_synchronized(func):
@@ -227,6 +247,12 @@ class L1Manager:
 
         self._registered_listeners: list[L1ManagerListener] = []
 
+        # Optional split-tier manifest; when wired, ``is_key_evictable``
+        # consults it for K-child keys so the LRU policy can't evict a
+        # K-child whose store is still in flight.  ``None`` outside
+        # split-tier deployments.
+        self._split_tier_manifest: "SplitTierManifest | None" = None
+
         self._event_bus = get_event_bus()
 
         L1Manager._gauge_target = self
@@ -268,6 +294,50 @@ class L1Manager:
         """
         with self._lock:
             self._registered_listeners.append(listener)
+
+    def set_split_tier_manifest(self, manifest: "SplitTierManifest | None") -> None:
+        """Wire a split-tier manifest so :meth:`is_key_evictable` can
+        gate K-child evictions on the manifest state.
+
+        Without this hook, the LRU eviction policy can pick a K-child
+        whose manifest state is :class:`SplitTierState.STORE_IN_FLIGHT`
+        (the V codec / inner L2 store is still running).  Evicting it
+        breaks the active store path, the manifest goes to
+        ``INVALIDATED``, paired-eviction queues V-child delete on L2,
+        and the logical key cannot remain a usable composite.
+
+        Args:
+            manifest: The manifest instance shared with the
+                ``SerdeL2AdapterWrapper``, or ``None`` to clear.
+                Idempotent; the manifest is just a reference, not
+                owned by the L1Manager.
+        """
+        self._split_tier_manifest = manifest
+
+    def register_external_memory_provider(
+        self, provider: L1MemoryUsageProvider
+    ) -> None:
+        """Register an auxiliary memory provider with the underlying
+        :class:`L1MemoryManager`.
+
+        Bytes contributed by the provider count toward
+        :meth:`get_memory_usage` for observability and
+        :meth:`get_memory_pressure` for the eviction trigger. Without this
+        hook, slab-style
+        providers (e.g. ``SerdeL2AdapterWrapper``'s K-child slab)
+        hold real L1 bytes that the eviction policy treats as
+        absent, and eviction never fires on those entries.
+
+        See :class:`lmcache.v1.distributed.memory_manager.L1MemoryUsageProvider`
+        for the protocol shape.
+        """
+        self._memory_manager.register_external_memory_provider(provider)
+
+    def unregister_external_memory_provider(
+        self, provider: L1MemoryUsageProvider
+    ) -> None:
+        """Mirror of :meth:`register_external_memory_provider`."""
+        self._memory_manager.unregister_external_memory_provider(provider)
 
     @l1_mgr_synchronized
     def reserve_read(
@@ -359,11 +429,15 @@ class L1Manager:
         self,
         keys: list[ObjectKey],
         read_locks: int = 1,
+        delete_when_unlocked: bool = False,
     ) -> dict[ObjectKey, L1Error]:
         """Finish read access for the given keys.
 
-        Will delete the object if it is temporary and read
-        count reaches zero.
+        Deletes temporary objects when their read count reaches zero.  A
+        caller may also atomically arm the exact resident being unlocked for
+        deletion after its final reader exits.  Combining the unlock and
+        marker under the L1 lock prevents the marker from landing on a later
+        replacement under the same key.
 
         Args:
             keys: The list of object keys to finish read
@@ -373,6 +447,9 @@ class L1Manager:
                 default); the reservation owner releasing the
                 whole reservation passes the ``reserve_read``
                 total.
+            delete_when_unlocked: Delete this exact resident immediately if
+                the released locks were its last readers, or arm it for
+                deletion by the final remaining reader.
 
         Returns:
             A dictionary mapping each object key to an
@@ -384,7 +461,7 @@ class L1Manager:
                 means the reader may read inconsistent data.
         """
         total = _validate_read_locks(read_locks)
-        need_to_free: list[MemoryObj] = []
+        need_to_free: list[L1ObjectState] = []
         need_to_free_keys: list[ObjectKey] = []
         ret: dict[ObjectKey, L1Error] = {}
         successful_keys: list[ObjectKey] = []
@@ -409,21 +486,27 @@ class L1Manager:
                 ret[key] = L1Error.KEY_IN_WRONG_STATE
                 continue
 
+            if delete_when_unlocked:
+                entry.delete_when_unlocked = True
+
             # TODO(perf): support a count argument in
             # TTLLock.unlock() to avoid Python for-loop
             # overhead (TTLLock is C++ std::atomic).
             for _ in range(total):
                 entry.read_lock.unlock()
-            if entry.is_temporary and not entry.read_lock.is_locked():
-                need_to_free.append(entry.memory_obj)
+            if (
+                entry.is_temporary or entry.delete_when_unlocked
+            ) and not entry.read_lock.is_locked():
+                # NOTE: temporary objects shouldn't have write-locks
+                need_to_free.append(entry)
                 need_to_free_keys.append(key)
                 del self._objects[key]
 
             ret[key] = L1Error.SUCCESS
             successful_keys.append(key)
 
-        freed_meta = [self._object_meta(obj) for obj in need_to_free]
-        self._memory_manager.free(need_to_free)
+        freed_meta = [self._object_meta(entry.memory_obj) for entry in need_to_free]
+        self._free_entries(need_to_free)
 
         for listener in self._registered_listeners:
             listener.on_l1_keys_read_finished(successful_keys)
@@ -557,6 +640,102 @@ class L1Manager:
         return ret
 
     @l1_mgr_synchronized
+    def reserve_external_writes(
+        self,
+        keys: list[ObjectKey],
+        memory_objs: list[MemoryObj],
+        is_temporary: list[bool] | None = None,
+        tag: str = "",
+    ) -> dict[ObjectKey, L1OperationResult]:
+        """Stage externally provided memory objects for admission into L1.
+
+        This is the slab / kmem_cache-style entry point: the caller has
+        already obtained ``MemoryObj`` backing buffers from its own pool
+        (today, :class:`SerdeL2AdapterWrapper`'s K-child slab) and just
+        needs the L1 state-dict bookkeeping done.  Compared to
+        :meth:`reserve_write`, this skips ``self._memory_manager.allocate``
+        entirely -- no address-manager scan, no free-block coalescing,
+        no per-call ``TensorMemoryAllocator`` work.  The global mutex is
+        still held across the state-dict insert (no per-key fan-out),
+        so this is not a sharding fix; it is a "shorten the critical
+        section" fix.
+
+        Semantics match :meth:`reserve_write` for the new-key path:
+
+        * Each key that is neither resident nor already staged by ``tag``
+          becomes a staging entry backed by the supplied object. It remains
+          invisible to readers until a matching finish-write operation.
+        * Each resident key or key already staged by ``tag`` is reported
+          ``L1Error.KEY_NOT_WRITABLE`` (this is the "new"-mode
+          equivalent; updating a pre-existing entry with a different
+          backing buffer would change its address and break readers).
+
+        Listeners + the L1_WRITE_RESERVED event fire as usual so
+        downstream observers (StoreController, observability) see the
+        same shape as a normal :meth:`reserve_write`.
+
+        Args:
+            keys: Logical keys to register.
+            memory_objs: Backing buffers, one per key, parallel to
+                ``keys``.  The caller's pool owns the memory; the
+                ``MemoryObj.parent_allocator`` is expected to point at
+                the pool so :meth:`delete` / GC returns the underlying
+                buffer to the free-list instead of releasing it back
+                to ``L1MemoryManager``.
+            is_temporary: Per-key temporary flag (``None`` defaults to
+                all-False).  Same semantics as :meth:`reserve_write`.
+            tag: Writer identity. The same tag must be passed to the
+                finish-write operation that completes or discards the write.
+
+        Returns:
+            Dictionary mapping each key to ``(L1Error, MemoryObj)``.
+            ``L1Error.KEY_NOT_WRITABLE`` for keys that collided with an
+            existing entry; ``L1Error.SUCCESS`` for the new
+            registrations.
+        """
+        if len(keys) != len(memory_objs):
+            raise ValueError(
+                "L1Manager.reserve_external_writes: keys and memory_objs "
+                "must have the same length"
+            )
+        if is_temporary is None:
+            is_temporary = [False] * len(keys)
+        elif len(is_temporary) != len(keys):
+            raise ValueError(
+                "L1Manager.reserve_external_writes: is_temporary length "
+                "must match keys length"
+            )
+
+        ret: dict[ObjectKey, L1OperationResult] = {}
+        successful_keys: list[ObjectKey] = []
+        for key, mem_obj, is_temp in zip(keys, memory_objs, is_temporary, strict=True):
+            if key in self._objects or self._get_staging(key, tag) is not None:
+                ret[key] = (L1Error.KEY_NOT_WRITABLE, None)
+                continue
+            mem_obj.set_l1_manager(self._l1_manager_id)
+            entry = L1ObjectState(
+                memory_obj=mem_obj,
+                write_lock=TTLLock(self._write_ttl_seconds),
+                read_lock=TTLLock(self._read_ttl_seconds),
+                is_temporary=is_temp,
+                is_external=True,
+            )
+            entry.write_lock.lock()
+            self._put_staging(key, tag, entry)
+            ret[key] = (L1Error.SUCCESS, mem_obj)
+            successful_keys.append(key)
+
+        for listener in self._registered_listeners:
+            listener.on_l1_keys_reserved_write(successful_keys)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L1_WRITE_RESERVED,
+                metadata={"keys": successful_keys, "tag": tag},
+            )
+        )
+        return ret
+
+    @l1_mgr_synchronized
     def finish_write(
         self,
         keys: list[ObjectKey],
@@ -592,7 +771,7 @@ class L1Manager:
         ret: dict[ObjectKey, L1Error] = {}
         notification_keys: list[ObjectKey] = []
         notification_keys_meta: list[L1ObjectMeta] = []
-        discarded: list[MemoryObj] = []
+        discarded: list[L1ObjectState] = []
 
         for key in keys:
             err, entry = self._take_staging(key, tag, "finish write")
@@ -606,14 +785,14 @@ class L1Manager:
                     key,
                     tag,
                 )
-                discarded.append(entry.memory_obj)
+                discarded.append(entry)
                 continue
             self._objects[key] = entry
             if not entry.is_temporary:
                 notification_keys.append(key)
                 notification_keys_meta.append(self._object_meta(entry.memory_obj))
 
-        self._memory_manager.free(discarded)
+        self._free_entries(discarded)
 
         if notification_keys:
             for listener in self._registered_listeners:
@@ -671,7 +850,7 @@ class L1Manager:
         successful_keys: list[ObjectKey] = []
         successful_keys_meta: list[L1ObjectMeta] = []
         resident_keys: list[ObjectKey] = []
-        discarded: list[MemoryObj] = []
+        discarded: list[L1ObjectState] = []
 
         for key in keys:
             err, entry = self._take_staging(key, tag, "finish_write_and_reserve_read")
@@ -690,14 +869,14 @@ class L1Manager:
                     key,
                     tag,
                 )
-                discarded.append(entry.memory_obj)
+                discarded.append(entry)
                 resident_keys.append(key)
                 entry = resident
             for _ in range(total):
                 entry.read_lock.lock()
             ret[key] = (L1Error.SUCCESS, entry.memory_obj)
 
-        self._memory_manager.free(discarded)
+        self._free_entries(discarded)
         if resident_keys:
             self._report_read_reserved(resident_keys)
 
@@ -710,6 +889,47 @@ class L1Manager:
             )
         )
         return ret
+
+    def _free_entries(self, entries: list[L1ObjectState]) -> None:
+        """Free the entries' memory objects, routing each to its owner.
+
+        Catalog-owned objects go to the memory manager's batched free.
+        Externally-registered objects (``reserve_external_writes`` --
+        e.g. the serde wrapper's K-child slab) are returned to their
+        own ``parent_allocator``: handing a foreign raw address to the
+        memory manager's allocator poisons its free list on the CPU
+        tier and raises outright on Device-DAX, which would kill the
+        eviction loop.
+
+        Args:
+            entries: Catalog entries whose backing buffers are being
+                released. Callers must have removed them from the resident
+                or staging table that owned them.
+        """
+        own: list[MemoryObj] = []
+        for entry in entries:
+            if not entry.is_external:
+                own.append(entry.memory_obj)
+                continue
+            obj = entry.memory_obj
+            parent = getattr(obj, "parent_allocator", None)
+            if parent is None:
+                logger.warning(
+                    "L1Manager: externally-registered memory object has "
+                    "no parent allocator; falling back to the L1 memory "
+                    "manager free (possible pool accounting leak)"
+                )
+                own.append(obj)
+                continue
+            try:
+                parent.free(obj)
+            except Exception:
+                logger.exception(
+                    "L1Manager: external pool free raised; the buffer "
+                    "is leaked back to its pool's accounting"
+                )
+        if own:
+            self._memory_manager.free(own)
 
     @l1_mgr_synchronized
     def delete(
@@ -736,7 +956,7 @@ class L1Manager:
                 exists for it, so it cannot be deleted. Never returned when
                 ``force`` is True.
         """
-        need_to_free: list[MemoryObj] = []
+        need_to_free: list[L1ObjectState] = []
         ret: dict[ObjectKey, L1Error] = {}
         successful_keys: list[ObjectKey] = []
         gone_keys: list[ObjectKey] = []
@@ -765,7 +985,7 @@ class L1Manager:
             if locked:
                 logger.warning("L1Manager: force-deleting locked key %s", key)
 
-            need_to_free.append(entry.memory_obj)
+            need_to_free.append(entry)
             del self._objects[key]
             ret[key] = L1Error.SUCCESS
             successful_keys.append(key)
@@ -800,7 +1020,7 @@ class L1Manager:
                 reservation expired).
         """
         ret: dict[ObjectKey, L1Error] = {}
-        discarded: list[MemoryObj] = []
+        discarded: list[L1ObjectState] = []
         gone_keys: list[ObjectKey] = []
 
         for key in keys:
@@ -813,11 +1033,11 @@ class L1Manager:
                 key,
                 tag,
             )
-            discarded.append(entry.memory_obj)
+            discarded.append(entry)
             if key not in self._objects and key not in self._staging:
                 gone_keys.append(key)
 
-        self._memory_manager.free(discarded)
+        self._free_entries(discarded)
         self._report_staging_gone(gone_keys)
         return ret
 
@@ -842,12 +1062,18 @@ class L1Manager:
         """Clear objects from L1 cache.
 
         Args:
-            force: If True, clear ALL objects including read-locked ones and
-                every staging object. This may corrupt in-flight
-                store/prefetch operations. If False (default), only clear
-                unlocked resident objects and staging objects whose write
-                lock expired, keeping read-locked objects and live staging
-                objects intact.
+            force: If True, clear ALL resident and staging objects, including
+                locked ones.
+                This may corrupt in-flight store/prefetch operations
+                (a hard reset -- see the restart-semantics note in
+                ``StorageManager.clear``).  If False (default), only
+                clear resident objects eviction itself would remove and
+                staging objects whose write lock has expired.
+                Write-locked, read-locked, and -- under a wired
+                split-tier manifest -- STORE_IN_FLIGHT K children are
+                kept intact, so a non-forced clear never destroys the
+                L1-canonical half of a composite a store is still
+                writing.
         """
         if force:
             staging_count = sum(len(per_tag) for per_tag in self._staging.values())
@@ -859,9 +1085,9 @@ class L1Manager:
                 staging_count,
             )
             all_keys = list(self._objects.keys())
-            all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
-            all_meta = [self._object_meta(obj) for obj in all_memory_objs]
-            self._memory_manager.free(all_memory_objs)
+            all_entries = list(self._objects.values())
+            all_meta = [self._object_meta(entry.memory_obj) for entry in all_entries]
+            self._free_entries(all_entries)
             self._objects.clear()
             for listener in self._registered_listeners:
                 listener.on_l1_keys_deleted_by_manager(all_keys)
@@ -884,21 +1110,31 @@ class L1Manager:
             return
 
         keys_to_clear: list[ObjectKey] = []
-        objs_to_free: list[MemoryObj] = []
-        locked_count = 0
+        entries_to_free: list[L1ObjectState] = []
+        pinned_count = 0
 
         for key, entry in list(self._objects.items()):
-            if entry.read_lock.is_locked():
-                locked_count += 1
+            # Skip anything eviction itself would refuse to remove:
+            # locked objects AND split-tier K children pinned by an
+            # in-flight store (is_key_evictable consults the manifest).
+            # Clearing an unlocked STORE_IN_FLIGHT K child would destroy
+            # the composite's L1-canonical half while the store still
+            # reports success -- the exact corruption the eviction gate
+            # exists to prevent.  is_key_evictable does not take the lock
+            # (we already hold it) and returns True for every unlocked
+            # key when no manifest is wired, so non-split-tier clear is
+            # unchanged.
+            if not self.is_key_evictable(key):
+                pinned_count += 1
                 continue
             keys_to_clear.append(key)
-            objs_to_free.append(entry.memory_obj)
+            entries_to_free.append(entry)
 
         for key in keys_to_clear:
             del self._objects[key]
 
         if keys_to_clear:
-            self._free_and_report_deleted(keys_to_clear, objs_to_free)
+            self._free_and_report_deleted(keys_to_clear, entries_to_free)
 
         reclaimed_count = 0
         gone_keys: list[ObjectKey] = []
@@ -912,10 +1148,10 @@ class L1Manager:
 
         logger.info(
             "L1Manager: cleared %d objects and %d expired staging objects, "
-            "%d locked objects and %d staging objects remaining.",
+            "%d pinned objects and %d staging objects remaining.",
             len(keys_to_clear),
             reclaimed_count,
-            locked_count,
+            pinned_count,
             staging_count,
         )
 
@@ -926,16 +1162,45 @@ class L1Manager:
         L1Manager.delete() will check again and safely reject a key
         that became locked between the check and the actual deletion.
 
+        Split-tier extension: when a manifest is wired via
+        :meth:`set_split_tier_manifest`, K-child keys are additionally
+        gated by manifest state.  A K-child is non-evictable ONLY while
+        its logical entry is :class:`SplitTierState.STORE_IN_FLIGHT` --
+        an active store path holds it as its L1-resident half (the V
+        codec / inner L2 store hasn't finished yet), so evicting it
+        silently corrupts the in-flight write and stalls the producer.
+        A K-child that is ``COMPLETE``, ``INVALIDATED``,
+        ``DELETE_IN_FLIGHT``, or untracked (an orphan whose manifest
+        entry was already dropped by paired-eviction / post-INVALIDATED
+        cleanup) is evictable.  V-children live on L2 and are not
+        subject to L1 eviction; they bypass this gate.
+
         Args:
             key: The object key to check.
 
         Returns:
             True if the key has a resident object that is not read-locked,
-            or a staging object whose write lock expired; False otherwise.
+            subject to the split-tier manifest gate, or a staging object
+            whose write lock expired; False otherwise.
         """
         entry = self._objects.get(key, None)
-        if entry is not None and not entry.read_lock.is_locked():
+        if entry is not None:
+            if entry.read_lock.is_locked():
+                return False
+
+            manifest = self._split_tier_manifest
+            if manifest is not None:
+                logical_key = manifest.logical_for_k_child(key)
+                if logical_key is not None:
+                    state = manifest.lookup(logical_key)
+                    # STORE_IN_FLIGHT: an active store path holds this K
+                    # child as its L1-resident half; evicting now corrupts
+                    # the in-flight V codec / L2 store. A missing entry is
+                    # an orphan and is safe to evict.
+                    if state is SplitTierState.STORE_IN_FLIGHT:
+                        return False
             return True
+
         per_tag = self._staging.get(key, None)
         if per_tag is None:
             return False
@@ -955,6 +1220,15 @@ class L1Manager:
             via "L1ManagerListener" to notify the memory usage changes.
         """
         return self._memory_manager.get_memory_usage()
+
+    def get_memory_pressure(self) -> float:
+        """Return the highest utilization among non-fungible L1 pools.
+
+        Returns:
+            Utilization used by the eviction trigger.  Aggregate bytes for
+            metrics remain available through :meth:`get_memory_usage`.
+        """
+        return self._memory_manager.get_memory_pressure()
 
     @l1_mgr_synchronized
     def get_staging_memory_usage(self) -> int:
@@ -1101,10 +1375,10 @@ class L1Manager:
     def close(self) -> None:
         """Close the L1Manager and free all resources."""
         with self._lock:
-            all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
+            all_entries = list(self._objects.values())
             for per_tag in self._staging.values():
-                all_memory_objs.extend(staged.memory_obj for staged in per_tag.values())
-            self._memory_manager.free(all_memory_objs)
+                all_entries.extend(per_tag.values())
+            self._free_entries(all_entries)
             self._objects.clear()
             self._staging.clear()
             self._staging_bytes = 0
@@ -1159,6 +1433,24 @@ class L1Manager:
         }
 
     # Debugging APIs
+    @l1_mgr_synchronized
+    def has_object_or_staging(self, key: ObjectKey) -> bool:
+        """Return whether ``key`` has resident or staged L1 state.
+
+        Unlike :meth:`get_object_state`, this includes write-reserved staging
+        objects.  Lifecycle code uses it after a non-forced clear to
+        distinguish a deliberately preserved in-flight write from a key whose
+        backing has actually gone away.
+
+        Args:
+            key: The object key to query.
+
+        Returns:
+            ``True`` if the key is resident or has at least one staging
+            writer; otherwise ``False``.
+        """
+        return key in self._objects or key in self._staging
+
     @l1_mgr_synchronized
     def get_object_state(self, key: ObjectKey) -> L1ObjectState | None:
         """Get the internal state of the resident object with the given key.
@@ -1270,7 +1562,7 @@ class L1Manager:
         per_tag = self._staging.get(key, None)
         if per_tag is None:
             return 0
-        freed: list[MemoryObj] = []
+        freed: list[L1ObjectState] = []
         for tag, staged in list(per_tag.items()):
             if staged.write_lock.is_locked():
                 if not force:
@@ -1286,8 +1578,8 @@ class L1Manager:
                     key,
                     tag,
                 )
-            freed.append(self._pop_staging(key, tag).memory_obj)
-        self._memory_manager.free(freed)
+            freed.append(self._pop_staging(key, tag))
+        self._free_entries(freed)
         return len(freed)
 
     def _report_read_reserved(self, keys: list[ObjectKey]) -> None:
@@ -1315,12 +1607,16 @@ class L1Manager:
     def _free_and_report_deleted(
         self,
         keys: list[ObjectKey],
-        objs: list[MemoryObj],
+        entries: list[L1ObjectState],
     ) -> None:
-        """Free ``objs`` and report ``keys`` as deleted to listeners and
-        the event bus."""
-        freed_meta = [self._object_meta(obj) for obj in objs]
-        self._memory_manager.free(objs)
+        """Free ``entries`` and report ``keys`` as deleted.
+
+        Args:
+            keys: Keys removed from the resident catalog.
+            entries: Removed resident entries whose buffers must be freed.
+        """
+        freed_meta = [self._object_meta(entry.memory_obj) for entry in entries]
+        self._free_entries(entries)
 
         for listener in self._registered_listeners:
             listener.on_l1_keys_deleted_by_manager(keys)

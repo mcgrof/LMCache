@@ -2,7 +2,7 @@
 """GDS slab-file L1 memory manager."""
 
 # Standard
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 # First Party
 from lmcache.logging import init_logger
@@ -17,6 +17,12 @@ from lmcache.v1.memory_management import (
     MemoryObj,
     MemoryObjMetadata,
 )
+
+if TYPE_CHECKING:
+    # First Party
+    from lmcache.v1.distributed.memory_manager.l1_memory_manager import (
+        L1MemoryUsageProvider,
+    )
 
 logger = init_logger(__name__)
 
@@ -121,6 +127,24 @@ class GDSL1MemoryManager:
         free_size = self._address_manager.get_free_size()
         total_size = self._address_manager.get_heap_size()
         return total_size - free_size, total_size
+
+    def get_memory_pressure(self) -> float:
+        """Return utilization of the single GDS slab pool."""
+        used, total = self.get_memory_usage()
+        return 0.0 if total == 0 else used / total
+
+    def register_external_memory_provider(
+        self, provider: "L1MemoryUsageProvider"
+    ) -> None:
+        """No-op: the GDS slab tier has no external-provider accounting
+        (the serde slab pool augments the CPU DRAM tier, not GDS)."""
+        return
+
+    def unregister_external_memory_provider(
+        self, provider: "L1MemoryUsageProvider"
+    ) -> None:
+        """No-op counterpart to :meth:`register_external_memory_provider`."""
+        return
 
     def get_l1_memory_desc(self) -> Optional[L1MemoryDesc]:
         """Return ``None``: the GDS L1 medium is the slab file, not a buffer.
