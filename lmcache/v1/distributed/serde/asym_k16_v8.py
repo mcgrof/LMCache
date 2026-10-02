@@ -647,9 +647,9 @@ def _create_asym_k16_v8_v_only_serde(kwargs: dict[str, object]) -> SerdeProcesso
 
     Returns an :class:`AsyncSerdeProcessor` wrapping the V-only
     multi-output pair.  ``input_slot_mapping`` returns ``(None, 1)``
-    so the serializer receives no K. The ordinary all-in-L2 wrapper rejects
-    this incomplete mapping. A split-tier owner must retain K separately and
-    compose it with the restored V before reporting a logical cache hit.
+    so the wrapper passes no K to the serializer. The wrapper keeps K as an
+    L1 child, writes V as an L2 child, and resolves the logical key only while
+    both the in-memory manifest and K child remain present.
     """
     fp8_dtype = _resolve_dtype(str(kwargs.get("fp8_dtype", "float8_e4m3fn")))
     scale_scope = _resolve_scale_scope(str(kwargs.get("scale_scope", "PER_TENSOR")))
