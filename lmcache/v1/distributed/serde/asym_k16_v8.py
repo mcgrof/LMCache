@@ -51,7 +51,12 @@ from lmcache.v1.distributed.serde.multi import (
     MultiSerializer,
     validate_group_size,
 )
-from lmcache.v1.kv_codec import AsymK16V8Codec, EncodedKV, ScaleScope
+from lmcache.v1.kv_codec import (
+    AsymK16V8Codec,
+    EncodedKV,
+    ScaleScheme,
+    ScaleScope,
+)
 from lmcache.v1.kv_codec.asym_k16_v8 import (
     _tensor_to_bytes_fast,
     compute_v_scales,
@@ -243,6 +248,13 @@ class AsymK16V8MultiDeserializer(MultiDeserializer):
             )
 
         enc = self._codec.from_bytes(blob)
+        if enc.scale_scheme != ScaleScheme.COMPUTED_PER_TENSOR:
+            raise ValueError(
+                "AsymK16V8MultiDeserializer: blob scale_scheme="
+                f"{enc.scale_scheme.name} is not COMPUTED_PER_TENSOR; a "
+                "RAW_UNIT (byte-through) blob carries raw fp8 codes with no "
+                "scales and requires a matching byte-through deserializer."
+            )
         # Push the K dtype conversion into the codec so the serde
         # doesn't need a post-decode cast.
         if k_obj is not None and k_obj.tensor is not None:
@@ -502,6 +514,13 @@ class AsymK16V8VOnlyMultiDeserializer(MultiDeserializer):
         blob = src_view.numpy().tobytes()
 
         enc = self._codec.from_bytes(blob)
+        if enc.scale_scheme != ScaleScheme.COMPUTED_PER_TENSOR:
+            raise ValueError(
+                "AsymK16V8VOnlyMultiDeserializer: blob scale_scheme="
+                f"{enc.scale_scheme.name} is not COMPUTED_PER_TENSOR; a "
+                "RAW_UNIT (byte-through) blob carries raw fp8 codes with no "
+                "scales and requires a matching byte-through deserializer."
+            )
         if enc.k_payload_len != 0:
             raise ValueError(
                 "AsymK16V8VOnlyMultiDeserializer: blob has k_payload_len="

@@ -401,7 +401,7 @@ class AsymK16V8Codec:
 
     @staticmethod
     def _check_hash_match(got: CodecHashes, expected: CodecHashes) -> None:
-        for key in CodecHashes._CHECK_ORDER:
+        for key in CodecHashes.field_names():
             ev = getattr(expected, key)
             gv = getattr(got, key)
             if ev and gv and ev != gv:
