@@ -45,3 +45,12 @@ wins the K lock, it cancels the cleanup claim and preserves the composite.
 Otherwise it waits for physical V deletion to terminate before dropping the
 claim. Adapter removal detaches future paired passes and drains prior passes
 before closing the adapter they captured.
+
+## Serialization and restoration
+
+The wrapper copies K into its L1 child and V into private scratch before
+allowing early release. Allocation or codec failure rolls back the owned
+buffers and generation. Lookup maps a logical key to its V child and masks
+incomplete composites. Load checks the exact K layout, copies K into the
+caller-provided destination, and decodes V from L2. A missing component is a
+miss. Supporting several K/V pairs in one object is outside this interface.

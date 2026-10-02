@@ -180,16 +180,19 @@ sequenceDiagram
 
 ## Lookup / Unlock / Eviction
 
-These paths don't involve any transform, so the wrapper delegates
-directly to the inner adapter — including the lookup event fd
-itself, to avoid an unnecessary thread hop per lookup.
+These paths do not run a transform. Together placement delegates logical keys
+directly. Split-tier placement maps logical keys to V-child keys and masks a
+reported hit unless the manifest is `COMPLETE`. Load then checks that the
+matching K child is readable in L1 with the expected shape and dtype. The lookup
+event fd remains the inner adapter's fd, avoiding an extra thread hop.
 
 | API | Behavior |
 |---|---|
 | `get_lookup_and_lock_event_fd` | Returns the inner adapter's fd (pass-through) |
-| `submit_lookup_and_lock_task` / `query_lookup_and_lock_result` | Delegated directly |
-| `submit_unlock` | Delegated directly |
-| `delete` / `get_usage` / `supports_global_eviction` | Delegated directly |
+| `submit_lookup_and_lock_task` / `query_lookup_and_lock_result` | Direct in together mode; split-tier maps to V children and gates results on manifest state |
+| `submit_unlock` | Direct in together mode; split-tier maps logical keys to V children |
+| `delete` | Delegates the supplied physical keys; higher-level split-tier cleanup supplies fenced child keys |
+| `get_usage` / `supports_global_eviction` | Delegated directly |
 | `register_listener` | Registers on the inner adapter (listeners track real storage state) |
 
 The wrapper does **not** maintain its own byte accounting — it
@@ -200,9 +203,9 @@ they see the inner adapter's byte totals through the wrapper's
 
 ## Temp Buffer Lifecycle
 
-Temp byte buffers are the only new L1 state the wrapper introduces.
-They exist entirely within the wrapper's knowledge — the caller never
-sees the temp keys.
+Temp byte buffers are private to the wrapper; the caller never sees their
+keys. Split-tier placement also introduces the K-child residents and V-scratch
+pools described below.
 
 **Store path:**
 
@@ -244,8 +247,34 @@ that non-`None` mapping indexes cover every parent group exactly once.
 
 `asym_k16_v8` uses `(0, 1)` and therefore accepts one K/V pair. A parent with
 multiple pairs fails closed until the wire format supports repeated pairs. A
-V-only `(None, 1)` mapping is also rejected by this ordinary wrapper path;
-deployments need a split-tier owner that preserves and restores K separately.
+V-only `(None, 1)` mapping is accepted only when `StorageManager` wires the
+split-tier owner described below.
+
+## V-only split-tier placement
+
+`KV_SPLIT_TIER` stores one logical K/V object as two derived children:
+
+1. copy exact native K into an L1 K-child;
+2. copy V into a shape/dtype-specific scratch pool;
+3. serialize V into the filesystem L2 adapter under the V-child key;
+4. mark the in-memory manifest `COMPLETE` only after L2 acknowledges;
+5. release the original logical entry, leaving K-only pressure in L1.
+
+Lookup is the intersection of an L2 V hit, a `COMPLETE` manifest entry, and a
+matching exact-layout K child. Load deserializes V into group 1 and copies K
+into group 0 only when shape and dtype match exactly. Store failure, L1 K
+eviction, `clear`, and runtime adapter removal fence the manifest before
+deleting generation-less child keys, so delayed cleanup cannot delete a
+replacement store. The filesystem adapter treats its 30-second delete
+threshold as an operational warning and continues waiting for the unlink to
+become terminal; returning with a pending unlink would let that old operation
+remove a later generation's file.
+
+The initial support matrix is deliberately narrow: CPU pinned-memory L1, one
+filesystem L2 adapter, one K/V pair per object, LRU without per-adapter L2
+eviction or isolated quotas. Other topologies fail during configuration. The
+manifest is process-local and is not restart-persistent; V-only entries left on
+L2 after restart are unreachable cold-tier data, not cache hits.
 
 ## Failure Policy: All-or-Nothing per Submit
 
@@ -291,8 +320,10 @@ One background thread per wrapper instance, started in `__init__`.
 - Single `threading.Lock` protecting: the task-id counter, the four
   reverse-lookup dicts, the two completion dicts, and the phase flip
   on store tasks.
-- `close()` sets a stop flag and joins the thread; the poll timeout
-  (`500 ms`) bounds shutdown latency.
+- `close()` sets a stop flag and joins the thread. An idle poll wakes within
+  `500 ms`, but shutdown also waits for active serde and storage operations.
+  In particular, a stalled filesystem unlink can delay shutdown indefinitely
+  because physical cleanup must finish before its child names can be reused.
 - `_finalize_store` / `_finalize_load` write 1 to the wrapper's own
   eventfd to wake the upstream controller's poll loop.
 
