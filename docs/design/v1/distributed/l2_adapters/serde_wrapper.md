@@ -242,7 +242,7 @@ mapping and the wrapper builds zero-copy `GroupSlotView` objects over the
 parent's groups. Before allocating a temp or touching L2, the wrapper verifies
 that non-`None` mapping indexes cover every parent group exactly once.
 
-A codec with the mapping `(0, 1)` accepts one K/V pair. A parent with
+`asym_k16_v8` uses `(0, 1)` and therefore accepts one K/V pair. A parent with
 multiple pairs fails closed until the wire format supports repeated pairs. A
 V-only `(None, 1)` mapping is also rejected by this ordinary wrapper path;
 deployments need a split-tier owner that preserves and restores K separately.

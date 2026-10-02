@@ -16,7 +16,8 @@ or controllers — it just defines:
   a thread pool and signaling an eventfd on completion.
 - A factory / registration mechanism so adapters can reference a serde
   by name (`{"type": "fp8", ...}` in JSON config).
-- Built-in fp8 quantization, TurboQuant compression, and AES-GCM encryption.
+- Built-in serdes including **fp8 quantization** and the two-slot
+  ``asym_k16_v8`` K/V codec.
 
 How the async interface is actually plugged into the L2 path lives in
 [`docs/design/v1/distributed/l2_adapters/serde_wrapper.md`][wrapper-doc]
@@ -177,6 +178,8 @@ rejects duplicate names, matching the pattern already used by
 estimate may exceed its emitted bytes; the safe default is `UPPER_BOUND`.
 
 Each wrapped adapter owns and closes its own `SerdeProcessor` instance.
+Configuration inspection may construct a short-lived processor to derive the
+storage layout, so factories must not return a process-global singleton.
 
 ## Built-in fp8
 
@@ -245,7 +248,8 @@ needs multiple tensors implements `MultiSerializer` / `MultiDeserializer`.
 the serde's slot mapping.
 
 The wrapper requires the mapping to cover every parent group exactly once.
-A `(0, 1)` mapping supports exactly one K/V pair and fails closed for `[K, V, K, V, ...]` layouts rather than reporting a
+The built-in `asym_k16_v8` mapping is `(0, 1)`, so it supports exactly one K/V
+pair and fails closed for `[K, V, K, V, ...]` layouts rather than reporting a
 partial cache hit. The `(None, 1)` V-only mapping is intentionally incomplete
 and therefore cannot be used by an ordinary all-in-L2 wrapper; it requires the
 paired split-tier placement that supplies K independently.
