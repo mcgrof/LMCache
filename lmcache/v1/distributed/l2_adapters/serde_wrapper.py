@@ -53,6 +53,7 @@ from lmcache.v1.distributed.serde import (
     make_temp_key,
     serialized_layout_desc,
 )
+from lmcache.v1.distributed.serde.multi import GroupSlotView, MemoryObjGroup
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.platform import consume_fd, create_event_notifier
 
@@ -180,6 +181,12 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
             wrapped_id = self._next_task_id
             self._next_task_id += 1
 
+        if not self._serde_mapping_covers_objects(
+            objects, self._serde.input_slot_mapping(), role="store input"
+        ):
+            self._finalize_store(wrapped_id, success=False)
+            return wrapped_id
+
         temp_keys, temp_objs = self._alloc_temp_buffers(keys, objects)
         if temp_objs is None:
             logger.warning(
@@ -203,8 +210,11 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
         try:
             with self._lock:
                 self._store_tasks[wrapped_id] = state
+                serde_src = self._build_serde_src_inputs(objects)
                 serde_task_id = self._serde.submit_serialize(
-                    objects, temp_objs, state.keys
+                    serde_src,  # type: ignore[arg-type]
+                    temp_objs,
+                    state.keys,
                 )
                 self._serde_to_store[serde_task_id] = wrapped_id
         except Exception:
@@ -257,6 +267,12 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
         with self._lock:
             wrapped_id = self._next_task_id
             self._next_task_id += 1
+
+        if not self._serde_mapping_covers_objects(
+            objects, self._serde.output_slot_mapping(), role="load output"
+        ):
+            self._finalize_load(wrapped_id, Bitmap(len(keys)))
+            return wrapped_id
 
         temp_keys, temp_objs = self._alloc_temp_buffers(keys, objects)
         if temp_objs is None:
@@ -544,7 +560,12 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
 
             state.load_bitmap = bitmap
             try:
-                serde_id = self._serde.submit_deserialize(src_objs, dst_objs, sel_keys)
+                serde_dst = self._build_serde_dst_outputs(dst_objs)
+                serde_id = self._serde.submit_deserialize(
+                    src_objs,
+                    serde_dst,  # type: ignore[arg-type]
+                    sel_keys,
+                )
             except Exception:
                 logger.exception(
                     "Serde wrapper: submit_deserialize raised for task %d",
@@ -648,6 +669,88 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
             self._l1_manager.finish_write_and_delete(temp_keys, tag=_L1_WRITE_TAG)
         except Exception:
             logger.exception("Serde wrapper: failed releasing write-locked temps")
+
+    # ------------------------------------------------------------------
+    # Multi-output dispatch: build per-slot GroupSlotView tuples when
+    # the underlying serde is multi-output (e.g. AsymK16V8Multi*), or
+    # pass MemoryObjs through unchanged for single-tensor serdes.  The
+    # mapping is queried from the SerdeProcessor (default ``None`` means
+    # single-tensor; a non-None tuple defines the per-slot ↔ parent-group
+    # routing -- e.g. identity ``(0, 1)`` for together placement,
+    # ``(None, 1)`` for split-tier placement).
+    # ------------------------------------------------------------------
+
+    def _build_serde_src_inputs(
+        self, objects: list[MemoryObj]
+    ) -> "list[MemoryObj] | list[MemoryObjGroup]":
+        """Adapt source ``objects`` to the shape the serde expects.
+
+        Returns the input list unchanged for single-tensor serdes.  For
+        multi-output serdes, returns a parallel list of
+        :data:`MemoryObjGroup` tuples whose slots are
+        :class:`GroupSlotView` instances over the parent's groups (or
+        ``None`` for slots the mapping marks absent).
+        """
+        mapping = self._serde.input_slot_mapping()
+        if mapping is None:
+            return objects
+        return [  # type: ignore[return-value]
+            tuple(
+                GroupSlotView(obj, idx) if idx is not None else None for idx in mapping
+            )
+            for obj in objects
+        ]
+
+    def _build_serde_dst_outputs(
+        self, dst_objs: list[MemoryObj]
+    ) -> "list[MemoryObj] | list[MemoryObjGroup]":
+        """Adapt destination ``dst_objs`` to the shape the deserializer
+        expects.  Symmetric to :meth:`_build_serde_src_inputs` for the
+        load path.
+        """
+        mapping = self._serde.output_slot_mapping()
+        if mapping is None:
+            return dst_objs
+        return [  # type: ignore[return-value]
+            tuple(
+                GroupSlotView(obj, idx) if idx is not None else None for idx in mapping
+            )
+            for obj in dst_objs
+        ]
+
+    def _serde_mapping_covers_objects(
+        self,
+        objects: list[MemoryObj],
+        mapping: tuple[int | None, ...] | None,
+        *,
+        role: str,
+    ) -> bool:
+        """Validate that a multi-output serde covers every parent group.
+
+        Args:
+            objects: Parent memory objects submitted for store or load.
+            mapping: Serde slot-to-parent mapping, or ``None``.
+            role: Human-readable operation side for diagnostics.
+
+        Returns:
+            ``True`` when every object's groups are covered exactly once.
+        """
+        if mapping is None:
+            return True
+        referenced = [idx for idx in mapping if idx is not None]
+        for obj in objects:
+            group_count = len(obj.get_shapes())
+            if sorted(referenced) != list(range(group_count)):
+                logger.error(
+                    "Serde wrapper: %s mapping %r does not cover all %d "
+                    "parent groups exactly once; refusing an incomplete "
+                    "operation",
+                    role,
+                    mapping,
+                    group_count,
+                )
+                return False
+        return True
 
     def _finalize_store(
         self,

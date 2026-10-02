@@ -25,8 +25,8 @@ this serde to L2:
 
 * serialize input ``src = (None, V)`` -- the K slot MUST be
   ``None``. Emits an :class:`EncodedKV` with ``k_payload_len = 0``;
-  the ``k_dtype`` tag is still recorded so cross-config gating
-  works on the eventual restore.
+  the required ``k_dtype`` header field is a non-authoritative
+  placeholder because K is outside this serializer's input.
 * deserialize output ``dst = (None | K_skip, V_out)`` -- slot 0
   is a no-op regardless of input (K is sourced from L1); slot 1
   is dequantized from the stored FP8.
@@ -291,9 +291,9 @@ class AsymK16V8VOnlyMultiSerializer(MultiSerializer):
     Split-tier path: K stays in L1 (CPU-pinned host memory) and is
     not written to the byte buffer; only the FP8-quantized V plus
     its scales hit L2.  The blob is a regular :class:`EncodedKV`
-    with ``k_payload_len = 0`` and the ``k_dtype`` tag set to
-    whatever dtype K would have been (so cross-config gating still
-    works on the eventual restore).
+    with ``k_payload_len = 0`` and a non-authoritative ``k_dtype``
+    placeholder. The placement owner must validate the separately retained
+    K object before composing it with restored V.
 
     Slot semantics:
 
@@ -313,9 +313,8 @@ class AsymK16V8VOnlyMultiSerializer(MultiSerializer):
         fp8_dtype: torch.dtype = torch.float8_e4m3fn,
         scale_scope: ScaleScope = ScaleScope.PER_TENSOR,
         scale_dtype: torch.dtype = torch.float32,
-        # The k_dtype tag is recorded in the header so a future
-        # restore that pairs this V blob with its CPU-resident K can
-        # cross-check dtype agreement.  Defaults to bfloat16.
+        # K is outside the serializer input; this header tag is only a
+        # placeholder, not evidence of the retained K object's dtype.
         k_dtype_tag: torch.dtype = torch.bfloat16,
     ) -> None:
         # Reuse the same codec instance for header serialization.
@@ -332,6 +331,10 @@ class AsymK16V8VOnlyMultiSerializer(MultiSerializer):
     @property
     def group_size(self) -> int:
         return _GROUP_SIZE_V_ONLY
+
+    def input_slot_mapping(self) -> tuple[None, int]:
+        """Return an absent K slot and parent group 1 for the V input."""
+        return (None, 1)
 
     def serialize(self, src: MemoryObjGroup, dst: MemoryObj, key: ObjectKey) -> int:
         # ``key`` unused: this serde is content-agnostic.
@@ -471,6 +474,10 @@ class AsymK16V8VOnlyMultiDeserializer(MultiDeserializer):
     @property
     def group_size(self) -> int:
         return _GROUP_SIZE_V_ONLY
+
+    def output_slot_mapping(self) -> tuple[None, int]:
+        """Return an absent K slot and parent group 1 for the V output."""
+        return (None, 1)
 
     def deserialize(self, src: MemoryObj, dst: MemoryObjGroup, key: ObjectKey) -> None:
         # ``key`` unused: this serde is content-agnostic.

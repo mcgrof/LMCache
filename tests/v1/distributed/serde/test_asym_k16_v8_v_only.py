@@ -243,3 +243,15 @@ def test_v_only_deserializer_refuses_storage_only_blob() -> None:
     v_out = _FakeMemoryObj(tensor=torch.zeros_like(v))
     with pytest.raises(ValueError, match="storage-only-dequant"):
         v_only_d.deserialize(buf, _grp(None, v_out), _TEST_KEY)
+
+
+def test_v_only_deserialize_allows_skipped_v_slot() -> None:
+    """An explicitly skipped V output preserves the documented no-op API."""
+    serializer = AsymK16V8VOnlyMultiSerializer()
+    deserializer = AsymK16V8VOnlyMultiDeserializer()
+    v = _bf16_tensor(2, 4, seed=42)
+    layout = (None, MemoryLayoutDesc(shapes=[v.shape], dtypes=[v.dtype]))
+    buffer = _byte_buffer(serializer.estimate_serialized_size(layout))
+    serializer.serialize(_grp(None, _FakeMemoryObj(tensor=v)), buffer, _TEST_KEY)
+
+    deserializer.deserialize(buffer, _grp(None, None), _TEST_KEY)
