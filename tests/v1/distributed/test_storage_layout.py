@@ -205,10 +205,10 @@ def test_apply_kv_component_split_preserves_total_bytes() -> None:
     split = apply_kv_component_split(packed)
     packed_bytes = sum(
         s.numel() * d.itemsize
-        for s, d in zip(packed.shapes, packed.dtypes, strict=False)
+        for s, d in zip(packed.shapes, packed.dtypes, strict=True)
     )
     split_bytes = sum(
-        s.numel() * d.itemsize for s, d in zip(split.shapes, split.dtypes, strict=False)
+        s.numel() * d.itemsize for s, d in zip(split.shapes, split.dtypes, strict=True)
     )
     assert packed_bytes == split_bytes
 

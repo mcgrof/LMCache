@@ -292,6 +292,7 @@ def test_multi_manager_harness_rejects_unsupported_serving(
         store.get_l1_usage,
         store.report_status,
         store.publish_capacity,
+        lambda: store.contains_l1_key(key(1)),
     ):
         with pytest.raises(ValueError, match="owner-routed writes only"):
             report()

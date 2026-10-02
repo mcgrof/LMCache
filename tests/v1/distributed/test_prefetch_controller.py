@@ -31,6 +31,7 @@ from lmcache.v1.distributed.api import (
 )
 from lmcache.v1.distributed.config import L1ManagerConfig, L1MemoryManagerConfig
 from lmcache.v1.distributed.error import L1Error
+from lmcache.v1.distributed.internal_api import L1ManagerListener
 from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.l2_adapters.fault_inject_l2_adapter import (
     FaultInjectL2Adapter,
@@ -279,6 +280,35 @@ def assert_l2_unlocked(adapter: MockL2Adapter) -> None:
     assert ok, "L2 locks should be released"
 
 
+class _DrainSpyListener(L1ManagerListener):
+    """Record which L1 write-completion transition each key used."""
+
+    def __init__(self) -> None:
+        self.write_finished: set[ObjectKey] = set()
+        self.reserve_read_finished: set[ObjectKey] = set()
+
+    def on_l1_keys_reserved_read(self, keys: list[ObjectKey]) -> None:
+        pass
+
+    def on_l1_keys_read_finished(self, keys: list[ObjectKey]) -> None:
+        pass
+
+    def on_l1_keys_reserved_write(self, keys: list[ObjectKey]) -> None:
+        pass
+
+    def on_l1_keys_write_finished(self, keys: list[ObjectKey]) -> None:
+        self.write_finished.update(keys)
+
+    def on_l1_keys_finish_write_and_reserve_read(self, keys: list[ObjectKey]) -> None:
+        self.reserve_read_finished.update(keys)
+
+    def on_l1_keys_deleted_by_manager(self, keys: list[ObjectKey]) -> None:
+        pass
+
+    def on_l1_keys_accessed(self, keys: list[ObjectKey]) -> None:
+        pass
+
+
 # =============================================================================
 # Fixtures
 # =============================================================================
@@ -457,6 +487,64 @@ class TestSingleAdapterPrefetch:
         assert_read_locked(l1_manager, held)
         assert l1_manager.get_staging_memory_usage() == 0
         l1_manager.finish_read(held)
+        ctrl.stop()
+        fault.close()
+
+
+# =============================================================================
+# Drain-silent L2 admission
+# =============================================================================
+
+
+class TestPrefetchDrainSilentEgress:
+    """L2 loads and failed reservations must never enter the store drain."""
+
+    def test_no_lock_load_does_not_fire_store_drain(self, l1_manager):
+        """An unlocked prefetch fill uses the quiet admission transition."""
+        adapter = make_adapter()
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(4)]
+        store_keys_in_l2(adapter, keys, layout)
+        spy = _DrainSpyListener()
+        l1_manager.register_listener(spy)
+        ctrl = make_controller(l1_manager, [adapter])
+        ctrl.start()
+
+        req_id = ctrl.submit_prefetch_request(
+            single_row_spec(keys, lock_mode=PrefetchLockMode.NO_LOCK)
+        )
+        assert row_bits(wait_for_result(ctrl, req_id)) == [0, 1, 2, 3]
+
+        assert spy.write_finished.isdisjoint(keys)
+        assert set(keys).issubset(spy.reserve_read_finished)
+        assert all(l1_manager.is_key_evictable(key) for key in keys)
+        l1_manager.delete(keys)
+        ctrl.stop()
+        adapter.close()
+
+    def test_partial_load_failure_discards_without_store_drain(self, l1_manager):
+        """A failed L2 cell is discarded without publishing garbage to L2."""
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(5)]
+        inner = make_adapter()
+        store_keys_in_l2(inner, keys, layout)
+        fault = FaultInjectL2Adapter(inner, rate=0.0, seed=0, gap_indices=(2,))
+        spy = _DrainSpyListener()
+        l1_manager.register_listener(spy)
+        ctrl = make_controller(l1_manager, [fault])
+        ctrl.start()
+
+        req_id = ctrl.submit_prefetch_request(
+            single_row_spec(keys, fetching_policy="full")
+        )
+        assert row_bits(wait_for_result(ctrl, req_id)) == [0, 1, 3, 4]
+
+        loaded = {keys[i] for i in (0, 1, 3, 4)}
+        assert spy.write_finished.isdisjoint(keys)
+        assert loaded.issubset(spy.reserve_read_finished)
+        assert keys[2] not in spy.reserve_read_finished
+        assert_absent(l1_manager, [keys[2]])
+        l1_manager.finish_read(list(loaded))
         ctrl.stop()
         fault.close()
 
@@ -1416,6 +1504,8 @@ class TestShutdown:
         layout = make_layout()
         keys = [make_object_key(i) for i in range(3)]
         store_keys_in_l2(adapter, keys, layout)
+        spy = _DrainSpyListener()
+        l1_manager.register_listener(spy)
         ctrl = make_controller(l1_manager, [adapter])
         ctrl.start()
 
@@ -1427,6 +1517,7 @@ class TestShutdown:
         ctrl.stop()
 
         assert_l2_unlocked(adapter)
+        assert spy.write_finished.isdisjoint(keys)
         assert l1_manager.get_staging_memory_usage() == 0
         assert ctrl.report_status()["in_flight_request_count"] == 0
         adapter.close()

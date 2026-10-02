@@ -54,3 +54,16 @@ buffers and generation. Lookup maps a logical key to its V child and masks
 incomplete composites. Load checks the exact K layout, copies K into the
 caller-provided destination, and decodes V from L2. A missing component is a
 miss. Supporting several K/V pairs in one object is outside this interface.
+
+## Manager admission and lifecycle
+
+The supported service configuration uses CPU DRAM L1, one filesystem L2
+adapter, one object group and one K/V pair per object. Device-DAX/GDS L1,
+multiple adapters, L2 eviction and isolated quotas are rejected before resource
+construction. Runtime additions cannot change the frozen layout or placement.
+
+Clear and adapter removal share the lifecycle lock. Clear preserves active
+stores unless explicitly forced, invalidates orphaned composites, and retains
+the cleanup claim through physical deletion. Shutdown waits for active clear.
+A process restart loses K and the manifest; remaining V files cannot form hits.
+The filesystem adapter must not return or close while an unlink remains live.

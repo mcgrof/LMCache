@@ -201,6 +201,11 @@ class LookupModule:
             )
             return
 
+        # NOTE: the L1 storage-layout policy is applied inside
+        # submit_prefetch_task (the choke point); do NOT pre-apply it here
+        # or a multi-output serde would split the layout twice.  The
+        # MP_LOOKUP metadata below therefore logs the transfer-side
+        # (packed) shapes the requester presented.
         num_kv_readers = key.require_num_kv_readers()
 
         chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(
