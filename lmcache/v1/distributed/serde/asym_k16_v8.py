@@ -43,6 +43,7 @@ import torch
 
 # First Party
 from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.serde.base import SerdeSizeContract
 from lmcache.v1.distributed.serde.multi import (
     LayoutDescGroup,
     MemoryObjGroup,
@@ -547,3 +548,138 @@ class AsymK16V8VOnlyMultiDeserializer(MultiDeserializer):
                 f"{tuple(target_shape)} expects {v_obj.tensor.numel()}"
             )
         v_obj.tensor.copy_(v_dq_flat.reshape(target_shape))
+
+
+# ============================================================================
+# Factory registration (selectable from YAML via serde_config.type)
+# ============================================================================
+#
+# AsyncSerdeProcessor is typed for the single-tensor Serializer /
+# Deserializer ABCs, but at runtime its dispatch is duck-typed -- it
+# forwards each work item to ``serialize`` / ``deserialize`` unchanged.
+# Multi-output serdes plug in via the same processor with ``# type:
+# ignore[arg-type]``; the SerdeL2AdapterWrapper detects the
+# MultiSerializer / MultiDeserializer at dispatch time and builds
+# MemoryObjGroup views over the parent grouped MemoryObj using
+# ``input_slot_mapping`` / ``output_slot_mapping``.
+
+# First Party
+from lmcache.v1.distributed.serde.async_processor import (  # noqa: E402
+    AsyncSerdeProcessor,
+)
+from lmcache.v1.distributed.serde.base import SerdeProcessor  # noqa: E402
+from lmcache.v1.distributed.serde.factory import register_serde_factory  # noqa: E402
+
+
+def _resolve_dtype(name: str) -> torch.dtype:
+    dtype = getattr(torch, name, None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"Unknown torch dtype: {name!r}")
+    return dtype
+
+
+def _resolve_scale_scope(name: str) -> ScaleScope:
+    try:
+        scope = ScaleScope[name]
+    except KeyError as e:
+        valid = ", ".join(s.name for s in ScaleScope)
+        raise ValueError(f"Unknown ScaleScope {name!r}. Valid: {valid}") from e
+    if scope is not ScaleScope.PER_TENSOR:
+        raise ValueError(
+            "Asymmetric storage serdes support only PER_TENSOR scale_scope; "
+            f"got {name!r}. Per-head/page axes and external scales are not "
+            "provided by the storage wrapper."
+        )
+    return scope
+
+
+def _create_asym_k16_v8_serde(kwargs: dict[str, object]) -> SerdeProcessor:
+    """Create the storage-only asymmetric K16/V8 serde.
+
+    Accepted ``kwargs``:
+
+    * ``fp8_dtype`` (str, default ``"float8_e4m3fn"``): torch fp8
+      dtype used for V quantization.
+    * ``scale_scope`` (str, default ``"PER_TENSOR"``): name of a
+      :class:`ScaleScope` member. Only ``PER_TENSOR`` is supported;
+      the storage wrapper does not provide per-head/page axes or external
+      scales.
+    * ``scale_dtype`` (str, default ``"float32"``): torch dtype for
+      the per-scope scale tensor.
+    * ``max_workers`` (int, default ``4``): bounded drainer-side thread
+      pool.  Torch codec operations release the GIL, so multiple submitted
+      chunks can overlap; tune this value to the host's CPU budget.
+
+    Returns an :class:`AsyncSerdeProcessor` wrapping the multi-output
+    storage-only K16/V8 pair.  The SerdeL2AdapterWrapper consumes the
+    processor's ``MultiSerializer`` / ``MultiDeserializer`` shape via
+    its ``input_slot_mapping`` / ``output_slot_mapping`` hooks (the
+    storage-only mode uses the identity mapping ``(0, 1)``).
+    """
+    fp8_dtype = _resolve_dtype(str(kwargs.get("fp8_dtype", "float8_e4m3fn")))
+    scale_scope = _resolve_scale_scope(str(kwargs.get("scale_scope", "PER_TENSOR")))
+    scale_dtype = _resolve_dtype(str(kwargs.get("scale_dtype", "float32")))
+    max_workers = int(kwargs.get("max_workers", 4))  # type: ignore[call-overload]
+    return AsyncSerdeProcessor(
+        AsymK16V8MultiSerializer(  # type: ignore[arg-type]
+            fp8_dtype=fp8_dtype,
+            scale_scope=scale_scope,
+            scale_dtype=scale_dtype,
+        ),
+        AsymK16V8MultiDeserializer(  # type: ignore[arg-type]
+            fp8_dtype=fp8_dtype,
+            scale_scope=scale_scope,
+            scale_dtype=scale_dtype,
+        ),
+        max_workers=max_workers,
+    )
+
+
+def _create_asym_k16_v8_v_only_serde(kwargs: dict[str, object]) -> SerdeProcessor:
+    """Create the V-only split-tier asymmetric K16/V8 serde.
+
+    Accepted ``kwargs``: same as :func:`_create_asym_k16_v8_serde`,
+    plus:
+
+    * ``k_dtype_tag`` (str, default ``"bfloat16"``): non-authoritative
+      header placeholder.  K itself is never written; the live L1 K object
+      supplies its actual dtype and V-only objects are not restart durable.
+
+    Returns an :class:`AsyncSerdeProcessor` wrapping the V-only
+    multi-output pair.  ``input_slot_mapping`` returns ``(None, 1)``
+    so the serializer receives no K. The ordinary all-in-L2 wrapper rejects
+    this incomplete mapping. A split-tier owner must retain K separately and
+    compose it with the restored V before reporting a logical cache hit.
+    """
+    fp8_dtype = _resolve_dtype(str(kwargs.get("fp8_dtype", "float8_e4m3fn")))
+    scale_scope = _resolve_scale_scope(str(kwargs.get("scale_scope", "PER_TENSOR")))
+    scale_dtype = _resolve_dtype(str(kwargs.get("scale_dtype", "float32")))
+    k_dtype_tag = _resolve_dtype(str(kwargs.get("k_dtype_tag", "bfloat16")))
+    # Keep the bounded default shared by the other asymmetric codecs.
+    max_workers = int(kwargs.get("max_workers", 4))  # type: ignore[call-overload]
+    return AsyncSerdeProcessor(
+        AsymK16V8VOnlyMultiSerializer(  # type: ignore[arg-type]
+            fp8_dtype=fp8_dtype,
+            scale_scope=scale_scope,
+            scale_dtype=scale_dtype,
+            k_dtype_tag=k_dtype_tag,
+        ),
+        AsymK16V8VOnlyMultiDeserializer(  # type: ignore[arg-type]
+            fp8_dtype=fp8_dtype,
+            scale_scope=scale_scope,
+            scale_dtype=scale_dtype,
+        ),
+        max_workers=max_workers,
+    )
+
+
+register_serde_factory(
+    "asym_k16_v8",
+    _create_asym_k16_v8_serde,
+    size_contract=SerdeSizeContract.UPPER_BOUND,
+)
+register_serde_factory(
+    "asym_k16_v8_v_only",
+    _create_asym_k16_v8_v_only_serde,
+    size_contract=SerdeSizeContract.UPPER_BOUND,
+)

@@ -78,3 +78,35 @@ def test_upper_bound_serde_accepts_filesystem_used_length_contract(tmp_path) -> 
     adapter.serde_config = SerdeConfig(type="test-upper-bound-admission")
     manager = StorageManager(_config([adapter]))
     manager.close()
+
+
+@pytest.mark.parametrize(
+    "adapter",
+    [
+        S3L2AdapterConfig(
+            s3_endpoint="s3://test-bucket",
+            s3_region="us-east-1",
+        ),
+        ValkeyL2AdapterConfig(startup_nodes=[("localhost", 6379)]),
+    ],
+    ids=["s3", "valkey"],
+)
+def test_computed_asym_rejects_backend_without_used_length_before_resources(
+    adapter: S3L2AdapterConfig | ValkeyL2AdapterConfig,
+) -> None:
+    """COMPUTED KV_TOGETHER emits less than its upper-bound estimate."""
+    adapter.serde_config = SerdeConfig(type="asym_k16_v8")
+    with pytest.raises(ValueError, match="Upper-bound serde.*actual-used-length"):
+        StorageManager(_config([adapter]))
+
+
+def test_computed_asym_accepts_filesystem_used_length_contract(tmp_path) -> None:
+    adapter = FSL2AdapterConfig(
+        base_path=str(tmp_path),
+        relative_tmp_dir=None,
+        read_ahead_size=None,
+        use_odirect=False,
+    )
+    adapter.serde_config = SerdeConfig(type="asym_k16_v8")
+    manager = StorageManager(_config([adapter]))
+    manager.close()
