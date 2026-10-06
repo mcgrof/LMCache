@@ -142,6 +142,12 @@ def _make_connector(
         get_extra_config_value=lambda key, default: default
     )
     connector._request_trackers = {}
+    # Built without running __init__, so every attribute the code under
+    # test reads has to be set here. request_finished consults the storage
+    # handoff mode to decide whether to defer freeing the source blocks;
+    # this connector is a scheduler outside that mode.
+    connector._storage_pd_mode = False
+    connector._storage_pd_raw_role = "writer"
     return connector
 
 
@@ -206,6 +212,21 @@ def test_request_finished_engine_initialized_runs_storage_manager_cancel() -> No
     assert delay_free is False
     assert return_params is None
     assert engine.storage_manager.cancelled == ["req-engine-abort"]
+
+
+def test_aborted_prefill_before_first_token_does_not_crash() -> None:
+    """A timed-out producer can be cancelled before it generated anything."""
+    engine = _FakeEngine()
+    connector = _make_connector(engine=engine, lookup_client=None, async_loading=False)
+    request = _make_aborted_request("req-aborted-before-first-token")
+    request.kv_transfer_params = {"ret_first_tok": True}
+    request._output_token_ids = []
+
+    delay_free, return_params = connector.request_finished(request, [0, 1])
+
+    assert delay_free is False
+    assert return_params is None
+    assert engine.storage_manager.cancelled == ["req-aborted-before-first-token"]
 
 
 def test_request_finished_engine_with_async_loading_runs_both_cancels() -> None:

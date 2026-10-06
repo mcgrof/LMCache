@@ -2,6 +2,7 @@
 # Standard
 from collections import defaultdict
 from collections.abc import Iterable
+from concurrent.futures import Future
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -12,6 +13,7 @@ from typing import (
     Optional,
     Tuple,
     Union,
+    cast,
 )
 
 if TYPE_CHECKING:
@@ -59,6 +61,10 @@ from lmcache.v1.memory_management import (
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.platform import current_device_spec
+from lmcache.v1.storage_backend.raw_block import (
+    RawBlockPublicationReceipt,
+    RawBlockReadContext,
+)
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.system_detection import NUMADetector, NUMAMapping
 from lmcache.v1.token_database import (
@@ -191,7 +197,15 @@ class LMCacheEngine:
         # NOTE (Jiayi): This is currently used to support
         # dropping the kv cache from the buffer in PD backend
         # at decoder.
-        self.remove_after_retrieve = config.enable_pd and config.pd_role == "receiver"
+        # A transfer-channel handoff hands the decoder its own copy, which
+        # the decoder then owns. A handoff through shared storage does not:
+        # the writer still owns those extents, so removing on retrieve would
+        # drop a mapping the writer is holding for its own reasons.
+        self.remove_after_retrieve = (
+            config.enable_pd
+            and not config.pd_uses_shared_storage
+            and config.pd_role == "receiver"
+        )
 
         # asymmetric store/retrieve location can be specified
         # this is typically used (but not limited) in PD system
@@ -392,7 +406,7 @@ class LMCacheEngine:
         offsets: Optional[List[int]] = None,
         mask: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> None:
+    ) -> Future | None:
         """Store the tokens/hashes and mask into the cache engine.
 
         :param Optional[torch.Tensor] tokens: The tokens of the corresponding KV caches.
@@ -415,7 +429,7 @@ class LMCacheEngine:
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping store operation")
-            return
+            return None
 
         assert self.gpu_connector is not None, (
             "gpu_connector is required for store operation"
@@ -423,7 +437,7 @@ class LMCacheEngine:
 
         if self._is_passive():
             logger.debug("rank=%d ignore store", self.metadata.worker_id)
-            return
+            return None
 
         assert self.storage_manager is not None
 
@@ -464,7 +478,7 @@ class LMCacheEngine:
                 "Freeze mode enabled, skipping store operation for %d tokens",
                 num_to_store_tokens,
             )
-            return
+            return None
 
         store_stats = self.stats_monitor.on_store_request(num_to_store_tokens)
 
@@ -563,7 +577,7 @@ class LMCacheEngine:
 
         # memory_objs might be empty, directly return to avoid sending tokens
         if not memory_objs:
-            return
+            return None
 
         with store_stats.profile_from_gpu():
             self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
@@ -572,7 +586,7 @@ class LMCacheEngine:
             transfer_spec = kwargs.get("transfer_spec", None)
             # TODO: we implicitly rely on batched_put to call ref_count_down
             # this management should be done in a cleaner way
-            self.storage_manager.batched_put(
+            completion = self.storage_manager.batched_put(
                 keys,
                 memory_objs,
                 transfer_spec=transfer_spec,
@@ -598,6 +612,7 @@ class LMCacheEngine:
             (store_stats.process_tokens_time + store_stats.from_gpu_time) * 1000,
             store_stats.put_time * 1000,
         )
+        return completion
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -802,6 +817,8 @@ class LMCacheEngine:
         self,
         tokens: Union[torch.Tensor, list[int]],
         mask: Optional[torch.Tensor] = None,
+        *,
+        storage_pd_read_context: Optional[RawBlockReadContext] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Retrieve the KV caches from the cache engine. And put the retrieved
@@ -813,6 +830,10 @@ class LMCacheEngine:
             have the same length as tokens. And the mask should ALWAYS be like
             FFFFFTTTTTTT, where True means the tokens needs to be matched,
             and the Falses will ALWAYS be at the PREFIX of the tensor.
+
+        :param Optional[RawBlockReadContext] storage_pd_read_context:
+            Identity of the adopted publication for a synchronous storage P/D
+            restore. This follows storage reads, not GPU connector operations.
 
         :param **kwargs: The additional arguments for the storage backend which
             will be passed into the gpu_connector.
@@ -875,6 +896,7 @@ class LMCacheEngine:
                         tokens,
                         mask,
                         ret_mask,
+                        storage_pd_read_context=storage_pd_read_context,
                         **kwargs,
                     )
 
@@ -1274,6 +1296,142 @@ class LMCacheEngine:
             if pin:
                 # touch_cache is tightly coupled with batched_contains
                 self.storage_manager.touch_cache()
+
+    def release_unread_storage_publication(
+        self,
+        req_id: str,
+        receipt: RawBlockPublicationReceipt,
+        *,
+        reason: str = "",
+    ) -> bool:
+        """Resolve one published request that will never be read.
+
+        For the configuration that runs without a consumer: nothing was
+        ever told about these publications, so nothing will acknowledge
+        them, and the extents would stay held until the writer stopped
+        publishing altogether. The backend still refuses to release a
+        publication some consumer claimed.
+
+        Args:
+            req_id: The request name the publication was announced under.
+            receipt: Durable publication identity to match against.
+            reason: Why no reader was assigned, for the writer's log.
+
+        Returns:
+            Whether the hold was released.
+        """
+        if self.storage_manager is None:
+            raise RuntimeError("storage P/D requires a storage manager")
+        backends = [
+            backend
+            for backend in self.storage_manager.storage_backends.values()
+            if callable(getattr(backend, "release_unread_publication", None))
+        ]
+        if len(backends) != 1:
+            raise RuntimeError(
+                "storage P/D requires exactly one publication-aware backend"
+            )
+        return cast(Any, backends[0]).release_unread_publication(
+            req_id, receipt, reason=reason
+        )
+
+    def adopt_storage_publication(
+        self,
+        tokens: Union[torch.Tensor, List[int]],
+        receipt: RawBlockPublicationReceipt,
+        *,
+        request_configs: Optional[dict] = None,
+        timeout_ms: int = 5000,
+    ) -> Optional[int]:
+        """Fence a shared-storage reader to an advertised request manifest.
+
+        The decoder request contains the prefiller's first generated token,
+        while the published KV manifest describes only the original prompt.
+        Try the exact token list first, then the list without that continuation
+        token.  Each candidate must still match the receipt's ordered digest.
+
+        Args:
+            tokens: Decoder tokens that may include one continuation token.
+            receipt: Durable publication identity advertised by the writer.
+            request_configs: Per-request cache key configuration.
+            timeout_ms: Maximum time to wait for the compatible generation.
+
+        Returns:
+            The number of tokens covered by the adopted manifest, or None when
+            no candidate matches.
+        """
+        if self.storage_manager is None:
+            raise RuntimeError("storage P/D requires a storage manager")
+
+        adoption_backends = [
+            backend
+            for backend in self.storage_manager.storage_backends.values()
+            if callable(getattr(backend, "adopt_publication", None))
+        ]
+        if len(adoption_backends) != 1:
+            raise RuntimeError(
+                "storage P/D requires exactly one publication-aware backend"
+            )
+        backend = cast(Any, adoption_backends[0])
+
+        token_candidates = [tokens]
+        if len(tokens) > 0:
+            token_candidates.append(tokens[:-1])
+        for candidate_index, candidate_tokens in enumerate(token_candidates):
+            chunk_infos = list(
+                self.token_database.process_tokens(
+                    tokens=candidate_tokens,
+                    request_configs=request_configs,
+                )
+            )
+            keys = [chunk_info[2] for chunk_info in chunk_infos]
+            if len(keys) != receipt.key_count:
+                continue
+            candidate_timeout = timeout_ms if candidate_index else 0
+            if backend.adopt_publication(
+                receipt,
+                keys,
+                timeout_ms=candidate_timeout,
+            ):
+                return len(candidate_tokens)
+        return None
+
+    def publish_existing_storage_request(
+        self,
+        tokens: Union[torch.Tensor, List[int]],
+        transfer_spec: Any,
+        *,
+        request_configs: Optional[dict] = None,
+    ) -> Future:
+        """Publish an all-deduplicated storage-P/D request.
+
+        Args:
+            tokens: Tokens whose cache keys belong to the request manifest.
+            transfer_spec: P/D transfer metadata carrying request identity.
+            request_configs: Per-request cache key configuration.
+
+        Returns:
+            Future completed with the durable publication receipt.
+        """
+        if self.storage_manager is None:
+            raise RuntimeError("storage P/D requires a storage manager")
+        backends = [
+            backend
+            for backend in self.storage_manager.storage_backends.values()
+            if callable(getattr(backend, "publish_existing_request", None))
+        ]
+        if len(backends) != 1:
+            raise RuntimeError(
+                "storage P/D requires exactly one publication-aware backend"
+            )
+        keys = [
+            chunk_info[2]
+            for chunk_info in self.token_database.process_tokens(
+                tokens=tokens,
+                request_configs=request_configs,
+            )
+        ]
+        return cast(Any, backends[0]).publish_existing_request(keys, transfer_spec)
 
     @_lmcache_nvtx_annotate
     def move(
@@ -1779,12 +1937,17 @@ class LMCacheEngine:
         else:
             block_mapping = self.storage_manager.get_block_mapping(chunk_infos)
 
+        get_options: dict[str, Any] = {}
+        if kwargs.get("storage_pd_read_context") is not None:
+            get_options["storage_pd_read_context"] = kwargs["storage_pd_read_context"]
+
         last_failed_block_start = None
         for location, blocks in block_mapping.items():
             keys = [key for key, _, _ in blocks]
             memory_objs = self.storage_manager.batched_get(
                 keys=keys,
                 location=location,
+                **get_options,
             )
 
             used_keys: set[CacheEngineKey] = set()
@@ -1956,7 +2119,11 @@ class LMCacheEngine:
         :return: True when PD is enabled and ``pd_backend_mode`` is ``"sync"``.
         :rtype: bool
         """
-        return self.config.enable_pd and self.config.pd_backend_mode == "sync"
+        return (
+            self.config.enable_pd
+            and not self.config.pd_uses_shared_storage
+            and self.config.pd_backend_mode == "sync"
+        )
 
     def _get_slot_mapping_list(
         self,
