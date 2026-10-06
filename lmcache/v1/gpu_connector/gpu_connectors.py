@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, cast
 import abc
 
 # Third Party
@@ -339,35 +339,164 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         )
 
     @_lmcache_nvtx_annotate
-    def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
-        """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
-        The kvcaches should correspond to the "WHOLE token sequence".
+    def from_gpu(
+        self, memory_obj: MemoryObj, start: int, end: int, **kwargs: object
+    ) -> None:
+        """Gather one KV range and wait until its staging buffer is ready.
 
-        Will set the memory_obj.metadata.fmt to MemoryFormat.KV_2LTD.
+        Args:
+            memory_obj: CPU or CUDA staging object receiving the KV data.
+            start: First token index in the full slot mapping.
+            end: Exclusive last token index in the full slot mapping.
+            **kwargs: ``slot_mapping`` tensor and, until initialized,
+                ``kvcaches`` tensors. The range must exclude cached-prefix
+                entries whose slot mapping is -1.
 
-        Note:
-          1. This function expects the 'slot_mapping' is a "full slot mapping"
-             where it's length is the same as the whole token sequence.
-          2. In the case that there is prefix caching, slot_mapping will starts
-             with -1s until the end of the matched prefix. The start and end
-             should NEVER overlap with the prefix caching (which means the
-             underlying CUDA kernel will never see -1 in slot_mapping)
+        Returns:
+            None. On successful return the gather is complete, so storage
+            may read the staging object and the source slots may be reused.
 
-        :raises ValueError: If 'kvcaches' is not provided in kwargs,
-        :raises AssertionError: If the memory object does not have a tensor.
-        :raises ValueError: If 'slot_mapping' is not provided in kwargs.
+        Raises:
+            AssertionError: Required tensors or compatible metadata are absent.
+            ValueError: Required transfer arguments are missing or invalid.
+            RuntimeError: CUDA transfer or synchronization fails.
+
+        The caller's current stream on the connector device must cover all
+        producers of the KV data and slot mapping. Join any other producer
+        streams before calling. Do not submit further source writes or access
+        destinations until return, and keep every buffer alive. Calls using
+        this connector must be serialized. A CUDA synchronization error does not prove
+        quiescence; callers must not recycle buffers after such an error.
         """
-        assert memory_obj.tensor is not None
+        self.batched_from_gpu([memory_obj], [start], [end], **kwargs)
+
+    # TODO(Jiayi): need to optimize to enable real batching
+    def batched_to_gpu(
+        self,
+        memory_objs: Union[
+            List[List[MemoryObj]], List[MemoryObj], List[int], None
+        ] = None,
+        starts: Optional[List[int]] = None,
+        ends: Optional[List[int]] = None,
+        **kwargs: object,
+    ) -> None:
+        """Scatter a ready staging batch and wait before its sources can be reused.
+
+        Args:
+            memory_objs: CPU or CUDA staging objects whose contents are ready.
+            starts: First token index of each range in the full slot mapping.
+            ends: Exclusive last token index of each range.
+            **kwargs: ``slot_mapping`` tensor, optional ``kvcaches`` tensors,
+                and optional ``vllm_cached_tokens`` integer, as in :meth:`to_gpu`.
+
+        Returns:
+            None. On successful return all scatters have completed. An empty
+            batch performs no stream work.
+
+        Raises:
+            ValueError: Batch lengths differ or transfer arguments are invalid.
+            AssertionError: Required tensors or compatible metadata are absent.
+            RuntimeError: CUDA transfer or synchronization fails.
+
+        Callers must complete storage reads and any required external-DMA
+        visibility operations before calling, and provide ready slot mapping
+        and source tensors. Keep all buffers alive and prevent concurrent
+        access to the destination slots until return. Calls using this connector
+        must be serialized. Queued scatters are
+        drained if a later enqueue raises; CUDA synchronization failure does
+        not establish quiescence and does not permit buffer recycling.
+        """
+        if memory_objs is None or starts is None or ends is None:
+            raise ValueError("memory_objs, starts and ends must be provided")
+        typed_memory_objs = cast("List[MemoryObj]", memory_objs)
+        if not (len(typed_memory_objs) == len(starts) == len(ends)):
+            raise ValueError("memory_objs, starts and ends must have equal lengths")
+        if not typed_memory_objs:
+            return
+        try:
+            with torch.cuda.stream(self.load_stream):
+                for memory_obj, start, end in zip(
+                    typed_memory_objs, starts, ends, strict=True
+                ):
+                    self.to_gpu(memory_obj, start, end, **kwargs)
+        finally:
+            self.load_stream.synchronize()
+
+    # TODO(Jiayi): need to optimize to enable real batching
+    def batched_from_gpu(
+        self,
+        memory_objs: Union[List[List[MemoryObj]], List[MemoryObj]],
+        starts: List[int],
+        ends: List[int],
+        **kwargs: object,
+    ) -> None:
+        """Gather a batch, then wait once before exposing its staging buffers.
+
+        Args:
+            memory_objs: CPU or CUDA staging objects, one per token range.
+            starts: First token index of each range in the full slot mapping.
+            ends: Exclusive last token index of each range.
+            **kwargs: ``slot_mapping`` and optional ``kvcaches`` tensors,
+                with the same requirements as :meth:`from_gpu`.
+
+        Returns:
+            None. All gathers are complete on successful return. An empty
+            batch performs no stream work.
+
+        Raises:
+            ValueError: Batch lengths differ or transfer arguments are invalid.
+            AssertionError: Required tensors or compatible metadata are absent.
+            RuntimeError: CUDA transfer or synchronization fails.
+
+        The caller must join all KV and slot-mapping producer streams into
+        its current stream on the connector device before calling. Keep all
+        buffers alive; do not submit further source writes or access the
+        destinations until return. Calls using this connector must be serialized.
+        Queued gathers are drained even if a later enqueue raises. If CUDA
+        synchronization itself fails, quiescence is unknown and callers must
+        not recycle the buffers. The wait covers this batch's gather, not
+        any subsequent storage I/O using the resulting staging objects.
+        """
+        typed_memory_objs = cast("List[MemoryObj]", memory_objs)
+        if not (len(typed_memory_objs) == len(starts) == len(ends)):
+            raise ValueError("memory_objs, starts and ends must have equal lengths")
+        if not typed_memory_objs:
+            return
+
+        producer_stream = torch.cuda.current_stream(device=self.store_stream.device)
+        try:
+            with torch.cuda.stream(self.store_stream):
+                self.store_stream.wait_stream(producer_stream)
+                for memory_obj, start, end in zip(
+                    typed_memory_objs, starts, ends, strict=True
+                ):
+                    self._enqueue_from_gpu(memory_obj, start, end, **kwargs)
+        finally:
+            # io_uring and other storage backends cannot observe CUDA stream
+            # dependencies. CPU and CUDA staging must both be ready here.
+            self.store_stream.synchronize()
+
+    def get_shape(self, num_tokens: int) -> torch.Size:
+        kv_size = 1 if self.use_mla else 2
+        return torch.Size([kv_size, self.num_layers, num_tokens, self.hidden_dim_size])
+
+    def _enqueue_from_gpu(
+        self, memory_obj: MemoryObj, start: int, end: int, **kwargs: object
+    ) -> None:
+        """Enqueue one gather while the caller owns the store-stream context."""
+        if memory_obj.tensor is None:
+            raise ValueError("memory_obj must have a tensor")
 
         self.initialize_kvcaches_ptr(**kwargs)
-        assert self.kvcaches is not None, (
-            "kvcaches should be provided in kwargs or initialized beforehand."
-        )
+        if self.kvcaches is None:
+            raise ValueError(
+                "kvcaches should be provided in kwargs or initialized beforehand."
+            )
 
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
 
-        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        slot_mapping = cast(torch.Tensor, kwargs["slot_mapping"])
 
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
 
@@ -403,30 +532,8 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                 )
                 memory_obj.tensor.copy_(tmp_gpu_buffer, non_blocking=True)
 
-        if not memory_obj.tensor.is_cuda:
-            # Force a synchronize if the target buffer is NOT CUDA device
-            # NOTE: for better performance, we may not want to sync for every
-            # memory object
-            self.store_stream.synchronize()
-
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
-
-    # TODO(Jiayi): need to optimize to enable real batching
-    def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
-        with torch.cuda.stream(self.load_stream):
-            for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
-                self.to_gpu(memory_obj, start, end, **kwargs)
-        self.load_stream.synchronize()
-
-    # TODO(Jiayi): need to optimize to enable real batching
-    def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
-        for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
-            self.from_gpu(memory_obj, start, end, **kwargs)
-
-    def get_shape(self, num_tokens: int) -> torch.Size:
-        kv_size = 1 if self.use_mla else 2
-        return torch.Size([kv_size, self.num_layers, num_tokens, self.hidden_dim_size])
 
 
 class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
@@ -586,14 +693,161 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
             )
 
     @_lmcache_nvtx_annotate
-    def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
-        assert memory_obj.raw_tensor is not None
-        assert "slot_mapping" in kwargs
+    def from_gpu(
+        self, memory_obj: MemoryObj, start: int, end: int, **kwargs: object
+    ) -> None:
+        """Gather one KV range and wait until its staging buffer is ready.
 
-        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        Args:
+            memory_obj: CPU or CUDA staging object receiving the KV data.
+            start: First token index in the full slot mapping.
+            end: Exclusive last token index in the full slot mapping.
+            **kwargs: ``slot_mapping`` tensor and, until initialized,
+                ``kvcaches`` tensors. The range must exclude cached-prefix
+                entries whose slot mapping is -1.
+
+        Returns:
+            None. On successful return the gather is complete, so storage
+            may read the staging object and the source slots may be reused.
+
+        Raises:
+            AssertionError: Required tensors or compatible metadata are absent.
+            ValueError: Required transfer arguments are missing or invalid.
+            RuntimeError: CUDA transfer or synchronization fails.
+
+        The caller's current stream on the connector device must cover all
+        producers of the KV data and slot mapping. Join any other producer
+        streams before calling. Do not submit further source writes or access
+        destinations until return, and keep every buffer alive. Calls using
+        this connector must be serialized. A CUDA synchronization error does not prove
+        quiescence; callers must not recycle buffers after such an error.
+        """
+        self.batched_from_gpu([memory_obj], [start], [end], **kwargs)
+
+    def batched_to_gpu(
+        self,
+        memory_objs: Union[
+            List[List[MemoryObj]], List[MemoryObj], List[int], None
+        ] = None,
+        starts: Optional[List[int]] = None,
+        ends: Optional[List[int]] = None,
+        **kwargs: object,
+    ) -> None:
+        """Scatter a ready staging batch and wait before its sources can be reused.
+
+        Args:
+            memory_objs: CPU or CUDA staging objects whose contents are ready.
+            starts: First token index of each range in the full slot mapping.
+            ends: Exclusive last token index of each range.
+            **kwargs: ``slot_mapping`` tensor, optional ``kvcaches`` tensors,
+                and optional ``vllm_cached_tokens`` integer, as in :meth:`to_gpu`.
+
+        Returns:
+            None. On successful return all scatters have completed. An empty
+            batch performs no stream work.
+
+        Raises:
+            ValueError: Batch lengths differ or transfer arguments are invalid.
+            AssertionError: Required tensors or compatible metadata are absent.
+            RuntimeError: CUDA transfer or synchronization fails.
+
+        Callers must complete storage reads and any required external-DMA
+        visibility operations before calling, and provide ready slot mapping
+        and source tensors. Keep all buffers alive and prevent concurrent
+        access to the destination slots until return. Calls using this connector
+        must be serialized. Queued scatters are
+        drained if a later enqueue raises; CUDA synchronization failure does
+        not establish quiescence and does not permit buffer recycling.
+        """
+        if memory_objs is None or starts is None or ends is None:
+            raise ValueError("memory_objs, starts and ends must be provided")
+        typed_memory_objs = cast("List[MemoryObj]", memory_objs)
+        if not (len(typed_memory_objs) == len(starts) == len(ends)):
+            raise ValueError("memory_objs, starts and ends must have equal lengths")
+        if not typed_memory_objs:
+            return
+        try:
+            with torch.cuda.stream(self.load_stream):
+                for memory_obj, start, end in zip(
+                    typed_memory_objs, starts, ends, strict=True
+                ):
+                    self.to_gpu(memory_obj, start, end, **kwargs)
+        finally:
+            self.load_stream.synchronize()
+
+    def batched_from_gpu(
+        self,
+        memory_objs: Union[List[List[MemoryObj]], List[MemoryObj]],
+        starts: List[int],
+        ends: List[int],
+        **kwargs: object,
+    ) -> None:
+        """Gather a batch, then wait once before exposing its staging buffers.
+
+        Args:
+            memory_objs: CPU or CUDA staging objects, one per token range.
+            starts: First token index of each range in the full slot mapping.
+            ends: Exclusive last token index of each range.
+            **kwargs: ``slot_mapping`` and optional ``kvcaches`` tensors,
+                with the same requirements as :meth:`from_gpu`.
+
+        Returns:
+            None. All gathers are complete on successful return. An empty
+            batch performs no stream work.
+
+        Raises:
+            ValueError: Batch lengths differ or transfer arguments are invalid.
+            AssertionError: Required tensors or compatible metadata are absent.
+            RuntimeError: CUDA transfer or synchronization fails.
+
+        The caller must join all KV and slot-mapping producer streams into
+        its current stream on the connector device before calling. Keep all
+        buffers alive; do not submit further source writes or access the
+        destinations until return. Calls using this connector must be serialized.
+        Queued gathers are drained even if a later enqueue raises. If CUDA
+        synchronization itself fails, quiescence is unknown and callers must
+        not recycle the buffers. The wait covers this batch's gather, not
+        any subsequent storage I/O using the resulting staging objects.
+        """
+        typed_memory_objs = cast("List[MemoryObj]", memory_objs)
+        if not (len(typed_memory_objs) == len(starts) == len(ends)):
+            raise ValueError("memory_objs, starts and ends must have equal lengths")
+        if not typed_memory_objs:
+            return
+
+        producer_stream = torch.cuda.current_stream(device=self.store_stream.device)
+        try:
+            with torch.cuda.stream(self.store_stream):
+                self.store_stream.wait_stream(producer_stream)
+                for memory_obj, start, end in zip(
+                    typed_memory_objs, starts, ends, strict=True
+                ):
+                    self._enqueue_from_gpu(memory_obj, start, end, **kwargs)
+        finally:
+            # io_uring and other storage backends cannot observe CUDA stream
+            # dependencies. CPU and CUDA staging must both be ready here.
+            self.store_stream.synchronize()
+
+    def get_shape(self, num_tokens: int) -> torch.Size:
+        raise NotImplementedError
+
+    def _enqueue_from_gpu(
+        self, memory_obj: MemoryObj, start: int, end: int, **kwargs: object
+    ) -> None:
+        """Enqueue one gather while the caller owns the store-stream context."""
+        if memory_obj.raw_tensor is None:
+            raise ValueError("memory_obj must have a raw tensor")
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+
+        slot_mapping = cast(torch.Tensor, kwargs["slot_mapping"])
         self.initialize_kvcaches_ptr(**kwargs)
-        assert self.kvcaches is not None
-        assert self.kvcaches[0].device == self.device
+        if self.kvcaches is None:
+            raise ValueError(
+                "kvcaches should be provided in kwargs or initialized beforehand."
+            )
+        if self.kvcaches[0].device != self.device:
+            raise ValueError("kvcaches must be on the connector device")
         self._initialize_kv_cache_pointers()
         assert self.group_kv_cache_pointers_on_gpu is not None
         with torch.cuda.stream(self.store_stream):
@@ -638,27 +892,8 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                     assert memory_obj_tensor is not None
                     memory_obj_tensor.copy_(tmp_gpu_buffer, non_blocking=True)
 
-        if not memory_obj.raw_tensor.is_cuda:
-            # Force a synchronize if the target buffer is NOT CUDA device
-            # NOTE: for better performance, we may not want to sync for every
-            # memory object
-            self.store_stream.synchronize()
-
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
-
-    def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
-        with torch.cuda.stream(self.load_stream):
-            for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
-                self.to_gpu(memory_obj, start, end, **kwargs)
-        self.load_stream.synchronize()
-
-    def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
-        for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
-            self.from_gpu(memory_obj, start, end, **kwargs)
-
-    def get_shape(self, num_tokens: int) -> torch.Size:
-        raise NotImplementedError
 
 
 class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
