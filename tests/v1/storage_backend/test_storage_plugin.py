@@ -10,6 +10,7 @@ and verifies that:
 """
 
 # Standard
+from collections import OrderedDict
 from typing import Any, Callable, List, Optional, Sequence
 import asyncio
 
@@ -448,6 +449,51 @@ class TestCreateDynamicBackends:
         for backend in storage_backends.values():
             backend.close()
 
+    def test_required_backend_that_cannot_be_built_stops_startup(self, async_loop):
+        """A backend the deployment depends on must not be skipped.
+
+        An optional cache tier that fails to build leaves the engine
+        slower but correct. A backend that carries the payload leaves it
+        serving without the data it was configured to move, which looked
+        identical to a healthy start.
+        """
+        extra_config = {
+            "storage_plugin.payload_backend.module_path": "nonexistent.module.path",
+            "storage_plugin.payload_backend.class_name": "NonexistentClass",
+            "storage_plugin.payload_backend.required": True,
+        }
+        config = create_test_config(
+            extra_config=extra_config,
+            storage_plugins=["payload_backend"],
+        )
+
+        with pytest.raises(RuntimeError, match="payload_backend"):
+            CreateStorageBackends(
+                config=config,
+                metadata=create_test_metadata(),
+                loop=async_loop,
+                dst_device="cpu",
+            )
+
+    def test_required_backend_missing_its_class_stops_startup(self, async_loop):
+        """An incomplete declaration is a configuration error, not a skip."""
+        extra_config = {
+            "storage_plugin.payload_backend.module_path": "some.module",
+            "storage_plugin.payload_backend.required": True,
+        }
+        config = create_test_config(
+            extra_config=extra_config,
+            storage_plugins=["payload_backend"],
+        )
+
+        with pytest.raises(RuntimeError, match="payload_backend"):
+            CreateStorageBackends(
+                config=config,
+                metadata=create_test_metadata(),
+                loop=async_loop,
+                dst_device="cpu",
+            )
+
     def test_dynamic_backend_with_invalid_module_path(self, async_loop):
         """
         Test that invalid module path is handled gracefully.
@@ -482,3 +528,197 @@ class TestCreateDynamicBackends:
         # Close all backends
         for backend in storage_backends.values():
             backend.close()
+
+
+@pytest.fixture
+def standalone_async_loop():
+    """An event loop for tests outside the class that owns its own."""
+    loop = asyncio.new_event_loop()
+    yield loop
+    loop.close()
+
+
+def test_the_plugin_named_as_the_pd_data_path_is_required(standalone_async_loop):
+    """A handoff's data path is not an optional cache tier.
+
+    A deployment that names raw_block as where its key-value data travels
+    cannot serve without it, so a construction failure has to stop startup
+    whether or not the plugin was separately marked required.
+    """
+    extra_config = {
+        "storage_plugin.raw_block.module_path": "nonexistent.module.path",
+        "storage_plugin.raw_block.class_name": "NonexistentClass",
+    }
+    config = create_test_config(
+        extra_config=extra_config,
+        storage_plugins=["raw_block"],
+    )
+    config.enable_pd = True
+    config.pd_role = "sender"
+    config.pd_data_path = "raw_block"
+    # local_cpu opens a separate route into the plugin loader, so turn it off:
+    # this has to exercise the shared-storage route and nothing else.
+    config.local_cpu = False
+    config.max_local_cpu_size = 0.0
+    assert config.pd_uses_shared_storage is True
+
+    with pytest.raises(RuntimeError, match="raw_block"):
+        CreateStorageBackends(
+            config=config,
+            metadata=create_test_metadata(),
+            loop=standalone_async_loop,
+            dst_device="cpu",
+        )
+
+
+def test_empty_extra_config_is_refused_when_a_plugin_is_required(
+    standalone_async_loop,
+):
+    """An unconfigurable data path must stop startup, not warn.
+
+    The loader returned early when extra_config was empty, before it looked
+    at whether any plugin was required. On the shared-storage route that
+    left the engine with no backend carrying the payload: with capacity to
+    spare it would fall through to a local CPU allocator, and with none it
+    failed later for an unrelated-looking reason.
+    """
+    config = create_test_config(storage_plugins=["raw_block"])
+    config.extra_config = {}
+    config.enable_pd = True
+    config.pd_role = "sender"
+    config.pd_data_path = "raw_block"
+    config.local_cpu = False
+    config.max_local_cpu_size = 0.0
+
+    with pytest.raises(ValueError, match="extra_config is empty"):
+        CreateStorageBackends(
+            config=config,
+            metadata=create_test_metadata(),
+            loop=standalone_async_loop,
+            dst_device="cpu",
+        )
+
+
+def test_a_data_path_absent_from_storage_plugins_is_refused(standalone_async_loop):
+    """Naming a data path that is not enabled cannot silently do nothing."""
+    config = create_test_config(
+        extra_config=MOCK_BACKEND_EXTRA_CONFIG,
+        storage_plugins=["mock_backend"],
+    )
+    config.enable_pd = True
+    config.pd_role = "sender"
+    config.pd_data_path = "raw_block"
+    config.local_cpu = False
+    config.max_local_cpu_size = 0.0
+
+    with pytest.raises(ValueError, match="not\nlisted in storage_plugins|not listed"):
+        CreateStorageBackends(
+            config=config,
+            metadata=create_test_metadata(),
+            loop=standalone_async_loop,
+            dst_device="cpu",
+        )
+
+
+def test_empty_extra_config_still_only_warns_for_an_optional_plugin(
+    standalone_async_loop,
+):
+    """A cache tier that cannot be configured is still only a warning."""
+    config = create_test_config(storage_plugins=["mock_backend"])
+    config.extra_config = {}
+
+    backends = CreateStorageBackends(
+        config=config,
+        metadata=create_test_metadata(),
+        loop=standalone_async_loop,
+        dst_device="cpu",
+    )
+    assert "mock_backend" not in backends
+    for backend in backends.values():
+        backend.close()
+
+
+def test_required_storage_plugins_names_the_data_path():
+    """The data path is required whether or not it says so itself."""
+    # First Party
+    from lmcache.v1.storage_backend import required_storage_plugins
+
+    config = create_test_config(storage_plugins=["raw_block", "extra_tier"])
+    config.extra_config = {"storage_plugin.extra_tier.required": False}
+    config.enable_pd = True
+    config.pd_role = "sender"
+    config.pd_data_path = "raw_block"
+    assert required_storage_plugins(config) == {"raw_block"}
+
+    # Without the handoff, only an explicit declaration makes one required.
+    config.enable_pd = False
+    config.extra_config = {"storage_plugin.extra_tier.required": True}
+    assert required_storage_plugins(config) == {"extra_tier"}
+
+
+def test_shared_storage_allocates_from_the_gpu_endpoint_not_local_cpu():
+    """On the shared-storage route the data path allocates for the engine.
+
+    The review asked for this to be asserted, not inferred. A run that
+    silently allocated from a local CPU backend would be staging the payload
+    through host memory while the configuration says the GPU-resident
+    plugin carries it, and the earlier plugin-loader hole made exactly that
+    reachable.
+    """
+    # Standard
+    from unittest import mock
+
+    # First Party
+    from lmcache.v1.storage_backend.abstract_backend import (
+        AllocatorBackendInterface,
+    )
+    from lmcache.v1.storage_backend.storage_manager import StorageManager
+
+    class _Endpoint:
+        """Stands in for the raw-block backend with a GPU staging pool.
+
+        Registered as a virtual subclass so the selection's isinstance check
+        passes without reimplementing the whole allocator interface, which
+        this test does not exercise.
+        """
+
+        is_gpu_endpoint = True
+
+        def __init__(self, name: str) -> None:
+            self._name = name
+
+        def __str__(self) -> str:
+            return self._name
+
+        def __getattr__(self, item):
+            return mock.MagicMock()
+
+    AllocatorBackendInterface.register(_Endpoint)
+
+    config = create_test_config(storage_plugins=["raw_block"])
+    config.enable_pd = True
+    config.pd_role = "sender"
+    config.pd_data_path = "raw_block"
+    config.local_cpu = False
+    config.max_local_cpu_size = 0.0
+    assert config.pd_uses_shared_storage is True
+
+    manager = StorageManager.__new__(StorageManager)
+    manager.config = config
+    manager.enable_pd = config.enable_pd
+    # Both present, as a real strict run has: only the GPU endpoint may win.
+    manager.storage_backends = OrderedDict(
+        [
+            ("LocalCPUBackend", _Endpoint("LocalCPUBackend")),
+            ("raw_block", _Endpoint("raw_block")),
+        ]
+    )
+    manager.storage_backends["LocalCPUBackend"].is_gpu_endpoint = False
+
+    chosen = manager._get_allocator_backend(config)
+    assert str(chosen) == "raw_block"
+
+    # And with the transfer-channel route it is the PD backend instead.
+    config.pd_data_path = "transfer_channel"
+    manager.storage_backends["PDBackend"] = _Endpoint("PDBackend")
+    assert str(manager._get_allocator_backend(config)) == "PDBackend"

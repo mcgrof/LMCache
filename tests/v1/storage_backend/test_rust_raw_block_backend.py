@@ -41,6 +41,7 @@ from lmcache.v1.storage_backend.raw_block import (
     RawBlockCoreConfig,
     RawBlockKeySpec,
     RawBlockPutManyResult,
+    encode_legacy_key,
 )
 from tests.v1.storage_backend.raw_block_test_utils import is_skip_safe_io_error
 
@@ -56,9 +57,16 @@ def _has_ext() -> bool:
 
 
 class _FakeRawBlockDevice:
-    def __init__(self, path: str, *, size_bytes: int, **kwargs):
+    def __init__(
+        self,
+        path: str,
+        *,
+        size_bytes: int,
+        data: bytearray | None = None,
+        **kwargs,
+    ):
         del path, kwargs
-        self._data = bytearray(size_bytes)
+        self._data = data if data is not None else bytearray(size_bytes)
         self._next_batch_id = 1
         self._batch_results: dict[int, list[bool]] = {}
         self.batched_reads: list[tuple[list[int], list[int]]] = []
@@ -132,13 +140,37 @@ class _FakeRawBlockDevice:
     def wait_iouring(self, batch_id):
         return self._batch_results.pop(batch_id, []), []
 
+    def is_idle(self):
+        """Everything handed to this device was answered for synchronously."""
+        return True
+
+    def is_poisoned(self):
+        return False
+
     def close(self):
         return None
 
 
-def _install_fake_raw_block_device(monkeypatch, *, size_bytes: int = 64 * 1024):
+def _install_fake_raw_block_device(
+    monkeypatch,
+    *,
+    size_bytes: int = 64 * 1024,
+    shared_by_path: bool = False,
+):
+    shared_data: dict[str, bytearray] = {}
+
     def create_fake_device(path: str, **kwargs):
-        return _FakeRawBlockDevice(path, size_bytes=size_bytes, **kwargs)
+        data = (
+            shared_data.setdefault(path, bytearray(size_bytes))
+            if shared_by_path
+            else None
+        )
+        return _FakeRawBlockDevice(
+            path,
+            size_bytes=size_bytes,
+            data=data,
+            **kwargs,
+        )
 
     monkeypatch.setitem(
         sys.modules,
@@ -1033,6 +1065,85 @@ def test_rust_raw_block_backend_close_is_thread_safe(memory_allocator, loop_in_t
 
         assert errors == []
         backend.close()
+
+
+@pytest.mark.parametrize("quiesced", [True, False])
+def test_storage_pd_listener_failure_unwinds_constructed_resources(
+    monkeypatch: pytest.MonkeyPatch,
+    loop_in_thread: asyncio.AbstractEventLoop,
+    quiesced: bool,
+) -> None:
+    """A refused listener releases only resources proven safe to release."""
+    # First Party
+    from lmcache.v1.storage_backend.plugins import rust_raw_block_backend as plugin
+
+    _pin_the_chain_root(monkeypatch)
+    _install_fake_raw_block_device(monkeypatch, size_bytes=64 * 1024 * 1024)
+    allocator = AdHocMemoryAllocator(device="cpu")
+    captured: list[RustRawBlockBackend] = []
+    events: list[str] = []
+    close_core = RawBlockCore.close
+
+    def close_with_outcome(core: RawBlockCore) -> types.SimpleNamespace:
+        events.append("core")
+        close_core(core)
+        return types.SimpleNamespace(may_release_backing_resources=quiesced)
+
+    def refuse_listener(backend: RustRawBlockBackend, extra: Any) -> None:
+        del extra
+        captured.append(backend)
+        backend._gpu_allocator = types.SimpleNamespace(
+            close=lambda: events.append("gpu")
+        )
+        assert backend._pd_tracker is not None
+        assert backend.local_cpu_backend is not None
+        close_tracker = backend._pd_tracker.close
+
+        def stop_tracker() -> bool:
+            events.append("tracker")
+            return close_tracker()
+
+        monkeypatch.setattr(backend._pd_tracker, "close", stop_tracker)
+        retain_cpu = backend.local_cpu_backend.retain_backing_resources
+
+        def retain_backing() -> None:
+            events.append("retain")
+            retain_cpu()
+
+        monkeypatch.setattr(
+            backend.local_cpu_backend, "retain_backing_resources", retain_backing
+        )
+        raise ValueError("acknowledgement listener refused")
+
+    monkeypatch.setattr(RawBlockCore, "close", close_with_outcome)
+    monkeypatch.setattr(RustRawBlockBackend, "_build_ack_receiver", refuse_listener)
+    try:
+        with pytest.raises(ValueError, match="acknowledgement listener refused"):
+            _make_raw_block_backend(
+                "/tmp/plugin-pd-listener-refusal",
+                allocator,
+                loop_in_thread,
+                io_engine="posix",
+                storage_pd_mode=True,
+            )
+        backend = captured[0]
+        assert backend._pd_tracker is not None
+        assert backend._pd_tracker._closed
+        assert events == ["tracker", "core", "gpu" if quiesced else "retain"]
+        if not quiesced:
+            assert any(
+                graph[0] is backend._core
+                and graph[1] is backend.local_cpu_backend
+                and graph[2] is backend._gpu_allocator
+                for graph in plugin._RETAINED_AFTER_UNKNOWN_OUTCOME
+            )
+    finally:
+        # Stop test-owned workers even when the unfixed constructor leaks them.
+        for backend in captured:
+            assert backend._pd_tracker is not None
+            if not backend._pd_tracker._closed:
+                backend._pd_tracker.close()
+                close_core(backend._core)
 
 
 @pytest.mark.skipif(
@@ -2676,6 +2787,8 @@ def _make_raw_block_backend(
     loop: asyncio.AbstractEventLoop,
     *,
     io_engine: str = "io_uring",
+    role: str = "writer",
+    storage_pd_mode: bool = False,
 ) -> RustRawBlockBackend:
     """Build a RustRawBlockBackend over a fake raw-block device.
 
@@ -2695,6 +2808,7 @@ def _make_raw_block_backend(
         lmcache_instance_id="test_rust_raw_block_backend_plugin_dedup",
     )
     config.storage_plugins = []
+    config.save_unfull_chunk = storage_pd_mode
     config.extra_config = {
         "rust_raw_block.device_path": dev_path,
         "rust_raw_block.block_align": 4096,
@@ -2702,6 +2816,9 @@ def _make_raw_block_backend(
         "rust_raw_block.meta_total_bytes": 4 * 1024 * 1024,
         "rust_raw_block.meta_enable_periodic": False,
         "rust_raw_block.io_engine": io_engine,
+        "rust_raw_block.role": role,
+        "rust_raw_block.storage_pd_mode": storage_pd_mode,
+        "rust_raw_block.allow_unsafe_pd_io_for_testing": storage_pd_mode,
     }
     metadata = LMCacheMetadata(
         model_name="test_model",
@@ -2754,6 +2871,262 @@ def test_rust_raw_block_backend_skips_failed_worker_without_retaining_objects(
     finally:
         memory_obj.ref_count_down()
         backend.close()
+
+
+def _pin_the_chain_root(monkeypatch, value: int = 424242) -> None:
+    """Give this process a reproducible key-derivation chain root.
+
+    vLLM derives the root from ``os.urandom`` when ``PYTHONHASHSEED`` is
+    unset, so every token database built in such a process gets a
+    *different* one -- no two engines can agree, not even in one process.
+    A test cannot set that variable (it only takes effect at interpreter
+    start), so the root is pinned here instead, which is what a serving
+    deployment achieves by exporting the seed.
+
+    The engine refuses an unreproducible root outright rather than writing
+    one to a device; that refusal has its own test.
+    """
+    # First Party
+    from lmcache.v1 import token_database as token_database_module
+
+    monkeypatch.setattr(token_database_module, "NONE_HASH", value, raising=False)
+    original = token_database_module.ChunkedTokenDatabase.__init__
+
+    def _init_without_rerandomizing(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        token_database_module.NONE_HASH = value
+
+    monkeypatch.setattr(
+        token_database_module.ChunkedTokenDatabase,
+        "__init__",
+        _init_without_rerandomizing,
+    )
+
+
+def test_storage_pd_backend_publishes_then_reader_adopts(
+    monkeypatch,
+    memory_allocator,
+    loop_in_thread,
+):
+    """Request completion includes writes and an adoptable generation."""
+    _pin_the_chain_root(monkeypatch)
+    _install_fake_raw_block_device(
+        monkeypatch,
+        size_bytes=64 * 1024 * 1024,
+        shared_by_path=True,
+    )
+    path = "/tmp/raw-block-storage-pd"
+    writer = _make_raw_block_backend(
+        path,
+        memory_allocator,
+        loop_in_thread,
+        io_engine="posix",
+        role="writer",
+        storage_pd_mode=True,
+    )
+    reader = _make_raw_block_backend(
+        path,
+        memory_allocator,
+        loop_in_thread,
+        io_engine="posix",
+        role="reader",
+        storage_pd_mode=True,
+    )
+    allocator = AdHocMemoryAllocator(device="cpu")
+    keys = [
+        CacheEngineKey("test_model", 1, 0, 9001 + i, torch.bfloat16) for i in range(2)
+    ]
+    objs = [
+        allocator.allocate(
+            [torch.Size([2, 16, 8, 128])],
+            [torch.bfloat16],
+            fmt=MemoryFormat.KV_T2D,
+        )
+        for _ in keys
+    ]
+    assert all(obj is not None for obj in objs)
+    typed_objs = [obj for obj in objs if obj is not None]
+    typed_objs[0].tensor.fill_(17)
+    typed_objs[1].tensor.fill_(23)
+    expected = [bytes(obj.byte_array) for obj in typed_objs]
+    transfer_spec = types.SimpleNamespace(
+        req_id="request-storage-pd",
+        total_chunks=2,
+        is_last_prefill=True,
+    )
+
+    try:
+        futures = writer.batched_submit_put_task(
+            keys,
+            typed_objs,
+            transfer_spec=transfer_spec,
+        )
+        assert futures is not None and len(futures) == 1
+        receipt = futures[0].result(timeout=5)
+        assert receipt.key_count == 2
+        assert reader.adopt_publication(receipt, keys, timeout_ms=1_000)
+
+        loaded = reader.batched_get_blocking(keys)
+        assert all(obj is not None for obj in loaded)
+        for obj, payload in zip(loaded, expected, strict=True):
+            assert obj is not None
+            assert bytes(obj.byte_array) == payload
+            obj.ref_count_down()
+    finally:
+        for obj in typed_objs:
+            obj.ref_count_down()
+        reader.close()
+        writer.close()
+
+
+def test_storage_pd_shared_inflight_write_gives_each_request_a_lease(
+    monkeypatch,
+    memory_allocator,
+    loop_in_thread,
+):
+    """One physical write may back two independently released publications."""
+    _pin_the_chain_root(monkeypatch)
+    _install_fake_raw_block_device(monkeypatch, size_bytes=64 * 1024 * 1024)
+    writer = _make_raw_block_backend(
+        "/tmp/raw-block-storage-pd-shared",
+        memory_allocator,
+        loop_in_thread,
+        io_engine="posix",
+        role="writer",
+        storage_pd_mode=True,
+    )
+    allocator = AdHocMemoryAllocator(device="cpu")
+    key = CacheEngineKey("test_model", 1, 0, 9010, torch.bfloat16)
+    objects = [
+        allocator.allocate(
+            [torch.Size([2, 16, 8, 128])],
+            [torch.bfloat16],
+            fmt=MemoryFormat.KV_T2D,
+        )
+        for _ in range(2)
+    ]
+    assert all(obj is not None for obj in objects)
+    typed_objects = [obj for obj in objects if obj is not None]
+    entered = threading.Event()
+    resume = threading.Event()
+    original_put_many = writer._core.put_many
+
+    def delayed_put_many(*args, **kwargs):
+        entered.set()
+        assert resume.wait(5)
+        return original_put_many(*args, **kwargs)
+
+    monkeypatch.setattr(writer._core, "put_many", delayed_put_many)
+    first = types.SimpleNamespace(
+        req_id="shared-first", total_chunks=1, is_last_prefill=True
+    )
+    second = types.SimpleNamespace(
+        req_id="shared-second", total_chunks=1, is_last_prefill=True
+    )
+    try:
+        first_futures = writer.batched_submit_put_task(
+            [key], [typed_objects[0]], transfer_spec=first
+        )
+        assert first_futures is not None
+        assert entered.wait(5)
+        second_futures = writer.batched_submit_put_task(
+            [key], [typed_objects[1]], transfer_spec=second
+        )
+        assert second_futures is not None
+        assert writer.report_status()["active_operation_count"] == 1
+        resume.set()
+        first_receipt = first_futures[0].result(timeout=5)
+        second_receipt = second_futures[0].result(timeout=5)
+        assert writer.report_status()["active_operation_count"] == 0
+
+        encoded_key = encode_legacy_key(key).encoded
+        assert writer._core.lock_refcount(encoded_key) == 2
+        assert writer.release_unread_publication(first.req_id, first_receipt)
+        assert writer._core.lock_refcount(encoded_key) == 1
+        assert writer.release_unread_publication(second.req_id, second_receipt)
+        assert writer._core.lock_refcount(encoded_key) == 0
+        assert writer._core.report_status()["bytes_deduplicated"] > 0
+    finally:
+        resume.set()
+        for obj in typed_objects:
+            obj.ref_count_down()
+        writer.close()
+
+
+@pytest.mark.no_shared_allocator
+@pytest.mark.parametrize("failure", ["empty_batch", "lookup", "reference"])
+def test_storage_pd_admission_failure_settles_previous_batches(
+    monkeypatch: pytest.MonkeyPatch,
+    loop_in_thread: asyncio.AbstractEventLoop,
+    failure: str,
+) -> None:
+    """An abandoned batch must not leave an earlier completion waiting forever."""
+    _pin_the_chain_root(monkeypatch)
+    _install_fake_raw_block_device(monkeypatch, size_bytes=64 * 1024 * 1024)
+    allocator = AdHocMemoryAllocator(device="cpu")
+    writer = _make_raw_block_backend(
+        "/tmp/raw-block-storage-pd-admission",
+        allocator,
+        loop_in_thread,
+        io_engine="posix",
+        storage_pd_mode=True,
+    )
+    keys = [
+        CacheEngineKey("test_model", 1, 0, 9020 + i, torch.bfloat16) for i in range(2)
+    ]
+    objects = [
+        allocator.allocate(
+            [torch.Size([2, 16, 8, 128])],
+            [torch.bfloat16],
+            fmt=MemoryFormat.KV_T2D,
+        )
+        for _ in keys
+    ]
+    assert all(obj is not None for obj in objects)
+    typed_objects = [obj for obj in objects if obj is not None]
+    spec = types.SimpleNamespace(
+        req_id="admission-request", total_chunks=2, is_last_prefill=False
+    )
+    try:
+        first = writer.batched_submit_put_task(
+            keys[:1], typed_objects[:1], transfer_spec=spec
+        )
+        assert first is not None
+        deadline = time.monotonic() + 5
+        while writer.exists_in_put_tasks(keys[0]) and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert not writer.exists_in_put_tasks(keys[0])
+        assert not first[0].done()
+        assert writer.report_status()["core"]["publication_protected_key_count"] == 1
+
+        def fail(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("batch preparation failed")
+
+        next_keys, next_objects = keys[1:], typed_objects[1:]
+        if failure == "empty_batch":
+            next_keys, next_objects = [], []
+        elif failure == "lookup":
+            monkeypatch.setattr(writer._core, "contains_key", fail)
+        else:
+            monkeypatch.setattr(typed_objects[1], "ref_count_up", fail)
+        before_refs = [obj.get_ref_count() for obj in typed_objects]
+        spec.is_last_prefill = True
+        with pytest.raises((RuntimeError, ValueError)):
+            writer.batched_submit_put_task(next_keys, next_objects, transfer_spec=spec)
+
+        assert first[0].done(), "an earlier batch still awaits an abandoned request"
+        with pytest.raises((RuntimeError, ValueError)):
+            first[0].result()
+        assert not any(writer.exists_in_put_tasks(key) for key in keys)
+        assert [obj.get_ref_count() for obj in typed_objects] == before_refs
+        status = writer.report_status()
+        assert status["pd_tracker"]["inflight_request_count"] == 0
+        assert status["core"]["publication_protected_key_count"] == 0
+        assert status["live_lease_count"] == 0
+    finally:
+        for obj in typed_objects:
+            obj.ref_count_down()
+        writer.close()
 
 
 def test_rust_raw_block_backend_batched_submit_rolls_back_refs_on_dispatch_failure(
@@ -2832,8 +3205,9 @@ def test_rust_raw_block_backend_batched_submit_rolls_back_only_unscheduled_refs(
         def fake_put_many(
             keys: list[RawBlockKeySpec],
             objs: list[Any],
+            **kwargs: Any,
         ) -> RawBlockPutManyResult:
-            del objs
+            del objs, kwargs
             return RawBlockPutManyResult(
                 results=[True] * len(keys),
                 stored_keys=[key.encoded for key in keys],
@@ -2900,6 +3274,87 @@ def test_batched_write_rejects_misaligned_offset():
                 dev.batched_write([1], [buf], [align])  # offset 1 is not aligned
         finally:
             dev.close()
+
+
+@pytest.mark.skipif(
+    not _has_ext(), reason="lmcache_rust_raw_block_io extension not installed"
+)
+def test_pointer_only_buffers_require_dmabuf_registration():
+    """A device pointer must never fall through to host-memory dereference."""
+    # Third Party
+    from lmcache_rust_raw_block_io import RawBlockDevice
+
+    class PointerOnlyBuffer:
+        nbytes = 4096
+
+        @staticmethod
+        def data_ptr() -> int:
+            return 0x1000
+
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+
+        dev = RawBlockDevice(
+            dev_path,
+            writable=True,
+            use_odirect=False,
+            alignment=4096,
+            io_engine="io_uring",
+        )
+        try:
+            pointer = PointerOnlyBuffer()
+            with pytest.raises(ValueError, match="dma-buf registration"):
+                dev.batched_write([0], [pointer], [4096])
+            with pytest.raises(ValueError, match="dma-buf registration"):
+                dev.batched_read([0], [pointer], [4096])
+        finally:
+            dev.close()
+
+
+@pytest.mark.skipif(
+    not _has_ext(), reason="lmcache_rust_raw_block_io extension not installed"
+)
+def test_dmabuf_registration_rejects_ranges_outside_exported_extent():
+    """Registration validates every pointer range before touching io_uring."""
+    # Third Party
+    from lmcache_rust_raw_block_io import RawBlockDevice
+
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        dmabuf_path = os.path.join(td, "dmabuf.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+        with open(dmabuf_path, "wb") as f:
+            f.truncate(4096)
+
+        dmabuf_fd = os.open(dmabuf_path, os.O_RDWR)
+        dev = RawBlockDevice(
+            dev_path,
+            writable=True,
+            use_odirect=False,
+            alignment=4096,
+            io_engine="io_uring",
+        )
+        try:
+            with pytest.raises(ValueError, match="exceeds.*extent"):
+                dev.register_fixed_dmabufs(
+                    [0x1000],
+                    [8192],
+                    [dmabuf_fd],
+                    [0x1000],
+                )
+            with pytest.raises(ValueError, match="inconsistent bases"):
+                dev.register_fixed_dmabufs(
+                    [0x1000, 0x2000],
+                    [4096, 4096],
+                    [dmabuf_fd, dmabuf_fd],
+                    [0x1000, 0x2000],
+                )
+        finally:
+            dev.close()
+            os.close(dmabuf_fd)
 
 
 @pytest.mark.skipif(
@@ -3028,82 +3483,56 @@ def test_rust_raw_block_backend_sizes_slots_without_a_cpu_tier(
             backend.close()
 
 
-@pytest.mark.skipif(
-    not _has_ext(), reason="lmcache_rust_raw_block_io extension not installed"
-)
-def test_pointer_only_buffers_require_dmabuf_registration():
-    """A device pointer must never fall through to host-memory dereference."""
-    # Third Party
-    from lmcache_rust_raw_block_io import RawBlockDevice
+@pytest.mark.parametrize("failure", ["lease_capacity", "missing_loop"])
+def test_storage_pd_refusal_returns_unscheduled_buffers(
+    monkeypatch: pytest.MonkeyPatch,
+    loop_in_thread: asyncio.AbstractEventLoop,
+    failure: str,
+) -> None:
+    """Return staging references when no write can reach the event loop."""
+    # Standard
+    from types import SimpleNamespace
 
-    class PointerOnlyBuffer:
-        nbytes = 4096
+    # First Party
+    from lmcache.v1.storage_backend.raw_block import RawBlockPDRequestTracker
 
-        @staticmethod
-        def data_ptr() -> int:
-            return 0x1000
-
-    with tempfile.TemporaryDirectory() as td:
-        dev_path = os.path.join(td, "dev.bin")
-        with open(dev_path, "wb") as f:
-            f.truncate(8 * 1024 * 1024)
-
-        dev = RawBlockDevice(
-            dev_path,
-            writable=True,
-            use_odirect=False,
-            alignment=4096,
-            io_engine="io_uring",
-        )
-        try:
-            pointer = PointerOnlyBuffer()
-            with pytest.raises(ValueError, match="dma-buf registration"):
-                dev.batched_write([0], [pointer], [4096])
-            with pytest.raises(ValueError, match="dma-buf registration"):
-                dev.batched_read([0], [pointer], [4096])
-        finally:
-            dev.close()
-
-
-@pytest.mark.skipif(
-    not _has_ext(), reason="lmcache_rust_raw_block_io extension not installed"
-)
-def test_dmabuf_registration_rejects_ranges_outside_exported_extent():
-    """Registration validates every pointer range before touching io_uring."""
-    # Third Party
-    from lmcache_rust_raw_block_io import RawBlockDevice
-
-    with tempfile.TemporaryDirectory() as td:
-        dev_path = os.path.join(td, "dev.bin")
-        dmabuf_path = os.path.join(td, "dmabuf.bin")
-        with open(dev_path, "wb") as f:
-            f.truncate(8 * 1024 * 1024)
-        with open(dmabuf_path, "wb") as f:
-            f.truncate(4096)
-
-        dmabuf_fd = os.open(dmabuf_path, os.O_RDWR)
-        dev = RawBlockDevice(
-            dev_path,
-            writable=True,
-            use_odirect=False,
-            alignment=4096,
-            io_engine="io_uring",
-        )
-        try:
-            with pytest.raises(ValueError, match="exceeds.*extent"):
-                dev.register_fixed_dmabufs(
-                    [0x1000],
-                    [8192],
-                    [dmabuf_fd],
-                    [0x1000],
-                )
-            with pytest.raises(ValueError, match="inconsistent bases"):
-                dev.register_fixed_dmabufs(
-                    [0x1000, 0x2000],
-                    [4096, 4096],
-                    [dmabuf_fd, dmabuf_fd],
-                    [0x1000, 0x2000],
-                )
-        finally:
-            dev.close()
-            os.close(dmabuf_fd)
+    _install_fake_raw_block_device(monkeypatch, size_bytes=64 * 1024 * 1024)
+    allocator = AdHocMemoryAllocator(device="cpu")
+    backend = _make_raw_block_backend(
+        "/tmp/plugin-pd-refusal", allocator, loop_in_thread
+    )
+    # Exercise the storage-P/D admission path with the ordinary backend's
+    # fake device; key derivation and registration are not used by this test.
+    backend._storage_pd_mode = True
+    backend._pd_tracker = RawBlockPDRequestTracker(backend._core, max_live_leases=1)
+    key = CacheEngineKey("test_model", 1, 0, 2003, torch.bfloat16)
+    obj = allocator.allocate(
+        [torch.Size([2, 16, 8, 128])], [torch.bfloat16], fmt=MemoryFormat.KV_T2D
+    )
+    assert obj is not None
+    before = obj.get_ref_count()
+    transfer = SimpleNamespace(req_id="refused", total_chunks=1, is_last_prefill=True)
+    try:
+        if failure == "lease_capacity":
+            backend._pd_tracker.register_batch(
+                "existing", ["key-existing"], expected_chunks=2, is_last_batch=False
+            )
+            with pytest.raises(RuntimeError, match="at its bound"):
+                backend.batched_submit_put_task([key], [obj], transfer)
+        else:
+            backend.loop = None
+            futures = backend.batched_submit_put_task([key], [obj], transfer)
+            assert futures is not None
+            with pytest.raises(RuntimeError, match="requires an asyncio event loop"):
+                futures[0].result(timeout=5)
+        assert obj.get_ref_count() == before
+        assert not backend.exists_in_put_tasks(key)
+        assert not backend.contains(key)
+    finally:
+        # No I/O was scheduled in either refusal. Release test-owned state
+        # even when a broken implementation leaves its staging hold behind.
+        while obj.get_ref_count() > before:
+            obj.ref_count_down()
+        backend._put_tasks.discard(key)
+        obj.ref_count_down()
+        backend.close()

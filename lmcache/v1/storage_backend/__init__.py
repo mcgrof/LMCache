@@ -37,6 +37,24 @@ def is_cuda_worker(metadata: LMCacheMetadata) -> bool:
     return metadata.role != "scheduler" and torch_dev.is_available()
 
 
+def required_storage_plugins(config: LMCacheEngineConfig) -> set[str]:
+    """Return the plugins this deployment cannot serve without.
+
+    A plugin is required when the deployment says so, and when it is named
+    as the data path of a prefill/decode handoff, because then it is the
+    thing carrying the key-value data rather than a tier in front of it.
+    """
+    extra = config.extra_config or {}
+    required = {
+        name
+        for name in (config.storage_plugins or [])
+        if bool(extra.get(f"storage_plugin.{name}.required", False))
+    }
+    if getattr(config, "pd_uses_shared_storage", False) and config.pd_data_path:
+        required.add(str(config.pd_data_path))
+    return required
+
+
 def storage_plugin_launcher(
     config: LMCacheEngineConfig,
     metadata: LMCacheMetadata,
@@ -53,18 +71,41 @@ def storage_plugin_launcher(
     """
     # Get the list of allowed external backends if configured
     storage_plugins = set(config.storage_plugins) if config.storage_plugins else set()
-    if storage_plugins and not config.extra_config:
-        logger.warning(
-            "storage_plugins=%s is set but extra_config is empty; "
-            "plugin settings must be provided under extra_config, e.g. "
-            "extra_config.storage_plugin.<name>.module_path/class_name",
-            sorted(storage_plugins),
-        )
-        return
+
+    # A plugin that only adds a cache tier can be skipped when it cannot be
+    # built: the engine is slower without it but still correct. A plugin that
+    # carries the payload cannot, because serving without it means serving
+    # without the data. Work out which are which before the early returns
+    # below, because an empty extra_config leaves a required plugin just as
+    # unbuildable as a broken one, and returning quietly there let the engine
+    # continue to a local CPU allocator on the shared-storage route.
+    required_plugins = required_storage_plugins(config)
+
     if not config.extra_config:
+        if required_plugins:
+            raise ValueError(
+                "storage plugins "
+                f"{sorted(required_plugins)} are required but extra_config is "
+                "empty, so their module_path and class_name cannot be read"
+            )
+        if storage_plugins:
+            logger.warning(
+                "storage_plugins=%s is set but extra_config is empty; "
+                "plugin settings must be provided under extra_config, e.g. "
+                "extra_config.storage_plugin.<name>.module_path/class_name",
+                sorted(storage_plugins),
+            )
         return
 
+    missing_required = required_plugins - storage_plugins
+    if missing_required:
+        raise ValueError(
+            f"storage plugins {sorted(missing_required)} are required but not "
+            "listed in storage_plugins, so nothing would carry the payload"
+        )
+
     for storage_plugin in storage_plugins:
+        required = storage_plugin in required_plugins
         try:
             module_path = config.extra_config.get(
                 f"storage_plugin.{storage_plugin}.module_path"
@@ -74,9 +115,10 @@ def storage_plugin_launcher(
             )
 
             if not module_path or not class_name:
-                logger.warning(
-                    "Backend %s missing module_path or class_name", storage_plugin
-                )
+                message = f"Backend {storage_plugin} missing module_path or class_name"
+                if required:
+                    raise ValueError(message)
+                logger.warning(message)
                 continue
 
             logger.warning(
@@ -105,6 +147,11 @@ def storage_plugin_launcher(
             logger.info("Created dynamic backend: %s", storage_plugin)
 
         except Exception as e:
+            if required:
+                raise RuntimeError(
+                    f"Required storage backend {storage_plugin} could not be "
+                    f"created: {e}"
+                ) from e
             logger.error("Failed to create backend %s: %s", storage_plugin, e)
 
 
@@ -129,7 +176,14 @@ def CreateStorageBackends(
         "enable_nixl_storage"
     )
 
-    if config.enable_pd and "PDBackend" not in _skip:
+    # The transfer-channel backend is the data path itself, so it is only
+    # built when that is the path in use. A handoff through shared storage
+    # reaches the decoder through the storage plugin instead.
+    if (
+        config.enable_pd
+        and not config.pd_uses_shared_storage
+        and "PDBackend" not in _skip
+    ):
         # First Party
         if config.pd_backend_mode == "async":
             # First Party
@@ -172,6 +226,7 @@ def CreateStorageBackends(
             )
     elif (
         not config.enable_pd
+        or config.pd_uses_shared_storage
         or config.local_cpu
         or (enable_nixl_storage and config.nixl_buffer_device == "cpu")
     ):
@@ -301,7 +356,10 @@ def CreateStorageBackends(
         backend_name = str(remote_backend)
         storage_backends[backend_name] = remote_backend
 
-    if not config.enable_pd or config.local_cpu:
+    # On the transfer-channel route a storage plugin would be a separate
+    # cache tier, and prefill/decode does not use one. On the shared-storage
+    # route the plugin is the data path, so it has to be loaded.
+    if not config.enable_pd or config.pd_uses_shared_storage or config.local_cpu:
         # Load storage backends from configuration
         storage_plugin_launcher(
             config,
