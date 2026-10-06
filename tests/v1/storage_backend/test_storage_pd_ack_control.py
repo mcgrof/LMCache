@@ -1,0 +1,1124 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Drive the acknowledgement exchange over a real loopback socket.
+
+These are protocol tests, not serving tests: everything here runs on
+127.0.0.1 with no device, no model and no GPU, because what is under test
+is who is allowed to decide that an extent is reclaimable and what counts
+as having decided it.
+
+The properties they hold the exchange to are the ones a lost message would
+otherwise break quietly. A consumer must not retire an obligation on a
+successful send; a writer must not answer before it has acted; a duplicate
+must free nothing twice; a message that does not correlate with the
+question being asked must be discarded rather than accepted as its answer.
+"""
+
+# Future
+from __future__ import annotations
+
+# Standard
+from pathlib import Path
+from queue import Empty, Queue
+from types import SimpleNamespace
+from typing import Any, Optional
+from unittest.mock import Mock
+import json
+import socket as socketlib
+import threading
+import time
+
+# Third Party
+import msgspec
+import pytest
+import zmq
+
+# First Party
+from lmcache.v1.storage_backend import storage_pd_ack as ack_module
+from lmcache.v1.storage_backend.raw_block import RawBlockPublicationReceipt
+from lmcache.v1.storage_backend.storage_pd_ack import (
+    ACK_ALREADY_APPLIED,
+    ACK_APPLIED,
+    ACK_REJECTED,
+    ACK_UNRESOLVED,
+    UNREAD_RELEASED,
+    UNREAD_UNRESOLVED,
+    StoragePDAckClient,
+    StoragePDAckObligation,
+    StoragePDAckReply,
+    StoragePDAckRequest,
+    StoragePDAckServer,
+    StoragePDClaimAnswer,
+    StoragePDClaimRequest,
+    StoragePDUnreadAnswer,
+    StoragePDUnreadClient,
+    StoragePDUnreadReply,
+    StoragePDUnreadRequest,
+)
+from lmcache.v1.storage_backend.storage_pd_protocol import (
+    StoragePDReadAck,
+    StoragePDStatus,
+)
+
+LOOPBACK = "127.0.0.1"
+
+
+@pytest.mark.parametrize("failure", ["socket_options", "bind", "thread_start"])
+def test_ack_server_startup_failure_closes_its_bound_socket(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """A failed constructor must release resources without waiting for GC."""
+    socket = Mock()
+    worker = Mock()
+    error = RuntimeError("startup failed")
+    if failure == "socket_options":
+        socket.setsockopt.side_effect = error
+    elif failure == "bind":
+        socket.bind.side_effect = error
+    else:
+        worker.start.side_effect = error
+    context = Mock()
+    context.socket.return_value = socket
+    monkeypatch.setattr(ack_module, "get_zmq_context", lambda **kwargs: context)
+    monkeypatch.setattr(ack_module.threading, "Thread", lambda **kwargs: worker)
+    with pytest.raises(RuntimeError) as caught:
+        StoragePDAckServer(
+            lambda request: (ACK_APPLIED, ""),
+            claim_handler=lambda request: StoragePDClaimAnswer(True),
+            unread_handler=lambda request: StoragePDUnreadAnswer(True),
+            bind_host=LOOPBACK,
+            port=12345,
+        )
+    assert caught.value is error
+    socket.close.assert_called_once_with(linger=0)
+
+
+@pytest.mark.parametrize("recv_timeout_ms", [0, -1])
+def test_ack_server_rejects_unbounded_receive_timeout(recv_timeout_ms: int) -> None:
+    """Shutdown must be able to leave an otherwise idle receive loop."""
+    with pytest.raises(ValueError, match="positive timeout"):
+        StoragePDAckServer(
+            lambda request: (ACK_APPLIED, ""),
+            claim_handler=lambda request: StoragePDClaimAnswer(True),
+            unread_handler=lambda request: StoragePDUnreadAnswer(True),
+            bind_host=LOOPBACK,
+            port=12345,
+            recv_timeout_ms=recv_timeout_ms,
+        )
+
+
+def _free_port() -> int:
+    with socketlib.socket(socketlib.AF_INET, socketlib.SOCK_STREAM) as probe:
+        probe.bind((LOOPBACK, 0))
+        return int(probe.getsockname()[1])
+
+
+def _ack(req_id: str = "request-1", **overrides) -> StoragePDReadAck:
+    fields = {
+        "req_id": req_id,
+        "consumer_instance_id": "consumer-1",
+        "tp_rank": 0,
+        "writer_epoch": "writer-1",
+        "checkpoint_seq": 7,
+        "manifest_digest": "digest",
+    }
+    fields.update(overrides)
+    return StoragePDReadAck(**fields)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("first_outcome", ["lost", "unresolved"])
+def test_unread_client_retries_the_same_receipt_after_request_loss(
+    monkeypatch: pytest.MonkeyPatch, first_outcome: str
+) -> None:
+    """Progress does not depend on a later request after one attempt is lost."""
+    client = StoragePDUnreadClient(
+        attempt_timeout_ms=50,
+        retry_interval_s=0.01,
+        poll_interval_s=0.005,
+    )
+    receipt = RawBlockPublicationReceipt(
+        writer_epoch="writer-1",
+        checkpoint_seq=7,
+        key_count=1,
+        manifest_digest="digest",
+        ack_endpoint="127.0.0.1:9999",
+    )
+    status = StoragePDStatus.ready("request-1", 0, receipt)
+    requests: list[StoragePDUnreadRequest] = []
+
+    def exchange(endpoint, request, timeout_ms):
+        assert endpoint == receipt.ack_endpoint
+        assert timeout_ms > 0
+        requests.append(request)
+        if len(requests) == 1:
+            if first_outcome == "lost":
+                return None
+            return SimpleNamespace(
+                released=False,
+                req_id=request.status.req_id,
+                writer_epoch=request.status.writer_epoch,
+                nonce=request.nonce,
+                reason="the writer could not decide",
+                final=False,
+            )
+        return StoragePDUnreadReply(
+            True,
+            request.status.req_id,
+            request.status.writer_epoch,
+            request.nonce,
+            "already released",
+        )
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    try:
+        obligation = client.offer(
+            status,
+            session_id="session-1",
+            reason="no decoder",
+            deadline_s=1.0,
+        )
+        assert obligation is not None
+        assert obligation.wait(timeout=2.0) == UNREAD_RELEASED
+    finally:
+        client.close()
+
+    assert len(requests) == 2
+    assert requests[0].status == requests[1].status == status
+    assert requests[0].session_id == requests[1].session_id == "session-1"
+    assert requests[0].nonce != requests[1].nonce
+
+
+def test_unread_handler_exception_is_not_a_terminal_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep retry ownership when a writer handler cannot decide."""
+    received: Queue[bytes] = Queue()
+    sent: Queue[bytes] = Queue()
+
+    class Transport:
+        def setsockopt(self, _option: int, _value: int) -> None:
+            pass
+
+        def bind(self, _endpoint: str) -> None:
+            pass
+
+        def recv(self) -> bytes:
+            try:
+                return received.get(timeout=0.01)
+            except Empty as exc:
+                raise zmq.Again() from exc
+
+        def send(self, raw: bytes) -> None:
+            sent.put(raw)
+
+        def close(self, *, linger: int) -> None:
+            pass
+
+    def fail(_request: StoragePDUnreadRequest) -> StoragePDUnreadAnswer:
+        raise OSError("publication state temporarily unavailable")
+
+    context = Mock()
+    context.socket.return_value = Transport()
+    monkeypatch.setattr(ack_module, "get_zmq_context", lambda **kwargs: context)
+    server = StoragePDAckServer(
+        lambda _request: (ACK_REJECTED, "unexpected ACK"),
+        claim_handler=lambda _request: StoragePDClaimAnswer(False),
+        unread_handler=fail,
+        bind_host=LOOPBACK,
+        port=9999,
+    )
+    try:
+        status = StoragePDStatus.ready(
+            "request-1", 0, RawBlockPublicationReceipt("writer-1", 7, 1, "digest")
+        )
+        request = StoragePDUnreadRequest(status, "session-1", "nonce-1")
+        received.put(msgspec.msgpack.encode(request))
+        reply = msgspec.msgpack.decode(sent.get(timeout=1), type=StoragePDUnreadReply)
+        assert not reply.released
+        assert not getattr(reply, "final", True)
+        assert reply.nonce == request.nonce
+    finally:
+        assert server.close(timeout_s=1)
+
+
+def test_unread_client_reports_an_unavailable_writer_and_stops(monkeypatch) -> None:
+    """A deadline and shutdown both settle retained work as unresolved."""
+    client = StoragePDUnreadClient(
+        attempt_timeout_ms=10,
+        retry_interval_s=0.005,
+        max_live_obligations=1,
+        poll_interval_s=0.002,
+    )
+    status = StoragePDStatus.ready(
+        "request-1",
+        0,
+        RawBlockPublicationReceipt(
+            "writer-1", 7, 1, "digest", ack_endpoint="127.0.0.1:9999"
+        ),
+    )
+    monkeypatch.setattr(client, "_exchange", lambda *_args: None)
+    first = client.offer(
+        status,
+        session_id="session-1",
+        reason="no decoder",
+        deadline_s=0.03,
+    )
+    assert first is not None
+    assert (
+        client.offer(
+            StoragePDStatus.ready(
+                "request-2",
+                0,
+                RawBlockPublicationReceipt(
+                    "writer-1",
+                    8,
+                    1,
+                    "digest-2",
+                    ack_endpoint="127.0.0.1:9999",
+                ),
+            ),
+            session_id="session-1",
+            reason="no decoder",
+        )
+        is None
+    )
+    assert first.wait(timeout=1.0) == UNREAD_UNRESOLVED
+    assert first.attempts > 0
+    assert client.close(timeout_s=1.0)
+
+
+def test_unread_client_shutdown_does_not_claim_unanswered_work(monkeypatch) -> None:
+    client = StoragePDUnreadClient(poll_interval_s=0.002)
+    status = StoragePDStatus.ready(
+        "request-1",
+        0,
+        RawBlockPublicationReceipt(
+            "writer-1", 7, 1, "digest", ack_endpoint="127.0.0.1:9999"
+        ),
+    )
+    monkeypatch.setattr(client, "_exchange", lambda *_args: None)
+    obligation = client.offer(
+        status,
+        session_id="session-1",
+        reason="no decoder",
+    )
+    assert obligation is not None
+    assert client.close(timeout_s=1.0)
+    assert obligation.outcome == UNREAD_UNRESOLVED
+
+
+class _Writer:
+    """A writer that releases a hold exactly once per request."""
+
+    def __init__(self) -> None:
+        self.held: dict[str, int] = {}
+        self.applied: list[str] = []
+        self.seen: list[StoragePDAckRequest] = []
+        self.claims: list[StoragePDClaimRequest] = []
+        self.unread_reports: list[StoragePDUnreadRequest] = []
+        self.lock = threading.Lock()
+        self.reply_after_apply = True
+        self.raise_in_handler = False
+        self.refuse_claims = False
+        self.refusal_is_final = False
+
+    def hold(self, req_id: str, count: int = 1) -> None:
+        with self.lock:
+            self.held[req_id] = self.held.get(req_id, 0) + count
+
+    def claim(self, request: StoragePDClaimRequest) -> StoragePDClaimAnswer:
+        """Grant a read of anything this writer is actually holding."""
+        with self.lock:
+            self.claims.append(request)
+            if self.refuse_claims:
+                return StoragePDClaimAnswer(
+                    False, "bound elsewhere", final=self.refusal_is_final
+                )
+            if self.held.get(request.read.req_id, 0) <= 0:
+                return StoragePDClaimAnswer(False, "no such publication")
+            return StoragePDClaimAnswer(True)
+
+    def unread(self, request: StoragePDUnreadRequest) -> StoragePDUnreadAnswer:
+        """Release a publication nothing claimed."""
+        with self.lock:
+            self.unread_reports.append(request)
+            req_id = request.status.req_id
+            if self.held.get(req_id, 0) <= 0:
+                return StoragePDUnreadAnswer(False, "no such publication")
+            if any(claim.read.req_id == req_id for claim in self.claims):
+                return StoragePDUnreadAnswer(False, "a consumer claimed this read")
+            self.held[req_id] -= 1
+            return StoragePDUnreadAnswer(True)
+
+    def handle(self, request: StoragePDAckRequest) -> tuple[str, str]:
+        with self.lock:
+            self.seen.append(request)
+            if self.raise_in_handler:
+                raise OSError("the writer could not reach its device")
+            ack = request.ack
+            if ack.writer_epoch != "writer-1":
+                return ACK_REJECTED, "not this writer"
+            if ack.consumer_instance_id != "consumer-1":
+                return ACK_REJECTED, "not the bound consumer"
+            if ack.manifest_digest != "digest":
+                return ACK_REJECTED, "receipt mismatch"
+            if ack.req_id in self.applied:
+                return ACK_ALREADY_APPLIED, ""
+            if self.held.get(ack.req_id, 0) <= 0:
+                return ACK_REJECTED, "no such hold"
+            self.held[ack.req_id] -= 1
+            self.applied.append(ack.req_id)
+        if not self.reply_after_apply:
+            # Applied, then the answer is lost. The consumer must retry and
+            # must not be told twice that it released something.
+            raise _DroppedReply()
+        return ACK_APPLIED, ""
+
+
+class _DroppedReply(Exception):
+    """Raised after a successful release to model a lost reply."""
+
+
+@pytest.fixture
+def writer():
+    return _Writer()
+
+
+@pytest.fixture
+def server(writer):
+    port = _free_port()
+    instance = StoragePDAckServer(
+        writer.handle,
+        claim_handler=writer.claim,
+        unread_handler=writer.unread,
+        bind_host=LOOPBACK,
+        port=port,
+        advertise_host=LOOPBACK,
+        recv_timeout_ms=50,
+    )
+    yield instance
+    instance.close(timeout_s=5.0)
+
+
+@pytest.fixture
+def client():
+    instance = StoragePDAckClient(
+        attempt_timeout_ms=300,
+        retry_interval_s=0.05,
+        max_live_obligations=4,
+        poll_interval_s=0.01,
+    )
+    yield instance
+    instance.close(timeout_s=5.0)
+
+
+def _settled(obligation, timeout: float = 10.0) -> Optional[str]:
+    return obligation.wait(timeout=timeout)
+
+
+def _owe(client: StoragePDAckClient, ack: StoragePDReadAck, **kwargs):
+    """Take room for an acknowledgement and then owe it, as a restore does.
+
+    Serving reserves before the read and owes after it. These tests are not
+    reading anything, so the two happen together -- but they still happen in
+    that order, because ``owe`` cannot be called without the room.
+    """
+    reservation = client.reserve(endpoint=kwargs["endpoint"])
+    if reservation is None:
+        return None
+    return client.owe(ack, reservation=reservation, **kwargs)
+
+
+def test_ack_obligation_is_traced_before_the_worker_can_send(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Record acceptance before background delivery can apply the ACK."""
+    path = tmp_path / "timeline.jsonl"
+    monkeypatch.setenv("LMCACHE_STORAGE_PD_TRACE_FILE", str(path))
+    attempted = threading.Event()
+    observed: list[dict] = []
+    trace = ack_module.trace_storage_pd_event
+
+    def slow_trace(event: str, **fields: Any) -> None:
+        attempted.wait(0.1)
+        trace(event, **fields)
+
+    def attempt(
+        _client: StoragePDAckClient, _obligation: StoragePDAckObligation
+    ) -> None:
+        if attempted.is_set():
+            return
+        if path.exists():
+            observed.extend(json.loads(line) for line in path.read_text().splitlines())
+        attempted.set()
+
+    monkeypatch.setattr(ack_module, "trace_storage_pd_event", slow_trace)
+    monkeypatch.setattr(StoragePDAckClient, "_attempt", attempt)
+    client = StoragePDAckClient(poll_interval_s=0.001)
+    try:
+        obligation = _owe(
+            client,
+            _ack(),
+            endpoint="127.0.0.1:9999",
+            session_id="session-1",
+            deadline_s=10.0,
+            consumer_request_id="decode-1",
+            restore_attempt_id="restore-1",
+            namespace_identity="namespace-1",
+        )
+        assert obligation is not None
+        assert attempted.wait(1.0)
+    finally:
+        client.close()
+    assert observed
+    assert all(row["event"] == "ack_owed" for row in observed)
+    assert observed[0]["consumer_instance_id"] == "consumer-1"
+    assert observed[0]["consumer_request_id"] == "decode-1"
+    assert observed[0]["restore_attempt_id"] == "restore-1"
+    assert observed[0]["namespace_identity"] == "namespace-1"
+
+
+def test_closed_ack_client_does_not_trace_an_unaccepted_obligation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A reserved read whose client stopped must remain unresolved."""
+    path = tmp_path / "timeline.jsonl"
+    monkeypatch.setenv("LMCACHE_STORAGE_PD_TRACE_FILE", str(path))
+    client = StoragePDAckClient()
+    reservation = client.reserve(endpoint="127.0.0.1:9999")
+    assert reservation is not None
+    client.close()
+    obligation = client.owe(
+        _ack(),
+        endpoint="127.0.0.1:9999",
+        session_id="session-1",
+        deadline_s=10.0,
+        reservation=reservation,
+        restore_attempt_id="restore-1",
+    )
+    reservation.release()
+    assert obligation is None
+    assert not path.exists()
+
+
+def test_a_writer_applies_and_the_consumer_hears_it(server, client, writer):
+    """The ordinary case: one request, one release, one validated answer."""
+    writer.hold("request-1")
+    obligation = _owe(
+        client,
+        _ack(),
+        endpoint=server.endpoint,
+        session_id="session-1",
+        deadline_s=10.0,
+    )
+    assert obligation is not None
+    assert _settled(obligation) == ACK_APPLIED
+    assert writer.held["request-1"] == 0
+    assert writer.applied == ["request-1"]
+
+
+def test_a_dropped_reply_after_a_release_frees_nothing_twice(server, client, writer):
+    """The writer released the hold and its answer was lost.
+
+    The consumer has no way to know the difference between that and a
+    request that never arrived, so it asks again. The second answer must
+    say the hold was already applied, and the writer must not release a
+    second reference.
+    """
+    writer.hold("request-1")
+    writer.reply_after_apply = False
+    obligation = _owe(
+        client,
+        _ack(),
+        endpoint=server.endpoint,
+        session_id="session-1",
+        deadline_s=10.0,
+    )
+    assert obligation is not None
+
+    # Wait until the release has happened, then let the writer answer.
+    deadline = time.monotonic() + 10.0
+    while not writer.applied and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert writer.applied == ["request-1"]
+    assert not obligation.settled, "a lost reply is not an answer"
+    writer.reply_after_apply = True
+
+    assert _settled(obligation) == ACK_ALREADY_APPLIED
+    assert writer.held["request-1"] == 0
+    assert writer.applied == ["request-1"], "the release must have run once"
+    assert obligation.attempts >= 2
+
+
+def test_an_unreachable_writer_leaves_the_obligation_owed(client, writer):
+    """A send that cannot even be made is not an acknowledgement.
+
+    Nothing is listening, so every attempt fails. The obligation stays owed
+    until its own deadline and then reports that it was never answered --
+    it never reports that the hold is gone.
+    """
+    obligation = _owe(
+        client,
+        _ack(),
+        endpoint=f"{LOOPBACK}:{_free_port()}",
+        session_id="session-1",
+        deadline_s=0.5,
+    )
+    assert obligation is not None
+    assert _settled(obligation) == ACK_UNRESOLVED
+    assert obligation.attempts >= 1
+    assert writer.applied == []
+
+
+def test_a_writer_that_arrives_late_is_still_reached(client, writer):
+    """The consumer may finish reading before the writer is listening.
+
+    The obligation is owned by a background worker rather than by the
+    restore that created it, so it keeps trying with no further serving
+    request of any kind.
+    """
+    port = _free_port()
+    writer.hold("request-1")
+    obligation = _owe(
+        client,
+        _ack(),
+        endpoint=f"{LOOPBACK}:{port}",
+        session_id="session-1",
+        deadline_s=15.0,
+    )
+    assert obligation is not None
+
+    deadline = time.monotonic() + 5.0
+    while obligation.attempts < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert obligation.attempts >= 1
+    assert not obligation.settled
+
+    server = StoragePDAckServer(
+        writer.handle,
+        claim_handler=writer.claim,
+        unread_handler=writer.unread,
+        bind_host=LOOPBACK,
+        port=port,
+        advertise_host=LOOPBACK,
+        recv_timeout_ms=50,
+    )
+    try:
+        assert _settled(obligation) == ACK_APPLIED
+    finally:
+        server.close(timeout_s=5.0)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"writer_epoch": "someone-else"},
+        {"consumer_instance_id": "a-restarted-consumer"},
+        {"manifest_digest": "someone-elses-digest"},
+        {"req_id": "a-request-that-was-never-published"},
+    ],
+    ids=["wrong-producer", "wrong-consumer", "wrong-receipt", "unknown-request"],
+)
+def test_a_wrong_identity_releases_nothing(server, client, writer, overrides):
+    """The writer checks every field, and a rejection is final.
+
+    A consumer told "rejected" stops offering the message: this writer will
+    never apply it, and retrying forever would keep a control worker busy
+    over something that can only be answered one way.
+    """
+    writer.hold("request-1")
+    obligation = _owe(
+        client,
+        _ack(**overrides),
+        endpoint=server.endpoint,
+        session_id="session-1",
+        deadline_s=10.0,
+    )
+    assert obligation is not None
+    assert _settled(obligation) == ACK_REJECTED
+    assert writer.applied == []
+    assert writer.held["request-1"] == 1
+
+
+def test_two_requests_sharing_a_key_have_two_holds(server, client, writer):
+    """One acknowledgement releases one hold, not the key.
+
+    Two requests whose manifests name the same extent each hold a
+    reference. Treating the key as the unit would let the first
+    acknowledgement free the extent while the second reader is still
+    reading it.
+    """
+    writer.hold("request-1")
+    writer.hold("request-2")
+    first = _owe(
+        client,
+        _ack("request-1"),
+        endpoint=server.endpoint,
+        session_id="session-1",
+        deadline_s=10.0,
+    )
+    assert first is not None
+    assert _settled(first) == ACK_APPLIED
+
+    assert writer.held == {"request-1": 0, "request-2": 1}
+
+    second = _owe(
+        client,
+        _ack("request-2"),
+        endpoint=server.endpoint,
+        session_id="session-1",
+        deadline_s=10.0,
+    )
+    assert second is not None
+    assert _settled(second) == ACK_APPLIED
+    assert writer.held == {"request-1": 0, "request-2": 0}
+
+
+def test_saturation_refuses_new_work_and_recovers_without_a_next_request(
+    client, writer
+):
+    """A full outbox stops admitting rather than abandoning a hold.
+
+    Evicting the oldest obligation to make room is how a writer ends up
+    holding extents nobody is responsible for. The bound refuses instead,
+    and the refusal is the caller's signal to stop publishing.
+
+    Recovery then has to happen with no further request arriving, which is
+    what a background owner is for.
+    """
+    port = _free_port()
+    endpoint = f"{LOOPBACK}:{port}"
+    owed = []
+    for index in range(4):
+        writer.hold(f"request-{index}")
+        obligation = _owe(
+            client,
+            _ack(f"request-{index}"),
+            endpoint=endpoint,
+            session_id="session-1",
+            deadline_s=20.0,
+        )
+        assert obligation is not None
+        owed.append(obligation)
+
+    # The refusal lands on the reservation, before the read: a consumer that
+    # read first and then found no room would already hold bytes nothing
+    # will release.
+    writer.hold("one-too-many")
+    assert client.reserve(endpoint=endpoint) is None
+    assert client.live_count() == 4
+    assert client.reserved_count() == 0
+
+    server = StoragePDAckServer(
+        writer.handle,
+        claim_handler=writer.claim,
+        unread_handler=writer.unread,
+        bind_host=LOOPBACK,
+        port=port,
+        advertise_host=LOOPBACK,
+        recv_timeout_ms=50,
+    )
+    try:
+        for obligation in owed:
+            assert _settled(obligation, timeout=20.0) == ACK_APPLIED
+    finally:
+        server.close(timeout_s=5.0)
+
+    assert sorted(writer.applied) == [f"request-{index}" for index in range(4)]
+    # And the room is back, without anything having asked.
+    deadline = time.monotonic() + 5.0
+    while client.live_count() > 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert client.live_count() == 0
+    again = _owe(
+        client,
+        _ack("one-too-many"),
+        endpoint=endpoint,
+        session_id="session-1",
+        deadline_s=5.0,
+    )
+    assert again is not None
+
+
+def test_a_writer_that_cannot_say_is_not_a_writer_that_applied(server, client, writer):
+    """A handler that raised has established nothing.
+
+    The reply has to carry that, because the alternative is a consumer
+    retiring an obligation for a release that never happened.
+    """
+    writer.hold("request-1")
+    writer.raise_in_handler = True
+    obligation = _owe(
+        client,
+        _ack(),
+        endpoint=server.endpoint,
+        session_id="session-1",
+        deadline_s=1.0,
+    )
+    assert obligation is not None
+    assert _settled(obligation) == ACK_UNRESOLVED
+    assert writer.applied == []
+    assert writer.held["request-1"] == 1
+    assert len(writer.seen) >= 2, "an unresolved answer is not a final one"
+
+
+def test_an_advertised_wildcard_is_refused(writer):
+    """A bind wildcard is not an address a consumer can reach.
+
+    Publishing "0.0.0.0" as the place to reply tells every consumer to
+    connect to itself. The bind address and the advertised address are
+    separate, and the advertised one has to be routable.
+    """
+    with pytest.raises(ValueError, match="not an address"):
+        StoragePDAckServer(
+            writer.handle,
+            claim_handler=writer.claim,
+            unread_handler=writer.unread,
+            bind_host="0.0.0.0",
+            port=_free_port(),
+        )
+
+
+def test_a_reply_about_something_else_is_not_an_answer(client):
+    """A well-formed reply that answers a different question is discarded.
+
+    A reply carrying another attempt's correlation is what a socket out of
+    step with its own alternation delivers. Accepting it would settle this
+    obligation on a writer's statement about some other hold -- and if that
+    statement is APPLIED, the consumer stops asking about an extent still
+    held.
+    """
+    port = _free_port()
+    replies: list[str] = []
+
+    def _answer_the_wrong_question() -> None:
+        context: zmq.Context = zmq.Context.instance()
+        rep = context.socket(zmq.REP)
+        rep.setsockopt(zmq.LINGER, 0)
+        rep.setsockopt(zmq.RCVTIMEO, 200)
+        rep.bind(f"tcp://{LOOPBACK}:{port}")
+        try:
+            while len(replies) < 2:
+                try:
+                    raw = rep.recv()
+                except zmq.Again:
+                    continue
+                request = msgspec.msgpack.decode(raw, type=StoragePDAckRequest)
+                if not replies:
+                    # Correct in every field but the correlation.
+                    replies.append("foreign")
+                    rep.send(
+                        msgspec.msgpack.encode(
+                            StoragePDAckReply(
+                                outcome=ACK_APPLIED,
+                                req_id=request.ack.req_id,
+                                writer_epoch=request.ack.writer_epoch,
+                                consumer_instance_id=(request.ack.consumer_instance_id),
+                                nonce="a-nonce-from-another-attempt",
+                            )
+                        )
+                    )
+                    continue
+                replies.append("correlated")
+                rep.send(
+                    msgspec.msgpack.encode(
+                        StoragePDAckReply(
+                            outcome=ACK_APPLIED,
+                            req_id=request.ack.req_id,
+                            writer_epoch=request.ack.writer_epoch,
+                            consumer_instance_id=request.ack.consumer_instance_id,
+                            nonce=request.nonce,
+                        )
+                    )
+                )
+        finally:
+            rep.close(linger=0)
+
+    responder = threading.Thread(target=_answer_the_wrong_question, daemon=True)
+    responder.start()
+    try:
+        obligation = _owe(
+            client,
+            _ack(),
+            endpoint=f"{LOOPBACK}:{port}",
+            session_id="session-1",
+            deadline_s=15.0,
+        )
+        assert obligation is not None
+        assert _settled(obligation) == ACK_APPLIED
+        assert replies == ["foreign", "correlated"]
+        assert obligation.attempts >= 2, "the foreign reply must not have settled it"
+    finally:
+        responder.join(timeout=5)
+
+
+def test_an_unintelligible_request_still_gets_an_answer(server, writer):
+    """A reply socket owes an answer for every message it accepted.
+
+    Skipping the reply leaves the socket out of step with its own
+    alternation: the next receive raises, the server thread exits, and
+    every later acknowledgement times out against a writer that is up and
+    listening. One malformed message would take the whole channel down.
+    """
+    writer.hold("request-1")
+    context: zmq.Context = zmq.Context.instance()
+    req = context.socket(zmq.REQ)
+    req.setsockopt(zmq.LINGER, 0)
+    req.setsockopt(zmq.RCVTIMEO, 3000)
+    req.setsockopt(zmq.SNDTIMEO, 3000)
+    req.connect(f"tcp://{server.endpoint}")
+    try:
+        req.send(b"this is not a msgpack acknowledgement")
+        first = msgspec.msgpack.decode(req.recv(), type=StoragePDAckReply)
+        assert first.outcome == ACK_REJECTED
+        assert "undecodable" in first.reason
+    finally:
+        req.close(linger=0)
+
+    # And the channel still works for a real one.
+    client = StoragePDAckClient(
+        attempt_timeout_ms=1000,
+        retry_interval_s=0.05,
+        max_live_obligations=2,
+        poll_interval_s=0.01,
+    )
+    try:
+        obligation = _owe(
+            client,
+            _ack(),
+            endpoint=server.endpoint,
+            session_id="session-1",
+            deadline_s=10.0,
+        )
+        assert obligation is not None
+        assert _settled(obligation) == ACK_APPLIED
+    finally:
+        client.close(timeout_s=5.0)
+
+
+def test_a_granted_claim_is_what_permits_a_read(server, client, writer):
+    """The ordinary case: ask before reading, and be told yes."""
+    writer.hold("request-1")
+
+    assert client.claim(_ack(), endpoint=server.endpoint, session_id="session-1")
+
+    assert len(writer.claims) == 1
+    assert writer.claims[0].read.req_id == "request-1"
+    assert writer.claims[0].session_id == "session-1"
+
+
+def test_a_claim_for_nothing_the_writer_holds_is_refused(server, client, writer):
+    """A read cannot be granted over a publication that is not held."""
+    assert not client.claim(
+        _ack("never-published"),
+        endpoint=server.endpoint,
+        session_id="session-1",
+    )
+
+
+def test_a_final_refusal_stops_the_consumer_asking(server, client, writer):
+    """A session bound to another incarnation stays bound for its life.
+
+    Asking once per request would spend a round trip to be told the same
+    thing, on the restore path, where it delays every read.
+    """
+    writer.hold("request-1")
+    writer.hold("request-2")
+    writer.refuse_claims = True
+    writer.refusal_is_final = True
+
+    assert not client.claim(_ack(), endpoint=server.endpoint, session_id="session-1")
+    assert not client.claim(
+        _ack("request-2"), endpoint=server.endpoint, session_id="session-1"
+    )
+
+    assert len(writer.claims) == 1
+
+
+def test_a_refusal_that_could_change_is_asked_again(server, client, writer):
+    """A publication this writer does not hold yet may be held later."""
+    writer.hold("request-1")
+    writer.hold("request-2")
+    writer.refuse_claims = True
+
+    assert not client.claim(_ack(), endpoint=server.endpoint, session_id="session-1")
+    assert not client.claim(
+        _ack("request-2"), endpoint=server.endpoint, session_id="session-1"
+    )
+
+    # One attempt each, both asked: 3 attempts per claim at the fixture's
+    # settings would be 6, so count the requests the writer saw rather than
+    # the calls made.
+    assert [request.read.req_id for request in writer.claims] == [
+        "request-1",
+        "request-2",
+    ]
+
+
+def test_an_unreachable_writer_does_not_grant_a_read(client):
+    """Nothing is granted by a writer that never answered.
+
+    Reading on the assumption that it would have granted the read is how a
+    consumer ends up holding bytes it can never legitimately release.
+    """
+    endpoint = f"{LOOPBACK}:{_free_port()}"
+
+    assert not client.claim(_ack(), endpoint=endpoint, session_id="session-1")
+
+
+def test_a_claim_handler_that_raised_grants_nothing(writer, client):
+    """A writer that could not decide has not recorded a reader."""
+    port = _free_port()
+
+    def explode(request: StoragePDClaimRequest) -> StoragePDClaimAnswer:
+        raise OSError("the writer could not reach its own state")
+
+    server = StoragePDAckServer(
+        writer.handle,
+        claim_handler=explode,
+        unread_handler=writer.unread,
+        bind_host=LOOPBACK,
+        port=port,
+        advertise_host=LOOPBACK,
+        recv_timeout_ms=50,
+    )
+    try:
+        assert not client.claim(
+            _ack(), endpoint=server.endpoint, session_id="session-1"
+        )
+        # The socket is still in step: it answered, so the next exchange works.
+        writer.hold("request-1")
+        assert client.live_count() == 0
+        obligation = _owe(
+            client,
+            _ack(),
+            endpoint=server.endpoint,
+            session_id="session-1",
+            deadline_s=10.0,
+        )
+        assert obligation is not None
+        assert _settled(obligation) == ACK_APPLIED
+    finally:
+        server.close(timeout_s=5.0)
+
+
+def test_an_attempt_does_not_outspend_its_obligation(client, monkeypatch):
+    """The deadline is absolute, so an attempt may not reach past it.
+
+    An attempt given its own full timeout can start just inside the
+    obligation's deadline and return long after it, which makes the
+    deadline a suggestion rather than the bound the obligation is reported
+    against.
+    """
+    spent: list[int] = []
+
+    def record(endpoint, request, expect=StoragePDAckReply, *, timeout_ms=None):
+        spent.append(timeout_ms)
+        return None
+
+    monkeypatch.setattr(client, "_exchange", record)
+    # The configured attempt timeout is 300ms; this obligation has 50 left.
+    obligation = StoragePDAckObligation(
+        _ack(),
+        endpoint=f"{LOOPBACK}:{_free_port()}",
+        session_id="session-1",
+        deadline=time.monotonic() + 0.05,
+    )
+
+    client._attempt(obligation)
+
+    assert spent and spent[0] <= 50
+
+
+@pytest.mark.parametrize("send_elapsed_s", [0.08, 0.12])
+def test_send_and_receive_share_one_attempt_budget(
+    client: StoragePDAckClient,
+    monkeypatch: pytest.MonkeyPatch,
+    send_elapsed_s: float,
+) -> None:
+    """Spend time waiting to send before computing the receive timeout."""
+    now = [10.0]
+    received_with: list[int] = []
+
+    class Socket:
+        def __init__(self) -> None:
+            self.options: dict[int, int] = {}
+            self.closed = False
+
+        def setsockopt(self, option: int, value: int) -> None:
+            self.options[option] = value
+
+        def connect(self, _endpoint: str) -> None:
+            pass
+
+        def send(self, raw: bytes) -> None:
+            now[0] += send_elapsed_s
+
+        def recv(self) -> bytes:
+            received_with.append(self.options[zmq.RCVTIMEO])
+            raise zmq.Again()
+
+        def close(self, *, linger: int) -> None:
+            self.closed = True
+
+    transport = Socket()
+    context = Mock()
+    context.socket.return_value = transport
+    client._context = context
+    monkeypatch.setattr(ack_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    request = StoragePDAckRequest(_ack(), "session-1", 1, "nonce")
+
+    assert client._exchange("127.0.0.1:5999", request, timeout_ms=100) is None
+
+    assert transport.closed
+    if send_elapsed_s < 0.1:
+        assert len(received_with) == 1
+        assert 0 < received_with[0] <= 20
+    else:
+        assert not received_with, "an expired attempt must not start another wait"
+
+
+@pytest.mark.parametrize("operation", ["claim", "ack", "unread"])
+def test_control_connect_failure_closes_each_created_socket(
+    client: StoragePDAckClient, operation: str
+) -> None:
+    """A failed connect must not abandon the socket created for that attempt."""
+    transport = Mock()
+    transport.connect.side_effect = zmq.ZMQError("connect failed")
+    context = Mock()
+    context.socket.return_value = transport
+    client._context = context
+    if operation == "claim":
+        assert not client.claim(
+            _ack(), endpoint="127.0.0.1:5999", session_id="session-1"
+        )
+    elif operation == "ack":
+        obligation = _owe(
+            client,
+            _ack(),
+            endpoint="127.0.0.1:5999",
+            session_id="session-1",
+            deadline_s=0.03,
+        )
+        assert obligation is not None
+        assert obligation.wait(timeout=1) == ACK_UNRESOLVED
+    else:
+        unread = StoragePDUnreadClient(retry_interval_s=0.005, poll_interval_s=0.002)
+        unread._context = context
+        try:
+            status = StoragePDStatus.ready(
+                "request-1",
+                0,
+                RawBlockPublicationReceipt(
+                    "writer-1", 7, 1, "digest", ack_endpoint="127.0.0.1:5999"
+                ),
+            )
+            obligation = unread.offer(
+                status, session_id="session-1", reason="no reader", deadline_s=0.03
+            )
+            assert obligation is not None
+            assert obligation.wait(timeout=1) == UNREAD_UNRESOLVED
+        finally:
+            assert unread.close(timeout_s=1)
+    assert transport.connect.call_count > 0
+    assert transport.close.call_count == transport.connect.call_count
+    transport.close.assert_called_with(linger=0)
