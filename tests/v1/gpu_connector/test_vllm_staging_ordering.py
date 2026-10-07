@@ -322,7 +322,14 @@ class MemoryObject:
         self.tensor = tensor
         self.raw_tensor = tensor
         self.metadata = SimpleNamespace(fmt="KV_2LTD")
+        self.padding = [0xD3] * 11
         self.ref_count = 1
+
+    def zero_padding(self) -> None:
+        """Queue padding initialization on the selected staging stream."""
+        self.tensor.cuda.current.enqueue(
+            lambda: self.padding.__setitem__(slice(None), [0] * len(self.padding))
+        )
 
     def ref_count_up(self) -> None:
         """Acquire an allocation owner, preventing reuse after uncertain work."""
@@ -467,6 +474,10 @@ class TestVLLMStagingOrdering(unittest.TestCase):
                 self.assertEqual(
                     [obj.tensor.values for obj in scenario.objects],
                     scenario.expected_chunks(),
+                )
+                self.assertEqual(
+                    [obj.padding for obj in scenario.objects],
+                    [[0] * 11] * len(scenario.objects),
                 )
 
     def test_failed_stream_wait_retains_owners_and_refuses_reuse(self) -> None:

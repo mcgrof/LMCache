@@ -186,6 +186,46 @@ def test_real_copy_helper_releases_partial_groups(
         manager.close()
 
 
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("failure", ["copy", "dispatch", "none"])
+def test_writeback_failure_releases_loaded_and_host_owners(
+    monkeypatch: pytest.MonkeyPatch, batched: bool, failure: str
+) -> None:
+    stream = CopyStream()
+    count = 2 if batched else 1
+    sources = [CopyObject(stream, i + 1, device="cuda") for i in range(count)]
+    destinations = [
+        CopyObject(stream, 0, enqueue_fails=failure == "copy" and i == count - 1)
+        for i in range(count)
+    ]
+    host = cpu_backend(list(destinations))
+    if failure == "dispatch":
+        host.batched_submit_put_task.side_effect = OSError("dispatch refused")
+    storage = Mock()
+    storage.get_blocking.return_value = sources[0]
+    storage.batched_get_blocking.return_value = sources
+    manager = make_manager(monkeypatch, host, stream, storage)
+    keys = cache_keys(count)
+    try:
+
+        def load() -> Any:
+            if batched:
+                return manager.batched_get(keys, location="Storage")
+            return manager.get(keys[0], location="Storage")
+
+        if failure == "none":
+            loaded = load()
+            assert loaded == (sources if batched else sources[0])
+        else:
+            with pytest.raises((RuntimeError, OSError), match="failed|refused"):
+                load()
+        assert not stream.pending
+        assert all(obj.references == 0 for obj in destinations)
+        assert all(obj.references == (1 if failure == "none" else 0) for obj in sources)
+    finally:
+        manager.close()
+
+
 def test_failed_sync_retains_owners_rejects_reuse_and_preserves_backends(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -358,8 +358,19 @@ class StorageManager:
     def _get_allocator_backend(
         self, config: LMCacheEngineConfig
     ) -> AllocatorBackendInterface:
+        gpu_endpoints = [
+            backend
+            for backend in self.storage_backends.values()
+            if getattr(backend, "is_gpu_endpoint", False)
+        ]
         if self.enable_pd:
             allocator_backend = self.storage_backends["PDBackend"]
+        elif gpu_endpoints:
+            # A backend that stages KV chunks in device memory (the raw-block
+            # backend with a GPU pool) allocates for the engine, so the GPU
+            # connector copies device-to-device and the backend moves the
+            # chunk to storage straight from VRAM.
+            allocator_backend = gpu_endpoints[0]
         elif "MaruBackend" in self.storage_backends:
             if "LocalCPUBackend" in self.storage_backends:
                 allocator_backend = self.storage_backends["LocalCPUBackend"]
@@ -493,6 +504,10 @@ class StorageManager:
     ) -> Optional[MemoryObj]:
         """
         Blocking function to get the memory object from the storages.
+
+        Returns one caller-owned reference, or None for a miss. If CPU cache
+        writeback fails, the loaded reference is released before propagating
+        the failure (or retained if GPU copy quiescence is unknown).
         """
 
         # Search all backends for blocking get
@@ -501,14 +516,23 @@ class StorageManager:
             # are allocated by the allocator backend.
             memory_obj = backend.get_blocking(key)
             if memory_obj:
-                if (
-                    backend_name not in ["LocalCPUBackend", "PDBackend", "MaruBackend"]
-                    and "LocalCPUBackend" in self.storage_backends
-                ):
-                    local_cpu_backend = self.storage_backends["LocalCPUBackend"]
-                    assert isinstance(local_cpu_backend, LocalCPUBackend)
-                    local_cpu_backend.submit_put_task(key, memory_obj)
-                return memory_obj
+                delivered = False
+                try:
+                    if (
+                        backend_name
+                        not in ["LocalCPUBackend", "PDBackend", "MaruBackend"]
+                        and "LocalCPUBackend" in self.storage_backends
+                    ):
+                        local_cpu_backend = self.storage_backends["LocalCPUBackend"]
+                        assert isinstance(local_cpu_backend, LocalCPUBackend)
+                        self._write_back_to_local_cpu(
+                            local_cpu_backend, [key], [memory_obj]
+                        )
+                    delivered = True
+                    return memory_obj
+                finally:
+                    if not delivered:
+                        memory_obj.ref_count_down()
 
         return None
 
@@ -536,35 +560,94 @@ class StorageManager:
         keys: List[CacheEngineKey],
         location: Optional[str] = None,
     ) -> List[Optional[MemoryObj]]:
-        """
-        Blocking function to get the memory objects from the storages.
+        """Load objects synchronously from the selected storage backends.
+
+        Args:
+            keys: Ordered cache keys to load.
+            location: Backend name, or None to search all active backends.
+
+        Returns:
+            Caller-owned objects aligned with keys, using None for misses.
+            Failed CPU-cache writeback releases the loaded references before
+            propagating the error; copies with unknown quiescence retain them.
         """
         # TODO (ApostaC): remove the nested optional here
         for backend_name, storage_backend in self.get_active_storage_backends(location):
             memory_objs = storage_backend.batched_get_blocking(keys)
             if memory_objs:
-                # Align with single-key `get()` logic:
-                # auto-write remote data to local CPU cache
-                if (
-                    backend_name not in ["LocalCPUBackend", "PDBackend", "MaruBackend"]
-                    and "LocalCPUBackend" in self.storage_backends
-                    and None not in memory_objs
-                ):
-                    logger.debug(
-                        "Storing %s objects from %s to LocalCPUBackend",
-                        len(keys),
-                        backend_name,
-                    )
-                    local_cpu_backend = self.storage_backends["LocalCPUBackend"]
-                    assert isinstance(local_cpu_backend, LocalCPUBackend)
-                    # Type cast: Safe (we verified no Nones above)
-                    # `batched_submit_put_task` expects list[MemoryObj]
-                    # TODO (lisiG9): Refactor this write-back logic into caching
-                    #  policy module
-                    memory_objs_no_none = cast(List[MemoryObj], memory_objs)
-                    local_cpu_backend.batched_submit_put_task(keys, memory_objs_no_none)
-                return memory_objs
+                delivered = False
+                try:
+                    # Align with single-key `get()` logic:
+                    # auto-write remote data to local CPU cache
+                    if (
+                        backend_name
+                        not in ["LocalCPUBackend", "PDBackend", "MaruBackend"]
+                        and "LocalCPUBackend" in self.storage_backends
+                        and None not in memory_objs
+                    ):
+                        logger.debug(
+                            "Storing %s objects from %s to LocalCPUBackend",
+                            len(keys),
+                            backend_name,
+                        )
+                        local_cpu_backend = self.storage_backends["LocalCPUBackend"]
+                        assert isinstance(local_cpu_backend, LocalCPUBackend)
+                        # Type cast: Safe (we verified no Nones above)
+                        # `batched_submit_put_task` expects list[MemoryObj]
+                        # TODO (lisiG9): Refactor this write-back logic into caching
+                        #  policy module
+                        memory_objs_no_none = cast(List[MemoryObj], memory_objs)
+                        self._write_back_to_local_cpu(
+                            local_cpu_backend, keys, memory_objs_no_none
+                        )
+                    delivered = True
+                    return memory_objs
+                finally:
+                    if not delivered:
+                        for memory_obj in memory_objs:
+                            if memory_obj is not None:
+                                memory_obj.ref_count_down()
         return [None] * len(keys)
+
+    def _write_back_to_local_cpu(
+        self,
+        local_cpu_backend: LocalCPUBackend,
+        keys: Sequence[CacheEngineKey],
+        memory_objs: List[MemoryObj],
+    ) -> None:
+        """Admit objects loaded from another backend into the local CPU cache.
+
+        Objects that live in device memory (loaded by a GPU-endpoint backend)
+        are copied into local CPU objects first; admitting them as they are
+        would pin the device staging slots for as long as the CPU cache kept
+        them.
+
+        That copy is only worth paying for when the cache will keep the
+        result.  With the hot cache off the backend drops every admission, so
+        a load served out of device memory would otherwise copy each chunk to
+        the host on the way back and then throw it away.
+        """
+        if not local_cpu_backend.use_hot:
+            return
+        if all(
+            memory_obj.tensor is None or memory_obj.tensor.device.type == "cpu"
+            for memory_obj in memory_objs
+        ):
+            local_cpu_backend.batched_submit_put_task(keys, memory_objs)
+            return
+        try:
+            host_keys, host_objs = allocate_and_copy_objects(
+                local_cpu_backend, keys, memory_objs, self.internal_copy_stream
+            )
+        except RuntimeError:
+            self._retain_failed_copy_resources()
+            raise
+        try:
+            if host_objs:
+                local_cpu_backend.batched_submit_put_task(host_keys, host_objs)
+        finally:
+            for memory_obj in host_objs:
+                memory_obj.ref_count_down()
 
     def layerwise_batched_get(
         self,
@@ -1458,7 +1541,10 @@ class StorageManager:
         # Consumers must settle I/O before their shared backing arenas are freed.
         backends = sorted(
             self.storage_backends.items(),
-            key=lambda item: isinstance(item[1], AllocatorBackendInterface),
+            key=lambda item: (
+                isinstance(item[1], LocalCPUBackend),
+                isinstance(item[1], AllocatorBackendInterface),
+            ),
         )
         if self._retain_failed_copy_resources():
             backends = []

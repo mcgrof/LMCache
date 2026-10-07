@@ -485,8 +485,8 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                 with the same requirements as :meth:`from_gpu`.
 
         Returns:
-            None. All gathers are complete on successful return. An empty
-            batch performs no stream work.
+            None. All gathers and owned-padding zeroes complete before successful
+            return. An empty batch performs no stream work.
 
         Raises:
             ValueError: Batch lengths differ or transfer arguments are invalid.
@@ -517,6 +517,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                     typed_memory_objs, starts, ends, strict=True
                 ):
                     self._enqueue_from_gpu(memory_obj, start, end, **kwargs)
+                    memory_obj.zero_padding()
         finally:
             # io_uring and other storage backends cannot observe CUDA stream
             # dependencies. CPU and CUDA staging must both be ready here.
@@ -840,8 +841,8 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 with the same requirements as :meth:`from_gpu`.
 
         Returns:
-            None. All gathers are complete on successful return. An empty
-            batch performs no stream work.
+            None. All gathers and owned-padding zeroes complete before successful
+            return. An empty batch performs no stream work.
 
         Raises:
             ValueError: Batch lengths differ or transfer arguments are invalid.
@@ -872,6 +873,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                     typed_memory_objs, starts, ends, strict=True
                 ):
                     self._enqueue_from_gpu(memory_obj, start, end, **kwargs)
+                    memory_obj.zero_padding()
         finally:
             # io_uring and other storage backends cannot observe CUDA stream
             # dependencies. CPU and CUDA staging must both be ready here.

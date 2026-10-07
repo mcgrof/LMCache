@@ -28,6 +28,7 @@ Supported Backends
    mock
    mooncake
    nixl
+   raw_block_dmabuf
    redis
    bigtable
    resp
