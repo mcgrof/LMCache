@@ -6,7 +6,12 @@ from __future__ import annotations
 
 # Standard
 from collections import OrderedDict
-from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
+from concurrent.futures import (
+    CancelledError,
+    Future,
+    InvalidStateError,
+    ThreadPoolExecutor,
+)
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Iterator, Optional, Sequence
@@ -220,7 +225,11 @@ class RawBlockPDRequestTracker:
         is_last_batch: bool,
         completed_keys: Sequence[str] = (),
     ) -> Future[RawBlockPublicationReceipt]:
-        """Register one request batch and return its terminal future."""
+        """Register a batch and return a future whose cancellation retires it.
+
+        Cancellation releases pre-publication protection. Publication already
+        in flight keeps its pins and admission capacity until its worker finishes.
+        """
         if not req_id:
             raise ValueError("storage P/D requires a non-empty request id")
         if expected_chunks <= 0:
@@ -234,12 +243,14 @@ class RawBlockPDRequestTracker:
         if not set(completed_keys).issubset(batch_key_set):
             raise ValueError("completed keys must belong to the registered batch")
         publish: tuple[str, list[str], Future[RawBlockPublicationReceipt]] | None
+        created = False
         with self._request_update():
             if self._closed:
                 raise RuntimeError("raw-block P/D request tracker is closed")
             if (
                 req_id not in self._requests
-                and len(self._leases) + len(self._requests) >= self._max_live_leases
+                and len(self._leases) + len(self._requests.keys() | self._publishing)
+                >= self._max_live_leases
             ):
                 # Refusing is the point. Publishing anyway would add a hold
                 # nobody is going to release, and evicting an older one to
@@ -248,11 +259,16 @@ class RawBlockPDRequestTracker:
                 raise RuntimeError(
                     "raw-block P/D already holds "
                     f"{len(self._leases)} unacknowledged lease(s) and "
-                    f"{len(self._requests)} in-flight request(s), at its "
+                    f"{len(self._requests.keys() | self._publishing)} "
+                    "in-flight request/publication(s), at its "
                     f"bound of {self._max_live_leases}; refusing to publish "
                     f"{req_id} rather than abandon one of them"
                 )
-            if req_id in self._finished or req_id in self._leases:
+            if (
+                req_id in self._finished
+                or req_id in self._leases
+                or req_id in self._publishing
+            ):
                 raise RuntimeError(
                     f"request {req_id} has already finished and cannot be "
                     "registered again"
@@ -261,6 +277,7 @@ class RawBlockPDRequestTracker:
             if state is None:
                 state = _RequestState(expected_chunks=expected_chunks)
                 self._requests[req_id] = state
+                created = True
             elif state.expected_chunks != expected_chunks:
                 self._fail_locked(
                     req_id,
@@ -328,6 +345,10 @@ class RawBlockPDRequestTracker:
                 return state.terminal
             publish = self._maybe_start_publication_locked(req_id, state)
             terminal = state.terminal
+        if created:
+            # add_done_callback may run synchronously if another batch caller
+            # already cancelled this future. Never register it under the lock.
+            terminal.add_done_callback(lambda done: self._cancel_request(req_id, done))
         if publish is not None:
             self._submit_publication(*publish)
         return terminal
@@ -1020,6 +1041,17 @@ class RawBlockPDRequestTracker:
                 "inflight_request_count": len(self._requests),
                 "publication_task_count": len(self._publishing),
             }
+
+    def _cancel_request(
+        self, req_id: str, terminal: Future[RawBlockPublicationReceipt]
+    ) -> None:
+        """Retire only the incarnation whose public future was cancelled."""
+        if not terminal.cancelled():
+            return
+        with self._request_update():
+            state = self._requests.get(req_id)
+            if state is not None and state.terminal is terminal:
+                self._fail_locked(req_id, state, CancelledError())
 
     def _maybe_start_publication_locked(
         self,

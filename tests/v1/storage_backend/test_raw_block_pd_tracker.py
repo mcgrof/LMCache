@@ -69,6 +69,66 @@ class _FakeCore:
         self.linked_publications.append((req_id, receipt))
 
 
+@pytest.mark.parametrize("last_batch", [False, True])
+def test_cancelled_future_retires_admission_before_write_completion(
+    last_batch: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancelled waiter cannot strand request capacity or protection."""
+    core = _FakeCore()
+    released: list[str] = []
+    monkeypatch.setattr(
+        core, "release_publication_protection", released.append, raising=False
+    )
+    tracker = RawBlockPDRequestTracker(core, max_live_leases=1)  # type: ignore[arg-type]
+    try:
+        terminal = tracker.register_batch(
+            "cancelled", ["key"], expected_chunks=1, is_last_batch=last_batch
+        )
+        assert terminal.cancel()
+        assert tracker.report_status()["inflight_request_count"] == 0
+        assert released == ["cancelled"]
+        tracker.complete_batch("cancelled", ["key"])
+        assert not core.publish_started.is_set()
+        replacement = tracker.register_batch(
+            "replacement", ["next"], expected_chunks=1, is_last_batch=True
+        )
+        assert not replacement.done()
+    finally:
+        tracker.close()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_terminated_request_counts_inflight_publication_until_quiescent(
+    cancel: bool,
+) -> None:
+    """Retiring a waiter must not bypass the bounded publisher queue."""
+    core = _FakeCore()
+    tracker = RawBlockPDRequestTracker(core, max_live_leases=1)  # type: ignore[arg-type]
+    try:
+        terminal = tracker.register_batch(
+            "publishing",
+            ["key"],
+            expected_chunks=1,
+            is_last_batch=True,
+            completed_keys=["key"],
+        )
+        assert core.publish_started.wait(2)
+        if cancel:
+            assert terminal.cancel()
+        else:
+            tracker.fail_request("publishing", OSError("request ended"))
+        assert tracker.report_status()["publication_task_count"] == 1
+        with pytest.raises(RuntimeError, match="at its bound"):
+            tracker.register_batch(
+                "next", ["next-key"], expected_chunks=1, is_last_batch=True
+            )
+        assert core.leased == ["key"]
+    finally:
+        core.allow_publish.set()
+        assert tracker.close(timeout_s=2)
+    assert core.leased == []
+
+
 @pytest.mark.parametrize("outcome", ["success", "failure", "invalid_batch", "close"])
 def test_terminal_callbacks_can_query_retired_tracker_state(outcome: str) -> None:
     """Synchronous Future callbacks must not run inside the admission lock."""
