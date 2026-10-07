@@ -339,6 +339,10 @@ class RawBlockCloseOutcome:
         return self.quiescence is NativeQuiescence.PROVEN and not self.poisoned
 
 
+class IncompatibleKeyDerivation(RuntimeError):
+    """A checkpoint uses a key namespace this engine cannot reproduce."""
+
+
 class RawBlockCore:
     """
     Shared raw-block storage engine used by both legacy non-MP and MP L2 paths.
@@ -2512,6 +2516,7 @@ class RawBlockCore:
             dirty_total = self._meta_dirty_total
             snapshot = {
                 "version": 1,
+                "key_namespace": self.key_namespace,
                 "device_path": self.device_path,
                 "capacity_bytes": self.capacity_bytes,
                 "block_align": self.block_align,
@@ -2627,6 +2632,20 @@ class RawBlockCore:
         )
         return self._write_checkpoint(payload, dirty_total_snapshot)
 
+    def _require_matching_key_namespace(self, theirs: Any) -> None:
+        """Refuse recovery under a different slot-header identity scheme.
+
+        Otherwise header validation treats every live entry as stale and
+        makes those slots available for writes over the original cache.
+        Older checkpoints lack this field, so preserve their recovery behavior.
+        """
+        if theirs is None or str(theirs) == self.key_namespace:
+            return
+        raise IncompatibleKeyDerivation(
+            f"raw-block checkpoint uses key namespace {theirs!r}, "
+            f"not {self.key_namespace!r}; refusing to recycle its live extents"
+        )
+
     def _is_valid_checkpoint_entry(self, offset: int, size: int) -> bool:
         """Return whether a checkpoint entry references a valid data slot."""
         if offset < self._data_base_offset:
@@ -2645,6 +2664,7 @@ class RawBlockCore:
             return False
         if int(data.get("version", 0)) != 1:
             return False
+        self._require_matching_key_namespace(data.get("key_namespace"))
         checkpoint_device_path = data.get("device_path")
         if checkpoint_device_path and checkpoint_device_path != self.device_path:
             logger.warning("Device metadata device_path mismatch; ignoring metadata")
