@@ -25,6 +25,27 @@ from lmcache.v1.system_detection import NUMAMapping
 
 logger = init_logger(__name__)
 
+_UNCERTAIN_MEMORY_OWNERS: list[tuple[list["MemoryObj"], tuple[object, ...]]] = []
+
+
+def retain_memory_owners(memory_objs: list["MemoryObj"], *owners: object) -> None:
+    """Retain allocations and their owner graphs until process exit.
+
+    Use only after a failed completion wait leaves asynchronous accesses
+    unresolved. Extra allocation references prevent ordinary caller cleanup
+    from returning their pages to a pool. Strong references keep allocator,
+    source tensor, stream, and backend objects alive as well. There is no
+    release operation because an unsuccessful wait did not prove quiescence.
+
+    Args:
+        memory_objs: Allocations which may still be accessed asynchronously.
+        *owners: Objects owning any additional resources used by those accesses.
+    """
+    retained = list(memory_objs)
+    for memory_obj in retained:
+        memory_obj.ref_count_up()
+    _UNCERTAIN_MEMORY_OWNERS.append((retained, owners))
+
 
 # Cache for ctypes ubyte-array types keyed by length.
 #
