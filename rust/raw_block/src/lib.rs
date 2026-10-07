@@ -17,7 +17,7 @@
 
 use pyo3::exceptions::{PyMemoryError, PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyAny;
+use pyo3::types::{PyAny, PyMemoryView};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::io;
@@ -494,6 +494,8 @@ struct FakeRingState {
     /// is passed to the kernel, and a test says so by reading them from
     /// here rather than from a device.
     registrations: Vec<FakeRegistration>,
+    /// Failed registration calls, matched by kind and slot in call order.
+    registration_failures: VecDeque<(String, u32, i32)>,
 }
 
 /// One resident or owned entry, as a flat map a test can compare exactly.
@@ -554,6 +556,7 @@ impl FakeRing {
                 syncs: 0,
                 dmabuf_extent: 1 << 30,
                 registrations: Vec::new(),
+                registration_failures: VecDeque::new(),
             })),
             notify,
         }
@@ -606,6 +609,16 @@ impl FakeRing {
     /// a kernel registered anything.
     fn register(&self, kind: &str, count: u32, offset: u32) -> io::Result<()> {
         let mut state = self.state.lock().unwrap();
+        if state
+            .registration_failures
+            .front()
+            .is_some_and(|(expected_kind, expected_offset, _)| {
+                expected_kind == kind && *expected_offset == offset
+            })
+        {
+            let (_, _, errno) = state.registration_failures.pop_front().unwrap();
+            return Err(io::Error::from_raw_os_error(errno));
+        }
         if kind == "unregister" {
             state.registrations.clear();
             state.registrations.push(FakeRegistration {
@@ -1596,6 +1609,16 @@ struct BufRef {
     len: usize,
     readonly: bool,
     host_accessible: bool,
+}
+
+/// Keep an export, not just the exporter, while a batched I/O owns its address.
+/// A reference to bytearray alone does not prevent resize from freeing memory.
+fn batch_buffer_owner(obj: &Bound<'_, PyAny>, host_accessible: bool) -> PyResult<Py<PyAny>> {
+    if host_accessible {
+        Ok(PyMemoryView::from(obj)?.into_any().unbind())
+    } else {
+        Ok(obj.clone().unbind())
+    }
 }
 
 impl BufRef {
@@ -3655,12 +3678,15 @@ impl RawBlockDevice {
     ///
     /// Registration must happen BEFORE any I/O using these buffers.
     /// The buffers must remain valid (not freed) until unregistered.
+    /// Refuses registration on a closed or poisoned device, or while a
+    /// fixed-buffer table is already installed.
     #[pyo3(signature = (buffer_ptrs, buffer_sizes))]
     fn register_fixed_buffers(
         &self,
         buffer_ptrs: Vec<usize>,
         buffer_sizes: Vec<usize>,
     ) -> PyResult<()> {
+        self.ensure_registration_available()?;
         if !self.use_iouring {
             return Err(PyRuntimeError::new_err("io_uring not enabled"));
         }
@@ -3673,14 +3699,6 @@ impl RawBlockDevice {
             return Err(PyValueError::new_err(
                 "at least one buffer must be provided",
             ));
-        }
-
-        {
-            let mut map = self.fixed_buffer_map.lock().unwrap();
-            map.clear();
-            for (idx, (ptr, size)) in buffer_ptrs.iter().zip(buffer_sizes.iter()).enumerate() {
-                map.insert(*ptr, (idx as u16, *size, None));
-            }
         }
 
         if let Some(ring) = &self.ring {
@@ -3696,6 +3714,12 @@ impl RawBlockDevice {
                 match result {
                     Ok(_) => {
                         self.fixed_buffers_registered.store(true, Ordering::Relaxed);
+                        let mut map = self.fixed_buffer_map.lock().unwrap();
+                        for (idx, (ptr, size)) in
+                            buffer_ptrs.iter().zip(buffer_sizes.iter()).enumerate()
+                        {
+                            map.insert(*ptr, (idx as u16, *size, None));
+                        }
                     }
                     Err(e) => {
                         return Err(PyRuntimeError::new_err(format!(
@@ -3722,17 +3746,18 @@ impl RawBlockDevice {
     /// inside its dma-buf, which the SQE then carries in place of a user
     /// address.
     ///
-    /// The dma-buf is registered against this device's fd, so the kernel maps
-    /// it to the device once, here, and every fixed read or write against it
-    /// is issued from that mapping: no DMA mapping per command, and a command
-    /// size bounded by the device's dma-buf ceiling (its MDTS on nvme-pci)
-    /// rather than the per-command mapping clamp.
+    /// The dma-buf is registered against this device's fd for later fixed
+    /// I/O. The kernel controls when the device mapping is established and
+    /// may split a transfer into multiple block requests or commands.
     ///
     /// Requires a kernel with dma-buf backed registered buffers (the
     /// io_uring extended buffer update).  On an older kernel the update
     /// fails with EINVAL; the caller should fall back to
-    /// `register_fixed_buffers`.  Refused on a `use_uring_cmd` engine: NVMe
-    /// passthrough cannot import a dma-buf registration.
+    /// `register_fixed_buffers` only after successful cleanup. If cleanup
+    /// fails, the device is poisoned, close retains the registration, and
+    /// the caller must retain the backing allocator. Refused on a
+    /// `use_uring_cmd` engine: NVMe passthrough cannot import a dma-buf
+    /// registration.
     #[pyo3(signature = (buffer_ptrs, buffer_sizes, dmabuf_fds, dmabuf_bases))]
     fn register_fixed_dmabufs(
         &self,
@@ -3741,6 +3766,7 @@ impl RawBlockDevice {
         dmabuf_fds: Vec<i32>,
         dmabuf_bases: Vec<usize>,
     ) -> PyResult<()> {
+        self.ensure_registration_available()?;
         if !self.use_iouring {
             return Err(PyRuntimeError::new_err("io_uring not enabled"));
         }
@@ -3846,11 +3872,22 @@ impl RawBlockDevice {
                 e
             )));
         }
+        // Even an empty sparse table is a live registration. A failed slot
+        // update must not let close forget the table or earlier slots.
+        self.fixed_buffers_registered.store(true, Ordering::Relaxed);
 
         for (idx, fd) in fds_in_order.iter().enumerate() {
             if let Err(e) = ring.register_dmabuf_slot(idx as u32, *fd, self.fd) {
-                // Leave no half-registered table behind.
-                let _ = ring.unregister_buffers();
+                if let Err(cleanup) = ring.unregister_buffers() {
+                    self.poisoned.store(true, Ordering::SeqCst);
+                    return Err(PyRuntimeError::new_err(format!(
+                        "dma-buf registration of slot {idx} (fd {fd}) failed: {e}; \
+                         buffer unregister also failed: {cleanup}; device is poisoned \
+                         and its backing allocator must be retained"
+                    )));
+                }
+                self.fixed_buffers_registered
+                    .store(false, Ordering::Relaxed);
                 return Err(PyRuntimeError::new_err(format!(
                     "dma-buf registration of slot {} (fd {}) failed: {}",
                     idx, fd, e
@@ -3884,6 +3921,9 @@ impl RawBlockDevice {
     /// `payload_lens` defaults to `total_lens`. Host padding is zero-filled
     /// without changing the source. Registered dma-buf buffers describe a
     /// complete physical slot, whose padding is not accessed by the CPU.
+    /// Host buffer exports remain pinned until the batch is polled after a
+    /// known completion. Unknown outcomes retain those exports permanently.
+    /// Callers must not modify source contents before completion.
     ///
     /// Returns a batch ID that must be passed to `wait_iouring()` to wait for
     /// completion and obtain a success bitmap plus sparse completion errors.
@@ -3983,6 +4023,19 @@ impl RawBlockDevice {
             )));
         }
 
+        let mut owners = Vec::with_capacity(n);
+        for (buffer, view) in buffers.iter().zip(views.iter()) {
+            match batch_buffer_owner(buffer, view.host_accessible) {
+                Ok(owner) => owners.push(owner),
+                Err(error) => {
+                    for view in views {
+                        view.release();
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
         // Generate a unique batch ID for this batch
         let batch_id = self.next_batch_id.fetch_add(1, Ordering::Relaxed);
 
@@ -3998,10 +4051,7 @@ impl RawBlockDevice {
         // Store buffer objects to keep them alive until they are complete
         {
             let mut stored_objs = self.batched_buffer_objs.lock().unwrap();
-            let batch_buffers = stored_objs.entry(batch_id).or_default();
-            for buffer in &buffers {
-                batch_buffers.push(buffer.clone().unbind());
-            }
+            stored_objs.insert(batch_id, owners);
         }
 
         // Extract pointers and capacities as usize before releasing GIL (raw
@@ -4188,44 +4238,6 @@ impl RawBlockDevice {
         Ok(batch_id)
     }
 
-    /// Wait for all in-flight I/O for a specific batch to complete.
-    /// The method waits on a per-batch condition variable that gets signaled
-    /// when the batch's in-flight count reaches 0.
-    ///
-    /// Args:
-    ///     batch_id: The batch ID returned by batched_write() or batched_read().
-    ///               Only completions from this batch are checked.
-    ///
-    /// Returns a success bitmap aligned with the operations submitted in this
-    /// batch and a sparse list of `(operation_index, error_message)` entries.
-    /// `batched_read()` and `batched_write()` can raise validation or
-    /// request-preparation errors instead of returning a batch ID. After a
-    /// batch ID is returned, I/O completion failures are reported in both
-    /// returned collections.
-    /// Release or quarantine a finished batch's Python buffer owners.
-    ///
-    /// A batch whose outcome the worker could not establish must keep them:
-    /// the device may still reach the memory they describe, and handing a
-    /// pool slice back to an allocator on the strength of a logical failure
-    /// is what this distinction exists to prevent. Logical completion is not
-    /// reusable capacity.
-    fn retire_batch_owners(&self, batch_id: u64) {
-        // The worker already moved this batch's owners if it marked the
-        // batch unknown, so that case is a no-op here rather than a second
-        // transfer. This is still the only release for a healthy batch, and
-        // for one the worker never saw.
-        if self.quarantined_batches.lock().unwrap().contains(&batch_id) {
-            drain_batch_owners(
-                &self.batched_buffer_objs,
-                &self.quarantined_owners,
-                Some(batch_id),
-            );
-            return;
-        }
-        let mut stored_objs = self.batched_buffer_objs.lock().unwrap();
-        stored_objs.remove(&batch_id);
-    }
-
     /// Whether any outcome on this device has been unknown.
     ///
     /// Sticky for the life of this device: once the engine cannot say what
@@ -4260,6 +4272,20 @@ impl RawBlockDevice {
         self.retained_owners.load(Ordering::SeqCst)
     }
 
+    /// Wait for all in-flight I/O for a specific batch to complete.
+    /// The method waits on a per-batch condition variable that gets signaled
+    /// when the batch's in-flight count reaches 0.
+    ///
+    /// Args:
+    ///     batch_id: The batch ID returned by batched_write() or batched_read().
+    ///               Only completions from this batch are checked.
+    ///
+    /// Returns a success bitmap aligned with the operations submitted in this
+    /// batch and a sparse list of `(operation_index, error_message)` entries.
+    /// `batched_read()` and `batched_write()` can raise validation or
+    /// request-preparation errors instead of returning a batch ID. After a
+    /// batch ID is returned, I/O completion failures are reported in both
+    /// returned collections.
     #[pyo3(signature = (batch_id))]
     fn wait_iouring(&self, py: Python<'_>, batch_id: u64) -> PyResult<IoUringBatchResults> {
         if !self.use_iouring {
@@ -4513,6 +4539,25 @@ impl RawBlockDevice {
                 described
             })
             .collect())
+    }
+
+    /// Fail a matching synthetic registration call without changing its table.
+    ///
+    /// Calls are matched in the order installed, by kind and slot offset.
+    /// `kind` is sparse, dmabuf or unregister; `errno` must be positive.
+    #[cfg(feature = "fault-injection")]
+    fn fake_registration_fails(&self, kind: String, offset: u32, errno: i32) -> PyResult<()> {
+        if !matches!(kind.as_str(), "sparse" | "dmabuf" | "unregister") || errno <= 0 {
+            return Err(PyValueError::new_err(
+                "registration failure requires sparse, dmabuf or unregister and positive errno",
+            ));
+        }
+        self.scripted_state()?
+            .lock()
+            .unwrap()
+            .registration_failures
+            .push_back((kind, offset, errno));
+        Ok(())
     }
 
     /// Ownership rules this ring saw broken, in order.
@@ -4782,6 +4827,10 @@ impl RawBlockDevice {
     /// All reads are queued to the worker thread, which processes them
     /// in batches to maximize throughput.
     ///
+    /// Host buffer exports remain pinned until the batch is polled after a
+    /// known completion. Unknown outcomes retain those exports permanently.
+    /// Callers must not access destination contents before completion.
+    ///
     /// Returns a batch ID that must be passed to `wait_iouring()` to wait for
     /// completion and obtain a success bitmap plus sparse completion errors.
     /// Validation or request-preparation errors are raised instead of returning
@@ -4843,6 +4892,19 @@ impl RawBlockDevice {
             views.push(view);
         }
 
+        let mut owners = Vec::with_capacity(n);
+        for (buffer, view) in buffers.iter().zip(views.iter()) {
+            match batch_buffer_owner(buffer, view.host_accessible) {
+                Ok(owner) => owners.push(owner),
+                Err(error) => {
+                    for view in views {
+                        view.release();
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
         // Generate a unique batch ID for this batch
         let batch_id = self.next_batch_id.fetch_add(1, Ordering::Relaxed);
 
@@ -4858,10 +4920,7 @@ impl RawBlockDevice {
         // Store buffer objects to keep them alive until they complete
         {
             let mut stored_objs = self.batched_buffer_objs.lock().unwrap();
-            let batch_buffers = stored_objs.entry(batch_id).or_default();
-            for buffer in &buffers {
-                batch_buffers.push(buffer.clone().unbind());
-            }
+            stored_objs.insert(batch_id, owners);
         }
 
         // Extract pointers as usize before releasing GIL (raw pointers are not Send)
@@ -5324,11 +5383,33 @@ impl RawBlockDevice {
         Ok(())
     }
 
+    /// Flush completed writes and device caches to persistent storage.
+    ///
+    /// Callers must await completion of every write this barrier must make
+    /// durable. Unrelated I/O may run concurrently; this does not substitute
+    /// for waiting on those operations. The kernel performs the file or block
+    /// device fsync without the GIL. Storage must honor flush commands for
+    /// the resulting durability guarantee to hold.
+    ///
+    /// Raises RuntimeError for closed or poisoned devices, and OSError
+    /// if the kernel cannot complete the flush.
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        self.ensure_io_available(false)?;
+        py.allow_threads(|| loop {
+            if unsafe { libc::fsync(self.fd) } == 0 {
+                return Ok(());
+            }
+            if errno() != libc::EINTR {
+                return Err(os_err("fsync failed"));
+            }
+        })
+    }
+
     /// Close the device after draining accepted I/O, without holding the GIL.
     ///
-    /// Repeated calls are harmless. This may wait indefinitely if an accepted
-    /// request cannot complete or be cancelled. Raises `OSError` if closing
-    /// the underlying file descriptor fails.
+    /// Repeated successful calls are harmless. A bounded drain that cannot
+    /// prove every operation has stopped raises RuntimeError and retains
+    /// the ring and its owners. Raises OSError if the descriptor close fails.
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
         if !self.closed.load(Ordering::Relaxed) {
             py.allow_threads(|| self.do_close())?;
@@ -5348,6 +5429,41 @@ impl RawBlockDevice {
 }
 
 impl RawBlockDevice {
+    /// Release or quarantine a finished batch's Python buffer owners.
+    ///
+    /// A batch whose outcome the worker could not establish must keep them:
+    /// the device may still reach the memory they describe, and handing a
+    /// pool slice back to an allocator on the strength of a logical failure
+    /// is what this distinction exists to prevent. Logical completion is not
+    /// reusable capacity.
+    fn retire_batch_owners(&self, batch_id: u64) {
+        // The worker already moved this batch's owners if it marked the
+        // batch unknown, so that case is a no-op here rather than a second
+        // transfer. This is still the only release for a healthy batch, and
+        // for one the worker never saw.
+        if self.quarantined_batches.lock().unwrap().contains(&batch_id) {
+            drain_batch_owners(
+                &self.batched_buffer_objs,
+                &self.quarantined_owners,
+                Some(batch_id),
+            );
+            return;
+        }
+        let mut stored_objs = self.batched_buffer_objs.lock().unwrap();
+        stored_objs.remove(&batch_id);
+    }
+
+    /// Refuse replacing a live table or registering on an unusable device.
+    fn ensure_registration_available(&self) -> PyResult<()> {
+        self.ensure_io_available(self.use_iouring)?;
+        if self.fixed_buffers_registered.load(Ordering::Relaxed) {
+            return Err(PyRuntimeError::new_err(
+                "fixed buffers are already registered",
+            ));
+        }
+        Ok(())
+    }
+
     /// Internal function to perform the cleanup operation.
     /// Stop the worker and wait for it, without tearing anything down.
     ///

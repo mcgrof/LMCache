@@ -142,6 +142,9 @@ def test_the_artifact_under_test_is_not_the_serving_one() -> None:
     assert serving.RawBlockDevice.has_fault_injection() is False, (
         "the serving build carries the fault seam"
     )
+    assert not hasattr(serving.RawBlockDevice, "retire_batch_owners"), (
+        "a caller must not be able to retire a batch before native completion"
+    )
     # And not the scripted ring either. A capability probe answering false
     # while the type still carries the control surface would mean the seam
     # was merely hidden.
@@ -425,6 +428,183 @@ def wait_until(predicate, seconds=10):
         time.sleep(0.005)
     return predicate()
 """
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_partial_dmabuf_registration_cleanup_controls_reuse(
+    tmp_path: Path, cleanup_fails: bool
+) -> None:
+    """A failed slot update permits reuse only after its table is withdrawn."""
+    scenario = SCRIPTED_PREAMBLE + textwrap.dedent(
+        f"""
+        dev = device()
+        dev.fake_registration_fails("dmabuf", 1, 22)
+        if {cleanup_fails!r}:
+            dev.fake_registration_fails("unregister", 0, 5)
+        try:
+            dev.register_fixed_dmabufs([4096, 8192], [4096, 4096], [7, 8], [0, 0])
+            raise AssertionError("slot update unexpectedly succeeded")
+        except RuntimeError as exc:
+            error = str(exc)
+        report = {{"error": error, "poisoned": dev.is_poisoned(),
+                   "idle": dev.is_idle(), "table": dev.fake_registrations()}}
+        if {cleanup_fails!r}:
+            refused = []
+            for call in (
+                lambda: dev.register_fixed_buffers([4096], [4096]),
+                lambda: dev.register_fixed_dmabufs([4096], [4096], [7], [0]),
+                lambda: dev.batched_write([0], [bytearray(4096)], [4096]),
+                dev.flush,
+            ):
+                try:
+                    call()
+                    refused.append(False)
+                except RuntimeError:
+                    refused.append(True)
+            report["refused"] = refused
+            closes = []
+            for _ in range(2):
+                try:
+                    dev.close()
+                    closes.append(False)
+                except RuntimeError:
+                    closes.append(True)
+            report["close_retained"] = closes
+            report["table_after_close"] = dev.fake_registrations()
+        else:
+            dev.register_fixed_dmabufs([4096], [4096], [7], [0])
+            report["retry_table"] = dev.fake_registrations()
+            dev.close()
+            report["table_after_close"] = dev.fake_registrations()
+        print(json.dumps(report))
+        """
+    )
+    target = tmp_path / "device.bin"
+    target.write_bytes(bytes(16384))
+    report = _run_scenario(scenario, target)
+    assert "slot 1" in report["error"]
+    assert report["poisoned"] is cleanup_fails
+    assert report["idle"] is not cleanup_fails
+    if cleanup_fails:
+        assert "unregister also failed" in report["error"]
+        assert [record["kind"] for record in report["table"]] == [1, 2]
+        assert report["refused"] == [True] * 4
+        assert report["close_retained"] == [True, True]
+        assert report["table_after_close"] == report["table"]
+    else:
+        assert [record["kind"] for record in report["table"]] == [3]
+        assert [record["kind"] for record in report["retry_table"]] == [3, 1, 2]
+        assert [record["kind"] for record in report["table_after_close"]] == [3]
+
+
+def test_registered_table_cannot_be_replaced_or_registered_after_close(
+    tmp_path: Path,
+) -> None:
+    """A rejected replacement preserves the live table used by fixed I/O."""
+    scenario = SCRIPTED_PREAMBLE + textwrap.dedent(
+        """
+        dev = device()
+        dev.register_fixed_dmabufs([4096], [4096], [7], [0])
+        original = dev.fake_registrations()
+        errors = []
+        for call in (
+            lambda: dev.register_fixed_buffers([8192], [4096]),
+            lambda: dev.register_fixed_dmabufs([8192], [4096], [8], [0]),
+        ):
+            try:
+                call()
+            except RuntimeError as exc:
+                errors.append(str(exc))
+        unchanged = dev.fake_registrations() == original
+        dev.close()
+        try:
+            dev.register_fixed_dmabufs([4096], [4096], [7], [0])
+        except RuntimeError as exc:
+            errors.append(str(exc))
+        print(json.dumps({"errors": errors, "unchanged": unchanged}))
+        """
+    )
+    target = tmp_path / "device.bin"
+    target.write_bytes(bytes(8192))
+    report = _run_scenario(scenario, target)
+    assert report["unchanged"] is True
+    assert len(report["errors"]) == 3
+    assert all("already registered" in error for error in report["errors"][:2])
+    assert "closed" in report["errors"][2]
+
+
+def test_flush_allows_unrelated_io_and_requires_an_open_device(tmp_path: Path) -> None:
+    """A completed request may be flushed while another request is active."""
+    scenario = SCRIPTED_PREAMBLE + textwrap.dedent(
+        """
+        dev = device()
+        batch = dev.batched_write([0], [bytearray(4096)], [4096])
+        assert wait_until(lambda: bool(dev.fake_owned()))
+        errors = []
+        dev.flush()
+        assert dev.fake_owned()
+        dev.fake_complete(dev.fake_owned()[0], 4096)
+        result = dev.wait_iouring(batch)
+        dev.flush()
+        dev.close()
+        try:
+            dev.flush()
+        except RuntimeError as exc:
+            errors.append(str(exc))
+        print(json.dumps({"errors": errors, "result": result}))
+        """
+    )
+    target = tmp_path / "device.bin"
+    target.write_bytes(bytes(8192))
+    report = _run_scenario(scenario, target)
+    assert report["result"] == [[True], []]
+    assert len(report["errors"]) == 1
+    assert "closed" in report["errors"][0]
+
+
+@pytest.mark.parametrize("direction", ["read", "write"])
+@pytest.mark.parametrize("complete", [False, True])
+def test_batched_io_pins_resizable_host_buffer_until_known_completion(
+    tmp_path: Path, direction: str, complete: bool
+) -> None:
+    """An exporter reference alone must not permit its backing to be moved."""
+    scenario = SCRIPTED_PREAMBLE + textwrap.dedent(
+        f"""
+        dev = device()
+        payload = bytearray(4096)
+        batch = dev.batched_{direction}([0], [payload], [4096])
+        assert wait_until(lambda: bool(dev.fake_owned()))
+        def can_resize():
+            try:
+                payload.extend(b"x")
+                return True
+            except BufferError:
+                return False
+        before = can_resize()
+        if {complete!r}:
+            dev.fake_complete(dev.fake_owned()[0], 4096)
+            assert dev.wait_iouring(batch) == ([True], [])
+            dev.close()
+        else:
+            try:
+                dev.close()
+            except RuntimeError:
+                pass
+            assert dev.is_poisoned()
+            assert dev.wait_iouring(batch)[0] == [False]
+        after = can_resize()
+        del dev
+        gc.collect()
+        print(json.dumps({{"before": before, "after": after,
+                          "after_drop": can_resize()}}))
+        """
+    )
+    target = tmp_path / "device.bin"
+    target.write_bytes(bytes(8192))
+    report = _run_scenario(scenario, target)
+    assert report["before"] is False
+    assert report["after"] is complete
+    assert report["after_drop"] is complete
 
 
 SCRIPTED_SHORT_COMPLETION = SCRIPTED_PREAMBLE + textwrap.dedent(
