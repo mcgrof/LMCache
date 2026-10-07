@@ -45,6 +45,7 @@ from lmcache.v1.storage_backend.abstract_backend import (
     StorageBackendInterface,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.storage_backend.raw_block import RawBlockReadContext
 
 if TYPE_CHECKING:
     # First Party
@@ -60,6 +61,42 @@ logger = init_logger(__name__)
 # on it rather than accumulating more allocations after the first failure.
 _FAILED_COPY_STREAMS: dict[int, object] = {}
 _FAILED_COPY_STREAMS_LOCK = threading.Lock()
+
+
+def _aggregate_futures(futures: Sequence[Future]) -> Future | None:
+    """Return one future that succeeds after every input future succeeds."""
+    if not futures:
+        return None
+    aggregate: Future = Future()
+    results: list[Any] = [None] * len(futures)
+    remaining = len(futures)
+    first_error: BaseException | None = None
+    result_lock = threading.Lock()
+
+    def completed(index: int, done: Future) -> None:
+        nonlocal first_error, remaining
+        error: BaseException | None
+        try:
+            value = done.result()
+        except BaseException as exc:
+            value = None
+            error = exc
+        else:
+            error = None
+        with result_lock:
+            results[index] = value
+            if error is not None and first_error is None:
+                first_error = error
+            remaining -= 1
+            if remaining == 0 and not aggregate.done():
+                if first_error is not None:
+                    aggregate.set_exception(first_error)
+                else:
+                    aggregate.set_result(results)
+
+    for index, future in enumerate(futures):
+        future.add_done_callback(functools.partial(completed, index))
+    return aggregate
 
 
 # Helper function to get the class name of the backend
@@ -363,7 +400,7 @@ class StorageManager:
             for backend in self.storage_backends.values()
             if getattr(backend, "is_gpu_endpoint", False)
         ]
-        if self.enable_pd:
+        if self.enable_pd and not self.config.pd_uses_shared_storage:
             allocator_backend = self.storage_backends["PDBackend"]
         elif gpu_endpoints:
             # A backend that stages KV chunks in device memory (the raw-block
@@ -444,7 +481,7 @@ class StorageManager:
         memory_objs: List[MemoryObj],
         transfer_spec=None,
         location: Optional[str] = None,
-    ) -> None:
+    ) -> Future | None:
         """
         Non-blocking function to batched put the memory objects into the
         storage backends.
@@ -468,6 +505,7 @@ class StorageManager:
             memory_objs,
         )
 
+        futures: list[Future] = []
         try:
             for backend_name, backend in self.storage_backends.items():
                 if location and backend_name != location:
@@ -488,7 +526,13 @@ class StorageManager:
                 # NOTE: the handling of exists_in_put_tasks
                 # is done in the backend
                 ks, objs = obj_dict[cname]
-                backend.batched_submit_put_task(ks, objs, transfer_spec=transfer_spec)
+                submitted = backend.batched_submit_put_task(
+                    ks,
+                    objs,
+                    transfer_spec=transfer_spec,
+                )
+                if submitted:
+                    futures.extend(submitted)
         except RuntimeError:
             self._retain_failed_copy_resources()
             raise
@@ -496,6 +540,7 @@ class StorageManager:
             for _cname, (_ks, objs) in obj_dict.items():
                 for memory_obj in objs:
                     memory_obj.ref_count_down()
+        return _aggregate_futures(futures)
 
     def get(
         self,
@@ -559,12 +604,17 @@ class StorageManager:
         self,
         keys: List[CacheEngineKey],
         location: Optional[str] = None,
+        *,
+        storage_pd_read_context: Optional[RawBlockReadContext] = None,
     ) -> List[Optional[MemoryObj]]:
         """Load objects synchronously from the selected storage backends.
 
         Args:
             keys: Ordered cache keys to load.
             location: Backend name, or None to search all active backends.
+            storage_pd_read_context: Adopted request identity to carry with
+                this restore. Publication-aware backends receive it with each
+                read; ordinary cache hits keep their existing behavior.
 
         Returns:
             Caller-owned objects aligned with keys, using None for misses.
@@ -573,7 +623,13 @@ class StorageManager:
         """
         # TODO (ApostaC): remove the nested optional here
         for backend_name, storage_backend in self.get_active_storage_backends(location):
-            memory_objs = storage_backend.batched_get_blocking(keys)
+            read_publication = getattr(
+                storage_backend, "batched_get_for_publication", None
+            )
+            if storage_pd_read_context is not None and callable(read_publication):
+                memory_objs = read_publication(keys, storage_pd_read_context)
+            else:
+                memory_objs = storage_backend.batched_get_blocking(keys)
             if memory_objs:
                 delivered = False
                 try:
@@ -1528,6 +1584,15 @@ class StorageManager:
         """
         for backend in self.storage_backends.values():
             backend.cancel_request(req_id)
+
+    def finish_request(self, req_id: str) -> None:
+        """Notify storage backends that no more request batches will arrive.
+
+        Args:
+            req_id: Request identifier that finished on the model worker.
+        """
+        for backend in self.storage_backends.values():
+            backend.finish_request(req_id)
 
     def close(self) -> None:
         """Close backends and stop the worker, including incomplete construction.

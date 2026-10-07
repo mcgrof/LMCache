@@ -321,6 +321,14 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
         # Default implementation is no-op
         return
 
+    def finish_request(self, req_id: str) -> None:
+        """Notify the backend that no more batches will arrive for a request.
+
+        Args:
+            req_id: Request identifier that has finished on the model worker.
+        """
+        return
+
 
 class AllocatorBackendInterface(StorageBackendInterface):
     """

@@ -20,6 +20,7 @@ Key scenarios tested:
 """
 
 # Standard
+from concurrent.futures import Future
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any, Iterator, cast
@@ -38,8 +39,35 @@ from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
 from lmcache.v1.storage_backend.storage_manager import (
     StorageManager,
+    _aggregate_futures,
     allocate_and_copy_objects,
 )
+
+
+def test_aggregate_futures_preserves_results_and_waits_for_all() -> None:
+    first: Future[Any] = Future()
+    second: Future[Any] = Future()
+    aggregate = _aggregate_futures([first, second])
+    assert aggregate is not None
+
+    second.set_result("second")
+    assert not aggregate.done()
+    first.set_result("first")
+
+    assert aggregate.result(timeout=1) == ["first", "second"]
+
+
+def test_aggregate_futures_propagates_failure() -> None:
+    first: Future[Any] = Future()
+    second: Future[Any] = Future()
+    aggregate = _aggregate_futures([first, second])
+    assert aggregate is not None
+
+    first.set_exception(OSError("store failed"))
+    assert not aggregate.done()
+    second.set_result("completed for cleanup")
+    with pytest.raises(OSError, match="store failed"):
+        aggregate.result(timeout=1)
 
 
 class MockMemoryObj:
