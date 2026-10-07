@@ -43,7 +43,7 @@ Example Configuration
      azure_account_key: "your-account-key"
 
 Configuration Parameters (in extra_config)
------------------------------------------
+------------------------------------------
 
 * **azure_account_url**: Storage account URL, e.g.
   ``https://<account>.blob.core.windows.net``. Required unless
