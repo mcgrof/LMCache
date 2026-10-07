@@ -2,13 +2,13 @@
 """
 Unit tests for PDBackendAsync (async PD sender/receiver).
 
-No NIXL, CUDA, or real ZMQ peers required — all I/O is mocked with
-asyncio.sleep stubs so tests run fast (< 1 s total) in CI.  Assertions
-focus on timing and call ordering; data integrity is covered separately
-by the NIXL integration tests.
+No NIXL, CUDA, or real ZMQ peers required — all I/O is mocked.
+Assertions cover submission, completion, and request ordering; data
+integrity is covered separately by the NIXL integration tests.
 """
 
 # Standard
+from concurrent.futures import Future
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -44,8 +44,6 @@ from lmcache.v1.storage_backend.pd_backend_async import (
 )
 
 TRANSFER_DELAY = 0.15
-NONBLOCKING_THRESHOLD_RATIO = 0.25
-CI_SERIAL_TIMEOUT_MARGIN = 3
 _DEFAULT_SHAPE = [4, 2, 16, 8, 128]
 
 
@@ -257,32 +255,74 @@ def async_receiver():
 # ── sender tests ──────────────────────────────────────────────────────────
 
 
-def test_sender_nonblocking_fifo_transfers(async_sender):
-    """batched_submit_put_task returns immediately; all requests complete."""
-    N = 4
-    done_events = [threading.Event() for _ in range(N)]
+def test_sender_submits_while_transfers_are_pending(
+    async_sender: PDBackendAsync,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Return from every submission before any transfer is allowed to complete."""
+    keys = [_make_key(i) for i in range(4)]
+    objects = [_make_mem_obj(i) for i in range(len(keys))]
+    specs = [_make_transfer_spec(req_id=f"req-{i}") for i in range(len(keys))]
+    started = [threading.Event() for _ in keys]
+    completed = {key: threading.Event() for key in keys}
+    releases: list[Future[None]] = [Future() for _ in keys]
+    callbacks: list[CacheEngineKey] = []
+    errors: list[BaseException] = []
+    submitted = threading.Event()
+    # Bound a stalled test without treating host scheduling latency as a result.
+    timeout = 5.0
 
-    def make_cb(i):
-        def cb(key):
-            done_events[i].set()
+    async def gated_write(objects: list[MemoryObj], transfer_spec: dict) -> int:
+        assert len(objects) == 1
+        index = objects[0].meta.address
+        started[index].set()
+        await asyncio.wrap_future(releases[index])
+        return 1
 
-        return cb
+    def on_complete(key: CacheEngineKey) -> None:
+        callbacks.append(key)
+        completed[key].set()
 
-    t0 = time.monotonic()
-    for i in range(N):
-        async_sender.batched_submit_put_task(
-            [_make_key(i)],
-            [_make_mem_obj(i)],
-            transfer_spec=_make_transfer_spec(req_id=f"req-{i}"),
-            on_complete_callback=make_cb(i),
-        )
-    enqueue_elapsed = time.monotonic() - t0
+    def submit() -> None:
+        try:
+            for key, obj, spec in zip(keys, objects, specs, strict=True):
+                async_sender.batched_submit_put_task(
+                    [key],
+                    [obj],
+                    transfer_spec=spec,
+                    on_complete_callback=on_complete,
+                )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            submitted.set()
 
-    assert enqueue_elapsed < TRANSFER_DELAY * NONBLOCKING_THRESHOLD_RATIO
+    monkeypatch.setattr(
+        async_sender.transfer_channel, "async_batched_write", gated_write
+    )
+    caller = threading.Thread(target=submit, daemon=True)
+    caller.start()
+    try:
+        assert submitted.wait(timeout), "submission waited for transfer completion"
+        assert not errors, errors
+        for event in started:
+            assert event.wait(timeout), "submitted transfer never reached the channel"
+        assert callbacks == []
 
-    timeout = TRANSFER_DELAY * N * CI_SERIAL_TIMEOUT_MARGIN
-    for i, ev in enumerate(done_events):
-        assert ev.wait(timeout=timeout), f"req-{i} did not complete"
+        # Independent transfers may finish out of submission order. Each callback
+        # must follow its own transfer, even while the other writes remain pending.
+        for index in reversed(range(len(keys))):
+            releases[index].set_result(None)
+            assert completed[keys[index]].wait(timeout), "missing completion callback"
+            assert callbacks == list(reversed(keys[index:]))
+        for obj in objects:
+            assert obj.get_ref_count() == 1
+    finally:
+        for release in releases:
+            if not release.done():
+                release.set_result(None)
+        caller.join(timeout)
+        assert not caller.is_alive(), "submission thread did not stop"
 
 
 def test_sender_flow_control_backpressure(async_sender):
