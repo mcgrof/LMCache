@@ -150,6 +150,7 @@ def _stream(body: dict) -> list[dict]:
     client = TestClient(proxy.app)
     response = client.post("/v1/completions", json=body)
     assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("text/event-stream")
     chunks = []
     for line in response.text.splitlines():
         if not line.startswith("data: "):

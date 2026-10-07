@@ -1162,6 +1162,38 @@ async def test_decoder_validation_preserves_complete_events(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [b'{"choices":', b"\xff", b"[]", b"null"])
+async def test_malformed_decoder_event_cannot_be_hidden_by_a_valid_finish(
+    monkeypatch: pytest.MonkeyPatch, payload: bytes
+) -> None:
+    """A terminal choice cannot repair data lost earlier in the response."""
+    events = [
+        b"data: " + payload + b"\n\n",
+        b'data: {"choices":[{"text":"end","finish_reason":"stop"}]}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+
+    async def decode(*_args):
+        for event in events:
+            yield event
+
+    monkeypatch.setattr(proxy, "stream_service_response", decode)
+    completion = proxy.DecoderStreamCompletion()
+    streamed = [
+        chunk
+        async for chunk in proxy.stream_decoder_response(
+            None,
+            "/v1/completions",
+            {},
+            completion,  # type: ignore[arg-type]
+        )
+    ]
+    assert not completion.succeeded
+    assert any(b'"error"' in chunk for chunk in streamed)
+    assert streamed[-1] == events[-1]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("temporary", [False, True])
 async def test_cancelled_unread_admission_closes_only_a_temporary_client(
     monkeypatch: pytest.MonkeyPatch, temporary: bool

@@ -84,23 +84,26 @@ simultaneous batch (the default is 4 GiB).
 
 ## Launch
 
-From this directory, start the proxy first:
+Choose one session value and export that same value in the proxy, writer, and
+reader shells. From this directory, start the proxy first:
 
 ```bash
+export LMCACHE_STORAGE_PD_SESSION=qualification-REPLACE_WITH_UNIQUE_RUN_ID
 ../../../.venv/bin/python ../disagg_proxy_server.py \
   --host localhost --port 9100 \
   --prefiller-host localhost --prefiller-port 7100 --num-prefillers 1 \
   --decoder-host localhost --decoder-port 7200 \
   --decoder-init-port 7300 --decoder-alloc-port 7400 --num-decoders 1 \
   --proxy-host localhost --proxy-port 7500 --model MODEL \
-  --storage-pd --storage-pd-ready-timeout-s 30
+  --storage-pd --storage-pd-session "$LMCACHE_STORAGE_PD_SESSION" \
+  --storage-pd-ready-timeout-s 30
 ```
 
 Then launch the reader before the writer on separate GPUs, with the same
 session value on both:
 
 ```bash
-export LMCACHE_STORAGE_PD_SESSION=$(date +%Y%m%d-%H%M%S)
+export LMCACHE_STORAGE_PD_SESSION=qualification-REPLACE_WITH_UNIQUE_RUN_ID
 DECODER_DEVICE_ID=1 ./launch_vllm.sh reader MODEL
 PREFILLER_DEVICE_ID=0 ./launch_vllm.sh writer MODEL
 ```

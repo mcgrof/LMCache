@@ -617,7 +617,7 @@ class StoragePDStreamingResponse(StreamingResponse):
         headers = (
             {"X-LMCache-PD-Request-ID": request_id} if request_id is not None else None
         )
-        super().__init__(content, media_type="application/json", headers=headers)
+        super().__init__(content, media_type="text/event-stream", headers=headers)
         self._owner = owner
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -685,6 +685,10 @@ class DecoderStreamCompletion:
         try:
             message = json.loads(payload)
         except (UnicodeDecodeError, json.JSONDecodeError):
+            self.protocol_failed = True
+            return
+        if not isinstance(message, dict):
+            self.protocol_failed = True
             return
         if isinstance(message, dict) and "error" in message:
             self.saw_error = True
@@ -772,12 +776,9 @@ def round_robin_pick_clients() -> tuple[ClientInfo, ClientInfo, ClientInfo]:
 def take_prefill_budget(req_data: dict) -> int:
     """Read the caller's token budget and give the prefiller one token.
 
-    A handoff spends one token on the prefiller, so a request asking for a
-    single token leaves the decoder none, which the engine rejects. Refuse it
-    here, naming the reason, rather than forwarding a request that cannot be
-    served. Both spellings of the budget are read, because a chat request
-    carries only ``max_completion_tokens`` and a request whose budget this
-    cannot find is a 500 rather than a refusal with a reason.
+    A handoff spends one token on the prefiller. A one-token budget is served
+    entirely by the prefiller without contacting the decoder. Both spellings
+    of the budget are accepted; a missing or non-positive budget is refused.
     """
     budget = req_data.get("max_tokens")
     if budget is None:
