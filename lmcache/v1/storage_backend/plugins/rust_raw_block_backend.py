@@ -21,6 +21,7 @@ from lmcache.v1.storage_backend.raw_block import (
     RawBlockCore,
     RawBlockCoreConfig,
     RawBlockKeySpec,
+    RawBlockPutManyResult,
     decode_legacy_key,
     encode_legacy_key,
     normalize_raw_block_io_engine,
@@ -37,6 +38,41 @@ if TYPE_CHECKING:
     from lmcache.v1.memory_management import MemoryObj
 
 logger = init_logger(__name__)
+
+# Resources kept alive because a device stopped being able to say what it was
+# doing with them. Nothing reads this list; holding a reference is the whole
+# point, so that no allocator, finalizer or exit handler can release memory a
+# command may still be reaching.
+_RETAINED_AFTER_UNKNOWN_OUTCOME: list[Any] = []
+
+
+def _probe_says_unknown(probe: Optional[Callable[[], Any]], what: str) -> bool:
+    """Read a health probe, insisting that it answer the question asked.
+
+    Only a genuine ``True`` means the outcome is unknown. The probe is a
+    predicate returning a bool, so anything else is a caller that substituted
+    something not answering this question -- and reading that as poison would
+    quarantine on nothing. A probe that *raises* is different: it was asked
+    and could not say, which is exactly the condition to fail closed on.
+    """
+    if probe is None:
+        return False
+    try:
+        answer = probe()
+    except Exception:  # pragma: no cover - a probe must not mask the path
+        logger.exception("RustRawBlockBackend: could not read %s health", what)
+        return True
+    if answer is True:
+        return True
+    if answer is not False:
+        logger.warning(
+            "RustRawBlockBackend: %s health probe answered %r, not a bool; "
+            "reading it as healthy",
+            what,
+            answer,
+        )
+    return False
+
 
 _DEFAULT_META_MAGIC = b"LMCIDX01"
 _DEFAULT_META_VERSION = 1
@@ -159,6 +195,11 @@ class RustRawBlockBackend(StoragePluginInterface):
 
         self._put_lock = threading.Lock()
         self._put_tasks: set[CacheEngineKey] = set()
+        self._quarantined_objs: list[MemoryObj] = []
+        self._pending_put_owners: list[list[MemoryObj]] = []
+        self._active_operations = 0
+        self._sealed = False
+        self._closed_once = False
         self._pin_lock = threading.Lock()
         self._pinned_keys: set[str] = set()
 
@@ -440,6 +481,8 @@ class RustRawBlockBackend(StoragePluginInterface):
         pending: list[tuple[CacheEngineKey, RawBlockKeySpec, MemoryObj]] = []
         for key, obj in zip(keys, objs, strict=False):
             with self._put_lock:
+                if self._sealed:
+                    break
                 if key in self._put_tasks:
                     continue
                 self._put_tasks.add(key)
@@ -492,6 +535,158 @@ class RustRawBlockBackend(StoragePluginInterface):
                     self._put_tasks.discard(key)
             raise
 
+    def _outcome_is_unknown(self) -> bool:
+        """Whether the worker or the core has stopped being able to say.
+
+        The core is asked first. It keeps the answer once it has adopted it,
+        and asking it costs nothing, whereas reaching the device can reopen
+        one -- or be refused outright for exactly the reason being asked
+        about.
+        """
+        if _probe_says_unknown(
+            getattr(self._core, "is_poisoned", None),
+            "raw-block core",
+        ):
+            return True
+        return self._native_outcome_is_unknown()
+
+    def _native_outcome_is_unknown(self) -> bool:
+        """Ask the existing device without opening a new one during teardown."""
+        raw = getattr(self._core, "_raw", None)
+        return _probe_says_unknown(getattr(raw, "is_poisoned", None), "native engine")
+
+    def _start_put_many(
+        self,
+        specs: Sequence[RawBlockKeySpec],
+        memory_objs: Sequence[MemoryObj],
+    ) -> tuple["asyncio.Future[Any]", threading.Event]:
+        """Start a batched write on a worker thread and track it honestly.
+
+        ``asyncio.to_thread`` hands work to an executor. Cancelling the task
+        that awaits it stops the waiting and never stops the thread, so the
+        task alone cannot say whether the device is still being handed these
+        buffers. The returned event is set by the thread itself and can.
+        """
+        io_finished = threading.Event()
+
+        def _run_put() -> RawBlockPutManyResult:
+            try:
+                return self._core.put_many(list(specs), list(memory_objs))
+            finally:
+                io_finished.set()
+
+        return asyncio.ensure_future(asyncio.to_thread(_run_put)), io_finished
+
+    def _settle_put_owners(
+        self,
+        pending: Sequence[tuple[CacheEngineKey, RawBlockKeySpec, MemoryObj]],
+        io_task: "asyncio.Future[Any]",
+        io_finished: threading.Event,
+    ) -> None:
+        """Release a batch's buffers, or keep them until that is provable.
+
+        Dropping the reference can return the object's pool slice to the
+        allocator, which is only safe once the device is known to have
+        finished with it. Two things make that unknowable: the engine
+        poisoned itself because its worker could not say, or -- the case a
+        failed request does not cover -- this coroutine was cancelled while
+        its I/O thread is still running, so nothing has happened yet that
+        could report an outcome at all.
+        """
+        if not io_finished.is_set():
+            self._retain_put_owners_until_done(pending, io_task, io_finished)
+            return
+        self._release_put_owners(pending)
+
+    def _release_put_owners(
+        self,
+        pending: Sequence[tuple[CacheEngineKey, RawBlockKeySpec, MemoryObj]],
+    ) -> None:
+        unknown = self._outcome_is_unknown()
+        for _key, _spec, memory_obj in pending:
+            if unknown:
+                self._quarantined_objs.append(memory_obj)
+            else:
+                memory_obj.ref_count_down()
+
+    def _retain_put_owners_until_done(
+        self,
+        pending: Sequence[tuple[CacheEngineKey, RawBlockKeySpec, MemoryObj]],
+        io_task: "asyncio.Future[Any]",
+        io_finished: threading.Event,
+    ) -> None:
+        """Hold a batch's buffers until its I/O thread has actually finished.
+
+        The batch is recorded where shutdown can see it, so an engine closing
+        with a write still in a thread does not destroy the memory under it.
+        If the callback never runs -- a loop torn down first, say -- the batch
+        stays recorded, which is the safe direction.
+        """
+        owners = [item[2] for item in pending]
+        with self._put_lock:
+            self._pending_put_owners.append(owners)
+        logger.warning(
+            "Raw-block write for %d key(s) was abandoned while its I/O "
+            "thread is still running; withholding its buffers until it ends",
+            len(owners),
+        )
+
+        def _settle(_task: "asyncio.Future[Any]") -> None:
+            with self._put_lock:
+                if not any(batch is owners for batch in self._pending_put_owners):
+                    return
+            if not io_finished.is_set():
+                # The task ended without its thread ending. Nothing here can
+                # say what the device is doing with these buffers.
+                self._quarantined_objs.extend(owners)
+            else:
+                self._release_put_owners(pending)
+            # Keep the batch visible until releasing or quarantining every
+            # owner is finished; shutdown must not miss that transition.
+            with self._put_lock:
+                for index, batch in enumerate(self._pending_put_owners):
+                    if batch is owners:
+                        del self._pending_put_owners[index]
+                        break
+
+        io_task.add_done_callback(_settle)
+
+    def _withhold_unproven_reads(
+        self,
+        unproven: Sequence[RawBlockKeySpec],
+        targets: Sequence[MemoryObj],
+        locked_specs: list[RawBlockKeySpec],
+    ) -> list[RawBlockKeySpec]:
+        """Keep a read nobody can vouch for out of everyone's reach.
+
+        Such a read may still be landing. Its destination buffers cannot go
+        back to the allocator, where the next request would be handed memory
+        the device is writing into; and its source extents cannot be
+        unlocked, because an unlocked entry can be evicted and its slot given
+        to a write while the read is still reading it. Neither is released
+        again for the life of this engine.
+
+        The keys are added to the pinned set, which is what already tells a
+        later prefix lookup not to take a lock reference this backend is
+        holding, so nothing re-locks or re-serves them either.
+
+        Returns the list the caller's ``finally`` may unlock. It is a return
+        value rather than a mutation so that there is no way to unlock what
+        this withheld by forgetting to look.
+        """
+        withheld = {spec.encoded for spec in unproven}
+        self._quarantined_objs.extend(targets)
+        with self._pin_lock:
+            self._pinned_keys |= withheld
+        logger.error(
+            "Raw-block read outcome is unknown for %d key(s); withholding "
+            "%d destination buffer(s) and keeping those keys locked. This "
+            "engine will not serve or reuse them again.",
+            len(withheld),
+            len(targets),
+        )
+        return [spec for spec in locked_specs if spec.encoded not in withheld]
+
     async def _submit_put_one(
         self,
         key: CacheEngineKey,
@@ -499,12 +694,10 @@ class RustRawBlockBackend(StoragePluginInterface):
         memory_obj: MemoryObj,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]],
     ) -> None:
+        pending = [(key, spec, memory_obj)]
+        io_task, io_finished = self._start_put_many([spec], [memory_obj])
         try:
-            put_result = await asyncio.to_thread(
-                self._core.put_many,
-                [spec],
-                [memory_obj],
-            )
+            put_result = await asyncio.shield(io_task)
             if not put_result.results or not put_result.results[0]:
                 raise RuntimeError(f"Failed to persist raw-block key {spec.encoded}")
             if on_complete_callback is not None:
@@ -513,7 +706,7 @@ class RustRawBlockBackend(StoragePluginInterface):
                 except Exception as e:
                     logger.warning("on_complete_callback failed for key %s: %s", key, e)
         finally:
-            memory_obj.ref_count_down()
+            self._settle_put_owners(pending, io_task, io_finished)
             with self._put_lock:
                 self._put_tasks.discard(key)
 
@@ -535,12 +728,9 @@ class RustRawBlockBackend(StoragePluginInterface):
         keys = [item[0] for item in pending]
         specs = [item[1] for item in pending]
         memory_objs = [item[2] for item in pending]
+        io_task, io_finished = self._start_put_many(specs, memory_objs)
         try:
-            put_result = await asyncio.to_thread(
-                self._core.put_many,
-                specs,
-                memory_objs,
-            )
+            put_result = await asyncio.shield(io_task)
             if len(put_result.results) != len(pending) or not all(put_result.results):
                 failed = []
 
@@ -569,12 +759,28 @@ class RustRawBlockBackend(StoragePluginInterface):
                             "on_complete_callback failed for key %s: %s", key, e
                         )
         finally:
-            for key, _spec, memory_obj in pending:
-                memory_obj.ref_count_down()
+            self._settle_put_owners(pending, io_task, io_finished)
+            for key, _spec, _memory_obj in pending:
                 with self._put_lock:
                     self._put_tasks.discard(key)
 
     def _batched_get_prefix(
+        self,
+        keys: Sequence[CacheEngineKey],
+    ) -> list[MemoryObj]:
+        # Include preparation and cleanup, not just the native read: the
+        # allocator is already in use while a destination is being built.
+        with self._put_lock:
+            if self._sealed:
+                return []
+            self._active_operations += 1
+        try:
+            return self._load_prefix(keys)
+        finally:
+            with self._put_lock:
+                self._active_operations -= 1
+
+    def _load_prefix(
         self,
         keys: Sequence[CacheEngineKey],
     ) -> list[MemoryObj]:
@@ -636,10 +842,27 @@ class RustRawBlockBackend(StoragePluginInterface):
             if loaded_count == len(allocated):
                 return allocated
 
+            if self._outcome_is_unknown():
+                # The bitmap's leading True entries are real completions, so
+                # that prefix is proven and is still served. What follows it
+                # is not, and is withheld rather than freed.
+                locked_specs = self._withhold_unproven_reads(
+                    load_specs[loaded_count:],
+                    allocated[loaded_count:],
+                    locked_specs,
+                )
+                return allocated[:loaded_count]
+
             for obj in allocated[loaded_count:]:
                 obj.ref_count_down()
             return allocated[:loaded_count]
         except Exception:
+            if self._outcome_is_unknown():
+                # Nothing was proven here, so none of it is released.
+                locked_specs = self._withhold_unproven_reads(
+                    prefix_specs, allocated, locked_specs
+                )
+                raise
             for obj in allocated:
                 obj.ref_count_down()
             raise
@@ -723,14 +946,55 @@ class RustRawBlockBackend(StoragePluginInterface):
         return self.local_cpu_backend
 
     def close(self) -> None:
+        with self._put_lock:
+            if self._closed_once:
+                return
+            self._closed_once = True
+            self._sealed = True
+
         deadline = time.monotonic() + 10.0
         while True:
             with self._put_lock:
-                pending = len(self._put_tasks)
-            if pending == 0 or time.monotonic() >= deadline:
+                pending = len(self._put_tasks) + self._active_operations
+                retained_batches = len(self._pending_put_owners)
+            if pending + retained_batches == 0 or time.monotonic() >= deadline:
                 break
             time.sleep(0.01)
-        self._core.close()
+        if pending or retained_batches:
+            # A deadline is not a fence for a caller still preparing I/O.
+            self._retain_whole_graph(retained_batches)
+            return
+
+        unknown = bool(self._quarantined_objs) or self._outcome_is_unknown()
+        try:
+            outcome = self._core.close()
+        except Exception:
+            logger.exception("Raw-block core close could not prove quiescence")
+            unknown = True
+        else:
+            if outcome is None or not outcome.may_release_backing_resources:
+                unknown = True
+        if unknown:
+            self._retain_whole_graph(retained_batches)
+
+    def _retain_whole_graph(self, retained_batches: int) -> None:
+        """Keep owners alive and prevent an explicit allocator close as well."""
+        if self.local_cpu_backend is not None:
+            self.local_cpu_backend.retain_backing_resources()
+        _RETAINED_AFTER_UNKNOWN_OUTCOME.append(
+            (
+                self._core,
+                self.local_cpu_backend,
+                self._quarantined_objs,
+                self._pending_put_owners,
+            )
+        )
+        logger.error(
+            "Raw-block backend retaining backing memory, %d buffer owner(s) "
+            "and %d abandoned batch(es): native quiescence was not proven",
+            len(self._quarantined_objs),
+            retained_batches,
+        )
 
     def _pin_if_needed(self, encoded_key: str) -> bool:
         with self._pin_lock:

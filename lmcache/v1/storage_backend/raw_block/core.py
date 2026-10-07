@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Optional
 import ctypes
+import enum
 import json
 import os
 import re
@@ -229,6 +230,115 @@ class RawBlockPutManyResult:
     stored_keys: list[str]
 
 
+def device_has_nothing_outstanding(device: Any) -> bool:
+    """Whether a device has answered for everything it was handed.
+
+    This is the question a writer's final index may be published on, and it
+    is deliberately weaker than proof of quiescence. Proof requires stopping
+    the worker, and stopping the worker takes away the thing the index write
+    needs -- so a writer that drained first would hang, and one that
+    published first would be deciding on a question asked too early.
+
+    What it does establish is that nothing is in flight and nothing has been
+    quarantined as of now. A submission the worker quarantines later, while
+    shutting down, is a separate event that only the close reports; a
+    checkpoint published before it is recorded as written but not vouched
+    for.
+
+    Fails closed for the same reason the health probe does: a probe that
+    raises was asked and could not answer. A device that cannot be asked at
+    all is an older native build, which can still answer the health
+    question.
+    """
+    probe = getattr(device, "is_idle", None)
+    if probe is None:
+        return not device_says_outcome_is_unknown(device)
+    try:
+        answer = probe()
+    except Exception:
+        logger.exception("RawBlockCore could not ask the device for its state")
+        return False
+    return answer is True
+
+
+def device_says_outcome_is_unknown(device: Any) -> bool:
+    """Ask a device whether it has stopped being able to say, failing closed.
+
+    A probe that raises was asked and could not answer, which is exactly the
+    condition to treat as unknown. Reading the raise as health is worse than
+    not asking: the caller then recycles on the strength of a question that
+    was never answered. A probe that returns something other than a bool is
+    an object that does not answer this question, and reading that as unknown
+    would quarantine on nothing.
+
+    A device with no such probe cannot report the condition at all, so the
+    absence is not an unanswered question and reads as healthy. That is a
+    real gap against an older native build, which is why the core keeps its
+    own flag once it has adopted one.
+    """
+    probe = getattr(device, "is_poisoned", None)
+    if probe is None:
+        return False
+    try:
+        answer = probe()
+    except Exception:
+        logger.exception("RawBlockCore could not read device health")
+        return True
+    return answer is True
+
+
+class NativeQuiescence(enum.Enum):
+    """What a close established about the device it was closing.
+
+    ``PROVEN`` is the only one that authorizes releasing anything the device
+    was given: the worker stopped, its registration was withdrawn and the
+    descriptor was closed. ``RETAINED`` covers every way that failed --
+    refused, poisoned, or a wait that gave up -- because they differ in what
+    to report, not in what may be released. ``NOT_ATTEMPTED`` exists so that
+    a second caller cannot read a repeat close as a fresh proof.
+    """
+
+    PROVEN = "proven"
+    RETAINED = "retained"
+    NOT_ATTEMPTED = "not_attempted"
+
+
+@dataclass(frozen=True)
+class RawBlockCloseOutcome:
+    """The result of closing one core, and what it permits."""
+
+    quiescence: NativeQuiescence
+    poisoned: bool
+    reason: str = ""
+    quarantined_slots: int = 0
+    final_checkpoint_written: bool = False
+
+    @property
+    def final_checkpoint_is_vouched_for(self) -> bool:
+        """Whether the published index names only extents that were proven.
+
+        A writer publishes its last index while it still has a worker to
+        write with, and can only know at that point that everything it had
+        handed over was answered for. If the close that follows then cannot
+        prove quiescence -- because the worker quarantined something on its
+        way out -- the index is already durable and may name an extent whose
+        write was never observed. It is written and it is not vouched for,
+        and those are different things a caller has to be able to tell
+        apart.
+        """
+        return self.final_checkpoint_written and self.quiescence is (
+            NativeQuiescence.PROVEN
+        )
+
+    @property
+    def may_release_backing_resources(self) -> bool:
+        """Whether the memory and descriptors behind this device are free.
+
+        Only a proven native close authorizes releasing the registered arena.
+        """
+        return self.quiescence is NativeQuiescence.PROVEN and not self.poisoned
+
+
 class RawBlockCore:
     """
     Shared raw-block storage engine used by both legacy non-MP and MP L2 paths.
@@ -389,6 +499,10 @@ class RawBlockCore:
 
         self._raw = None
         self._closed = False
+        self._poisoned = False
+        self._terminal = False
+        self._close_outcome: Optional[RawBlockCloseOutcome] = None
+        self._quarantined_slots: dict[int, None] = {}
 
         self._meta_seq: int = 0
         self._meta_dirty_total: int = 0
@@ -502,6 +616,9 @@ class RawBlockCore:
 
     def _rawdev(self) -> Any:
         """Return the lazily opened Rust raw-block device binding."""
+        if self._terminal:
+            raise RuntimeError("RawBlockCore is closed")
+        self.raise_if_failed()
         if self._raw is None:
             try:
                 # Third Party
@@ -890,6 +1007,8 @@ class RawBlockCore:
         self.raise_if_failed()
 
         with self._lock:
+            if self._closed or self.is_poisoned():
+                raise RuntimeError("RawBlockCore cannot admit reads after shutdown")
             items = [
                 (encoded_key, self._index.get(encoded_key))
                 for encoded_key in encoded_keys
@@ -1057,6 +1176,12 @@ class RawBlockCore:
         """
         return self._apply_loaded_state(data)
 
+    def is_poisoned(self) -> bool:
+        """Return the sticky verdict that native completion is unproven."""
+        if self._raw is not None:
+            self._adopt_native_poison(self._raw, "health check")
+        return self._poisoned
+
     def raise_if_failed(self) -> None:
         """Reject work after a terminal native io_uring submission failure.
 
@@ -1065,6 +1190,10 @@ class RawBlockCore:
                 submission errors and ordinary per-request I/O failures do not
                 mark the worker as failed.
         """
+        if self._raw is not None:
+            self._adopt_native_poison(self._raw, "health check")
+        if self._poisoned:
+            raise RuntimeError("RawBlockCore cannot establish the native I/O outcome")
         worker_error = self._worker_error()
         if worker_error is not None:
             raise RuntimeError(worker_error)
@@ -1080,7 +1209,11 @@ class RawBlockCore:
         with self._lock:
             worker_error = self._worker_error()
             return {
-                "is_healthy": not self._closed and worker_error is None,
+                "is_healthy": not self._closed
+                and not self.is_poisoned()
+                and worker_error is None,
+                "poisoned": self._poisoned,
+                "quarantined_slot_count": len(self._quarantined_slots),
                 "worker_error": worker_error,
                 "type": "RawBlockCore",
                 "key_namespace": self.key_namespace,
@@ -1114,32 +1247,135 @@ class RawBlockCore:
                 ),
             }
 
-    def close(self) -> None:
-        """Stop checkpointing, write a final checkpoint, and close the device."""
+    def close(self) -> RawBlockCloseOutcome:
+        """Stop checkpointing, write a final checkpoint, and close the device.
+
+        Returns what was established, because the caller's next decisions --
+        whether to free the memory behind this device, whether to release
+        what a reader may still be reading -- cannot be made from a return
+        of None. A repeated close reports the first result rather than
+        inventing a fresh one: it must not reach the device accessor, which
+        opens a new device that knows nothing about the old one.
+        """
         with self._lock:
             if self._closed:
-                return
+                return self._close_outcome or RawBlockCloseOutcome(
+                    quiescence=NativeQuiescence.NOT_ATTEMPTED,
+                    poisoned=self._poisoned,
+                    reason="a close was already in progress or complete",
+                    quarantined_slots=len(self._quarantined_slots or {}),
+                )
             self._closed = True
+            # Native idleness does not cover a caller still preparing a
+            # submission. Admission shares this lock, so these counts cannot
+            # grow after the seal and include reads as well as reserved puts.
+            active_callers = bool(self._inflight or self._inflight_io_count)
 
         self._meta_stop_evt.set()
+        checkpoint_stopped = True
         if self._meta_thread is not None:
             self._meta_thread.join(timeout=5)
-            self._meta_thread = None
+            checkpoint_stopped = not self._meta_thread.is_alive()
+            if checkpoint_stopped:
+                self._meta_thread = None
 
-        try:
-            self._checkpoint_once(force=True)
-        except Exception as e:
-            logger.warning("RawBlockCore final checkpoint failed: %s", e)
+        # Asked of the device this core actually has: the accessor below
+        # reopens a fresh one when the reference is dropped, and a fresh
+        # device knows nothing about what the old one could not establish.
+        #
+        # And answered by the device, not by the absence of a complaint:
+        # a writer about to publish its last index needs to know that
+        # everything it handed over has been answered for.
+        unknown = self._poisoned or active_callers or not checkpoint_stopped
+        if not unknown and self._raw is not None:
+            unknown = not device_has_nothing_outstanding(self._raw)
+        self._poisoned = unknown
 
-        if self._raw is not None:
+        checkpointed = False
+        if not unknown:
+            # A writer that cannot say what the device holds must not
+            # publish an index naming it. ordinary submission already refuses
+            # while running, and shutdown is not an exemption.
             try:
-                self._raw.close()
+                # The helper's own answer: it returns false for state that
+                # needed no checkpoint, and reporting that as "written"
+                # describes a generation that does not exist.
+                checkpointed = bool(self._checkpoint_once(force=True))
             except Exception as e:
-                logger.warning(
-                    "Failed to close raw block device %s: %s", self.device_path, e
+                logger.warning("RawBlockCore final checkpoint failed: %s", e)
+        else:
+            logger.error(
+                "RawBlockCore %s: skipping the final checkpoint because this "
+                "writer cannot establish what the device holds. The last "
+                "published index stands; these extents are not advertised.",
+                self.device_path,
+            )
+
+        def settle(quiescence: NativeQuiescence, reason: str) -> RawBlockCloseOutcome:
+            outcome = RawBlockCloseOutcome(
+                quiescence=quiescence,
+                poisoned=self._poisoned,
+                reason=reason,
+                quarantined_slots=len(self._quarantined_slots or {}),
+                final_checkpoint_written=checkpointed,
+            )
+            self._close_outcome = outcome
+            # From here nothing may open or be handed this device again.
+            self._terminal = True
+            if outcome.final_checkpoint_written and not (
+                outcome.final_checkpoint_is_vouched_for
+            ):
+                logger.error(
+                    "RawBlockCore %s published a final index and then could "
+                    "not prove the device was finished (%s). That index is "
+                    "durable and may name an extent whose write was never "
+                    "observed; a later incarnation reading it will serve "
+                    "those bytes as a hit.",
+                    self.device_path,
+                    reason,
                 )
-            finally:
-                self._raw = None
+            return outcome
+
+        if self._raw is None:
+            return settle(
+                NativeQuiescence.NOT_ATTEMPTED,
+                "no native device was open",
+            )
+        if unknown:
+            # Dropping this reference runs the native destructor, which frees
+            # the very owners the engine retained. Keep it bound: the handle,
+            # its registration and the buffers behind it stay alive for the
+            # life of the process, which is the price of not knowing when the
+            # device finished.
+            logger.error(
+                "RawBlockCore %s: retaining the native device, its buffer "
+                "registration and %d withheld extent(s) because an outcome "
+                "could not be established.",
+                self.device_path,
+                len(self._quarantined_slots or {}),
+            )
+            return settle(
+                NativeQuiescence.RETAINED,
+                "the engine could not establish what the device was doing",
+            )
+        try:
+            self._raw.close()
+        except Exception as e:
+            # The native close refuses when it cannot prove quiescence. That
+            # is a report, not noise: keep the reference and stay unhealthy.
+            self._poisoned = True
+            logger.error(
+                "Failed to close raw block device %s: %s. Retaining the "
+                "native device and everything it holds.",
+                self.device_path,
+                e,
+            )
+            return settle(
+                NativeQuiescence.RETAINED,
+                f"the native close was refused: {e}",
+            )
+        self._raw = None
+        return settle(NativeQuiescence.PROVEN, "the native engine closed")
 
     def _worker_error(self) -> str | None:
         if self._raw is None or self._closed:
@@ -1148,21 +1384,8 @@ class RawBlockCore:
         return get_worker_error() if get_worker_error is not None else None
 
     def _cleanup_after_init_failure(self) -> None:
-        """Close resources that may have been opened before init failed."""
-        self._meta_stop_evt.set()
-        if self._meta_thread is not None:
-            self._meta_thread.join(timeout=5)
-            self._meta_thread = None
-        if self._raw is not None:
-            try:
-                self._raw.close()
-            except Exception as e:
-                logger.warning(
-                    "Failed to close raw block device %s: %s", self.device_path, e
-                )
-            finally:
-                self._raw = None
-        self._closed = True
+        """Close only when the partially initialized device can prove it is idle."""
+        self.close()
 
     def _byte_view(self, buf: Any) -> memoryview:
         """Return a byte-addressable memoryview over a Python buffer.
@@ -1657,6 +1880,58 @@ class RawBlockCore:
             "io_uring read",
         )
 
+    def _adopt_native_poison(
+        self,
+        raw_dev: Any,
+        operation: str,
+        batch_id: Optional[int] = None,
+    ) -> bool:
+        """Take on the worker's verdict that it cannot say what happened.
+
+        A logical failure and an unknown outcome are different statements.
+        The engine poisons itself when it cannot say what the device is
+        doing, and it does so before signalling any completion, so asking
+        after one is not a race. Adopting it here is what makes the core stop
+        handing out storage and stop letting ordinary cleanup recycle an
+        extent, because a failed result is not proof the device has finished.
+
+        Every path that waits on the worker has to ask, not only the batched
+        one: a caller that never asks leaves the core healthy while the
+        worker has already given up, and an extent it rolls back becomes
+        immediately re-allocatable.
+
+        Returns whether the core is poisoned once this call is done.
+        """
+        if self._poisoned:
+            return True
+        if not device_says_outcome_is_unknown(raw_dev):
+            return False
+        self._poisoned = True
+        logger.error(
+            "RawBlockCore %s%s: the native engine could not establish what "
+            "the device is still doing. Refusing further work on this device "
+            "and withholding %d quarantined batch(es).",
+            operation,
+            f" batch {batch_id}" if batch_id is not None else "",
+            int(getattr(raw_dev, "quarantined_batch_count", int)()),
+        )
+        return True
+
+    def _quarantine_slot_locked(self, slot: int) -> None:
+        """Withhold a slot from allocation for this engine's lifetime.
+
+        Nothing takes a slot out of quarantine. Reuse needs proof that the
+        device is done with it, which this engine cannot obtain once its
+        worker has reported an outcome it could not determine.
+        """
+        if self._quarantined_slots is None:
+            self._quarantined_slots = {}
+        if slot in self._quarantined_slots:
+            return
+        self._quarantined_slots[slot] = None
+        self._free_slots.pop(slot, None)
+        self._remove_slot_from_affinity_pool_locked(slot)
+
     def _wait_iouring_results(
         self,
         raw_dev: Any,
@@ -1670,7 +1945,10 @@ class RawBlockCore:
         in the Rust batch. For io_uring_cmd, this is the post-splitting chunk
         count, not the number of logical reads or writes.
         """
-        results, completion_errors = raw_dev.wait_iouring(batch_id)
+        try:
+            results, completion_errors = raw_dev.wait_iouring(batch_id)
+        finally:
+            self._adopt_native_poison(raw_dev, operation, batch_id)
         results = list(results)
         for operation_index, error in completion_errors:
             logger.error(
@@ -2069,6 +2347,10 @@ class RawBlockCore:
 
     def _allocate_slot_locked(self, placement_id: PlacementId = None) -> int:
         """Allocate a slot offset while ``self._lock`` is held."""
+        if self._closed or self.is_poisoned():
+            raise RuntimeError(
+                "RawBlockCore cannot allocate after close or unknown I/O"
+            )
         self._ensure_capacity_and_layout()
 
         if self.fdp_slot_affinity_enabled and placement_id is not None:
@@ -2100,6 +2382,9 @@ class RawBlockCore:
     def _append_free_slot_locked(self, slot: int) -> None:
         """Add a slot to the free list while ``self._lock`` is held."""
         if slot < 0 or slot >= self._max_slots:
+            return
+        if self.is_poisoned():
+            self._quarantine_slot_locked(slot)
             return
         if slot in self._free_slots:
             return
