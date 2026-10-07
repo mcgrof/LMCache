@@ -42,7 +42,9 @@ def test_unreadable_recovery_keeps_entries_and_extents(
     core, keys, _ = stored_core
     offsets = [core.entry_offset(key.encoded) for key in keys]
     core.io_engine = engine
-    monkeypatch.setattr(core, "_read_buffers", lambda *args: [False] * len(args[0]))
+    monkeypatch.setattr(
+        core, "_read_buffers", lambda *args, **kwargs: [False] * len(args[0])
+    )
     with pytest.raises(RuntimeError, match="refusing recovery"):
         core._validate_loaded_entries()
     assert [core.entry_offset(key.encoded) for key in keys] == offsets
@@ -56,7 +58,7 @@ def test_known_invalid_headers_still_recycle(stored_core, monkeypatch, engine):
     old_offsets = {core.entry_offset(key.encoded) for key in keys}
     core.io_engine = engine
 
-    def invalid(offsets, buffers, *args):
+    def invalid(offsets, buffers, *args, **kwargs):
         for buffer in buffers:
             buffer[:] = bytes(len(buffer))
         return [True] * len(offsets)
@@ -91,7 +93,7 @@ def test_unknown_recovery_stops_before_another_batch(stored_core, monkeypatch):
     proxy = OutcomeProxy()
     core.set_raw_device_for_testing(proxy)
 
-    def unknown(offsets, *args):
+    def unknown(offsets, *args, **kwargs):
         calls.append(list(offsets))
         proxy.unknown = True
         raise RuntimeError("completion is unknown")
@@ -114,10 +116,10 @@ def test_fresh_reopen_does_not_recycle_an_unreadable_checkpoint(
     writer.close()
     read = RawBlockCore._read_buffers
 
-    def unreadable_headers(self, offsets, *args):
+    def unreadable_headers(self, offsets, *args, **kwargs):
         if all(offset >= self.meta_total_bytes for offset in offsets):
             return [False] * len(offsets)
-        return read(self, offsets, *args)
+        return read(self, offsets, *args, **kwargs)
 
     monkeypatch.setattr(RawBlockCore, "_read_buffers", unreadable_headers)
     with pytest.raises(RuntimeError, match="refusing recovery"):
