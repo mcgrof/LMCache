@@ -26,6 +26,7 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_allocators.ad_hoc_memory_allocator import AdHocMemoryAllocator
 from lmcache.v1.memory_management import (
     MemoryFormat,
+    MemoryObj,
     MemoryObjMetadata,
     TensorMemoryObj,
 )
@@ -2933,3 +2934,78 @@ def test_batched_write_rejects_misaligned_total_len():
                 dev.batched_write([0], [buf], [1])  # total_len 1 is not aligned
         finally:
             dev.close()
+
+
+@pytest.mark.no_shared_allocator
+def test_store_admission_failure_releases_entire_unscheduled_batch(
+    monkeypatch: pytest.MonkeyPatch,
+    loop_in_thread: asyncio.AbstractEventLoop,
+) -> None:
+    """A lookup failure after retaining one source rolls back batch ownership."""
+    _install_fake_raw_block_device(monkeypatch, size_bytes=64 * 1024 * 1024)
+    backend = _make_raw_block_backend(
+        "/tmp/plugin-admission-failure",
+        AdHocMemoryAllocator(device="cpu"),
+        loop_in_thread,
+    )
+    keys = [CacheEngineKey("test_model", 1, 0, i, torch.uint8) for i in (401, 402)]
+    objects: list[MemoryObj] = [_make_byte_obj(32) for _ in keys]
+    calls = 0
+
+    def fail_second_lookup(core: RawBlockCore, *args: Any, **kwargs: Any) -> bool:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("metadata lookup failed")
+        return False
+
+    try:
+        monkeypatch.setattr(RawBlockCore, "contains_key", fail_second_lookup)
+        with pytest.raises(RuntimeError, match="metadata lookup failed"):
+            backend.batched_submit_put_task(keys, objects)
+        assert [obj.get_ref_count() for obj in objects] == [1, 1]
+        assert not any(backend.exists_in_put_tasks(key) for key in keys)
+    finally:
+        backend.close()
+        for obj in objects:
+            obj.ref_count_down()
+
+
+@pytest.mark.no_shared_allocator
+@pytest.mark.parametrize("results", [[], [True], [True, True, True]])
+def test_store_completion_count_mismatch_cannot_report_success(
+    monkeypatch: pytest.MonkeyPatch,
+    loop_in_thread: asyncio.AbstractEventLoop,
+    results: list[bool],
+) -> None:
+    """Every admitted key needs one completion before reporting store success."""
+    _install_fake_raw_block_device(monkeypatch, size_bytes=64 * 1024 * 1024)
+    backend = _make_raw_block_backend(
+        "/tmp/plugin-completion-count",
+        AdHocMemoryAllocator(device="cpu"),
+        loop_in_thread,
+    )
+    keys = [CacheEngineKey("test_model", 1, 0, i, torch.uint8) for i in (411, 412)]
+    objects: list[MemoryObj] = [_make_byte_obj(32) for _ in keys]
+    callbacks: list[CacheEngineKey] = []
+
+    def mismatched_completion(
+        core: RawBlockCore, *args: Any, **kwargs: Any
+    ) -> RawBlockPutManyResult:
+        return RawBlockPutManyResult(results=results, stored_keys=[])
+
+    monkeypatch.setattr(RawBlockCore, "put_many", mismatched_completion)
+    try:
+        futures = backend.batched_submit_put_task(
+            keys, objects, on_complete_callback=callbacks.append
+        )
+        assert futures is not None and len(futures) == 1
+        with pytest.raises(RuntimeError, match="completion count"):
+            futures[0].result(timeout=5)
+        assert callbacks == []
+        assert [obj.get_ref_count() for obj in objects] == [1, 1]
+        assert not any(backend.exists_in_put_tasks(key) for key in keys)
+    finally:
+        backend.close()
+        for obj in objects:
+            obj.ref_count_down()
