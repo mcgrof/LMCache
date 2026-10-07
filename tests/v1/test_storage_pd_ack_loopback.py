@@ -23,6 +23,8 @@ from __future__ import annotations
 
 # Standard
 from collections import OrderedDict
+from types import SimpleNamespace
+import asyncio
 import contextlib
 import socket as socketlib
 import threading
@@ -372,6 +374,37 @@ def test_a_consumer_at_its_bound_does_not_read(writer) -> None:
     assert writer.core.locked == ["key-2"]
 
 
+def test_a_producer_only_publication_is_resolved_over_the_wire(writer) -> None:
+    """The single-token answer, resolved by the party that knows.
+
+    No decoder was assigned, so nothing will ever acknowledge this
+    publication. The proxy's own notifier tells the writer, which checks
+    that nobody claimed the read before releasing anything.
+    """
+    # First Party
+    from examples.disagg_prefill import disagg_proxy_server as proxy
+
+    status = writer.publish("request-1", ["key-1"])
+    assert writer.tracker.live_lease_count() == 1
+
+    previous = getattr(proxy, "global_args", None)
+    proxy.global_args = SimpleNamespace(storage_pd_session=SESSION)
+    try:
+        asyncio.run(
+            proxy.tell_producers_nobody_will_read(
+                [status], reason="the producer's single token is the whole answer"
+            )
+        )
+    finally:
+        if previous is None:
+            del proxy.global_args
+        else:
+            proxy.global_args = previous
+
+    assert writer.tracker.live_lease_count() == 0
+    assert writer.core.locked == []
+
+
 def test_a_lost_unread_reply_retries_the_applied_tombstone(writer) -> None:
     """The writer answers a duplicate only for the exact applied release."""
     status = writer.publish("request-1", ["key-1"])
@@ -405,6 +438,33 @@ def test_a_lost_unread_reply_retries_the_applied_tombstone(writer) -> None:
     assert attempts == 2
     assert writer.core.unlock_calls == 1
     assert writer.tracker.live_lease_count() == 0
+
+
+def test_a_claimed_publication_is_not_resolved_as_unread(writer, consumer) -> None:
+    """A consumer that took the read is the only one who can release it."""
+    # First Party
+    from examples.disagg_prefill import disagg_proxy_server as proxy
+
+    status = writer.publish("request-1", ["key-1"])
+    consumer.claim(status)
+
+    previous = getattr(proxy, "global_args", None)
+    proxy.global_args = SimpleNamespace(storage_pd_session=SESSION)
+    try:
+        asyncio.run(
+            proxy.tell_producers_nobody_will_read([status], reason="no decoder")
+        )
+    finally:
+        if previous is None:
+            del proxy.global_args
+        else:
+            proxy.global_args = previous
+
+    assert writer.tracker.live_lease_count() == 1
+    obligation = consumer.acknowledge(status)
+    assert obligation is not None
+    assert obligation.wait(timeout=20) == ACK_APPLIED
+    assert writer.core.locked == []
 
 
 def test_an_unreachable_writer_is_not_read_from(consumer) -> None:

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections import defaultdict
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterable
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import Optional
 import argparse
@@ -10,11 +11,15 @@ import itertools
 import json
 import math
 import os
+import re
 import time
+import uuid
 
 # Third Party
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
+from starlette.types import Receive, Scope, Send
+import anyio
 import httpx
 import msgspec
 import numpy as np
@@ -26,7 +31,16 @@ from lmcache.logging import init_logger
 from lmcache.v1.storage_backend.pd_backend import (
     PDMsg,
     ProxyNotif,
+    StoragePDStatus,
 )
+from lmcache.v1.storage_backend.storage_pd_ack import (
+    StoragePDUnreadClient,
+    StoragePDUnreadObligation,
+)
+from lmcache.v1.storage_backend.storage_pd_protocol import (
+    order_storage_pd_ready_statuses,
+)
+from lmcache.v1.storage_backend.storage_pd_trace import trace_storage_pd_event
 
 logger = init_logger(__name__)
 
@@ -172,6 +186,8 @@ async def lifespan(app: FastAPI):
     app.state.total_clients = app.state.prefill_clients + app.state.decode_clients
 
     app.state.zmq_task = asyncio.create_task(zmq_pull_server())
+    if global_args.storage_pd:
+        app.state.storage_pd_unread_client = StoragePDUnreadClient()
 
     global pd_buffer_semaphore
     kv_bytes_per_token = compute_kv_bytes_per_token(global_args.model)
@@ -191,15 +207,28 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown: Close clients
-    for client in app.state.prefill_clients:
-        await client.aclose()
-    for client in app.state.decode_clients:
-        await client.aclose()
-
+    # Shutdown: stop the receiver before the clients it feeds, and close
+    # every client even if one of them raises on the way out.
     global run_proxy
     run_proxy = False
-    await app.state.zmq_task  # Wait for background task to finish
+    zmq_task = app.state.zmq_task
+    try:
+        # The receiver spends its idle time inside recv(), which the flag
+        # alone cannot interrupt: an idle proxy would wait here forever.
+        # Cancelling wakes it, and its own cleanup closes the socket.
+        zmq_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await zmq_task
+    finally:
+        unread_client = app.state.storage_pd_unread_client
+        if unread_client is not None:
+            await asyncio.to_thread(unread_client.close, 5.0)
+            app.state.storage_pd_unread_client = None
+        for client in app.state.total_clients:
+            try:
+                await client.aclose()
+            except Exception:
+                logger.exception("Failed to close a proxy HTTP client")
 
 
 # Update FastAPI app initialization to use lifespan
@@ -287,6 +316,31 @@ def parse_args():
     parser.add_argument("--num-decoders", type=int, default=1)
     parser.add_argument("--proxy-host", type=str, default="localhost")
     parser.add_argument("--proxy-port", type=int, default=8500)
+    parser.add_argument(
+        "--storage-pd",
+        action="store_true",
+        help="Require durable per-rank raw-block READY statuses before decode.",
+    )
+    parser.add_argument(
+        "--storage-pd-session",
+        type=str,
+        default=os.environ.get("LMCACHE_STORAGE_PD_SESSION", ""),
+        help=(
+            "The producer/consumer session identifier this deployment uses. "
+            "It must be the same string every participating engine was given "
+            "(LMCACHE_STORAGE_PD_SESSION), because a producer only answers "
+            "control messages naming its own session."
+        ),
+    )
+    parser.add_argument(
+        "--storage-pd-ready-timeout-s",
+        type=float,
+        default=30.0,
+        help=(
+            "Maximum time for one storage-P/D handoff, covering both the "
+            "prefiller's answer and every READY status after it."
+        ),
+    )
 
     # PD buffer concurrency limiting. A weighted semaphore caps in-flight
     # chunk slots to prevent decoder buffer exhaustion deadlocks.
@@ -319,6 +373,17 @@ def parse_args():
     )
 
     args = parser.parse_args()
+    if args.storage_pd_ready_timeout_s <= 0:
+        parser.error("--storage-pd-ready-timeout-s must be positive")
+    if args.storage_pd and not args.storage_pd_session:
+        # Without it this proxy cannot resolve a publication nobody will
+        # read: the producer answers only for its own session, so the
+        # extents would stay held until the writer stopped publishing.
+        parser.error(
+            "--storage-pd needs --storage-pd-session (or "
+            "LMCACHE_STORAGE_PD_SESSION) set to the same value every "
+            "participating engine was given"
+        )
     return args
 
 
@@ -328,6 +393,10 @@ class ClientInfo:
     host: Optional[str] = None
     init_port: Optional[list[int]] = None
     alloc_port: Optional[list[int]] = None
+
+    async def aclose(self) -> None:
+        """Close the HTTP client this record owns."""
+        await self.client.aclose()
 
 
 # Initialize variables to hold the persistent clients
@@ -344,6 +413,15 @@ app.state.bound_clients = {}
 
 # Keep finished reqs
 app.state.finished_reqs = defaultdict(int)
+# Requests currently waiting for a storage P/D barrier. A status is only
+# admitted while its request is registered here, so traffic that arrives for
+# a request already finished, already failed, or never seen cannot bring its
+# state back into existence. These are plain dicts for that reason: a
+# defaultdict would create an entry for whatever key was read.
+app.state.storage_pd_active = {}
+app.state.storage_pd_statuses = {}
+app.state.storage_pd_failures = {}
+app.state.storage_pd_unread_client = None
 
 pd_buffer_semaphore: Optional[WeightedSemaphore] = None
 
@@ -352,48 +430,120 @@ zmq_ctx = zmq.asyncio.Context()
 run_proxy = True  # Shutdown flag
 
 
+async def tell_producers_nobody_will_read(
+    statuses: list[StoragePDStatus],
+    *,
+    reason: str,
+    timeout_ms: int = 2000,
+) -> list[StoragePDUnreadObligation]:
+    """Tell each producer rank that its publication has no reader.
+
+    The publication is real and durable; what is missing is a decoder, so
+    nothing is ever going to acknowledge it and the producer would hold
+    those extents until its own admission bound stopped it publishing. This
+    proxy is the party that knows no reader was assigned, so it says so --
+    and nothing here fabricates a read acknowledgement, because no read
+    happened. The producer still refuses to release a publication some
+    consumer claimed, so being wrong about this costs nothing.
+
+    The obligation is retained by a bounded background client and retried
+    without needing another serving request. A caller outside the proxy
+    lifespan gets a temporary client and waits for its terminal decisions.
+    """
+    client = app.state.storage_pd_unread_client
+    temporary_client = client is None
+    if client is None:
+        client = StoragePDUnreadClient(attempt_timeout_ms=timeout_ms)
+    obligations: list[StoragePDUnreadObligation] = []
+    try:
+        for status in statuses:
+            if status.state != "READY" or not status.ack_endpoint:
+                continue
+            offer_deadline = time.monotonic() + 60.0
+            while True:
+                obligation = client.offer(
+                    status,
+                    session_id=global_args.storage_pd_session,
+                    reason=reason,
+                )
+                if obligation is not None or time.monotonic() >= offer_deadline:
+                    break
+                await asyncio.sleep(0.01)
+            if obligation is None:
+                raise RuntimeError(
+                    "Storage P/D could not retain the unread publication "
+                    f"{status.req_id} before its admission deadline; its "
+                    "producer keeps the extents held"
+                )
+            obligations.append(obligation)
+        if temporary_client:
+            for obligation in obligations:
+                await asyncio.to_thread(obligation.wait, 60.0)
+        return obligations
+    finally:
+        if temporary_client:
+            with anyio.CancelScope(shield=True):
+                await asyncio.to_thread(client.close, 5.0)
+
+
 async def zmq_pull_server():
     socket = zmq_ctx.socket(zmq.PULL)
-    proxy_url = f"{global_args.proxy_host}:{global_args.proxy_port}"
+    # Close the socket from one place that every exit runs through: a bind
+    # failure, the shutdown flag, and the cancellation that wakes a blocked
+    # recv() all leave this coroutine by a different route.
     try:
-        socket.bind(f"tcp://{proxy_url}")
-    except zmq.ZMQError:
-        logger.exception("ZMQ proxy server failed to bind on %s", proxy_url)
-        return
-    logger.info("ZMQ proxy server started on %s", proxy_url)
-
-    while run_proxy:
+        proxy_url = f"{global_args.proxy_host}:{global_args.proxy_port}"
         try:
-            msg_bytes = await socket.recv()
-        except zmq.Again:
-            await asyncio.sleep(0.01)  # Avoid busy loop
-            continue
-        except zmq.ZMQError as exc:
-            if exc.errno in (zmq.ETERM, zmq.ENOTSOCK):
-                break
-            logger.warning("ZMQ recv error: %s", exc)
-            await asyncio.sleep(0.05)
-            continue
+            socket.bind(f"tcp://{proxy_url}")
+        except zmq.ZMQError:
+            logger.exception("ZMQ proxy server failed to bind on %s", proxy_url)
+            return
+        logger.info("ZMQ proxy server started on %s", proxy_url)
 
-        try:
-            msg = msgspec.msgpack.decode(msg_bytes, type=PDMsg)
-        except msgspec.DecodeError as exc:
-            logger.warning("ZMQ received non-PD message: %s", exc)
-            continue
-        except Exception as exc:
-            logger.exception("ZMQ message decode failed: %s", exc)
-            continue
+        while run_proxy:
+            try:
+                msg_bytes = await socket.recv()
+            except zmq.Again:
+                await asyncio.sleep(0.01)  # Avoid busy loop
+                continue
+            except zmq.ZMQError as exc:
+                if exc.errno in (zmq.ETERM, zmq.ENOTSOCK):
+                    break
+                logger.warning("ZMQ recv error: %s", exc)
+                await asyncio.sleep(0.05)
+                continue
 
-        if not isinstance(msg, ProxyNotif):
-            logger.debug("ZMQ ignored message type: %s", type(msg).__name__)
-            continue
+            try:
+                msg = msgspec.msgpack.decode(msg_bytes, type=PDMsg)
+            except msgspec.DecodeError as exc:
+                logger.warning("ZMQ received non-PD message: %s", exc)
+                continue
+            except Exception as exc:
+                logger.exception("ZMQ message decode failed: %s", exc)
+                continue
 
-        req_id = msg.req_id
-        app.state.finished_reqs[req_id] += 1
-        logger.debug("Prefill of req %s done.", req_id)
+            if isinstance(msg, StoragePDStatus):
+                record_storage_pd_status(msg)
+                continue
 
-    socket.close()
-    logger.info("ZMQ PULL server stopped.")
+            if not isinstance(msg, ProxyNotif):
+                logger.debug("ZMQ ignored message type: %s", type(msg).__name__)
+                continue
+
+            if global_args.storage_pd:
+                logger.debug(
+                    "Ignoring legacy prefill notification for storage P/D req %s",
+                    msg.req_id,
+                )
+                continue
+
+            req_id = msg.req_id
+            app.state.finished_reqs[req_id] += 1
+            logger.debug("Prefill of req %s done.", req_id)
+
+    finally:
+        socket.close(linger=0)
+        logger.info("ZMQ PULL server stopped.")
 
 
 async def send_request_to_service(
@@ -424,6 +574,190 @@ async def stream_service_response(
             yield chunk
 
 
+class StoragePDStreamOwner:
+    """Keep an unread publication owned until response delivery terminates."""
+
+    def __init__(self, statuses: list[StoragePDStatus]) -> None:
+        self._statuses = statuses
+        self._resolved = False
+
+    def complete(self) -> None:
+        """Retire proxy cleanup after the decoder reports successful completion."""
+        self._resolved = True
+
+    async def close(self) -> None:
+        """Queue unread cleanup once, including inside a cancelled ASGI scope."""
+        if self._resolved or not self._statuses:
+            return
+        with anyio.CancelScope(shield=True):
+            await tell_producers_nobody_will_read(
+                self._statuses,
+                reason=(
+                    "the proxy stream ended before decoder completion; "
+                    "the writer releases only if no consumer claimed it"
+                ),
+            )
+            self._resolved = True
+
+
+class StoragePDStreamingResponse(StreamingResponse):
+    """Resolve publication ownership even when sending response headers fails.
+
+    A response can fail before its body iterator starts. Its publication owner
+    therefore belongs to the ASGI response lifetime as well as the iterator.
+    """
+
+    def __init__(
+        self,
+        content: AsyncIterable[bytes],
+        owner: StoragePDStreamOwner,
+        *,
+        request_id: str | None = None,
+    ) -> None:
+        headers = (
+            {"X-LMCache-PD-Request-ID": request_id} if request_id is not None else None
+        )
+        super().__init__(content, media_type="text/event-stream", headers=headers)
+        self._owner = owner
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._owner.close()
+
+
+class DecoderStreamCompletion:
+    """Recognize a successful terminal SSE event without consuming the stream.
+
+    An HTTP 200 and an exhausted response iterator do not mean decode
+    succeeded. vLLM reports engine failures as an SSE ``error`` object and
+    can then send ``[DONE]`` before closing normally. The storage P/D proxy
+    must distinguish that from a completed restore/decode, because only the
+    latter authorizes it to stop owning the unread-publication outcome.
+
+    ``httpx`` may split an SSE line at any byte boundary, so observations are
+    buffered through newlines rather than matched within individual chunks.
+    The bytes are still forwarded unchanged by callers.
+    """
+
+    def __init__(self) -> None:
+        self._buffer = b""
+        self.saw_done = False
+        self.saw_error = False
+        self.saw_terminal_choice = False
+        self.saw_generated_token = False
+        self.protocol_failed = False
+
+    def feed(self, chunk: bytes) -> None:
+        self._buffer += chunk
+        while b"\n" in self._buffer:
+            line, self._buffer = self._buffer.split(b"\n", 1)
+            self._observe_line(line.rstrip(b"\r"))
+
+    def finish(self) -> None:
+        if self._buffer:
+            self._observe_line(self._buffer.rstrip(b"\r"))
+            self._buffer = b""
+
+    @property
+    def succeeded(self) -> bool:
+        return (
+            self.saw_done
+            and self.saw_terminal_choice
+            and not self.saw_error
+            and not self.protocol_failed
+        )
+
+    def _observe_line(self, line: bytes) -> None:
+        if not line.startswith(b"data:"):
+            return
+        payload = line[len(b"data:") :].strip()
+        if payload == b"[DONE]":
+            if not self.saw_terminal_choice:
+                self.protocol_failed = True
+            self.saw_done = True
+            return
+        if not payload:
+            return
+        if self.saw_done:
+            self.protocol_failed = True
+        try:
+            message = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.protocol_failed = True
+            return
+        if not isinstance(message, dict):
+            self.protocol_failed = True
+            return
+        if isinstance(message, dict) and "error" in message:
+            self.saw_error = True
+            return
+        if isinstance(message, dict):
+            choices = message.get("choices")
+            if isinstance(choices, list):
+                for choice in choices:
+                    if not isinstance(choice, dict):
+                        continue
+                    finish_reason = choice.get("finish_reason")
+                    if finish_reason in ("stop", "length"):
+                        self.saw_terminal_choice = True
+                    elif finish_reason is not None:
+                        self.protocol_failed = True
+                    if not self.saw_error and not self.protocol_failed:
+                        token_ids = choice.get("token_ids")
+                        text = choice.get("text")
+                        if (isinstance(text, str) and text) or (
+                            isinstance(token_ids, list)
+                            and token_ids
+                            and all(type(token_id) is int for token_id in token_ids)
+                        ):
+                            self.saw_generated_token = True
+
+
+async def stream_decoder_response(
+    client: httpx.AsyncClient,
+    endpoint: str,
+    req_data: dict,
+    completion: DecoderStreamCompletion,
+) -> AsyncIterable[bytes]:
+    """Forward complete SSE events and report a decoder that ends unfinished.
+
+    Keep a split DONE marker buffered until it can be checked. Otherwise an
+    error inserted before its final bytes would corrupt the event already
+    forwarded to the client. Event boundaries also preserve UTF-8 characters
+    when the chat endpoint converts completion events.
+    """
+    pending = b""
+    reported_failure = False
+    error_event = (
+        b'data: {"error":{"message":"The decoder stream ended without a '
+        b'completed choice and DONE marker","type":"server_error","code":500}}'
+        b"\n\n"
+    )
+    async for chunk in stream_service_response(client, endpoint, req_data):
+        pending += chunk
+        while match := re.search(rb"\r?\n\r?\n", pending):
+            event, pending = pending[: match.end()], pending[match.end() :]
+            completion.feed(event)
+            if (
+                completion.saw_done
+                and not completion.succeeded
+                and not completion.saw_error
+                and not reported_failure
+            ):
+                yield error_event
+                reported_failure = True
+            yield event
+    if pending:
+        completion.feed(pending)
+    completion.finish()
+    if not completion.succeeded and not completion.saw_error and not reported_failure:
+        yield error_event
+    if pending:
+        yield pending
+
+
 def round_robin_pick_client(clients, idx):
     return clients[idx % len(clients)]
 
@@ -439,11 +773,286 @@ def round_robin_pick_clients() -> tuple[ClientInfo, ClientInfo, ClientInfo]:
     return tokenization_client, prefill_client, decode_client
 
 
-async def wait_decode_kv_ready(req_id: str, num_tp_rank: int):
-    while app.state.finished_reqs[req_id] < num_tp_rank:
-        await asyncio.sleep(0.0001)  # sleep for 0.1 ms
-    logger.debug("Prefill node signaled kv ready for req %s", req_id)
-    app.state.finished_reqs.pop(req_id)
+def take_prefill_budget(req_data: dict) -> int:
+    """Read the caller's token budget and give the prefiller one token.
+
+    A handoff spends one token on the prefiller. A one-token budget is served
+    entirely by the prefiller without contacting the decoder. Both spellings
+    of the budget are accepted; a missing or non-positive budget is refused.
+    """
+    budget = req_data.get("max_tokens")
+    if budget is None:
+        budget = req_data.get("max_completion_tokens")
+    if budget is None:
+        raise ValueError(
+            "a prefill/decode handoff needs max_tokens (or "
+            "max_completion_tokens) so the decoder's budget can be computed"
+        )
+    budget = int(budget)
+    if budget < 1:
+        raise ValueError(
+            f"a generation budget must be at least one token; got {budget}"
+        )
+    req_data["max_tokens"] = 1
+    return budget
+
+
+def adopt_prefill_first_token(req_data: dict, prefill_output: dict) -> int:
+    """Carry the prefiller's one token into the decoder's prompt.
+
+    Raises when the producer reported no usable id. Continuing without it is
+    not a lesser answer, it is a different one: the budget has already been
+    spent on a token the decoder is not given, so the decoder continues from
+    the wrong prompt and emits a sequence that was never generated.
+    """
+    first_tok_id = (prefill_output.get("kv_transfer_params") or {}).get("first_tok")
+    if not isinstance(first_tok_id, int) or isinstance(first_tok_id, bool):
+        raise ValueError(
+            "prefiller reported no usable first token id "
+            f"({first_tok_id!r}); the decoder cannot continue from a prompt "
+            "missing the token the budget was spent on"
+        )
+    req_data["prompt"].append(first_tok_id)
+    return first_tok_id
+
+
+def producer_head_chunk(
+    prefill_output: dict,
+    first_tok_id: int,
+    *,
+    final: bool,
+) -> dict:
+    """Render the prefiller's one token as a completion chunk.
+
+    Carries the id and the probability record beside the text. A client
+    comparing generated tokens cannot recover an id from text without
+    retokenizing, which is a different operation and can disagree; and a
+    probability list that omits this token cannot be compared against one
+    that includes it.
+    """
+    choice = (prefill_output.get("choices") or [{}])[0]
+    return {
+        "id": prefill_output["id"],
+        "object": "text_completion",
+        "created": prefill_output["created"],
+        "model": prefill_output["model"],
+        "choices": [
+            {
+                "index": 0,
+                "text": choice.get("text", ""),
+                "token_ids": [first_tok_id],
+                "logprobs": choice.get("logprobs"),
+                "finish_reason": choice.get("finish_reason") if final else None,
+                "stop_reason": choice.get("stop_reason") if final else None,
+            }
+        ],
+        "usage": None,
+    }
+
+
+def producer_answer_is_complete(budget: int, prefill_output: dict) -> bool:
+    """Whether the prefiller's single token is the whole answer.
+
+    Two ways that happens: the caller asked for one token, or the producer
+    stopped of its own accord. Either way the decoder has nothing to
+    generate, and asking it for zero tokens is a request the engine refuses.
+    """
+    if budget <= 1:
+        return True
+    finish = (prefill_output.get("choices") or [{}])[0].get("finish_reason")
+    return finish not in (None, "", "length")
+
+
+def record_storage_pd_status(msg: StoragePDStatus) -> str:
+    """Take one producer status into the barrier's state, or refuse it.
+
+    Returns what was done, for the caller's log and for tests: ``ignored``
+    for a request that is not waiting on a barrier, ``failed`` for a
+    terminal status, ``conflict`` for a second, different READY from a rank
+    that already reported, and ``recorded`` otherwise.
+    """
+    req_id = msg.req_id
+    if not _pd_request_is_active(req_id):
+        # Late, duplicate or unknown: the request has already reached a
+        # terminal state or was never registered. Recording it would
+        # recreate state a barrier just cleared, and nothing would ever
+        # clear it again.
+        logger.debug(
+            "Storage P/D ignoring %s for inactive req %s rank %d",
+            msg.state,
+            req_id,
+            msg.tp_rank,
+        )
+        return "ignored"
+    if msg.state != "READY":
+        app.state.storage_pd_failures[req_id] = msg
+        logger.error(
+            "Storage P/D producer failed req %s rank %d at %s: %s",
+            req_id,
+            msg.tp_rank,
+            msg.error_stage,
+            msg.error_text,
+        )
+        return "failed"
+    ranks = app.state.storage_pd_statuses.setdefault(req_id, {})
+    previous = ranks.get(msg.tp_rank)
+    if previous is not None and previous != msg:
+        app.state.storage_pd_failures[req_id] = StoragePDStatus(
+            req_id=req_id,
+            writer_epoch=msg.writer_epoch,
+            tp_rank=msg.tp_rank,
+            state="FAILED",
+            error_stage="PROXY_BARRIER",
+            error_text="conflicting READY statuses for one TP rank",
+        )
+        return "conflict"
+    ranks[msg.tp_rank] = msg
+    if previous is None:
+        _trace_storage_pd_status_event("ready", msg)
+    logger.debug(
+        "Storage P/D req %s rank %d published checkpoint %d.",
+        req_id,
+        msg.tp_rank,
+        msg.checkpoint_seq,
+    )
+    return "recorded"
+
+
+def _trace_storage_pd_status_event(event: str, status: StoragePDStatus) -> None:
+    """Write one proxy-side event carrying the producer's receipt identity."""
+    trace_storage_pd_event(
+        event,
+        request_id=status.req_id,
+        tp_rank=status.tp_rank,
+        writer_epoch=status.writer_epoch,
+        advertised_checkpoint_seq=status.checkpoint_seq,
+        manifest_digest=status.manifest_digest,
+        namespace_identity=status.namespace_identity,
+    )
+
+
+def _trace_storage_pd_decode(statuses: list[StoragePDStatus]) -> None:
+    """Record the first observed generated token for every adopted TP rank."""
+    for status in statuses:
+        _trace_storage_pd_status_event("decode", status)
+
+
+def _register_pd_request(req_id: str) -> None:
+    """Admit statuses for this request from now until it is cleared.
+
+    Registration happens before the prefiller is contacted, because a
+    producer can report READY before its HTTP response comes back.
+    """
+    app.state.storage_pd_active[req_id] = time.monotonic()
+    app.state.storage_pd_statuses.setdefault(req_id, {})
+
+
+def _pd_request_is_active(req_id: str) -> bool:
+    """Whether this request is still waiting for its barrier."""
+    return req_id in app.state.storage_pd_active
+
+
+def _clear_pd_request_state(req_id: str) -> None:
+    app.state.storage_pd_active.pop(req_id, None)
+    app.state.storage_pd_failures.pop(req_id, None)
+    app.state.storage_pd_statuses.pop(req_id, None)
+    app.state.finished_reqs.pop(req_id, None)
+
+
+def _handoff_deadline() -> float:
+    """One absolute deadline for a whole handoff, fixed when it starts.
+
+    Every wait in the handoff is measured against this instant rather than
+    given its own fresh allowance, so no stage can extend the budget by
+    starting its clock late or by retrying.
+    """
+    return time.monotonic() + float(global_args.storage_pd_ready_timeout_s)
+
+
+async def prefill_within_handoff_budget(
+    client: httpx.AsyncClient,
+    req_data: dict,
+    req_id: str,
+    deadline: float,
+) -> httpx.Response:
+    """Post to the prefiller, bounded by the handoff's absolute deadline.
+
+    The prefill clients carry no timeout of their own, so a prefiller that
+    stops answering would hold the request open for as long as it likes,
+    and the wait for READY that follows only starts its clock once this
+    returns. Both stages share the one deadline.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        _clear_pd_request_state(req_id)
+        raise TimeoutError(
+            f"storage P/D request {req_id} exhausted its handoff budget "
+            "before the prefiller was contacted"
+        )
+    try:
+        return await asyncio.wait_for(
+            send_request_to_service(client, "/v1/completions", req_data),
+            timeout=remaining,
+        )
+    except (asyncio.TimeoutError, TimeoutError) as exc:
+        _clear_pd_request_state(req_id)
+        raise TimeoutError(
+            f"storage P/D request {req_id} timed out after {remaining:g}s "
+            f"waiting for the prefiller to answer"
+        ) from exc
+
+
+async def wait_decode_kv_ready(
+    req_id: str,
+    num_tp_rank: int,
+    *,
+    storage_pd: bool,
+    deadline: float,
+):
+    """Wait for every expected rank to report READY, or for the deadline.
+
+    The deadline is absolute and shared with the prefill call, so a barrier
+    that is handed an already exhausted budget fails rather than succeeding
+    on statuses that arrived too late to be useful.
+    """
+    expected_ranks = set(range(num_tp_rank))
+    while True:
+        if storage_pd and time.monotonic() >= deadline:
+            missing_ranks = expected_ranks - set(
+                app.state.storage_pd_statuses.get(req_id, {})
+            )
+            _clear_pd_request_state(req_id)
+            raise TimeoutError(
+                f"storage P/D request {req_id} timed out waiting for TP ranks "
+                f"{sorted(missing_ranks)}"
+            )
+        failure = app.state.storage_pd_failures.get(req_id)
+        if failure is not None:
+            _clear_pd_request_state(req_id)
+            raise RuntimeError(
+                f"storage P/D request {req_id} failed on TP rank "
+                f"{failure.tp_rank} at {failure.error_stage}: {failure.error_text}"
+            )
+        statuses = app.state.storage_pd_statuses.get(req_id, {})
+        unexpected_ranks = set(statuses) - expected_ranks
+        if unexpected_ranks:
+            _clear_pd_request_state(req_id)
+            raise RuntimeError(
+                f"storage P/D request {req_id} reported unexpected TP ranks "
+                f"{sorted(unexpected_ranks)}"
+            )
+        if set(statuses) == expected_ranks:
+            try:
+                ordered = order_storage_pd_ready_statuses(statuses, num_tp_rank)
+            finally:
+                _clear_pd_request_state(req_id)
+            logger.debug("Storage P/D signaled kv ready for req %s", req_id)
+            return ordered
+        if not storage_pd and app.state.finished_reqs[req_id] >= num_tp_rank:
+            _clear_pd_request_state(req_id)
+            logger.debug("Prefill node signaled kv ready for req %s", req_id)
+            return []
+        await asyncio.sleep(0.001)
 
 
 BOUND_CLIENTS_MAX_NUM = 1024 * 1024
@@ -475,11 +1084,14 @@ def pick_up_clients(request: Request) -> tuple[ClientInfo, ClientInfo, ClientInf
 async def handle_completions(request: Request):
     global counter, stats_calculator
     counter += 1
-    req_id = str(counter)  # we use counter as req_id
+    req_id = uuid.uuid4().hex if global_args.storage_pd else str(counter)
 
     st = time.time()
     slots = 0  # slots to release on error; set after successful acquire only
     acquired = False
+    observed_pd_statuses: dict[int, StoragePDStatus] = {}
+    ready_statuses: list[StoragePDStatus] = []
+    publication_owned = False
     try:
         req_data = await request.json()
 
@@ -491,9 +1103,8 @@ async def handle_completions(request: Request):
         )
         tokenize_output = tokenize_output.json()
 
-        org_max_tokens = req_data["max_tokens"]
+        org_max_tokens = take_prefill_budget(req_data)
         req_data["prompt"] = tokenize_output["tokens"]
-        req_data["max_tokens"] = 1
 
         # Acquire ceil(L/chunk_size) PD buffer slots before prefill.
         slots = math.ceil(len(tokenize_output["tokens"]) / global_args.chunk_size)
@@ -517,61 +1128,121 @@ async def handle_completions(request: Request):
         req_data["stream"] = False
         stream_options = req_data.pop("stream_options", None)
 
-        # Send request to prefill service, ignore the response
-        prefill_output = await send_request_to_service(
-            prefill_client.client, "/v1/completions", req_data
-        )
+        # Fix the whole handoff's deadline before anything waits, and admit
+        # this request's statuses from here: a producer can report READY
+        # before its HTTP response comes back.
+        handoff_deadline = _handoff_deadline()
+        if global_args.storage_pd:
+            _register_pd_request(req_id)
+            observed_pd_statuses = app.state.storage_pd_statuses[req_id]
+            prefill_response = await prefill_within_handoff_budget(
+                prefill_client.client, req_data, req_id, handoff_deadline
+            )
+        else:
+            prefill_response = await send_request_to_service(
+                prefill_client.client, "/v1/completions", req_data
+            )
+        prefill_output = prefill_response
 
         prefill_output = prefill_output.json()
 
         et = time.time()
         stats_calculator.add(et - st)
 
-        req_data["max_tokens"] = org_max_tokens - 1
-        req_data["prompt"].append(prefill_output["kv_transfer_params"]["first_tok"])
+        producer_only = producer_answer_is_complete(org_max_tokens, prefill_output)
+        first_tok_id = adopt_prefill_first_token(req_data, prefill_output)
+        if not producer_only:
+            req_data["max_tokens"] = org_max_tokens - 1
         req_data.pop("kv_transfer_params")
         req_data["stream"] = True
         if stream_options is not None:
             req_data["stream_options"] = stream_options
 
+        try:
+            statuses = await wait_decode_kv_ready(
+                req_id,
+                num_tp_rank,
+                storage_pd=global_args.storage_pd,
+                deadline=handoff_deadline,
+            )
+            ready_statuses = statuses
+            if statuses and producer_only:
+                # No decoder is going to read these, so nothing would ever
+                # acknowledge them. Say so now, while the statuses that
+                # identify the publications are still in hand.
+                await tell_producers_nobody_will_read(
+                    statuses,
+                    reason=(
+                        "the producer's single token is the whole answer, so "
+                        "no decoder was assigned this publication"
+                    ),
+                )
+                publication_owned = True
+            elif statuses:
+                req_data["kv_transfer_params"] = {
+                    "lmcache.storage_pd_request_id": req_id,
+                    "lmcache.storage_pd_statuses": [
+                        msgspec.to_builtins(status) for status in statuses
+                    ],
+                }
+        finally:
+            # The barrier clears its own state on every path it returns
+            # through, but a cancelled or failed request never reaches it.
+            if global_args.storage_pd:
+                _clear_pd_request_state(req_id)
+            if pd_buffer_semaphore is not None:
+                acquired = False
+                await pd_buffer_semaphore.release(slots)
+
+        stream_owner = StoragePDStreamOwner([] if producer_only else ready_statuses)
+
         # Stream response from decode service
         async def generate_stream():
-            head_chunk = {
-                "id": prefill_output["id"],
-                "object": "text_completion",
-                "created": prefill_output["created"],
-                "model": prefill_output["model"],
-                "choices": [
-                    {
-                        "index": 0,
-                        "text": prefill_output["choices"][0]["text"],
-                        "logprobs": None,
-                        "finish_reason": None,
-                        "stop_reason": None,
-                    }
-                ],
-                "usage": None,
-            }
-            yield (
-                "data: " + json.dumps(head_chunk, separators=(",", ":")) + "\n\n"
-            ).encode()
-
+            completion = DecoderStreamCompletion()
             try:
-                await wait_decode_kv_ready(req_id, num_tp_rank)
+                yield (
+                    "data: "
+                    + json.dumps(
+                        producer_head_chunk(
+                            prefill_output, first_tok_id, final=producer_only
+                        ),
+                        separators=(",", ":"),
+                    )
+                    + "\n\n"
+                ).encode()
+
+                if producer_only:
+                    # The answer is one token: either that is all the caller
+                    # asked for, or the producer stopped. The decoder has nothing
+                    # to generate, and asking it for zero tokens is a request the
+                    # engine refuses. The publication stands and no reader will
+                    # claim it, which is the writer's to resolve -- nothing here
+                    # fabricates a restore acknowledgement for a read that did
+                    # not happen.
+                    yield b"data: [DONE]\n\n"
+                    return
+
+                decoder_started = False
+                async for chunk in stream_decoder_response(
+                    decode_client.client, "/v1/completions", req_data, completion
+                ):
+                    if not decoder_started and completion.saw_generated_token:
+                        _trace_storage_pd_decode(ready_statuses)
+                        decoder_started = True
+                    yield chunk
+                if completion.succeeded:
+                    stream_owner.complete()
             finally:
-                if pd_buffer_semaphore is not None:
-                    await pd_buffer_semaphore.release(slots)
+                await stream_owner.close()
 
-            async for chunk in stream_service_response(
-                decode_client.client, "/v1/completions", req_data
-            ):
-                yield chunk
-
-        return StreamingResponse(generate_stream(), media_type="application/json")
+        publication_owned = True
+        return StoragePDStreamingResponse(
+            generate_stream(),
+            stream_owner,
+            request_id=req_id if global_args.storage_pd else None,
+        )
 
     except Exception as e:
-        if pd_buffer_semaphore is not None and acquired:
-            await pd_buffer_semaphore.release(slots)
         # Standard
         import sys
         import traceback
@@ -581,17 +1252,39 @@ async def handle_completions(request: Request):
         print(e)
         print("".join(traceback.format_exception(*exc_info)))
         raise
+    finally:
+        # One ownership scope for the whole request: registration, prefill,
+        # parsing and the barrier. The barrier clears its own state and
+        # releases the permit on every path it returns through, but a request
+        # that fails or is cancelled before reaching it never got there, and
+        # cancellation is not an Exception so the handler above never saw it.
+        # Both actions are idempotent, so this runs exactly once either way.
+        if global_args.storage_pd and not publication_owned:
+            unassigned = ready_statuses or list(observed_pd_statuses.values())
+            if unassigned:
+                await tell_producers_nobody_will_read(
+                    unassigned,
+                    reason="the proxy request ended before decoder assignment",
+                )
+        if global_args.storage_pd:
+            _clear_pd_request_state(req_id)
+        if pd_buffer_semaphore is not None and acquired:
+            acquired = False
+            await pd_buffer_semaphore.release(slots)
 
 
 @app.post("/v1/chat/completions")
 async def handle_chat_completions(request: Request):
     global counter, stats_calculator
     counter += 1
-    req_id = str(counter)
+    req_id = uuid.uuid4().hex if global_args.storage_pd else str(counter)
 
     st = time.time()
     slots = 0  # slots to release on error; set after successful acquire only
     acquired = False
+    observed_pd_statuses: dict[int, StoragePDStatus] = {}
+    ready_statuses: list[StoragePDStatus] = []
+    publication_owned = False
     try:
         req_data = await request.json()
 
@@ -604,9 +1297,8 @@ async def handle_chat_completions(request: Request):
         )
         tokenize_output = tokenize_output.json()
 
-        org_max_tokens = req_data["max_tokens"]
+        org_max_tokens = take_prefill_budget(req_data)
         req_data["prompt"] = tokenize_output["tokens"]
-        req_data["max_tokens"] = 1
 
         org_max_completion_tokens = None
         if "max_completion_tokens" in req_data:
@@ -636,30 +1328,84 @@ async def handle_chat_completions(request: Request):
         req_data["stream"] = False
         stream_options = req_data.pop("stream_options", None)
 
-        # Send request to prefill service, get the response
-        prefill_output = await send_request_to_service(
-            prefill_client.client, "/v1/completions", req_data
-        )
+        # Fix the whole handoff's deadline before anything waits, and admit
+        # this request's statuses from here: a producer can report READY
+        # before its HTTP response comes back.
+        handoff_deadline = _handoff_deadline()
+        if global_args.storage_pd:
+            _register_pd_request(req_id)
+            observed_pd_statuses = app.state.storage_pd_statuses[req_id]
+            prefill_response = await prefill_within_handoff_budget(
+                prefill_client.client, req_data, req_id, handoff_deadline
+            )
+        else:
+            prefill_response = await send_request_to_service(
+                prefill_client.client, "/v1/completions", req_data
+            )
+        prefill_output = prefill_response
 
         prefill_output = prefill_output.json()
 
         et = time.time()
         stats_calculator.add(et - st)
 
-        req_data["max_tokens"] = org_max_tokens - 1
-        if org_max_completion_tokens is not None:
-            req_data["max_completion_tokens"] = org_max_completion_tokens - 1
+        producer_only = producer_answer_is_complete(org_max_tokens, prefill_output)
+        if not producer_only:
+            req_data["max_tokens"] = org_max_tokens - 1
+            if org_max_completion_tokens is not None:
+                req_data["max_completion_tokens"] = org_max_completion_tokens - 1
 
         # Add the first token from prefill to the tokenized messages for decode
-        req_data["prompt"].append(prefill_output["kv_transfer_params"]["first_tok"])
+        first_tok_id = adopt_prefill_first_token(req_data, prefill_output)
 
         req_data.pop("kv_transfer_params")
         req_data["stream"] = True
         if stream_options is not None:
             req_data["stream_options"] = stream_options
 
+        try:
+            statuses = await wait_decode_kv_ready(
+                req_id,
+                num_tp_rank,
+                storage_pd=global_args.storage_pd,
+                deadline=handoff_deadline,
+            )
+            ready_statuses = statuses
+            if statuses and producer_only:
+                # No decoder is going to read these, so nothing would ever
+                # acknowledge them. Say so now, while the statuses that
+                # identify the publications are still in hand.
+                await tell_producers_nobody_will_read(
+                    statuses,
+                    reason=(
+                        "the producer's single token is the whole answer, so "
+                        "no decoder was assigned this publication"
+                    ),
+                )
+                publication_owned = True
+            elif statuses:
+                req_data["kv_transfer_params"] = {
+                    "lmcache.storage_pd_request_id": req_id,
+                    "lmcache.storage_pd_statuses": [
+                        msgspec.to_builtins(status) for status in statuses
+                    ],
+                }
+        finally:
+            # The barrier clears its own state on every path it returns
+            # through, but a cancelled or failed request never reaches it.
+            if global_args.storage_pd:
+                _clear_pd_request_state(req_id)
+            if pd_buffer_semaphore is not None:
+                acquired = False
+                await pd_buffer_semaphore.release(slots)
+
+        producer_choice = (prefill_output.get("choices") or [{}])[0]
+
+        decode_completion = DecoderStreamCompletion()
+        stream_owner = StoragePDStreamOwner([] if producer_only else ready_statuses)
+
         # Stream response from decode service
-        async def generate_stream():
+        async def generate_stream_body():
             initial_chunk = {
                 "id": prefill_output["id"],
                 "object": "chat.completion.chunk",
@@ -686,9 +1432,21 @@ async def handle_chat_completions(request: Request):
                 "choices": [
                     {
                         "index": 0,
-                        "delta": {"content": prefill_output["choices"][0]["text"]},
-                        "logprobs": None,
-                        "finish_reason": None,
+                        "delta": {"content": producer_choice.get("text", "")},
+                        # The prefiller already decided this token and
+                        # reported its integer id. Carry the id and the
+                        # probability record, not only the text they render
+                        # to: a client comparing generated tokens cannot
+                        # recover an id from text without retokenizing, and a
+                        # probability list missing this token cannot be
+                        # compared against one that includes it.
+                        "token_ids": [first_tok_id],
+                        "logprobs": producer_choice.get("logprobs"),
+                        "finish_reason": (
+                            producer_choice.get("finish_reason")
+                            if producer_only
+                            else None
+                        ),
                     }
                 ],
             }
@@ -696,16 +1454,22 @@ async def handle_chat_completions(request: Request):
                 "data: " + json.dumps(head_chunk, separators=(",", ":")) + "\n\n"
             ).encode()
 
-            try:
-                await wait_decode_kv_ready(req_id, num_tp_rank)
-            finally:
-                if pd_buffer_semaphore is not None:
-                    await pd_buffer_semaphore.release(slots)
+            if producer_only:
+                # One token is the whole answer, so there is nothing to
+                # decode and a zero-token request would be refused. The
+                # publication stands unread, which is the writer's to
+                # resolve; nothing here fabricates a restore acknowledgement.
+                yield b"data: [DONE]\n\n"
+                return
 
             # Stream and convert completion format chunks to chat completion format
-            async for chunk in stream_service_response(
-                decode_client.client, "/v1/completions", req_data
+            decoder_started = False
+            async for chunk in stream_decoder_response(
+                decode_client.client, "/v1/completions", req_data, decode_completion
             ):
+                if not decoder_started and decode_completion.saw_generated_token:
+                    _trace_storage_pd_decode(ready_statuses)
+                    decoder_started = True
                 chunk_str = chunk.decode("utf-8")
                 if chunk_str.startswith("data: ") and not chunk_str.startswith(
                     "data: [DONE]"
@@ -738,6 +1502,15 @@ async def handle_chat_completions(request: Request):
                                         "logprobs": completion_data["choices"][0].get(
                                             "logprobs"
                                         ),
+                                        # Carried, not dropped. Without this
+                                        # the chat lane reports exactly one
+                                        # token id -- the synthetic first
+                                        # one -- however long the answer is,
+                                        # which reads as id-capable while
+                                        # comparing nothing.
+                                        "token_ids": completion_data["choices"][0].get(
+                                            "token_ids"
+                                        ),
                                         "finish_reason": completion_data["choices"][
                                             0
                                         ].get("finish_reason"),
@@ -757,11 +1530,24 @@ async def handle_chat_completions(request: Request):
                 else:
                     yield chunk
 
-        return StreamingResponse(generate_stream(), media_type="application/json")
+        async def generate_stream():
+            try:
+                async for chunk in generate_stream_body():
+                    yield chunk
+                decode_completion.finish()
+                if producer_only or decode_completion.succeeded:
+                    stream_owner.complete()
+            finally:
+                await stream_owner.close()
+
+        publication_owned = True
+        return StoragePDStreamingResponse(
+            generate_stream(),
+            stream_owner,
+            request_id=req_id if global_args.storage_pd else None,
+        )
 
     except Exception as e:
-        if pd_buffer_semaphore is not None and acquired:
-            await pd_buffer_semaphore.release(slots)
         # Standard
         import sys
         import traceback
@@ -773,6 +1559,25 @@ async def handle_chat_completions(request: Request):
         print(e)
         print("".join(traceback.format_exception(*exc_info)))
         raise
+    finally:
+        # One ownership scope for the whole request: registration, prefill,
+        # parsing and the barrier. The barrier clears its own state and
+        # releases the permit on every path it returns through, but a request
+        # that fails or is cancelled before reaching it never got there, and
+        # cancellation is not an Exception so the handler above never saw it.
+        # Both actions are idempotent, so this runs exactly once either way.
+        if global_args.storage_pd and not publication_owned:
+            unassigned = ready_statuses or list(observed_pd_statuses.values())
+            if unassigned:
+                await tell_producers_nobody_will_read(
+                    unassigned,
+                    reason="the proxy request ended before decoder assignment",
+                )
+        if global_args.storage_pd:
+            _clear_pd_request_state(req_id)
+        if pd_buffer_semaphore is not None and acquired:
+            acquired = False
+            await pd_buffer_semaphore.release(slots)
 
 
 if __name__ == "__main__":
