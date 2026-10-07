@@ -2297,8 +2297,17 @@ class RawBlockCore:
         payload_len = int.from_bytes(hdr[16:24], "little", signed=False)
         return slot_identity, payload_len
 
-    def _read_slot_header(self, offset: int) -> Optional[tuple[int, int]]:
-        """Read and decode the slot header at a raw-device offset."""
+    def _read_slot_header(self, offset: int) -> tuple[str, Optional[tuple[int, int]]]:
+        """Read one slot header, saying which of three things happened.
+
+        ``"decoded"`` with the identity and length; ``"invalid"`` when bytes
+        arrived and are not one of ours; ``"unreadable"`` when the read did
+        not complete.
+
+        The third is not the same statement as the second, and collapsing
+        them is what let an I/O outcome nobody could establish look like
+        ordinary stale metadata -- which is recycled.
+        """
         buf = bytearray(self.header_bytes)
         try:
             with self._lock:
@@ -2311,10 +2320,13 @@ class RawBlockCore:
                     [self.header_bytes],
                 )
             ):
-                return None
-            return self._decode_slot_header(buf)
+                return "unreadable", None
+            decoded = self._decode_slot_header(buf)
+            if decoded is None:
+                return "invalid", None
+            return "decoded", decoded
         except Exception:
-            return None
+            return "unreadable", None
         finally:
             with self._lock:
                 self._inflight_io_count -= 1
@@ -2823,19 +2835,47 @@ class RawBlockCore:
 
     def _validate_loaded_entries(self) -> None:
         """Drop recovered entries whose slot headers do not match metadata."""
+        to_drop: list[str] = []
+        unreadable: Optional[str] = None
         with self._lock:
             items = list(self._index.items())
 
-        if not items:
-            return
+        headers = self._read_slot_headers([int(entry.offset) for _, entry in items])
+        for (encoded_key, entry), (state, slot_hdr) in zip(items, headers, strict=True):
+            if state == "unreadable":
+                # Not evidence this entry is stale -- evidence that the
+                # device did not answer. Dropping it and recycling its slot
+                # would be a decision made on no information, so validation
+                # stops and every entry it has not judged is kept. The same
+                # condition applies to all of them.
+                unreadable = encoded_key
+                break
+            if slot_hdr is None:
+                to_drop.append(encoded_key)
+                continue
+            try:
+                expected_identity = slot_identity_from_encoded_key(
+                    encoded_key,
+                    self.key_namespace,
+                )
+            except Exception:
+                to_drop.append(encoded_key)
+                continue
+            slot_identity, payload_len = slot_hdr
+            if int(slot_identity) != int(expected_identity):
+                to_drop.append(encoded_key)
+                continue
+            if int(payload_len) != int(entry.size):
+                to_drop.append(encoded_key)
 
-        offsets = [int(entry.offset) for _, entry in items]
-        headers = self._read_slot_headers(offsets)
-        to_drop = [
-            encoded_key
-            for (encoded_key, entry), slot_hdr in zip(items, headers, strict=True)
-            if self._is_stale_header(encoded_key, entry, slot_hdr)
-        ]
+        if unreadable is not None:
+            logger.error(
+                "RawBlockCore could not read the slot header for key %s; "
+                "stopping validation and keeping every entry it had not "
+                "judged. An unreadable header says the device did not "
+                "answer, not that the entry is stale.",
+                unreadable,
+            )
 
         if not to_drop:
             return
@@ -2845,6 +2885,9 @@ class RawBlockCore:
                 removed_entry = self._index.pop(encoded_key, None)
                 self._lock_refcnt.pop(encoded_key, None)
                 if removed_entry is not None:
+                    # A header that arrived and is not ours is a known
+                    # outcome, so ordinary recycling applies -- unless this
+                    # core has stopped being able to say, which this decides.
                     self._append_free_slot_locked(
                         self._offset_to_slot(int(removed_entry.offset))
                     )
@@ -2857,123 +2900,102 @@ class RawBlockCore:
         )
 
     def _read_slot_headers(
-        self,
-        offsets: list[int],
-    ) -> list[Optional[tuple[int, int]]]:
-        """Dispatch slot-header reads to the appropriate engine path."""
-        n = len(offsets)
-        if self.io_engine == "posix" and self._recovery_read_threads > 1 and n > 1:
+        self, offsets: list[int]
+    ) -> list[tuple[str, Optional[tuple[int, int]]]]:
+        """Read recovery headers without treating unreadable bytes as stale."""
+        if (
+            self.io_engine == "posix"
+            and self._recovery_read_threads > 1
+            and len(offsets) > 1
+        ):
             return self._read_slot_headers_posix_parallel(offsets)
-        if self.io_engine == "io_uring" and n > 1:
+        if self.io_engine == "io_uring" and len(offsets) > 1:
             return self._read_slot_headers_batched(offsets)
-        return [self._read_slot_header(off) for off in offsets]
+        return [self._read_slot_header(offset) for offset in offsets]
 
     def _read_slot_headers_posix_parallel(
-        self,
-        offsets: list[int],
-    ) -> list[Optional[tuple[int, int]]]:
-        """Return slot headers using a bounded POSIX reader thread pool."""
-        n = len(offsets)
-        max_workers = min(self._recovery_read_threads, n)
-        ranges = self._build_recovery_item_ranges(n, max_workers)
-        work_items = [(offsets, start, end) for start, end in ranges]
-
+        self, offsets: list[int]
+    ) -> list[tuple[str, Optional[tuple[int, int]]]]:
+        """Limit both POSIX reader threads and the number of queued tasks."""
+        max_workers = min(self._recovery_read_threads, len(offsets))
+        ranges = self._build_recovery_item_ranges(len(offsets), max_workers)
+        work = [(offsets, start, end) for start, end in ranges]
         with ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix="rawblk-recover",
+            max_workers=max_workers, thread_name_prefix="rawblk-recover"
         ) as pool:
             return [
                 header
-                for range_headers in pool.map(self._read_slot_header_range, work_items)
-                for header in range_headers
+                for headers in pool.map(self._read_slot_header_range, work)
+                for header in headers
             ]
 
     def _read_slot_header_range(
         self,
         work_item: tuple[list[int], int, int],
-    ) -> list[Optional[tuple[int, int]]]:
+    ) -> list[tuple[str, Optional[tuple[int, int]]]]:
         """Read one recovery range, preserving offset order and failed reads."""
         offsets, start, end = work_item
         return [self._read_slot_header(offsets[i]) for i in range(start, end)]
 
     def _read_slot_headers_batched(
-        self,
-        offsets: list[int],
-    ) -> list[Optional[tuple[int, int]]]:
-        """Return slot headers using the batched io_uring read path.
-
-        Splits the reads into ``iouring_queue_depth``-sized batches so a large
-        checkpoint does not allocate one buffer for every entry at once, then
-        reads each batch and concatenates results in input order. Failed
-        completions are retried individually before returning their headers.
-
-        Args:
-            offsets: Device byte offsets for each slot header to read.
-
-        Returns:
-            Decoded (slot_identity, payload_len) per slot, or None on error,
-            in the same order as ``offsets``.
-        """
-        n = len(offsets)
+        self, offsets: list[int]
+    ) -> list[tuple[str, Optional[tuple[int, int]]]]:
+        """Bound recovery buffers by queue depth and stop on an unreadable batch."""
+        headers: list[tuple[str, Optional[tuple[int, int]]]] = []
         batch_size = max(1, self.iouring_queue_depth)
-        headers: list[Optional[tuple[int, int]]] = []
-        for start in range(0, n, batch_size):
-            headers.extend(
-                self._read_slot_header_batch(offsets[start : start + batch_size])
-            )
+        for start in range(0, len(offsets), batch_size):
+            batch = self._read_slot_header_batch(offsets[start : start + batch_size])
+            headers.extend(batch)
+            if any(state == "unreadable" for state, _ in batch):
+                headers.extend([("unreadable", None)] * (len(offsets) - len(headers)))
+                break
         return headers
 
     def _read_slot_header_batch(
-        self,
-        offsets: list[int],
-    ) -> list[Optional[tuple[int, int]]]:
-        """Read one bounded batch of slot headers via a single batched_read.
+        self, offsets: list[int]
+    ) -> list[tuple[str, Optional[tuple[int, int]]]]:
+        """Read one batch through the attributed completion and poison checks.
 
-        Allocates a single contiguous pointer-aligned buffer for the batch,
-        issues one ``batched_read`` + ``wait_iouring``, and decodes each header
-        independently. Used for both regular io_uring block I/O and NVMe
-        passthrough (``use_uring_cmd``).
-
-        Args:
-            offsets: Device byte offsets for this batch (non-empty).
-
-        Returns:
-            Decoded (slot_identity, payload_len) per slot, or None on error.
-            Decode successful completions directly and reread only failed
-            slots. Submission errors or a completion-count mismatch require
-            rereading every slot because individual results are unavailable.
+        Retry a known failed read individually. An unknown outcome poisons the
+        core and must neither authorize a retry nor discard a recovered entry.
         """
-        n = len(offsets)
-        align = self.block_align
-        hdr = self.header_bytes
-        raw_buf = bytearray(n * hdr + align - 1)
-        addr = ctypes.addressof(ctypes.c_byte.from_buffer(raw_buf))
-        pad = (-addr) % align
-        views = [
-            memoryview(raw_buf)[pad + i * hdr : pad + (i + 1) * hdr] for i in range(n)
-        ]
-
+        buffers = [bytearray(self.header_bytes) for _ in offsets]
+        lengths = [self.header_bytes] * len(offsets)
         with self._lock:
             self._inflight_io_count += 1
         try:
-            raw_dev = self._rawdev()
-            batch_id = raw_dev.batched_read(offsets, views, [hdr] * n)
-            results = self._wait_iouring_results(
-                raw_dev, batch_id, n, "recovery header read"
+            results = self._read_buffers(
+                offsets,
+                buffers,
+                lengths,
+                lengths,
             )
-        except Exception:
-            results = [False] * n
+        except RuntimeError:
+            # Admission is sealed on poison. Ask the actual existing handle,
+            # not an accessor that correctly refuses new work at this point.
+            if self._raw is None or not self._adopt_native_poison(
+                self._raw, "recovery header read"
+            ):
+                raise
+            results = [False] * len(offsets)
         finally:
             with self._lock:
                 self._inflight_io_count -= 1
                 self._last_io_ts = time.monotonic()
-
-        return [
-            self._decode_slot_header(bytes(view))
-            if success
-            else self._read_slot_header(offset)
-            for offset, view, success in zip(offsets, views, results, strict=True)
-        ]
+        if len(results) != len(offsets):
+            return [("unreadable", None)] * len(offsets)
+        headers: list[tuple[str, Optional[tuple[int, int]]]] = []
+        for offset, buffer, success in zip(offsets, buffers, results, strict=True):
+            if success:
+                decoded = self._decode_slot_header(buffer)
+                headers.append(
+                    ("decoded" if decoded is not None else "invalid", decoded)
+                )
+            elif self.is_poisoned():
+                headers.append(("unreadable", None))
+            else:
+                headers.append(self._read_slot_header(offset))
+        return headers
 
     def _is_stale_header(
         self,
