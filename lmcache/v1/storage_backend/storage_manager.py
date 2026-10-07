@@ -36,6 +36,7 @@ from lmcache.v1.event_manager import EventManager, EventStatus, EventType
 from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObj,
+    retain_memory_owners,
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend import CreateStorageBackends, is_cuda_worker
@@ -54,6 +55,12 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# A failed GPU synchronization does not establish that a copy has stopped.
+# Keep the stream alive so its identity cannot be reused, and reject new work
+# on it rather than accumulating more allocations after the first failure.
+_FAILED_COPY_STREAMS: dict[int, object] = {}
+_FAILED_COPY_STREAMS_LOCK = threading.Lock()
+
 
 # Helper function to get the class name of the backend
 def get_backend_cname(backend: StorageBackendInterface) -> str:
@@ -67,56 +74,85 @@ def allocate_and_copy_objects(
     src_memory_objs: list[MemoryObj],
     stream: Any,
 ) -> tuple[Sequence[CacheEngineKey], list[MemoryObj]]:
-    """
-    Allocate the memory objects and copy the data from src_memory_objs to
-    the newly allocated memory objects
+    """Allocate and synchronously finish copies into another allocator.
 
     Args:
-        allocator_backend: the allocator backend to allocate the new memory
-          objects
-        keys: the cache engine keys corresponding to the memory objects
-        src_memory_objs: the memory objects to copy from
-        stream: the device-specific GPU stream to run the copy in
-            (e.g., torch_dev.Stream on CUDA or XPU)
+        allocator_backend: Allocator receiving the copied objects.
+        keys: Cache keys corresponding one-to-one with ``src_memory_objs``.
+        src_memory_objs: Source owners that the caller holds through this call.
+        stream: GPU copy stream, or ``None`` for blocking copies.
 
     Returns:
-        - list of cache engine keys that corresponds to the memory objects
-          that has been successfully allocated
-        - list of the memory objects that has been successfully allocated
+        Keys and owned destination objects for missing keys that fit in the
+        allocator. Allocation exhaustion returns the successfully copied prefix.
+        The caller must release the returned destination references.
+
+    Raises:
+        ValueError: Key and source lengths differ.
+        RuntimeError: Copying or stream synchronization fails, or the stream
+            previously failed synchronization.
+        OSError: The allocator refuses an allocation.
+
+    A failed enqueue drains earlier copies before releasing their destinations.
+    Failed synchronization retains source and destination owners for the process
+    lifetime, because neither allocation is safe to recycle. The manager must
+    also preserve backend resources when closing a failed copy stream.
     """
-    allocated_keys = []
-    allocated_objects = []
-    for key, src_memory_obj in zip(keys, src_memory_objs, strict=False):
-        if allocator_backend.contains(key):
-            continue
-        memory_obj = allocator_backend.allocate(
-            src_memory_obj.get_shape(),
-            src_memory_obj.get_dtype(),
-            fmt=src_memory_obj.meta.fmt,
-            eviction=True,
-            busy_loop=False,
-        )
+    if len(keys) != len(src_memory_objs):
+        raise ValueError("keys and src_memory_objs must have equal lengths")
+    with _FAILED_COPY_STREAMS_LOCK:
+        if id(stream) in _FAILED_COPY_STREAMS:
+            raise RuntimeError("Storage copy stream is unusable after failed sync")
 
-        if memory_obj is None:
-            break
-
-        if memory_obj.tensor is None:
-            # This should not happen with current implementation,
-            # but handle it defensively to avoid memory leak
-            logger.warning(
-                "Allocated MemoryObj has None tensor, this is unexpected. "
-                "Releasing the memory object."
+    allocated_keys: list[CacheEngineKey] = []
+    allocated_objects: list[MemoryObj] = []
+    copied_sources: list[MemoryObj] = []
+    copies_complete = False
+    quiescent = stream is None
+    try:
+        for key, src_memory_obj in zip(keys, src_memory_objs, strict=True):
+            if allocator_backend.contains(key):
+                continue
+            memory_obj = allocator_backend.allocate(
+                src_memory_obj.get_shape(),
+                src_memory_obj.get_dtype(),
+                fmt=src_memory_obj.meta.fmt,
+                eviction=True,
+                busy_loop=False,
             )
-            memory_obj.ref_count_down()
-            break
-
-        with torch_dev.stream(stream):
-            memory_obj.tensor.copy_(src_memory_obj.tensor, non_blocking=True)
-        allocated_keys.append(key)
-        allocated_objects.append(memory_obj)
-
-    if stream is not None:
-        stream.synchronize()
+            if memory_obj is None:
+                break
+            # Own the destination before inspecting or submitting its tensor:
+            # both operations can fail after an allocation has succeeded.
+            allocated_objects.append(memory_obj)
+            allocated_keys.append(key)
+            copied_sources.append(src_memory_obj)
+            destination = memory_obj.tensor
+            source = src_memory_obj.tensor
+            if destination is None or source is None:
+                raise RuntimeError("Storage copy requires tensor memory objects")
+            with torch_dev.stream(stream):
+                destination.copy_(source, non_blocking=stream is not None)
+        copies_complete = True
+    finally:
+        try:
+            if stream is not None:
+                stream.synchronize()
+                quiescent = True
+        finally:
+            if not quiescent:
+                retain_memory_owners(
+                    copied_sources + allocated_objects, allocator_backend, stream
+                )
+                with _FAILED_COPY_STREAMS_LOCK:
+                    _FAILED_COPY_STREAMS[id(stream)] = stream
+                # The quarantine owns one reference to each destination;
+                # sources still belong to the caller until it unwinds.
+                for memory_obj in allocated_objects:
+                    memory_obj.ref_count_down()
+            elif not copies_complete:
+                for memory_obj in allocated_objects:
+                    memory_obj.ref_count_down()
     return allocated_keys, allocated_objects
 
 
@@ -232,6 +268,7 @@ class StorageManager:
         async_lookup_server: Optional["LMCacheAsyncLookupServer"] = None,
     ):
         self.config = config
+        self._copy_owners_retained = False
         self.metadata = metadata
         self.loop = asyncio.new_event_loop()
 
@@ -395,6 +432,10 @@ class StorageManager:
         storage backends.
         Do not store if the same object is being stored (handled here by
         storage manager) or has been stored (handled by storage backend).
+
+        Consumes the caller's input references on both success and failure.
+        Copied staging groups are released only after their copies finish;
+        failed synchronization retains owners for the process lifetime.
         """
         # The dictionary from backend cname to objects and keys
         obj_dict: dict[
@@ -409,30 +450,34 @@ class StorageManager:
             memory_objs,
         )
 
-        for backend_name, backend in self.storage_backends.items():
-            if location and backend_name != location:
-                continue
-            # Skip bypassed backends
-            with self._bypass_lock:
-                if backend_name in self._bypassed_backends:
+        try:
+            for backend_name, backend in self.storage_backends.items():
+                if location and backend_name != location:
                     continue
+                # Skip bypassed backends
+                with self._bypass_lock:
+                    if backend_name in self._bypassed_backends:
+                        continue
 
-            allocator_backend = backend.get_allocator_backend()
-            cname = get_backend_cname(allocator_backend)
-            if cname not in obj_dict:
-                new_keys, new_objs = allocate_and_copy_objects(
-                    allocator_backend, keys, memory_objs, self.internal_copy_stream
-                )
-                obj_dict[cname] = (new_keys, new_objs)
+                allocator_backend = backend.get_allocator_backend()
+                cname = get_backend_cname(allocator_backend)
+                if cname not in obj_dict:
+                    new_keys, new_objs = allocate_and_copy_objects(
+                        allocator_backend, keys, memory_objs, self.internal_copy_stream
+                    )
+                    obj_dict[cname] = (new_keys, new_objs)
 
-            # NOTE: the handling of exists_in_put_tasks
-            # is done in the backend
-            ks, objs = obj_dict[cname]
-            backend.batched_submit_put_task(ks, objs, transfer_spec=transfer_spec)
-
-        for cname, (ks, objs) in obj_dict.items():
-            for memory_obj in objs:
-                memory_obj.ref_count_down()
+                # NOTE: the handling of exists_in_put_tasks
+                # is done in the backend
+                ks, objs = obj_dict[cname]
+                backend.batched_submit_put_task(ks, objs, transfer_spec=transfer_spec)
+        except RuntimeError:
+            self._retain_failed_copy_resources()
+            raise
+        finally:
+            for _cname, (_ks, objs) in obj_dict.items():
+                for memory_obj in objs:
+                    memory_obj.ref_count_down()
 
     def get(
         self,
@@ -1236,8 +1281,11 @@ class StorageManager:
 
         Returns:
             True if the backend was found and closed, False
-            otherwise.
+            otherwise, including when failed copy synchronization prevents
+            safe backend teardown.
         """
+        if self._retain_failed_copy_resources():
+            return False
         with self.manager_lock:
             backend = self.storage_backends.get(backend_name)
             if backend is None:
@@ -1326,8 +1374,11 @@ class StorageManager:
             class name.
 
         Raises:
+            RuntimeError: Failed copy synchronization prevents safe teardown.
             KeyError: If *backend_name* does not exist.
         """
+        if self._retain_failed_copy_resources():
+            raise RuntimeError("Cannot recreate backends after failed copy sync")
         with self.manager_lock:
             backend = self.storage_backends.get(backend_name)
             if backend is None:
@@ -1388,7 +1439,13 @@ class StorageManager:
         for backend in self.storage_backends.values():
             backend.cancel_request(req_id)
 
-    def close(self):
+    def close(self) -> None:
+        """Close backends and stop the worker, including incomplete construction.
+
+        A failed copy synchronization leaves DMA ownership unknown. In that
+        case the backend graph and its arenas remain alive until process exit,
+        while the manager's event-loop thread is still stopped.
+        """
         logger.info("Closing StorageManager...")
 
         # Consumers must settle I/O before their shared backing arenas are freed.
@@ -1396,6 +1453,8 @@ class StorageManager:
             self.storage_backends.items(),
             key=lambda item: isinstance(item[1], AllocatorBackendInterface),
         )
+        if self._retain_failed_copy_resources():
+            backends = []
         for name, backend in backends:
             try:
                 logger.info("Closing storage backend: %s", name)
@@ -1406,10 +1465,10 @@ class StorageManager:
 
         # Stop event loop
         try:
-            if self.loop.is_running():
-                logger.info("Stopping event loop...")
+            if not self.loop.is_closed():
+                # Queue stop even when construction failed before run_forever
+                # started; checking is_running() leaves that race unhandled.
                 self.loop.call_soon_threadsafe(self.loop.stop)
-                logger.info("Event loop stop signaled")
         except Exception as e:
             logger.error("Error stopping event loop: %s", e)
 
@@ -1428,4 +1487,24 @@ class StorageManager:
         else:
             logger.info("Storage manager thread already stopped")
 
+        if not self.thread.is_alive() and not self.loop.is_closed():
+            self.loop.close()
         logger.info("Storage manager closed.")
+
+    def _retain_failed_copy_resources(self) -> bool:
+        """Preserve the backend graph if the copy stream has unknown work."""
+        with _FAILED_COPY_STREAMS_LOCK:
+            if id(self.internal_copy_stream) not in _FAILED_COPY_STREAMS:
+                return False
+        with self.manager_lock:
+            if not self._copy_owners_retained:
+                for backend in self.storage_backends.values():
+                    if isinstance(backend, LocalCPUBackend):
+                        backend.retain_backing_resources()
+                retain_memory_owners([], self)
+                self._copy_owners_retained = True
+                logger.error(
+                    "Retaining storage backends after failed copy synchronization; "
+                    "GPU access to staging allocations may still be in progress"
+                )
+        return True
