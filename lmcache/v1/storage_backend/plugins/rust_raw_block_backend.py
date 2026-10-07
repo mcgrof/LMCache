@@ -186,6 +186,17 @@ class RustRawBlockBackend(StoragePluginInterface):
                     self.local_cpu_backend.get_memory_allocator()
                 )
             except Exception as e:
+                if self._outcome_is_unknown():
+                    try:
+                        outcome = self._core.close()
+                    except Exception:
+                        outcome = None
+                    if outcome is None or not outcome.may_release_backing_resources:
+                        _RETAINED_AFTER_UNKNOWN_OUTCOME.append(
+                            (self._core, self.local_cpu_backend)
+                        )
+                        self.local_cpu_backend.retain_backing_resources()
+                    raise
                 logger.warning(
                     "RustRawBlockBackend: failed to register io_uring fixed "
                     "buffers: %s. Falling back to non-fixed buffer mode.",
