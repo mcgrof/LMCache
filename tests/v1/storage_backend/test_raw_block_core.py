@@ -9,9 +9,12 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, call, patch
+import concurrent.futures
 import ctypes
 import dataclasses
 import importlib.util
+import json
+import os
 import stat
 import sys
 import threading
@@ -23,10 +26,19 @@ import pytest
 # First Party
 from lmcache.v1.memory_management import MemoryObj, TensorMemoryObj
 from lmcache.v1.storage_backend.raw_block import (
+    IncompatibleKeyDerivation,
+    NativeQuiescence,
     RawBlockCore,
     RawBlockCoreConfig,
+    RawBlockPublicationReceipt,
     encode_object_key,
     normalize_raw_block_placement_ids,
+)
+from lmcache.v1.storage_backend.raw_block.core import (
+    IO_PATH_IOURING_BATCHED,
+    RawBlockIoAttribution,
+    RawBlockIoContext,
+    RawBlockIoLedger,
 )
 from tests.v1.storage_backend.raw_block_test_utils import (
     RAW_BLOCK_CI_BLOCK_ALIGN,
@@ -40,6 +52,7 @@ from tests.v1.storage_backend.raw_block_test_utils import (
     make_object_key,
     make_raw_block_core_config,
     make_raw_block_file,
+    make_test_derivation,
     memory_obj_bytes,
 )
 import lmcache.v1.storage_backend.raw_block.core as raw_block_core
@@ -91,6 +104,7 @@ class _RecordingUringCmdRawDevice:
         offsets: list[int],
         buffers: list[memoryview],
         lengths: list[int],
+        request_tag: str | None = None,
     ) -> int:
         for target, total_len in zip(buffers, lengths, strict=True):
             self.read_buffers.append(target)
@@ -117,6 +131,7 @@ class _RecordingNativeRawDevice:
         offsets: list[int],
         buffers: list[Any],
         total_lens: list[int],
+        request_tag: str | None = None,
     ) -> int:
         """Record and submit a batch through the wrapped Rust implementation.
 
@@ -144,7 +159,6 @@ def _buffer_address(buf: memoryview) -> int:
 
 def test_raw_block_core_bounded_io_uring_write_uses_aligned_chunks(monkeypatch):
     core = RawBlockCore.__new__(RawBlockCore)
-    core._poisoned = False
     core.block_align = 4096
     core.max_data_transfer_size = 4096
     core.use_odirect = True
@@ -170,7 +184,6 @@ def test_raw_block_core_bounded_io_uring_write_uses_aligned_chunks(monkeypatch):
 
 def test_raw_block_core_bounded_io_uring_read_copyback_uses_aligned_chunks(monkeypatch):
     core = RawBlockCore.__new__(RawBlockCore)
-    core._poisoned = False
     core.block_align = 4096
     core.max_data_transfer_size = 4096
     core.use_odirect = True
@@ -481,6 +494,7 @@ class _RecordingRawDevice:
         total_lens: Sequence[int],
         placement_ids: Sequence[int | None] | None = None,
         payload_lens: Sequence[int] | None = None,
+        request_tag: str | None = None,
     ) -> int:
         logical_lens = list(total_lens if payload_lens is None else payload_lens)
         self.batched_write_calls.append(
@@ -520,6 +534,7 @@ class _RecordingRawDevice:
         offsets: Sequence[int],
         buffers: Sequence[Buffer],
         total_lens: Sequence[int],
+        request_tag: str | None = None,
     ) -> int:
         for off, buf, total in zip(offsets, buffers, total_lens, strict=True):
             self._copy_into(int(off), buf, int(total))
@@ -538,6 +553,7 @@ class _RecordingRawDevice:
         payload_len: int,
         total_len: int,
         placement_id: int | None = None,
+        request_tag: str | None = None,
     ) -> None:
         self.write_uring_count += 1
         self.store[int(offset)] = bytes(buf)[: int(total_len)]
@@ -869,6 +885,119 @@ def test_raw_block_core_io_uring_put_many_partial_slot_exhaustion(
         load_result = core.load_many_into([spec.encoded for spec in specs[:3]], loaded)
         assert load_result == [True] * 3
     finally:
+        core.close()
+
+
+def test_raw_block_core_bounded_pd_reclaims_only_unlocked_extent(
+    tmp_path: Path,
+) -> None:
+    path = make_raw_block_file(tmp_path)
+    fake = _RecordingRawDevice(size=128 * 1024 * 1024)
+    capacity = RAW_BLOCK_CI_META_TOTAL_BYTES + 2 * RAW_BLOCK_CI_SLOT_BYTES
+    core = _make_core_with_fake(
+        path,
+        fake,
+        io_engine="io_uring",
+        capacity_bytes=capacity,
+    )
+    core.evict_unlocked_on_full = True
+
+    try:
+        first, second, replacement = [
+            encode_object_key(make_object_key(i)) for i in range(3)
+        ]
+        objects = [make_memory_obj(bytes([i + 1]) * 1024) for i in range(3)]
+        assert core.put_many([first, second], objects[:2]).results == [True, True]
+        first_offset = core.entry_offset(first.encoded)
+        second_offset = core.entry_offset(second.encoded)
+        assert len(core.get_metadata_prefix([first.encoded], lock=True)) == 1
+
+        result = core.put_many([replacement], objects[2:])
+
+        assert result.results == [True]
+        assert core.entry_offset(first.encoded) == first_offset
+        assert core.entry_offset(second.encoded) is None
+        assert core.entry_offset(replacement.encoded) == second_offset
+        assert core.report_status()["capacity_evictions"] == 1
+    finally:
+        core.unlock_many([first.encoded])
+        core.close()
+
+
+def test_raw_block_core_bounded_pd_refuses_to_reclaim_leased_extents(
+    tmp_path: Path,
+) -> None:
+    path = make_raw_block_file(tmp_path)
+    fake = _RecordingRawDevice(size=128 * 1024 * 1024)
+    capacity = RAW_BLOCK_CI_META_TOTAL_BYTES + 2 * RAW_BLOCK_CI_SLOT_BYTES
+    core = _make_core_with_fake(
+        path,
+        fake,
+        io_engine="io_uring",
+        capacity_bytes=capacity,
+    )
+    core.evict_unlocked_on_full = True
+
+    try:
+        first, second, blocked = [
+            encode_object_key(make_object_key(i)) for i in range(3)
+        ]
+        objects = [make_memory_obj(bytes([i + 1]) * 1024) for i in range(3)]
+        assert core.put_many([first, second], objects[:2]).results == [True, True]
+        assert (
+            len(
+                core.get_metadata_prefix(
+                    [first.encoded, second.encoded],
+                    lock=True,
+                )
+            )
+            == 2
+        )
+
+        result = core.put_many([blocked], objects[2:])
+
+        assert result.results == [False]
+        assert core.contains_key(first.encoded)
+        assert core.contains_key(second.encoded)
+        assert not core.contains_key(blocked.encoded)
+        assert core.report_status()["capacity_evictions"] == 0
+    finally:
+        core.unlock_many([first.encoded, second.encoded])
+        core.close()
+
+
+def test_raw_block_core_bounded_pd_preserves_prepublication_extents(
+    tmp_path: Path,
+) -> None:
+    path = make_raw_block_file(tmp_path)
+    fake = _RecordingRawDevice(size=128 * 1024 * 1024)
+    capacity = RAW_BLOCK_CI_META_TOTAL_BYTES + RAW_BLOCK_CI_SLOT_BYTES
+    core = _make_core_with_fake(
+        path,
+        fake,
+        io_engine="io_uring",
+        capacity_bytes=capacity,
+    )
+    core.evict_unlocked_on_full = True
+
+    try:
+        protected, blocked = [encode_object_key(make_object_key(i)) for i in range(2)]
+        objects = [make_memory_obj(bytes([i + 1]) * 1024) for i in range(2)]
+        core.protect_publication("request-a", [protected.encoded])
+        assert core.put_many([protected], objects[:1]).results == [True]
+        status = core.report_status()
+        assert status["publication_protected_key_count"] == 1
+
+        assert core.put_many([blocked], objects[1:]).results == [False]
+        assert core.contains_key(protected.encoded)
+        assert core.report_status()["capacity_evictions"] == 0
+
+        core.release_publication_protection("request-a")
+        assert core.put_many([blocked], objects[1:]).results == [True]
+        assert not core.contains_key(protected.encoded)
+        assert core.contains_key(blocked.encoded)
+    finally:
+        core.release_publication_protection("request-a")
         core.close()
 
 
@@ -1348,6 +1477,7 @@ class _FakeRawDevice:
         payload_len: int,
         total_len: int,
         placement_id: int | None = None,
+        request_tag: str | None = None,
     ) -> None:
         del data
         self.write_uring_calls.append((offset, payload_len, total_len, placement_id))
@@ -1384,7 +1514,9 @@ def _make_fake_io_uring_core(
 
         def fake_stat(path: Any, *args: Any, **kwargs: Any) -> Any:
             if str(path) == str(device_path):
-                return types.SimpleNamespace(st_mode=stat.S_IFCHR)
+                return types.SimpleNamespace(
+                    st_mode=stat.S_IFCHR, st_rdev=os.makedev(234, 0)
+                )
             return real_stat(path, *args, **kwargs)
 
         monkeypatch.setattr(
@@ -1436,9 +1568,13 @@ def test_raw_block_core_checkpoint_uses_metadata_placement_id(tmp_path, monkeypa
         assert core.put_many([spec], [make_memory_obj(b"checkpoint")]).results == [True]
         core.checkpoint_now()
 
+        # The checkpoint is committed in two submissions -- metadata first,
+        # then the header that advertises it -- so a reader cannot observe a
+        # header pointing at metadata that is not on the device yet.  Each
+        # carries the metadata placement id.
         checkpoint_calls = raw_device.batched_write_calls[1:]
-        assert checkpoint_calls
-        assert checkpoint_calls[-1][2] == [7, 7]
+        assert len(checkpoint_calls) == 2
+        assert [call[2] for call in checkpoint_calls] == [[7], [7]]
     finally:
         core.close()
 
@@ -1844,19 +1980,19 @@ def _make_recovery_core(
     return core
 
 
+def _make_iouring_header_core(tmp_path, monkeypatch) -> RawBlockCore:
+    """Initialize the normal recovery and attribution paths without a device."""
+    core, _ = _make_fake_io_uring_core(tmp_path, monkeypatch)
+    core.iouring_queue_depth = 256
+    return core
+
+
 def _header_device() -> Mock:
     device = Mock()
     device.is_poisoned.return_value = False
     device.worker_error.return_value = None
     device.take_io_journal.return_value = ([], 0)
     return device
-
-
-def _make_iouring_header_core(tmp_path, monkeypatch) -> RawBlockCore:
-    """Initialize the normal recovery and attribution paths without a device."""
-    core, _ = _make_fake_io_uring_core(tmp_path, monkeypatch)
-    core.iouring_queue_depth = 256
-    return core
 
 
 def _slot_header(core: RawBlockCore, identity: int, payload_len: int) -> bytes:
@@ -2031,6 +2167,26 @@ def test_validate_loaded_entries_iouring_multi_entry_uses_batched_reader(
 ) -> None:
     specs = [encode_object_key(make_object_key(i)) for i in range(3)]
     core = _make_recovery_core(specs)
+    expected_offsets = [4096, 8192, 12288]
+    batched_mock = Mock(
+        return_value=[("decoded", (spec.slot_identity, 64)) for spec in specs]
+    )
+    monkeypatch.setattr(core, "_read_slot_headers_batched", batched_mock)
+    read_mock = Mock()
+    monkeypatch.setattr(core, "_read_slot_header", read_mock)
+
+    core._validate_loaded_entries()
+
+    batched_mock.assert_called_once_with(expected_offsets)
+    read_mock.assert_not_called()
+    assert list(core._index) == [spec.encoded for spec in specs]
+
+
+def test_validate_loaded_entries_uring_cmd_uses_batched_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    specs = [encode_object_key(make_object_key(i)) for i in range(3)]
+    core = _make_recovery_core(specs, use_uring_cmd=True)
     expected_offsets = [4096, 8192, 12288]
     batched_mock = Mock(
         return_value=[("decoded", (spec.slot_identity, 64)) for spec in specs]
@@ -2286,21 +2442,1508 @@ def test_raw_block_core_planning_exception_returns_the_slot_it_reserved(tmp_path
         core.close()
 
 
-def test_validate_loaded_entries_uring_cmd_uses_batched_reader(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    specs = [encode_object_key(make_object_key(i)) for i in range(3)]
-    core = _make_recovery_core(specs, use_uring_cmd=True)
-    expected_offsets = [4096, 8192, 12288]
-    batched_mock = Mock(
-        return_value=[("decoded", (spec.slot_identity, 64)) for spec in specs]
+def test_raw_block_core_refuses_work_once_the_native_outcome_is_unknown(tmp_path):
+    """A logical failure and an unknown outcome are different statements.
+
+    When the native engine cannot establish what the device is still doing, a
+    failed result is not proof the device has finished. The core must stop
+    handing out storage and must refuse to publish, because a receipt tells a
+    reader where to look and this core can no longer say what is there. It
+    must not merely report the request failed and carry on.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        first = encode_object_key(make_object_key(91))
+        assert core.put_many([first], [make_memory_obj(b"before")]).results == [True]
+        assert core.report_status()["is_healthy"] is True
+        assert core.report_status()["poisoned"] is False
+
+        # The engine reports it can no longer say. The core adopts that the
+        # next time it waits on a batch.
+        raw = core.raw_device()
+
+        class _Poisoned:
+            def __getattr__(self, item):
+                return getattr(raw, item)
+
+            def is_poisoned(self):
+                return True
+
+            def quarantined_batch_count(self):
+                return 1
+
+        core.set_raw_device_for_testing(_Poisoned())
+        second = encode_object_key(make_object_key(92))
+        third = encode_object_key(make_object_key(93))
+        with pytest.raises(RuntimeError, match="outcome"):
+            core.put_many([second, third], [make_memory_obj(b"during")] * 2)
+
+        assert core._poisoned is True
+        assert core.report_status()["is_healthy"] is False
+        assert core.report_status()["poisoned"] is True
+
+        # No further storage is handed out, and nothing new is published.
+        after = encode_object_key(make_object_key(94))
+        with pytest.raises(RuntimeError, match="outcome"):
+            core.put_many([after], [make_memory_obj(b"after")])
+        assert not core.contains_key(after.encoded)
+        with pytest.raises(RuntimeError, match="could not establish"):
+            core.publish_request([first.encoded])
+    finally:
+        core.set_raw_device_for_testing(raw)
+        core.close()
+
+
+def test_raw_block_core_withholds_extents_whose_outcome_is_unknown(tmp_path):
+    """An extent released after an unprovable write must leave the free list.
+
+    A logical failure is not a DMA fence. If the worker could not establish
+    what the device did, an extent rolled back here and handed to the next
+    request would give that request storage an earlier write may still be
+    landing in -- and the header would then name one key over another key's
+    bytes, which validates clean because the header is the later, successful
+    writer's.
+
+    The assertion that matters is the allocator's, not the admission gate's:
+    a slot has to be out of the allocator's reach rather than merely shadowed
+    by a guard that some other path might not consult.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    raw = core.raw_device()
+    try:
+        first = encode_object_key(make_object_key(81))
+        assert core.put_many([first], [make_memory_obj(b"before")]).results == [True]
+        free_before = set(core._free_slots)
+        next_slot_before = core._next_slot
+
+        class _Unknown:
+            """A worker that has given up, and whose writes now fail."""
+
+            unknown = False
+
+            def __getattr__(self, item):
+                return getattr(raw, item)
+
+            def is_poisoned(self):
+                return self.unknown
+
+            def quarantined_batch_count(self):
+                return 1
+
+            def wait_iouring(self, batch_id):
+                results, errors = raw.wait_iouring(batch_id)
+                self.unknown = True
+                return [False] * len(results), errors
+
+        core.set_raw_device_for_testing(_Unknown())
+        second = encode_object_key(make_object_key(82))
+        third = encode_object_key(make_object_key(83))
+        assert core.put_many(
+            [second, third], [make_memory_obj(b"during")] * 2
+        ).results == [False, False]
+
+        # The rollback did not put either extent back where it could be
+        # handed out again.
+        assert set(core._free_slots) == free_before
+        withheld = set(core._quarantined_slots or {})
+        assert withheld == {next_slot_before, next_slot_before + 1}
+        status = core.report_status()
+        assert status["quarantined_slot_count"] == 2
+        assert status["poisoned"] is True
+
+        # The allocator itself cannot reach them. This is the statement the
+        # admission guard cannot make: a caller that reached the allocator by
+        # some other route still does not get a withheld extent.
+        with core._lock:
+            with pytest.raises(RuntimeError, match="unknown I/O"):
+                core._allocate_slot_locked(None)
+        assert not (set(core._free_slots) & withheld)
+    finally:
+        core.set_raw_device_for_testing(raw)
+        core.close()
+
+
+def test_raw_block_core_adopts_an_unknown_outcome_from_a_padded_batch(
+    tmp_path, monkeypatch
+):
+    """A padded batch with an unknown outcome must withhold its extents."""
+    core, raw = _make_fake_io_uring_core(tmp_path, monkeypatch)
+    try:
+
+        class _UnknownPaddedBatch:
+            unknown = False
+
+            def __getattr__(self, item):
+                return getattr(raw, item)
+
+            def is_poisoned(self):
+                return self.unknown
+
+            def quarantined_batch_count(self):
+                return 1
+
+            def wait_iouring(self, *args, **kwargs):
+                self.unknown = True
+                return [False], [(0, "io_uring submit error: outcome unknown")]
+
+        core.set_raw_device_for_testing(_UnknownPaddedBatch())
+        # A padded batch must adopt an unknown worker outcome before reuse.
+        with pytest.raises(RuntimeError, match="io_uring write failed"):
+            core._write_buffers(
+                [core._data_base_offset],
+                [bytearray(4096)],
+                [len(b"unprovable")],
+                [4096],
+            )
+
+        assert core._poisoned is True
+        assert core.report_status()["poisoned"] is True
+
+        # And an extent released after it is withheld rather than freed.
+        with core._lock:
+            core._release_submitted_slot_locked(0)
+        assert set(core._quarantined_slots or {}) == {0}
+        assert 0 not in core._free_slots
+    finally:
+        core.set_raw_device_for_testing(raw)
+        core.close()
+
+
+def test_raw_block_core_refuses_to_read_once_the_outcome_is_unknown(tmp_path):
+    """A read hands the device fresh destinations, which is the same problem."""
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    raw = core.raw_device()
+    try:
+        key = encode_object_key(make_object_key(85))
+        assert core.put_many([key], [make_memory_obj(b"readable")]).results == [True]
+
+        core._poisoned = True
+        target = make_memory_obj(b"\x00" * len(b"readable"))
+        with pytest.raises(RuntimeError, match="outcome"):
+            core.load_many_into([key.encoded], [target])
+    finally:
+        core.set_raw_device_for_testing(raw)
+        core.close()
+
+
+def test_raw_block_core_counts_payload_apart_from_metadata(tmp_path):
+    """Slot headers and checkpoints are not cache payload.
+
+    Adding them into one total produces a number that answers no question,
+    and the question it is most often asked -- did the direct path carry
+    the KV -- least of all. Every put writes a header beside its payload,
+    so a merged total is always larger than the payload by an amount that
+    depends on the header size.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        payload = b"a" * 100
+        key = encode_object_key(make_object_key(71))
+        assert core.put_many([key], [make_memory_obj(payload)]).results == [True]
+
+        status = core.report_status()
+        writes = status["payload_writes"]
+        assert writes["logical_requests"] == 1
+        assert writes["logical_bytes"] == len(payload)
+        # Padding to the block size means more reached the device than the
+        # caller handed over, which is why these are separate.
+        assert writes["padded_bytes"] >= len(payload)
+        assert writes["completed_operations"] == 1
+        assert writes["completed_padded_bytes"] == writes["padded_bytes"]
+
+        rows = status["io_by_kind_and_path"]
+        header_rows = [name for name in rows if "slot_header" in name]
+        assert header_rows, "the header this put wrote is counted somewhere"
+        for name in header_rows:
+            assert rows[name]["logical_requests"] >= 1
+        assert not any("payload" in name and "read" in name for name in rows), (
+            "nothing has been read yet"
+        )
+    finally:
+        core.close()
+
+
+def test_raw_block_core_counts_a_read_and_says_which_path_ran(tmp_path):
+    """A read that moved bytes must not leave every total at zero.
+
+    The counters covered writes only, so a load reported nothing at all --
+    which makes them useless for the one claim they exist to support: that
+    a direct path carried payload in both directions and no fallback path
+    carried any.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        payload = b"b" * 128
+        key = encode_object_key(make_object_key(72))
+        assert core.put_many([key], [make_memory_obj(payload)]).results == [True]
+        destination = make_memory_obj(b"\x00" * len(payload))
+        assert core.load_many_into([key.encoded], [destination]) == [True]
+
+        status = core.report_status()
+        reads = status["payload_reads"]
+        assert reads["logical_requests"] == 1
+        assert reads["logical_bytes"] == len(payload)
+        assert reads["completed_operations"] == 1
+        assert reads["completed_padded_bytes"] > 0
+
+        # And the row names the route that actually ran, so a fallback
+        # carrying bytes is visible rather than folded into one total.
+        rows = status["io_by_kind_and_path"]
+        assert "read/payload/iouring_batched" in rows
+        assert "read/payload/sync" not in rows
+    finally:
+        core.close()
+
+
+def test_raw_block_core_does_not_call_a_deduplicated_hit_device_traffic(tmp_path):
+    """A key already on the device is not written again.
+
+    A hit moves no bytes, so nothing may be requested and nothing may
+    complete; the deduplicated total is where it is recorded, and it is
+    not an I/O quantity.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        payload = b"c" * 100
+        key = encode_object_key(make_object_key(73))
+        assert core.put_many([key], [make_memory_obj(payload)]).results == [True]
+        before = core.report_status()
+
+        assert core.put_many([key], [make_memory_obj(payload)]).results == [True]
+        after = core.report_status()
+
+        assert after["bytes_deduplicated"] == len(payload)
+        assert before["bytes_deduplicated"] == 0
+        assert after["payload_writes"] == before["payload_writes"]
+        assert after["io_by_kind_and_path"] == before["io_by_kind_and_path"]
+    finally:
+        core.close()
+
+
+def test_raw_block_core_keeps_an_entry_whose_header_it_could_not_read(tmp_path):
+    """An unreadable header is not evidence that an entry is stale.
+
+    Header validation drops entries whose slot no longer names them and
+    recycles their extents. A read that did not complete says nothing about
+    the entry, so dropping it and handing its slot back would be a decision
+    made on no information -- and the slot may be one the device is still
+    writing.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        key = encode_object_key(make_object_key(61))
+        assert core.put_many([key], [make_memory_obj(b"kept")]).results == [True]
+        free_before = set(core._free_slots)
+
+        slot = core._offset_to_slot(int(core._index[key.encoded].offset))
+
+        # The device stops answering, which is what an unknown read looks
+        # like from here.
+        real_read_buffers = core._read_buffers
+        core._read_buffers = lambda *args, **kwargs: [False]
+        core._validate_loaded_entries()
+
+        assert core.contains_key(key.encoded), "the entry was dropped on no evidence"
+        assert set(core._free_slots) == free_before
+        assert not (core._quarantined_slots or {})
+
+        # A free list is bookkeeping; what the allocator hands out is the
+        # property. Ask it for every extent it has and this one is not
+        # among them.
+        withheld = core._slot_to_offset(slot)
+        core._read_buffers = real_read_buffers
+        handed_out = set()
+        for seq in range(core._max_slots + 4):
+            later = encode_object_key(make_object_key(900 + seq))
+            if core.put_many([later], [make_memory_obj(b"later")]).results != [True]:
+                break
+            handed_out.add(int(core._index[later.encoded].offset))
+        assert handed_out, "the device refused every later write, proving nothing"
+        assert withheld not in handed_out
+    finally:
+        core.close()
+
+
+def test_raw_block_core_still_drops_an_entry_whose_header_is_not_its_own(tmp_path):
+    """A header that arrived and does not name this key is a known outcome.
+
+    That is the case validation exists for, and it must keep working: the
+    entry goes and its extent is recyclable, because nothing is in flight.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        key = encode_object_key(make_object_key(62))
+        assert core.put_many([key], [make_memory_obj(b"stale")]).results == [True]
+        slot = core._offset_to_slot(int(core._index[key.encoded].offset))
+
+        def _bytes_that_are_not_ours(
+            offsets, buffers, payload_lens, total_lens, kinds=None, **kwargs
+        ):
+            for buf in buffers:
+                buf[:] = b"\x00" * len(buf)
+            return [True] * len(offsets)
+
+        real_read_buffers = core._read_buffers
+        core._read_buffers = _bytes_that_are_not_ours
+        core._validate_loaded_entries()
+
+        assert not core.contains_key(key.encoded)
+        assert slot in core._free_slots
+        assert not (core._quarantined_slots or {})
+
+        # And recyclable means reused: the next request is given this extent
+        # rather than merely told the slot is free.
+        core._read_buffers = real_read_buffers
+        later = encode_object_key(make_object_key(920))
+        assert core.put_many([later], [make_memory_obj(b"later")]).results == [True]
+        assert int(core._index[later.encoded].offset) == core._slot_to_offset(slot)
+    finally:
+        core.close()
+
+
+def test_raw_block_core_withholds_a_dropped_entry_when_it_cannot_say(tmp_path):
+    """Even a known-bad header does not authorize recycling once poisoned.
+
+    The header says this entry is stale; poison says this engine cannot
+    establish what the device is doing with that extent. The second governs.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        key = encode_object_key(make_object_key(63))
+        assert core.put_many([key], [make_memory_obj(b"stale")]).results == [True]
+        slot = core._offset_to_slot(int(core._index[key.encoded].offset))
+
+        def _bytes_that_are_not_ours(
+            offsets, buffers, payload_lens, total_lens, kinds=None, **kwargs
+        ):
+            for buf in buffers:
+                buf[:] = b"\x00" * len(buf)
+            core._poisoned = True
+            return [True] * len(offsets)
+
+        real_read_buffers = core._read_buffers
+        core._read_buffers = _bytes_that_are_not_ours
+        core._validate_loaded_entries()
+
+        assert not core.contains_key(key.encoded)
+        assert slot not in core._free_slots
+        assert slot in (core._quarantined_slots or {})
+
+        # Running cleanup again is the obvious way the extent comes back:
+        # the entry is gone from the index now, so a second pass sees a
+        # quarantined slot with no owner and could read that as free.
+        core._read_buffers = real_read_buffers
+        core._validate_loaded_entries()
+        assert slot not in core._free_slots
+        assert slot in (core._quarantined_slots or {})
+
+        # Allocation pressure cannot probe this one: a poisoned core refuses
+        # every write, so there is no request to hand the extent to. That
+        # refusal is asserted where it belongs, in the put-admission tests.
+        later = encode_object_key(make_object_key(921))
+        with pytest.raises(RuntimeError, match="outcome"):
+            core.put_many([later], [make_memory_obj(b"later")])
+    finally:
+        core.close()
+
+
+def test_raw_block_core_fails_closed_on_an_unanswerable_probe(tmp_path):
+    """A probe that raises was asked and could not answer.
+
+    Reading the raise as an idle device leaves the core publishing an index
+    and recycling extents whose outcome nothing established, and propagates
+    the exception out of a close that has already stopped its checkpoint
+    thread.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    raw = core.raw_device()
+    try:
+
+        class _Unanswerable:
+            def __getattr__(self, item):
+                return getattr(raw, item)
+
+            def is_idle(self):
+                raise OSError("the device cannot be reached")
+
+        core.set_raw_device_for_testing(_Unanswerable())
+        outcome = core.close()
+
+        assert core._poisoned is True
+        assert outcome.quiescence is NativeQuiescence.RETAINED
+        assert outcome.may_release_backing_resources is False
+        assert outcome.final_checkpoint_written is False
+    finally:
+        core.set_raw_device_for_testing(raw)
+
+
+def test_raw_block_core_adopts_an_unanswerable_probe_after_a_failed_write(tmp_path):
+    """The write path asks the same question in the same conditions.
+
+    A per-write failure rolls its extent back, and whether that extent may
+    be handed out again is what the probe decides. A raise there left the
+    core healthy and the extent immediately re-allocatable.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+
+        class _Unanswerable:
+            def is_poisoned(self):
+                raise OSError("the device cannot be reached")
+
+        assert core._adopt_native_poison(_Unanswerable(), "io_uring write") is True
+        assert core._poisoned is True
+    finally:
+        core.close()
+
+
+def test_raw_block_core_does_not_read_a_non_bool_as_an_unknown_outcome(tmp_path):
+    """A device that answers something else has not said it cannot say.
+
+    Failing closed on anything but a clear yes would withhold every extent
+    behind every stand-in object, which is a way to pass this rule without
+    ever exercising it.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+
+        class _Chatty:
+            def is_poisoned(self):
+                return "no"
+
+        assert core._adopt_native_poison(_Chatty(), "io_uring write") is False
+        assert core._poisoned is False
+    finally:
+        core.close()
+
+
+def test_raw_block_core_close_reports_what_it_established(tmp_path):
+    """A caller's next decisions cannot be made from a return of None.
+
+    Whether the memory behind this device is free, and whether anything a
+    reader may still be reading can be released, are different questions
+    with different answers. Close has to say which it proved.
+    """
+    path = make_raw_block_file(tmp_path)
+    core = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    key = encode_object_key(make_object_key(51))
+    assert core.put_many([key], [make_memory_obj(b"value")]).results == [True]
+
+    outcome = core.close()
+    assert outcome.quiescence is NativeQuiescence.PROVEN
+    assert outcome.poisoned is False
+    assert outcome.may_release_backing_resources is True
+
+    # A repeat close reports the first result rather than inventing a fresh
+    # proof, and must not reach the accessor that would open a new device.
+    again = core.close()
+    assert again.quiescence in (
+        NativeQuiescence.PROVEN,
+        NativeQuiescence.NOT_ATTEMPTED,
     )
-    monkeypatch.setattr(core, "_read_slot_headers_batched", batched_mock)
-    read_mock = Mock()
-    monkeypatch.setattr(core, "_read_slot_header", read_mock)
+    assert core._raw is None
 
-    core._validate_loaded_entries()
 
-    batched_mock.assert_called_once_with(expected_offsets)
-    read_mock.assert_not_called()
-    assert list(core._index) == [spec.encoded for spec in specs]
+def test_raw_block_core_close_retains_when_it_cannot_say(tmp_path):
+    """A close that cannot prove quiescence authorizes nothing.
+
+    It also keeps the native handle bound: dropping it runs the destructor,
+    which frees the very owners the engine retained.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    raw = core.raw_device()
+    try:
+
+        class _Unknown:
+            def __getattr__(self, item):
+                return getattr(raw, item)
+
+            def is_idle(self):
+                return False
+
+            def is_poisoned(self):
+                return True
+
+            def quarantined_batch_count(self):
+                return 1
+
+        core.set_raw_device_for_testing(_Unknown())
+        outcome = core.close()
+
+        assert outcome.quiescence is NativeQuiescence.RETAINED
+        assert outcome.poisoned is True
+        assert outcome.may_release_backing_resources is False
+        # No index was published naming extents it cannot vouch for.
+        assert outcome.final_checkpoint_written is False
+        assert core._raw is not None
+    finally:
+        core.set_raw_device_for_testing(raw)
+
+
+def test_raw_block_core_refuses_to_call_a_concurrent_close_a_proof(tmp_path):
+    """A second caller arriving mid-close has established nothing itself.
+
+    The first caller set the flag and is still draining, so there is no
+    recorded result to report yet. Answering "closed" would let the second
+    caller release the arena while the first is still inside the device.
+    """
+    path = make_raw_block_file(tmp_path)
+    core = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    try:
+        with core._lock:
+            core._closed = True
+
+        outcome = core.close()
+
+        assert outcome.quiescence is NativeQuiescence.NOT_ATTEMPTED
+        assert outcome.may_release_backing_resources is False
+        assert core._raw is not None
+    finally:
+        with core._lock:
+            core._closed = False
+            core._close_outcome = None
+        core.close()
+
+
+def test_raw_block_core_counts_the_padded_write_route_it_actually_took(tmp_path):
+    """Account for a padded payload completed through the batched path."""
+    path = make_raw_block_file(tmp_path)
+    config = replace(
+        make_raw_block_core_config(path),
+        io_engine="io_uring",
+        use_odirect=True,
+    )
+    try:
+        core = RawBlockCore(config, key_namespace="object")
+    except Exception as exc:  # pragma: no cover - depends on the filesystem
+        if is_skip_safe_io_error(exc):
+            pytest.skip(f"O_DIRECT unavailable on this path: {exc}")
+        raise
+    try:
+        payload = b"d" * 100
+        key = encode_object_key(make_object_key(74))
+        assert core.put_many([key], [make_memory_obj(payload)]).results == [True]
+
+        status = core.report_status()
+        rows = status["io_by_kind_and_path"]
+        assert "write/payload/iouring_batched" in rows, sorted(rows)
+        row = rows["write/payload/iouring_batched"]
+        assert row["logical_requests"] == 1
+        assert row["logical_bytes"] == len(payload)
+        assert row["padded_bytes"] > len(payload), "the write was padded"
+        assert row["completed_operations"] == 1
+        assert row["completed_padded_bytes"] == row["padded_bytes"]
+
+        writes = status["payload_writes"]
+        assert writes["completed_padded_bytes"] == row["completed_padded_bytes"]
+    finally:
+        core.close()
+
+
+def test_raw_block_io_ledger_totals_are_exact_under_concurrency():
+    """An approximate total cannot answer "was it zero".
+
+    The certification these counters exist for is that a fallback route
+    carried no payload. A lost increment under concurrent writers makes
+    the delta between two runs approximate, and an approximate zero is
+    not a zero. Every update therefore takes the lock.
+    """
+    ledger = RawBlockIoLedger()
+    writers = 8
+    per_writer = 500
+
+    def _hammer() -> None:
+        for _ in range(per_writer):
+            ledger.logical_request(
+                "write", IO_PATH_IOURING_BATCHED, ["payload"], [7], [8]
+            )
+            ledger.submitted("write", IO_PATH_IOURING_BATCHED, ["payload"], [8])
+            ledger.completed("write", IO_PATH_IOURING_BATCHED, ["payload"], [8], [True])
+
+    threads = [threading.Thread(target=_hammer) for _ in range(writers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+
+    total = ledger.totals(direction="write", kind="payload")
+    assert total.logical_requests == writers * per_writer
+    assert total.logical_bytes == writers * per_writer * 7
+    assert total.padded_bytes == writers * per_writer * 8
+    assert total.submitted_operations == writers * per_writer
+    assert total.submitted_padded_bytes == writers * per_writer * 8
+    assert total.completed_operations == writers * per_writer
+    assert total.completed_padded_bytes == writers * per_writer * 8
+
+
+def test_raw_block_core_publishes_no_final_index_with_work_outstanding(tmp_path):
+    """The last index must not name extents nothing has answered for.
+
+    Close asked whether the device was *poisoned*, which is a question
+    about something that has already gone wrong. A device with commands
+    still in flight is not poisoned and is not finished either, and a
+    writer publishing on that answer makes a durable index naming extents
+    whose writes were never observed -- which the next incarnation serves
+    as a hit.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    raw = core.raw_device()
+    try:
+        key = encode_object_key(make_object_key(81))
+        assert core.put_many([key], [make_memory_obj(b"e" * 512)]).results == [True]
+
+        class _StillBusy:
+            def __getattr__(self, item):
+                return getattr(raw, item)
+
+            def is_idle(self):
+                return False
+
+        core.set_raw_device_for_testing(_StillBusy())
+        outcome = core.close()
+
+        assert outcome.quiescence is NativeQuiescence.RETAINED
+        assert outcome.final_checkpoint_written is False
+        assert outcome.final_checkpoint_is_vouched_for is False
+    finally:
+        core.set_raw_device_for_testing(raw)
+
+
+def test_raw_block_core_says_a_published_index_it_cannot_vouch_for(tmp_path):
+    """Written and vouched for are different things.
+
+    The index is published while the device still has a worker to write
+    with, because that is the only time it can be written. If the close
+    that follows then cannot prove quiescence, that index is already
+    durable and may name an unproven extent. Saying only that it was
+    written reports a clean shutdown.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    raw = core.raw_device()
+    try:
+        key = encode_object_key(make_object_key(82))
+        assert core.put_many([key], [make_memory_obj(b"f" * 512)]).results == [True]
+
+        class _RefusesAfterPublishing:
+            """Idle when asked, and unable to close afterwards."""
+
+            def __getattr__(self, item):
+                return getattr(raw, item)
+
+            def is_idle(self):
+                return True
+
+            def close(self):
+                raise RuntimeError("the worker quarantined a batch on its way out")
+
+        core.set_raw_device_for_testing(_RefusesAfterPublishing())
+        outcome = core.close()
+
+        assert outcome.final_checkpoint_written is True
+        assert outcome.quiescence is NativeQuiescence.RETAINED
+        assert outcome.final_checkpoint_is_vouched_for is False
+        assert outcome.may_release_backing_resources is False
+    finally:
+        core.set_raw_device_for_testing(raw)
+
+
+def test_close_reports_no_final_checkpoint_when_it_wrote_none(tmp_path) -> None:
+    """A generation that was not written is not a generation.
+
+    The checkpoint helper answers false for state that needed no checkpoint,
+    and reporting that as written describes a durable index that does not
+    exist. Everything downstream reads this field as "there is a newer
+    generation than the one on the device", including the warning that a
+    published index may name an unproven extent.
+    """
+    path = make_raw_block_file(tmp_path)
+    core = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    key = encode_object_key(make_object_key(91))
+    assert core.put_many([key], [make_memory_obj(b"g" * 512)]).results == [True]
+    # Published already, so the state close finds is clean and its
+    # checkpoint has nothing to write.
+    assert core.publish_index() is True
+
+    outcome = core.close()
+
+    assert outcome.quiescence is NativeQuiescence.PROVEN
+    assert outcome.final_checkpoint_written is False
+    assert outcome.final_checkpoint_is_vouched_for is False
+
+
+def test_a_closed_core_refuses_to_reopen_its_device(tmp_path) -> None:
+    """Close decided this device's fate, and that decision was acted on.
+
+    Handing out a device afterwards either opens a fresh one that knows
+    nothing about what the old one was doing, or hands back a handle that
+    was retained precisely so nobody would touch it again. Both turn a
+    settled teardown into an open question.
+    """
+    path = make_raw_block_file(tmp_path)
+    core = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    assert core.close().quiescence is NativeQuiescence.PROVEN
+
+    with pytest.raises(RuntimeError, match="will not be reopened"):
+        core._rawdev()
+    # And a repeated close still reports the first result rather than
+    # reaching the accessor for a fresh one.
+    assert core.close().quiescence is NativeQuiescence.PROVEN
+
+
+def test_a_closing_core_refuses_to_publish_a_request(tmp_path) -> None:
+    """A publication that arrives during shutdown writes nothing.
+
+    It would open a device the caller's teardown has already accounted for
+    and write an index into it that nobody is watching.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(
+        make_raw_block_core_config(path), derivation=make_test_derivation()
+    )
+    core = RawBlockCore(config, key_namespace="object")
+    key = encode_object_key(make_object_key(92))
+    assert core.put_many([key], [make_memory_obj(b"h" * 512)]).results == [True]
+    assert core.close().quiescence is NativeQuiescence.PROVEN
+
+    with pytest.raises(RuntimeError, match="stopped admitting publications"):
+        core.publish_request([key.encoded])
+
+
+def test_strict_publication_writes_no_close_time_checkpoint(tmp_path) -> None:
+    """A close-time generation can only name a request that did not finish.
+
+    Every published request writes its own forced checkpoint, so the last
+    generation on the device already names every request that completed.
+    One more at close adds a generation describing whatever was in the index
+    at shutdown -- including keys from a request that never published -- and
+    needs the device at exactly the moment teardown is trying to settle it.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(
+        make_raw_block_core_config(path),
+        derivation=make_test_derivation(),
+        close_writes_final_checkpoint=False,
+    )
+    core = RawBlockCore(config, key_namespace="object")
+    published = encode_object_key(make_object_key(93))
+    assert core.put_many([published], [make_memory_obj(b"i" * 512)]).results == [True]
+    receipt = core.publish_request([published.encoded])
+    # A key written after the publication, which no request ever published.
+    unpublished = encode_object_key(make_object_key(94))
+    assert core.put_many([unpublished], [make_memory_obj(b"j" * 512)]).results == [True]
+
+    outcome = core.close()
+
+    assert outcome.quiescence is NativeQuiescence.PROVEN
+    assert outcome.final_checkpoint_written is False
+
+    # A fresh reader sees the last published generation and nothing else.
+    reader = RawBlockCore(
+        replace(make_raw_block_core_config(path), role="reader"),
+        key_namespace="object",
+    )
+    try:
+        assert reader.publication_matches(receipt, [published.encoded])
+        assert reader.exists_many([unpublished.encoded], lock=False) == [False]
+    finally:
+        reader.close()
+
+
+def test_a_strict_engine_refuses_a_native_build_it_cannot_ask(tmp_path) -> None:
+    """A build that cannot be asked can only answer a weaker question.
+
+    What makes publishing an index for another engine safe is being able to
+    ask whether the device has answered for everything it was handed.
+    Falling back to the health probe would qualify this engine on a question
+    it never asked.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(
+        make_raw_block_core_config(path),
+        require_native_idle_capability=True,
+    )
+    core = RawBlockCore.__new__(RawBlockCore)
+    core.device_path = str(path)
+    core.require_native_idle_capability = True
+    core._raw = None
+    core._closed = False
+    core.role = "writer"
+    core.use_odirect = config.use_odirect
+    core.block_align = config.block_align
+    core.io_engine = config.io_engine
+    core.iouring_queue_depth = config.iouring_queue_depth
+    core.use_uring_cmd = config.use_uring_cmd
+
+    class _CannotBeAsked:
+        """An older native build: healthy, and unable to say more."""
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def is_poisoned(self) -> bool:
+            return False
+
+    stub = types.SimpleNamespace(RawBlockDevice=_CannotBeAsked)
+    with patch.dict(sys.modules, {"lmcache_rust_raw_block_io": stub}):
+        # Retrying must not return the incompatible handle cached by the
+        # failed first open.
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="cannot report whether anything"):
+                core._rawdev()
+
+
+def test_a_populated_namespace_is_refused_before_its_geometry_is_judged(
+    tmp_path,
+) -> None:
+    """A device another engine is writing is not an empty cache.
+
+    Every layout check answers a mismatch with "ignore this metadata and
+    start empty", which is right for a geometry this engine cannot read. It
+    is wrong ahead of the derivation contract: starting empty means
+    allocating over live extents while the other engine's checkpoint still
+    advertises them. So the contract is checked first, and it raises.
+    """
+    path = make_raw_block_file(tmp_path)
+    theirs = replace(
+        make_raw_block_core_config(path),
+        derivation=make_test_derivation(),
+    )
+    writer = RawBlockCore(theirs, key_namespace="object")
+    try:
+        key = encode_object_key(make_object_key(95))
+        assert writer.put_many([key], [make_memory_obj(b"k" * 512)]).results == [True]
+        assert writer.publish_index() is True
+    finally:
+        writer.close()
+
+    # Same device, a different derivation, and a slot geometry this engine
+    # would otherwise reject on its way past the contract.
+    mine = replace(
+        make_raw_block_core_config(path),
+        derivation=replace(
+            make_test_derivation(), hash_implementation="somebody.elses.hash"
+        ),
+        slot_bytes=make_raw_block_core_config(path).slot_bytes * 2,
+    )
+    with pytest.raises(IncompatibleKeyDerivation, match="derives keys differently"):
+        RawBlockCore(mine, key_namespace="object")
+
+
+def test_skipping_the_index_load_does_not_skip_the_namespace_contract(
+    tmp_path,
+) -> None:
+    """Whether to use the index is a choice; whether to write here is not.
+
+    ``load_checkpoint_on_init=false`` says this engine does not need the
+    device's index. It does not say the device is unused, and opening
+    somebody else's populated namespace as a fresh empty cache allocates
+    over extents their checkpoint still advertises.
+    """
+    path = make_raw_block_file(tmp_path)
+    theirs = replace(
+        make_raw_block_core_config(path),
+        derivation=make_test_derivation(),
+    )
+    writer = RawBlockCore(theirs, key_namespace="object")
+    try:
+        key = encode_object_key(make_object_key(96))
+        assert writer.put_many([key], [make_memory_obj(b"l" * 512)]).results == [True]
+        assert writer.publish_index() is True
+    finally:
+        writer.close()
+
+    mine = replace(
+        make_raw_block_core_config(path),
+        derivation=replace(
+            make_test_derivation(), hash_implementation="somebody.elses.hash"
+        ),
+        load_checkpoint_on_init=False,
+    )
+    with pytest.raises(IncompatibleKeyDerivation, match="derives keys differently"):
+        RawBlockCore(mine, key_namespace="object")
+
+
+def test_an_empty_namespace_still_opens_without_its_index(tmp_path) -> None:
+    """The one case that may follow normal initialization.
+
+    A device with nothing legible on it is not somebody else's, so refusing
+    it would refuse every first start.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(
+        make_raw_block_core_config(path),
+        derivation=make_test_derivation(),
+        load_checkpoint_on_init=False,
+    )
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        key = encode_object_key(make_object_key(97))
+        assert core.put_many([key], [make_memory_obj(b"m" * 512)]).results == [True]
+    finally:
+        core.close()
+
+
+def test_the_ledger_counts_logical_requests_apart_from_submissions(tmp_path) -> None:
+    """One request split into two transfers is one request and two transfers.
+
+    Counting both in one field read as duplicate device I/O for a payload
+    that was written once: 1 requested, 2 completed, same bytes. The units
+    are named apart so a reader can see a route that splits without
+    concluding anything about how much moved -- and so a physical operation
+    with no completion is visible as the gap it is.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(
+        make_raw_block_core_config(path),
+        io_engine="io_uring",
+        max_data_transfer_size=4096,
+    )
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        key = encode_object_key(make_object_key(98))
+        payload = b"n" * 8192
+        assert core.put_many([key], [make_memory_obj(payload)]).results == [True]
+
+        rows = core.report_status()["io_by_kind_and_path"]
+        row = rows["write/payload/iouring_bounded"]
+
+        assert row["logical_requests"] == 1
+        assert row["submitted_operations"] == 2
+        assert row["completed_operations"] == 2
+        # And the bytes belong to the logical side: a split moves no more
+        # of them.
+        assert row["logical_bytes"] == len(payload)
+        assert row["submitted_padded_bytes"] == row["padded_bytes"]
+        assert row["completed_padded_bytes"] == row["padded_bytes"]
+    finally:
+        core.close()
+
+
+def test_io_is_attributed_to_its_request_and_its_actual_path(tmp_path) -> None:
+    """Which request moved the bytes, and which buffer path really carried them.
+
+    The Python route name says which helper was used, not which kind of SQE
+    it produced: a configured dma-buf pool whose buffers miss the
+    registration map issues ordinary SQEs, and the configuration cannot tell
+    you that. So the path here is the native engine's own choice, recorded
+    where the SQE is built.
+
+    The request name comes with the job rather than from a "current request"
+    read when the completion is reaped -- by then the submitting thread is
+    gone and the I/O worker never had it.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        context = RawBlockIoContext(
+            run_id="run-under-test",
+            request_id="wire-request-7",
+            tp_rank=3,
+            incarnation="writer-under-test",
+        )
+        key = encode_object_key(make_object_key(99))
+        assert core.put_many(
+            [key], [make_memory_obj(b"o" * 512)], io_context=context
+        ).results == [True]
+
+        attribution = core.report_status()["io_by_request"]
+        rows = attribution["rows"]
+        mine = {
+            name: counts
+            for name, counts in rows.items()
+            if name.startswith(context.tag() + "/")
+        }
+        assert mine, rows
+
+        # Every row names a real native path, not a Python helper route.
+        for name in mine:
+            assert name.rsplit("/", 1)[1] in (
+                "regular",
+                "bounce",
+                "host_fixed",
+                "dmabuf_fixed",
+                "uring_cmd",
+                "uring_cmd_fixed",
+            )
+        # And every operation was answered for, which is the gate.
+        assert attribution["unanswered"] == {}
+        assert attribution["untagged_operations"] == 0
+        assert attribution["dropped_rows"] == 0
+        assert attribution["malformed_rows"] == 0
+        assert attribution["duplicate_rows"] == 0
+        assert attribution["evidence_failures"] == []
+        assert (
+            attribution["contexts"][context.tag()]["request_id"] == context.request_id
+        )
+        assert attribution["operations"]
+        assert all(operation["complete"] for operation in attribution["operations"])
+        for counts in mine.values():
+            answered = counts["completed"] + counts["short"] + counts["failed"]
+            assert counts["submitted"] == answered
+    finally:
+        core.close()
+
+
+def test_an_operation_nobody_named_is_counted_not_attributed(tmp_path) -> None:
+    """An unnamed operation is not somebody else's.
+
+    Attributing it to a neighbouring request would make that request's
+    accounting wrong in a way nothing could detect afterwards, so it is
+    counted apart and the count is part of the receipt.
+    """
+    record = RawBlockIoAttribution()
+    record.record(
+        [
+            {
+                "request_tag": "",
+                "direction": "write",
+                "path": "regular",
+                "outcome": "submitted",
+                "bytes": "4096",
+            }
+        ]
+    )
+
+    assert record.snapshot() == {}
+    assert record.untagged_operations == 1
+
+
+def test_an_unanswered_operation_is_a_failed_evidence_gate() -> None:
+    """A submission with no outcome is the gap, not a rounding error.
+
+    No total that happens to add up changes the fact that this request's
+    bytes cannot be accounted for.
+    """
+    record = RawBlockIoAttribution()
+    rows = [
+        {
+            "request_tag": "run/req/r0/epoch",
+            "device_instance_id": "1",
+            "batch_id": "1",
+            "operation_id": "2" if index == 1 else "1",
+            "attempt": "0",
+            "direction": "read",
+            "path": "dmabuf_fixed",
+            "outcome": outcome,
+            "bytes": "4096",
+        }
+        for index, outcome in enumerate(("submitted", "submitted", "completed"))
+    ]
+    record.record(rows, dropped=2)
+
+    assert record.unanswered() == {"run/req/r0/epoch/read/dmabuf_fixed": 1}
+    assert record.as_payload()["dropped_rows"] == 2
+
+
+def test_operation_join_keeps_overlapping_requests_and_short_remainders_apart() -> None:
+    """Join delayed CQEs by device, operation and attempt, never by timing."""
+    record = RawBlockIoAttribution()
+    first = RawBlockIoContext(
+        run_id="run",
+        request_id="request-a",
+        tp_rank=0,
+        incarnation="writer",
+        restore_attempt_id="restore-a",
+    )
+    second = RawBlockIoContext(
+        run_id="run",
+        request_id="request-b",
+        tp_rank=0,
+        incarnation="writer",
+        restore_attempt_id="restore-b",
+    )
+    first_tag = record.register_context(first)
+    second_tag = record.register_context(second)
+    receipt = RawBlockPublicationReceipt(
+        "writer",
+        7,
+        2,
+        "manifest-a",
+        namespace_identity="namespace-a",
+    )
+    record.link_publication("request-a", receipt)
+
+    def row(tag, operation, attempt, outcome, size, batch):
+        return {
+            "request_tag": tag,
+            "device_instance_id": "device-1",
+            "batch_id": str(batch),
+            "operation_id": str(operation),
+            "attempt": str(attempt),
+            "direction": "read",
+            "path": "regular",
+            "outcome": outcome,
+            "bytes": str(size),
+        }
+
+    # Both requests have a shared logical prefix, distinct suffix operations,
+    # and completions that arrive in the opposite order from submission.
+    record.record(
+        [
+            row(first_tag, 10, 0, "submitted", 4096, 1),
+            row(first_tag, 11, 0, "submitted", 8192, 1),
+            row(second_tag, 20, 0, "submitted", 4096, 2),
+            row(second_tag, 21, 0, "submitted", 4096, 2),
+            row(second_tag, 21, 0, "completed", 4096, 2),
+            row(first_tag, 11, 0, "short", 4096, 1),
+            row(first_tag, 11, 1, "submitted", 4096, 1),
+            row(second_tag, 20, 0, "completed", 4096, 2),
+            row(first_tag, 10, 0, "completed", 4096, 1),
+            row(first_tag, 11, 1, "completed", 4096, 1),
+        ]
+    )
+
+    operations, failures = record.operation_join()
+    assert failures == []
+    assert len(operations) == 4
+    split = next(
+        operation for operation in operations if operation["operation_id"] == 11
+    )
+    assert split["requested_bytes"] == split["completed_bytes"] == 8192
+    assert [attempt["outcome"] for attempt in split["attempts"]] == [
+        "short",
+        "completed",
+    ]
+    assert set(record.contexts()) == {first_tag, second_tag}
+    assert record.contexts()[first_tag]["advertised_checkpoint_seq"] == 7
+    assert record.contexts()[first_tag]["manifest_digest"] == "manifest-a"
+    assert record.contexts()[second_tag]["advertised_checkpoint_seq"] == -1
+
+
+def test_operation_join_exposes_failed_unanswered_and_duplicate_evidence() -> None:
+    """Bad CQE evidence stays an explicit gate instead of becoming a total."""
+    record = RawBlockIoAttribution()
+    context = RawBlockIoContext("run", "request", 0, "writer")
+    tag = record.register_context(context)
+    submitted = {
+        "request_tag": tag,
+        "device_instance_id": "device-1",
+        "batch_id": "1",
+        "operation_id": "7",
+        "attempt": "0",
+        "direction": "read",
+        "path": "dmabuf_fixed",
+        "outcome": "submitted",
+        "bytes": "4096",
+    }
+    short = {**submitted, "outcome": "short", "bytes": "2048"}
+    record.record([submitted, short])
+    # A second drain of the same rows must be visible, not double-credited.
+    record.record([submitted, short])
+
+    operations, failures = record.operation_join()
+    assert len(operations) == 1
+    assert not operations[0]["complete"]
+    assert any("short_dmabuf_is_terminal" in failure for failure in failures)
+    assert any("duplicate_rows=2" == failure for failure in failures)
+
+
+@pytest.mark.parametrize("operation", ["read", "write"])
+def test_close_retains_a_device_with_a_submission_still_being_prepared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    """Keep a device whose admitted caller has not reached native submission."""
+    # Standard
+    from concurrent.futures import Future, ThreadPoolExecutor
+
+    path = make_raw_block_file(tmp_path)
+    core = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    key = encode_object_key(make_object_key(98))
+    obj = make_memory_obj(b"x" * 512)
+    if operation == "read":
+        assert core.put_many([key], [obj]).results == [True]
+    raw = core.raw_device()
+    entered = threading.Event()
+    resume = threading.Event()
+    method_name = "_read_buffers" if operation == "read" else "_write_one"
+    original = getattr(core, method_name)
+
+    def delayed(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        assert resume.wait(5), "submission preparation did not resume"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(core, method_name, delayed)
+    with ThreadPoolExecutor(max_workers=1) as caller:
+        pending: Future[Any]
+        if operation == "read":
+            pending = caller.submit(core.load_many_into, [key.encoded], [obj])
+        else:
+            pending = caller.submit(core.put_many, [key], [obj])
+        try:
+            assert entered.wait(5), "the operation was not admitted"
+            assert raw.is_idle(), "the gated operation unexpectedly reached native I/O"
+            outcome = core.close()
+            assert outcome.quiescence is NativeQuiescence.RETAINED
+            assert outcome.may_release_backing_resources is False
+            assert outcome.final_checkpoint_written is False
+            resume.set()
+            result = pending.result(timeout=5)
+            assert (result if operation == "read" else result.results) == [False]
+        finally:
+            resume.set()
+    # This test gated before native submission; after joining that caller,
+    # no command can use the retained device. Production cannot assert this.
+    raw.close()
+
+
+def test_closed_core_refuses_read_admission(tmp_path: Path) -> None:
+    """Reject reads before examining a destination after shutdown."""
+    path = make_raw_block_file(tmp_path)
+    core = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    key = encode_object_key(make_object_key(99))
+    assert core.put_many([key], [make_memory_obj(b"x" * 512)]).results == [True]
+    assert core.close().may_release_backing_resources
+
+    class Destination:
+        accesses = 0
+
+        @property
+        def byte_array(self) -> bytes:
+            self.accesses += 1
+            raise RuntimeError("the destination must not be examined")
+
+    destination: Any = Destination()
+    with pytest.raises(RuntimeError, match="shutdown"):
+        core.load_many_into([key.encoded], [destination])
+    assert destination.accesses == 0
+
+
+def test_close_retains_a_checkpoint_thread_that_did_not_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Treat an expired checkpoint join as a live device caller."""
+    path = make_raw_block_file(tmp_path)
+    core = RawBlockCore(make_raw_block_core_config(path), key_namespace="object")
+    raw = core.raw_device()
+    entered = threading.Event()
+    resume = threading.Event()
+
+    def checkpoint() -> None:
+        entered.set()
+        assert resume.wait(5), "checkpoint thread did not resume"
+
+    worker = threading.Thread(target=checkpoint)
+    join = worker.join
+    worker.start()
+    assert entered.wait(5)
+    core._meta_thread = worker
+
+    def expired_join(timeout: float) -> None:
+        join(timeout=0)
+
+    monkeypatch.setattr(worker, "join", expired_join)
+    try:
+        outcome = core.close()
+        assert outcome.quiescence is NativeQuiescence.RETAINED
+        assert outcome.may_release_backing_resources is False
+        assert core._meta_thread is worker
+    finally:
+        resume.set()
+        join(timeout=5)
+        assert not worker.is_alive()
+        raw.close()
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_native_journal_collection_failure_remains_visible(
+    tmp_path: Path,
+    missing: bool,
+) -> None:
+    path = make_raw_block_file(tmp_path)
+    fake = _RecordingRawDevice(size=128 * 1024 * 1024)
+    core = _make_core_with_fake(path, fake, io_engine="io_uring")
+
+    def fail_drain() -> None:
+        raise RuntimeError("native journal unavailable")
+
+    if not missing:
+        fake.take_io_journal = fail_drain  # type: ignore[attr-defined]
+    try:
+        attribution = core.report_status()["io_by_request"]
+        assert attribution["collection_failures"] > 0
+        assert any(
+            "collection_failure_rows=" in failure
+            for failure in attribution["evidence_failures"]
+        )
+    finally:
+        core.close()
+
+
+@pytest.mark.parametrize(
+    ("io_engine", "failed_entry"),
+    [("posix", None), ("io_uring", None), ("io_uring", 1)],
+)
+def test_recovered_checkpoint_uses_bounded_header_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    io_engine: str,
+    failed_entry: int | None,
+) -> None:
+    """Recover every key while keeping I/O batches and POSIX tasks bounded."""
+    path = make_raw_block_file(tmp_path)
+    fake = _RecordingRawDevice(size=128 * 1024 * 1024)
+    writer = _make_core_with_fake(path, fake, io_engine="io_uring")
+    specs = [encode_object_key(make_object_key(i)) for i in range(5)]
+    payloads = [make_memory_obj(bytes([i + 1]) * 100) for i in range(5)]
+    assert writer.put_many(specs, payloads).results == [True] * 5
+    writer.checkpoint_now()
+    state = json.loads(
+        next(data for data in fake.store.values() if data.startswith(b"{")).rstrip(
+            b"\x00"
+        )
+    )
+
+    reader = _make_core_with_fake(path, fake, io_engine=io_engine)
+    reader.iouring_queue_depth = 2
+    # Bound the implementation's private recovery setting without adding a
+    # production configuration knob solely for this small fixture.
+    reader._recovery_read_threads = 2
+    batches: list[list[int]] = []
+    real_read = fake.batched_read
+
+    def read_batch(offsets, buffers, total_lens, request_tag=None):
+        batches.append(list(offsets))
+        return real_read(offsets, buffers, total_lens, request_tag=request_tag)
+
+    monkeypatch.setattr(fake, "batched_read", read_batch)
+    fake.fail_completion_entries = {failed_entry} if failed_entry is not None else set()
+    pools: list[tuple[int, int]] = []
+
+    class RecordingPool(concurrent.futures.ThreadPoolExecutor):
+        def __init__(self, *, max_workers, thread_name_prefix):
+            super().__init__(
+                max_workers=max_workers, thread_name_prefix=thread_name_prefix
+            )
+            self.worker_count = max_workers
+
+        def map(self, fn, *iterables, **kwargs):
+            items = list(iterables[0])
+            pools.append((self.worker_count, len(items)))
+            return super().map(fn, items, **kwargs)
+
+    monkeypatch.setattr(
+        "lmcache.v1.storage_backend.raw_block.core.ThreadPoolExecutor",
+        RecordingPool,
+        raising=False,
+    )
+    try:
+        assert reader.apply_loaded_state(state)
+        assert reader.indexed_key_count() == 5
+        assert all(reader.contains_key(spec.encoded) for spec in specs)
+        if io_engine == "io_uring":
+            expected = [2, 2, 1] if failed_entry is None else [2, 1, 2, 1, 1]
+            assert [len(batch) for batch in batches] == expected
+            assert pools == []
+        else:
+            assert batches == []
+            assert pools == [(2, 2)]
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_batched_recovery_withholds_unreadable_entries_and_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unknown first batch must not submit later batches or free their keys."""
+    path = make_raw_block_file(tmp_path)
+    fake = _RecordingRawDevice(size=128 * 1024 * 1024)
+    core = _make_core_with_fake(path, fake, io_engine="io_uring")
+    specs = [encode_object_key(make_object_key(i)) for i in range(5)]
+    assert core.put_many(specs, [make_memory_obj(b"data")] * 5).results == [True] * 5
+    core.checkpoint_now()
+    state = json.loads(
+        next(data for data in fake.store.values() if data.startswith(b"{")).rstrip(
+            b"\x00"
+        )
+    )
+    core.iouring_queue_depth = 2
+    batches: list[list[int]] = []
+
+    native_poisoned = False
+
+    def unknown_read(offsets, buffers, lengths, request_tag=None):
+        nonlocal native_poisoned
+        batches.append(list(offsets))
+        native_poisoned = True
+        raise RuntimeError("I/O outcome is unknown")
+
+    monkeypatch.setattr(fake, "batched_read", unknown_read)
+    monkeypatch.setattr(fake, "is_poisoned", lambda: native_poisoned, raising=False)
+    monkeypatch.setattr(fake, "quarantined_batch_count", lambda: 1, raising=False)
+    try:
+        assert core.apply_loaded_state(state)
+        assert len(batches) == 1
+        assert len(batches[0]) == 2
+        assert core.is_poisoned()
+        assert core.indexed_key_count() == 5
+        assert core.report_status()["free_slot_count"] == 0
+    finally:
+        core.close()
+
+
+def test_batched_recovery_propagates_non_poisoned_runtime_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Do not misreport a non-device failure as an unreadable header."""
+    path = make_raw_block_file(tmp_path)
+    fake = _RecordingRawDevice(size=128 * 1024 * 1024)
+    core = _make_core_with_fake(path, fake, io_engine="io_uring")
+    specs = [encode_object_key(make_object_key(i)) for i in range(2)]
+    assert core.put_many(specs, [make_memory_obj(b"data")] * 2).results == [True] * 2
+    core.checkpoint_now()
+    state = json.loads(
+        next(data for data in fake.store.values() if data.startswith(b"{")).rstrip(
+            b"\x00"
+        )
+    )
+
+    def broken_read(
+        offsets: Sequence[int],
+        buffers: Sequence[Any],
+        lengths: Sequence[int],
+        request_tag: str | None = None,
+    ) -> int:
+        del offsets, buffers, lengths, request_tag
+        raise RuntimeError("recovery setup failed")
+
+    monkeypatch.setattr(fake, "batched_read", broken_read)
+    monkeypatch.setattr(fake, "is_poisoned", lambda: False, raising=False)
+    try:
+        with pytest.raises(RuntimeError, match="recovery setup failed"):
+            core.apply_loaded_state(state)
+    finally:
+        core.close()
