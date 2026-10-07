@@ -219,8 +219,10 @@ def test_manager_closes_consumers_before_cpu_arena(allocator_consumer):
         "LocalCPUBackend": cpu,
         "RawBlock": consumer,
     }
-    manager.loop = SimpleNamespace(is_running=lambda: False)
+    manager.loop = asyncio.new_event_loop()
     manager.thread = SimpleNamespace(is_alive=lambda: False)
+    manager.internal_copy_stream = None
+    manager._copy_owners_retained = False
     manager.close()
     assert order == ["consumer", "allocator"]
 

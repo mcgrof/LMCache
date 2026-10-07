@@ -70,7 +70,7 @@ def storage_plugin_launcher(
     them using the specified module and class names.
     """
     # Get the list of allowed external backends if configured
-    storage_plugins = set(config.storage_plugins) if config.storage_plugins else set()
+    storage_plugins = tuple(dict.fromkeys(config.storage_plugins or []))
 
     # A plugin that only adds a cache tier can be skipped when it cannot be
     # built: the engine is slower without it but still correct. A plugin that
@@ -97,7 +97,7 @@ def storage_plugin_launcher(
             )
         return
 
-    missing_required = required_plugins - storage_plugins
+    missing_required = required_plugins - set(storage_plugins)
     if missing_required:
         raise ValueError(
             f"storage plugins {sorted(missing_required)} are required but not "
@@ -155,7 +155,8 @@ def storage_plugin_launcher(
             logger.error("Failed to create backend %s: %s", storage_plugin, e)
 
 
-def CreateStorageBackends(
+def _create_storage_backends(
+    storage_backends: OrderedDict[str, StorageBackendInterface],
     config: LMCacheEngineConfig,
     metadata: LMCacheMetadata,
     loop: asyncio.AbstractEventLoop,
@@ -164,11 +165,11 @@ def CreateStorageBackends(
     skip_backends: Optional[AbstractSet[str]] = None,
     existing_backends: Optional[OrderedDict[str, StorageBackendInterface]] = None,
 ) -> OrderedDict[str, StorageBackendInterface]:
+    """Populate caller-owned construction state for transactional cleanup."""
     if is_cuda_worker(metadata):
         dst_device = f"{torch_device_type}:{torch_dev.current_device()}"
     else:
         dst_device = "cpu"
-    storage_backends: OrderedDict[str, StorageBackendInterface] = OrderedDict()
     _skip = skip_backends or set()
 
     extra_config = config.extra_config
@@ -392,3 +393,56 @@ def CreateStorageBackends(
     else:
         # If audit is not enabled, use the original backends
         return storage_backends
+
+
+def CreateStorageBackends(
+    config: LMCacheEngineConfig,
+    metadata: LMCacheMetadata,
+    loop: asyncio.AbstractEventLoop,
+    dst_device: str = torch_device_type,
+    lmcache_worker: Optional["LMCacheWorker"] = None,
+    skip_backends: Optional[AbstractSet[str]] = None,
+    existing_backends: Optional[OrderedDict[str, StorageBackendInterface]] = None,
+) -> OrderedDict[str, StorageBackendInterface]:
+    """Create configured backends, rolling back newly owned backends on failure.
+
+    Existing backends are borrowed and are never closed by this operation.
+    A constructor that raises must clean up its own partially built resources;
+    successfully returned backends are closed in reverse construction order.
+
+    Args:
+        config: Storage configuration.
+        metadata: Model and worker metadata.
+        loop: Event loop available to backend workers.
+        dst_device: Requested target device, resolved for the current worker.
+        lmcache_worker: Optional controller worker.
+        skip_backends: Backend names already provided by the caller.
+        existing_backends: Caller-owned backends reused by new dependents.
+
+    Returns:
+        Newly constructed backends in tier order.
+
+    Raises:
+        Exception: Propagates the original backend construction failure.
+    """
+    storage_backends: OrderedDict[str, StorageBackendInterface] = OrderedDict()
+    try:
+        return _create_storage_backends(
+            storage_backends,
+            config,
+            metadata,
+            loop,
+            dst_device,
+            lmcache_worker,
+            skip_backends,
+            existing_backends,
+        )
+    except BaseException:
+        # Dependents must stop using a staging allocator before it closes.
+        # Reused backends belong to the caller and never enter this mapping.
+        for backend in reversed(storage_backends.values()):
+            try:
+                backend.close()
+            except Exception:
+                logger.exception("Backend cleanup failed during storage construction")
+        raise

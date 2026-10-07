@@ -11,8 +11,10 @@ and verifies that:
 
 # Standard
 from collections import OrderedDict
-from typing import Any, Callable, List, Optional, Sequence
+from types import SimpleNamespace
+from typing import Any, Callable, List, Optional, Sequence, cast
 import asyncio
+import sys
 
 # Third Party
 import pytest
@@ -20,6 +22,7 @@ import torch
 
 # First Party
 from lmcache.utils import CacheEngineKey
+from lmcache.v1 import storage_backend
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager
 from lmcache.v1.memory_allocators.ad_hoc_memory_allocator import AdHocMemoryAllocator
@@ -28,6 +31,7 @@ from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend import CreateStorageBackends
 from lmcache.v1.storage_backend.abstract_backend import (
     AllocatorBackendInterface,
+    StorageBackendInterface,
     StoragePluginInterface,
 )
 from lmcache.v1.storage_backend.storage_manager import StorageManager
@@ -722,3 +726,92 @@ def test_shared_storage_allocates_from_the_gpu_endpoint_not_local_cpu():
     config.pd_data_path = "transfer_channel"
     manager.storage_backends["PDBackend"] = _Endpoint("PDBackend")
     assert str(manager._get_allocator_backend(config)) == "PDBackend"
+
+
+@pytest.mark.no_shared_allocator
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_factory_failure_closes_new_backends_in_reverse_order(
+    monkeypatch: pytest.MonkeyPatch,
+    standalone_async_loop: asyncio.AbstractEventLoop,
+    cleanup_fails: bool,
+) -> None:
+    """A required plugin failure unwinds tiers before their CPU allocator."""
+    closed: list[str] = []
+
+    class OwnedCPU:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def __str__(self) -> str:
+            return "LocalCPUBackend"
+
+        def close(self) -> None:
+            closed.append("cpu")
+
+    class OwnedPlugin:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        def close(self) -> None:
+            closed.append("plugin")
+            if cleanup_fails:
+                raise RuntimeError("cleanup failed")
+
+    class RefusedPlugin:
+        def __init__(self, **kwargs: Any) -> None:
+            raise ValueError("construction refused")
+
+    module_name = "test_factory_transaction"
+    module = SimpleNamespace(OwnedPlugin=OwnedPlugin, RefusedPlugin=RefusedPlugin)
+    monkeypatch.setitem(sys.modules, module_name, module)
+    monkeypatch.setattr(storage_backend, "LocalCPUBackend", OwnedCPU)
+    config = create_test_config(
+        storage_plugins=["owned", "refused"],
+        extra_config={
+            "storage_plugin.owned.module_path": module_name,
+            "storage_plugin.owned.class_name": "OwnedPlugin",
+            "storage_plugin.refused.module_path": module_name,
+            "storage_plugin.refused.class_name": "RefusedPlugin",
+            "storage_plugin.refused.required": True,
+        },
+    )
+    with pytest.raises(RuntimeError, match="construction refused"):
+        CreateStorageBackends(config, create_test_metadata(), standalone_async_loop)
+    assert closed == ["plugin", "cpu"]
+
+
+@pytest.mark.no_shared_allocator
+def test_factory_failure_does_not_close_borrowed_cpu_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    standalone_async_loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Failure during incremental construction leaves the caller's tier alive."""
+
+    class BorrowedCPU:
+        def __init__(self) -> None:
+            self.close_count = 0
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    monkeypatch.setattr(storage_backend, "LocalCPUBackend", BorrowedCPU)
+    cpu = BorrowedCPU()
+    config = create_test_config(
+        storage_plugins=["refused"],
+        extra_config={
+            "storage_plugin.refused.module_path": "test_nonexistent_required_plugin",
+            "storage_plugin.refused.class_name": "RefusedPlugin",
+            "storage_plugin.refused.required": True,
+        },
+    )
+    with pytest.raises(RuntimeError, match="Required storage backend"):
+        CreateStorageBackends(
+            config,
+            create_test_metadata(),
+            standalone_async_loop,
+            skip_backends={"LocalCPUBackend"},
+            existing_backends=OrderedDict(
+                LocalCPUBackend=cast(StorageBackendInterface, cpu)
+            ),
+        )
+    assert cpu.close_count == 0
