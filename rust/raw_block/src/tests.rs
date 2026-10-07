@@ -115,19 +115,6 @@ fn placement_id_to_u16_rejects_reserved_and_out_of_range_values() {
 }
 
 #[test]
-fn prepare_iouring_write_buffer_keeps_fixed_buffer_for_zero_tail() {
-    let mut buf = vec![0u8; 4096];
-    buf[..4].copy_from_slice(b"data");
-    let ptr = buf.as_ptr() as usize;
-
-    let prepared = prepare_iouring_write_buffer(ptr, 4096, 4, 4096, false, 4096, Some(3)).unwrap();
-
-    assert_eq!(prepared.ptr_addr, ptr);
-    assert!(prepared.bounce.is_none());
-    assert_eq!(prepared.fixed_buffer_idx, Some(3));
-}
-
-#[test]
 fn close_releases_gil_while_draining() {
     assert_shutdown_releases_gil(ShutdownMethod::Close, ShutdownWait::Drain);
 }
@@ -377,4 +364,62 @@ fn normal_shutdown_does_not_report_a_terminal_worker_error() {
         device.call_method0("close").unwrap();
         assert!(device.call_method0("worker_error").unwrap().is_none());
     });
+}
+
+#[test]
+fn prepare_iouring_write_buffer_keeps_fixed_buffer_for_zero_tail() {
+    let mut buf = vec![0u8; 4096];
+    buf[..4].copy_from_slice(b"data");
+    let ptr = buf.as_ptr() as usize;
+    let prepared =
+        prepare_iouring_write_buffer(ptr, 4096, 4, 4096, false, 4096, Some(3), None).unwrap();
+    assert_eq!(prepared.ptr_addr, ptr);
+    assert!(prepared.bounce.is_none());
+    assert_eq!(prepared.fixed_buffer_idx, Some(3));
+}
+
+#[test]
+fn prepare_iouring_write_buffer_zeros_host_padding_without_mutating_source() {
+    for capacity in [4, 4096] {
+        let mut buf = vec![0xa5u8; capacity];
+        buf[..4].copy_from_slice(b"data");
+        let before = buf.clone();
+        let prepared = prepare_iouring_write_buffer(
+            buf.as_ptr() as usize,
+            capacity,
+            4,
+            4096,
+            false,
+            4096,
+            Some(3),
+            None,
+        )
+        .unwrap();
+        let bytes = unsafe { std::slice::from_raw_parts(prepared.ptr_addr as *const u8, 4096) };
+        assert_eq!(&bytes[..4], b"data");
+        assert!(bytes[4..].iter().all(|byte| *byte == 0));
+        assert!(prepared.bounce.is_some());
+        assert_eq!(prepared.fixed_buffer_idx, None);
+        assert_eq!(buf, before);
+    }
+}
+
+#[test]
+fn prepare_iouring_write_buffer_never_reads_registered_device_padding() {
+    // This address is deliberately not host memory. The device registration
+    // supplies the kernel mapping; buffer preparation must only check geometry.
+    let prepared =
+        prepare_iouring_write_buffer(0x1000, 4096, 4, 4096, true, 4096, Some(3), Some(8192))
+            .unwrap();
+    assert_eq!(prepared.ptr_addr, 0x1000);
+    assert_eq!(prepared.fixed_buffer_idx, Some(3));
+    assert_eq!(prepared.fixed_dmabuf, Some(8192));
+    assert!(prepared.bounce.is_none());
+    assert!(
+        prepare_iouring_write_buffer(0x1000, 4, 4, 4096, true, 4096, Some(3), Some(8192)).is_err()
+    );
+    assert!(
+        prepare_iouring_write_buffer(0x1001, 4096, 4, 4096, true, 4096, Some(3), Some(8192))
+            .is_err()
+    );
 }

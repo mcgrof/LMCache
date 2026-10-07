@@ -430,6 +430,108 @@ def wait_until(predicate, seconds=10):
 """
 
 
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_partial_dmabuf_registration_cleanup_controls_reuse(
+    tmp_path: Path, cleanup_fails: bool
+) -> None:
+    """A failed slot update permits reuse only after its table is withdrawn."""
+    scenario = SCRIPTED_PREAMBLE + textwrap.dedent(
+        f"""
+        dev = device()
+        dev.fake_registration_fails("dmabuf", 1, 22)
+        if {cleanup_fails!r}:
+            dev.fake_registration_fails("unregister", 0, 5)
+        try:
+            dev.register_fixed_dmabufs([4096, 8192], [4096, 4096], [7, 8], [0, 0])
+            raise AssertionError("slot update unexpectedly succeeded")
+        except RuntimeError as exc:
+            error = str(exc)
+        report = {{"error": error, "poisoned": dev.is_poisoned(),
+                   "idle": dev.is_idle(), "table": dev.fake_registrations()}}
+        if {cleanup_fails!r}:
+            refused = []
+            for call in (
+                lambda: dev.register_fixed_buffers([4096], [4096]),
+                lambda: dev.register_fixed_dmabufs([4096], [4096], [7], [0]),
+                lambda: dev.batched_write([0], [bytearray(4096)], [4096]),
+            ):
+                try:
+                    call()
+                    refused.append(False)
+                except RuntimeError:
+                    refused.append(True)
+            report["refused"] = refused
+            closes = []
+            for _ in range(2):
+                try:
+                    dev.close()
+                    closes.append(False)
+                except RuntimeError:
+                    closes.append(True)
+            report["close_retained"] = closes
+            report["table_after_close"] = dev.fake_registrations()
+        else:
+            dev.register_fixed_dmabufs([4096], [4096], [7], [0])
+            report["retry_table"] = dev.fake_registrations()
+            dev.close()
+            report["table_after_close"] = dev.fake_registrations()
+        print(json.dumps(report))
+        """
+    )
+    target = tmp_path / "device.bin"
+    target.write_bytes(bytes(16384))
+    report = _run_scenario(scenario, target)
+    assert "slot 1" in report["error"]
+    assert report["poisoned"] is cleanup_fails
+    assert report["idle"] is not cleanup_fails
+    if cleanup_fails:
+        assert "unregister also failed" in report["error"]
+        assert [record["kind"] for record in report["table"]] == [1, 2]
+        assert report["refused"] == [True] * 3
+        assert report["close_retained"] == [True, True]
+        assert report["table_after_close"] == report["table"]
+    else:
+        assert [record["kind"] for record in report["table"]] == [3]
+        assert [record["kind"] for record in report["retry_table"]] == [3, 1, 2]
+        assert [record["kind"] for record in report["table_after_close"]] == [3]
+
+
+def test_registered_table_cannot_be_replaced_or_registered_after_close(
+    tmp_path: Path,
+) -> None:
+    """A rejected replacement preserves the live table used by fixed I/O."""
+    scenario = SCRIPTED_PREAMBLE + textwrap.dedent(
+        """
+        dev = device()
+        dev.register_fixed_dmabufs([4096], [4096], [7], [0])
+        original = dev.fake_registrations()
+        errors = []
+        for call in (
+            lambda: dev.register_fixed_buffers([8192], [4096]),
+            lambda: dev.register_fixed_dmabufs([8192], [4096], [8], [0]),
+        ):
+            try:
+                call()
+            except RuntimeError as exc:
+                errors.append(str(exc))
+        unchanged = dev.fake_registrations() == original
+        dev.close()
+        try:
+            dev.register_fixed_dmabufs([4096], [4096], [7], [0])
+        except RuntimeError as exc:
+            errors.append(str(exc))
+        print(json.dumps({"errors": errors, "unchanged": unchanged}))
+        """
+    )
+    target = tmp_path / "device.bin"
+    target.write_bytes(bytes(8192))
+    report = _run_scenario(scenario, target)
+    assert report["unchanged"] is True
+    assert len(report["errors"]) == 3
+    assert all("already registered" in error for error in report["errors"][:2])
+    assert "closed" in report["errors"][2]
+
+
 @pytest.mark.parametrize("direction", ["read", "write"])
 @pytest.mark.parametrize("complete", [False, True])
 def test_batched_io_pins_resizable_host_buffer_until_known_completion(
@@ -1044,6 +1146,52 @@ SCRIPTED_SYNCHRONOUS_UNANSWERED = SCRIPTED_PREAMBLE + textwrap.dedent(
 )
 
 
+SCRIPTED_DMABUF_SHORT_TERMINAL = SCRIPTED_PREAMBLE + textwrap.dedent(
+    """
+    import ctypes
+
+    dev = device()
+    payload = bytearray(b"x" * 8192)
+    address = ctypes.addressof((ctypes.c_char * len(payload)).from_buffer(payload))
+    # A nonzero offset inside the registration, which is the case a
+    # remainder would get wrong: the SQE address of a registered dma-buf
+    # transfer is an offset into the registration, not a process address.
+    base = address - 4096
+    dev.register_fixed_dmabufs([address], [len(payload)], [7], [base])
+    registrations = dev.fake_registrations()
+
+    batch = dev.batched_write([0], [payload], [8192], [None])
+    assert wait_until(lambda: len(dev.fake_owned()) == 1)
+    submitted = dev.fake_owned_sqes()
+
+    # Half the bytes, and known to be half: a positive short completion.
+    dev.fake_complete(submitted[0]["user_data"], 4096)
+
+    # Look at the ring before waiting on the batch. A remainder nobody is
+    # going to answer for makes that wait never return, and a test that
+    # times out has reported nothing at all.
+    remainder = wait_until(
+        lambda: bool(dev.fake_resident()) or bool(dev.fake_owned()), seconds=2
+    )
+    report = {
+        "registrations": registrations,
+        "submitted": submitted,
+        "remainder_appeared": remainder,
+        "resident_after": dev.fake_resident_sqes(),
+        "owned_after": dev.fake_owned_sqes(),
+    }
+    if not remainder:
+        results, errors = dev.wait_iouring(batch)
+        report["results"] = list(results)
+        report["errors"] = [str(e) for _, e in errors]
+    report["poisoned"] = dev.is_poisoned()
+    report["quarantined_owners"] = dev.quarantined_owner_count()
+    report["violations"] = dev.fake_violations()
+    print(json.dumps(report))
+    """
+)
+
+
 def test_a_fatal_submit_answers_work_the_kernel_already_took(tmp_path) -> None:
     """A fatal submit is not news about one batch.
 
@@ -1103,6 +1251,51 @@ def test_a_synchronous_write_nobody_answered_for_is_woken_and_kept(tmp_path) -> 
     assert report["quarantined_owners"] >= 1, report
     assert report["close"] == "RuntimeError", report
     assert report["retained"] >= 1, report
+
+
+def test_a_short_registered_dmabuf_transfer_ends_there(tmp_path) -> None:
+    """A registered dma-buf transfer has no remainder to retry.
+
+    The SQE address of one is a byte offset inside the registration rather
+    than a process address, so advancing it by the bytes transferred aims
+    the next submission at an offset nobody registered. There is also no
+    bounce buffer to fall back to: the whole point of the registration is
+    that the device reaches that memory directly.
+
+    So a known short completion ends the operation. The registration here
+    is explicitly synthetic -- no descriptor reached a kernel -- which makes
+    this evidence about the engine's own decision and about nothing else.
+    """
+    device = tmp_path / "dev.bin"
+    with open(device, "wb") as handle:
+        handle.truncate(16 * 1024 * 1024)
+    report = _run_scenario(SCRIPTED_DMABUF_SHORT_TERMINAL, device)
+
+    assert report["violations"] == []
+    # The registration really went through the shared path: a sparse table
+    # and one dma-buf slot.
+    kinds = [record["kind"] for record in report["registrations"]]
+    assert kinds == [1, 2], report
+
+    # The submission carried the registration, at a nonzero offset inside
+    # it, with the registered index rather than a process address.
+    assert len(report["submitted"]) == 1, report
+    sqe = report["submitted"][0]
+    assert sqe["fixed_index"] == 0, report
+    assert sqe["dmabuf_offset"] == 4096, report
+    assert sqe["addr"] == 4096, report
+    assert sqe["len"] == 8192, report
+
+    # It ended there: no remainder was submitted and none is waiting to be.
+    assert report["remainder_appeared"] is False, report
+    assert report["resident_after"] == [], report
+    assert report["owned_after"] == [], report
+    assert report["results"] == [False], report
+    assert report["errors"], report
+    # A known short completion is a known outcome. The device answered for
+    # this request, so nothing is withheld on its account.
+    assert report["poisoned"] is False, report
+    assert report["quarantined_owners"] == 0, report
 
 
 SCRIPTED_SHORT_REMAINDER_RETRIED = SCRIPTED_PREAMBLE + textwrap.dedent(
@@ -1418,12 +1611,18 @@ SCRIPTED_REJECTED_WRITE = SCRIPTED_PREAMBLE + textwrap.dedent(
     class Payload(bytearray):
         pass
 
+    class PointerPayload:
+        nbytes = 4096
+
+        def data_ptr(self):
+            return 0x100000
+
     dev = RawBlockDevice(
         sys.argv[2], writable=True, use_iouring=True,
         use_odirect=CASE in ("offset", "length"), alignment=4096,
         iouring_queue_depth=8, fake_ring_capacity=8,
     )
-    payload = Payload(b"x" * 4096)
+    payload = PointerPayload() if CASE == "pointer" else Payload(b"x" * 4096)
     alive = weakref.ref(payload)
     offset = 1 if CASE == "offset" else 0
     payload_len = 4097 if CASE == "capacity" else 4096
@@ -1463,6 +1662,7 @@ SCRIPTED_REJECTED_WRITE = SCRIPTED_PREAMBLE + textwrap.dedent(
         ("short_total", "total_len must be >= payload_len"),
         ("offset", "O_DIRECT requires aligned offset"),
         ("length", "O_DIRECT requires aligned total_len"),
+        ("pointer", "pointer-only buffer is not fully covered"),
         ("placement", "placement"),
         ("allocation", "posix_memalign failed"),
     ],
