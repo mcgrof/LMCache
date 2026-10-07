@@ -5,13 +5,17 @@ from __future__ import annotations
 
 # Standard
 from collections.abc import Mapping
+from concurrent.futures import CancelledError
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
+import os
 import threading
 import time
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
 from lmcache.v1.storage_backend.abstract_backend import (
     AllocatorBackendInterface,
     StoragePluginInterface,
@@ -20,14 +24,32 @@ from lmcache.v1.storage_backend.raw_block import (
     DEFAULT_IOURING_QUEUE_DEPTH,
     RawBlockCore,
     RawBlockCoreConfig,
+    RawBlockDerivationDescriptor,
+    RawBlockIoContext,
     RawBlockKeySpec,
+    RawBlockPDRequestTracker,
+    RawBlockPublicationReceipt,
     RawBlockPutManyResult,
+    RawBlockReadContext,
+    ReadAckIdentity,
+    ReadAckOutcome,
     decode_legacy_key,
     encode_legacy_key,
     normalize_raw_block_io_engine,
     round_up,
     validate_raw_block_io_options,
 )
+from lmcache.v1.storage_backend.storage_pd_ack import (
+    ACK_REJECTED,
+    ACK_UNRESOLVED,
+    StoragePDAckRequest,
+    StoragePDAckServer,
+    StoragePDClaimAnswer,
+    StoragePDClaimRequest,
+    StoragePDUnreadAnswer,
+    StoragePDUnreadRequest,
+)
+from lmcache.v1.storage_backend.storage_pd_protocol import STORAGE_PD_INCARNATION
 
 if TYPE_CHECKING:
     # Standard
@@ -112,6 +134,23 @@ def _get_per_tp_device_path(
     return per_tp_devices.get(str(tp_rank), per_tp_devices.get(tp_rank))
 
 
+def _resolve_role(config: Any, extra: Mapping[str, Any]) -> str:
+    """Return which side of a handoff this node runs, writer or reader.
+
+    A handoff configured through ``pd_data_path`` already says which side
+    this node is, in ``pd_role``. Reading it from there means a deployment
+    states it once instead of twice, where the two could disagree. An
+    explicit plugin setting still wins, for a raw-block pairing set up
+    without the P/D switch at all.
+    """
+    explicit = str(extra.get("rust_raw_block.role", "") or "")
+    if explicit:
+        return explicit
+    if getattr(config, "pd_uses_shared_storage", False):
+        return "reader" if config.pd_role == "receiver" else "writer"
+    return "writer"
+
+
 class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
     """
     Legacy raw-block storage plugin wrapper.
@@ -188,10 +227,89 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                     "extra_config['rust_raw_block.device_path'] is required"
                 )
 
-        self._core = RawBlockCore(
-            self._build_core_config(extra),
-            key_namespace="legacy",
+        # Prefill/decode handoff over a shared NVMe namespace: the prefill
+        # side runs the "writer" role and publishes its index after every put
+        # batch; the decode side runs the "reader" role on the same namespace,
+        # never writes, and re-reads the published index when a lookup misses.
+        self._role = _resolve_role(self.config, extra)
+        if self._role not in ("writer", "reader"):
+            raise ValueError(
+                f"rust_raw_block.role must be 'writer' or 'reader', got {self._role!r}"
+            )
+        self._publish_after_put = (
+            bool(extra.get("rust_raw_block.publish_after_put", False))
+            and self._role == "writer"
         )
+        self._index_refresh_min_ms = int(
+            extra.get("rust_raw_block.index_refresh_min_ms", 50)
+        )
+        self._index_refresh_wait_ms = int(
+            extra.get("rust_raw_block.index_refresh_wait_ms", 0)
+        )
+        self._pd_dependency_timeout_s = max(
+            0.001,
+            int(extra.get("rust_raw_block.publication_adopt_timeout_ms", 30000))
+            / 1000.0,
+        )
+        self._last_refresh_ts = 0.0
+        self._refresh_lock = threading.Lock()
+        self._warned_reader_put = False
+        # Memory objects whose references are deliberately not dropped, because
+        # the device's access to them was never shown to have ended. Held for
+        # the life of this backend so their pool slices cannot be reallocated.
+        self._quarantined_objs: list[Any] = []
+        # A handoff configured through pd_data_path says the same thing as
+        # the plugin-level switch, so either turns the mode on.
+        self._storage_pd_mode = bool(
+            extra.get("rust_raw_block.storage_pd_mode", False)
+        ) or bool(getattr(self.config, "pd_uses_shared_storage", False))
+        if self._storage_pd_mode:
+            if bool(getattr(self.config, "use_layerwise", False)):
+                raise ValueError(
+                    "rust_raw_block.storage_pd_mode requires use_layerwise=false"
+                )
+            if bool(getattr(self.config, "enable_async_loading", False)):
+                raise ValueError(
+                    "rust_raw_block.storage_pd_mode requires enable_async_loading=false"
+                )
+            if not bool(getattr(self.config, "save_unfull_chunk", False)):
+                raise ValueError(
+                    "rust_raw_block.storage_pd_mode requires save_unfull_chunk=true"
+                )
+            if self._publish_after_put:
+                raise ValueError(
+                    "rust_raw_block.storage_pd_mode requires "
+                    "publish_after_put=false; the request tracker owns publication"
+                )
+            allow_unsafe_test_io = bool(
+                extra.get("rust_raw_block.allow_unsafe_pd_io_for_testing", False)
+            )
+            if not allow_unsafe_test_io and not bool(
+                extra.get("rust_raw_block.require_dmabuf_registration", False)
+            ):
+                raise ValueError(
+                    "rust_raw_block.storage_pd_mode requires strict dma-buf "
+                    "registration; set require_dmabuf_registration=true"
+                )
+            if (
+                not allow_unsafe_test_io
+                and int(extra.get("rust_raw_block.gpu_buffer_bytes", 0) or 0) <= 0
+            ):
+                raise ValueError(
+                    "rust_raw_block.storage_pd_mode requires a GPU staging "
+                    "arena; set rust_raw_block.gpu_buffer_bytes"
+                )
+
+        core_config = self._build_core_config(extra)
+        if self._storage_pd_mode:
+            # Derived rather than configured: it is a fact about how this
+            # deployment hashes, not a knob, and a knob would let the two
+            # sides of a handoff disagree with the engines they describe.
+            core_config = replace(
+                core_config,
+                derivation=self._observed_key_derivation("legacy"),
+            )
+        self._core = RawBlockCore(core_config, key_namespace="legacy")
         # A GPU staging pool makes the device the endpoint of every raw-block
         # read and write: the engine registers the pool's slots with io_uring
         # as dma-bufs exported from device memory, stores go out of the
@@ -223,7 +341,11 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                     self.get_memory_allocator()
                 )
             except Exception as e:
-                if self._gpu_allocator is not None or self._outcome_is_unknown():
+                if (
+                    self._gpu_allocator is not None
+                    or self._core.require_dmabuf_registration
+                    or self._outcome_is_unknown()
+                ):
                     try:
                         outcome = self._core.close()
                     except Exception:
@@ -237,6 +359,11 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                         )
                         if self.local_cpu_backend is not None:
                             self.local_cpu_backend.retain_backing_resources()
+                    if self._core.require_dmabuf_registration:
+                        raise RuntimeError(
+                            "RustRawBlockBackend requires dma-buf fixed-buffer "
+                            "registration, but registration failed"
+                        ) from e
                     raise
                 logger.warning(
                     "RustRawBlockBackend: failed to register io_uring fixed "
@@ -244,16 +371,66 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                     e,
                 )
         self._warn_if_loaded_metadata_looks_cross_rank()
-
+        self._pd_tracker = (
+            RawBlockPDRequestTracker(self._core)
+            if self._storage_pd_mode and self._role == "writer"
+            else None
+        )
+        # A writer that cannot hear an acknowledgement holds every extent it
+        # ever publishes for its own lifetime, so the listener is built
+        # beside the tracker that owns those leases.
+        self._ack_receiver: Optional[StoragePDAckServer] = None
+        self._ack_tp_rank = int(getattr(metadata, "worker_id", 0) or 0)
+        # Names one producer/consumer group's run. Both ends carry it, so a
+        # restart of the whole group is a new session and a restart of the
+        # consumer alone is not -- which is what lets the writer refuse a
+        # consumer that cannot have done the reading it claims.
+        self._pd_session_id = str(
+            extra.get("rust_raw_block.pd_session_id", "")
+            or os.environ.get("LMCACHE_STORAGE_PD_SESSION", "")
+        )
+        # An operator's assertion that this engine's shutdown is part of a
+        # whole-group stop: every engine that could read this namespace is
+        # going away too, so holds kept for readers have nobody left to
+        # protect. Nothing in this process can observe that, which is why
+        # it is configured rather than inferred, and why it is off by
+        # default -- a local shutdown says nothing about another machine.
+        self._pd_group_quiesced_teardown = bool(
+            extra.get("rust_raw_block.pd_group_quiesced_teardown", False)
+        )
         self._put_lock = threading.Lock()
         self._put_tasks: set[CacheEngineKey] = set()
-        self._quarantined_objs: list[MemoryObj] = []
+        # Batches whose I/O thread is still running after the task awaiting
+        # it went away. Their buffers are nobody's to release until it ends.
         self._pending_put_owners: list[list[MemoryObj]] = []
-        self._active_operations = 0
-        self._sealed = False
         self._closed_once = False
+        self._active_operations = 0
+        # Set at the top of close, before anything waits. A wait that runs
+        # while new work is still being admitted has no end, and every
+        # admission path below checks this rather than discovering a
+        # half-torn-down engine on its own.
+        self._sealed = False
         self._pin_lock = threading.Lock()
         self._pinned_keys: set[str] = set()
+        # This deployment's run, so an attribution row names which run it
+        # came from rather than only which request.
+        self._run_id = str(getattr(config, "lmcache_instance_id", "") or "") or str(
+            extra.get("rust_raw_block.run_id", "") or ""
+        )
+        if self._pd_tracker is not None:
+            try:
+                self._ack_receiver = self._build_ack_receiver(extra)
+                self._pd_tracker.ack_endpoint = self.ack_endpoint()
+            except BaseException:
+                # Listener refusal happens after the native device and
+                # publication worker exist. Initialize teardown state first
+                # so the normal ownership-aware close can unwind both.
+                try:
+                    self.close()
+                except Exception:
+                    self._retain_whole_graph(len(self._pending_put_owners))
+                    logger.exception("Raw-block P/D startup cleanup failed")
+                raise
 
     def __str__(self) -> str:
         return "RustRawBlockBackend"
@@ -382,6 +559,42 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             raise RuntimeError("RustRawBlockBackend has no staging pool to load into")
         return self.local_cpu_backend.allocate(shape, dtype, fmt)
 
+    def _outcome_is_unknown(self) -> bool:
+        """Whether the worker or the core has stopped being able to say.
+
+        The core is asked first. It keeps the answer once it has adopted it,
+        and asking it costs nothing, whereas reaching the device can reopen
+        one -- or be refused outright for exactly the reason being asked
+        about.
+        """
+        if _probe_says_unknown(
+            getattr(self._core, "is_poisoned", None),
+            "raw-block core",
+        ):
+            return True
+        return self._native_outcome_is_unknown()
+
+    def _native_outcome_is_unknown(self) -> bool:
+        """Whether the native engine has stopped being able to say.
+
+        Once it cannot establish what the device is doing, nothing this
+        backend releases can be shown to be safe to release, so it keeps what
+        it holds rather than handing it back.
+        """
+        try:
+            probe = getattr(self._raw, "is_poisoned", None)
+        except Exception:
+            # Obtaining the device is itself part of what can fail, and a
+            # core that has stopped being able to say refuses to hand one
+            # out at all. That refusal is not an answer about health: the
+            # core's own flag is, and _outcome_is_unknown reads it.
+            logger.warning(
+                "RustRawBlockBackend: could not reach the native engine to "
+                "ask about its health"
+            )
+            return False
+        return _probe_says_unknown(probe, "native engine")
+
     def _full_chunk_size_bytes(self) -> int:
         """Bytes one full KV chunk occupies, which sizes a device slot.
 
@@ -447,7 +660,32 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         default_slot_bytes = round_up(header_bytes + full_chunk_bytes, block_align)
         slot_bytes = int(extra.get("rust_raw_block.slot_bytes", default_slot_bytes))
 
+        role = _resolve_role(self.config, extra)
         return RawBlockCoreConfig(
+            role=role,
+            verify_slot_header_on_load=self._storage_pd_mode
+            or bool(
+                extra.get("rust_raw_block.verify_slot_header_on_load", role == "reader")
+            ),
+            publish_min_interval_ms=0
+            if self._storage_pd_mode
+            else int(extra.get("rust_raw_block.publish_min_interval_ms", 0)),
+            # Strict P/D publishes a forced checkpoint per request, so the
+            # last generation on the device already names every request that
+            # completed; one more at close could only name a request that
+            # did not. And this lane must be able to ask the native engine
+            # whether anything is outstanding, rather than settle for the
+            # weaker health question an older build can answer.
+            close_writes_final_checkpoint=not self._storage_pd_mode,
+            require_native_idle_capability=self._storage_pd_mode,
+            require_dmabuf_registration=bool(
+                extra.get("rust_raw_block.require_dmabuf_registration", False)
+            ),
+            evict_unlocked_on_full=self._storage_pd_mode,
+            writer_epoch=str(extra.get("rust_raw_block.writer_epoch", "") or ""),
+            namespace_identity=str(
+                extra.get("rust_raw_block.namespace_identity", "") or ""
+            ),
             device_path=self.device_path,
             capacity_bytes=capacity_bytes,
             block_align=block_align,
@@ -503,7 +741,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             first_loaded_key.to_string(),
         )
 
-    def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
+    def _contains_here(self, key: CacheEngineKey, pin: bool) -> bool:
         spec = encode_legacy_key(key)
         return (
             self._pin_if_needed(spec.encoded)
@@ -514,9 +752,133 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             )
         )
 
+    def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
+        if self._contains_here(key, pin):
+            return True
+        if self._role == "reader" and self._refresh_index():
+            return self._contains_here(key, pin)
+        return False
+
+    def batched_contains(self, keys: List[CacheEngineKey], pin: bool = False) -> int:
+        """Return the prefix hit count, letting a reader wait for the writer.
+
+        A reader that misses re-reads the writer's published index and, when
+        ``rust_raw_block.index_refresh_wait_ms`` is set, keeps re-reading until
+        the keys show up or the wait runs out.  That wait is the handoff: the
+        decode side asks before the prefill side has finished publishing.
+        """
+        hit = 0
+        while hit < len(keys) and self._contains_here(keys[hit], pin):
+            hit += 1
+        if hit == len(keys) or self._role != "reader":
+            return hit
+        deadline = time.monotonic() + self._index_refresh_wait_ms / 1000.0
+        while True:
+            if self._refresh_index():
+                while hit < len(keys) and self._contains_here(keys[hit], pin):
+                    hit += 1
+                if hit == len(keys):
+                    break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(remaining, max(self._index_refresh_min_ms, 1) / 1000.0))
+        return hit
+
+    def _refresh_index(self) -> bool:
+        """Re-read the writer's index, no more often than the configured
+        minimum spacing.  Returns True when the index changed."""
+        with self._put_lock:
+            if self._sealed:
+                return False
+            self._active_operations += 1
+        try:
+            with self._refresh_lock:
+                now = time.monotonic()
+                if (now - self._last_refresh_ts) * 1000.0 < self._index_refresh_min_ms:
+                    return False
+                self._last_refresh_ts = now
+                try:
+                    return bool(self._core.refresh_index_from_device())
+                except Exception as e:
+                    logger.warning("RustRawBlockBackend: index refresh failed: %s", e)
+                    return False
+        finally:
+            with self._put_lock:
+                self._active_operations -= 1
+
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         with self._put_lock:
             return key in self._put_tasks
+
+    def cancel_request(self, req_id: str) -> None:
+        """Prevent an aborted storage-P/D request from being published."""
+        if self._pd_tracker is not None:
+            self._pd_tracker.fail_request(
+                req_id,
+                CancelledError(f"storage P/D request {req_id} was cancelled"),
+            )
+
+    def finish_request(self, req_id: str) -> None:
+        """Fail an incomplete request after its model execution has ended."""
+        if self._pd_tracker is not None:
+            self._pd_tracker.finish_request(req_id)
+
+    def adopt_publication(
+        self,
+        receipt: RawBlockPublicationReceipt,
+        keys: Sequence[CacheEngineKey],
+        *,
+        timeout_ms: int,
+    ) -> bool:
+        """Adopt the request generation advertised by a storage-P/D writer."""
+        if self._role != "reader":
+            raise RuntimeError("only a raw-block reader can adopt a publication")
+        with self._put_lock:
+            if self._sealed:
+                raise RuntimeError("raw-block storage P/D is shutting down")
+            self._active_operations += 1
+        try:
+            encoded_keys = [encode_legacy_key(key).encoded for key in keys]
+            adopted = self._core.refresh_until_publication(
+                receipt,
+                encoded_keys,
+                timeout_ms=timeout_ms,
+                refresh_interval_ms=max(self._index_refresh_min_ms, 1),
+            )
+            return adopted
+        finally:
+            with self._put_lock:
+                self._active_operations -= 1
+
+    def publish_existing_request(
+        self,
+        keys: Sequence[CacheEngineKey],
+        transfer_spec: Any,
+    ) -> Future:
+        """Publish a final P/D request whose last iteration wrote no new KV."""
+        if self._pd_tracker is None or self._role != "writer":
+            raise RuntimeError("raw-block storage P/D writer is unavailable")
+        if self._sealed:
+            raise RuntimeError(
+                "raw-block storage P/D is shutting down and admits no "
+                "further publications"
+            )
+        req_id = str(getattr(transfer_spec, "req_id", "") or "")
+        expected_chunks = int(getattr(transfer_spec, "total_chunks", 0) or 0)
+        if self._pd_tracker.has_request(req_id):
+            return self._pd_tracker.finalize_request(
+                req_id,
+                expected_chunks=expected_chunks,
+            )
+        encoded_keys = [encode_legacy_key(key).encoded for key in keys]
+        return self._pd_tracker.register_batch(
+            req_id,
+            encoded_keys,
+            expected_chunks=expected_chunks,
+            is_last_batch=True,
+            completed_keys=encoded_keys,
+        )
 
     def pin(self, key: CacheEngineKey) -> bool:
         spec = encode_legacy_key(key)
@@ -527,9 +889,14 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         return self._unpin_if_needed(spec.encoded)
 
     def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
+        if self._role == "reader":
+            return False
         spec = encode_legacy_key(key)
         with self._pin_lock:
-            removed = self._core.delete_many([spec.encoded], force=force)[0]
+            removed = self._core.delete_many(
+                [spec.encoded],
+                force=force and not self._storage_pd_mode,
+            )[0]
             if removed:
                 self._pinned_keys.discard(spec.encoded)
         return removed
@@ -552,11 +919,14 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         Returns:
             Number of keys that were actually removed.
         """
-        if not keys:
+        if not keys or self._role == "reader":
             return 0
         encoded_keys = [encode_legacy_key(key).encoded for key in keys]
         with self._pin_lock:
-            results = self._core.delete_many(encoded_keys, force=force)
+            results = self._core.delete_many(
+                encoded_keys,
+                force=force and not self._storage_pd_mode,
+            )
             for encoded_key, removed in zip(encoded_keys, results, strict=True):
                 if removed:
                     self._pinned_keys.discard(encoded_key)
@@ -566,7 +936,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         self,
         keys: Sequence[CacheEngineKey],
         objs: List[MemoryObj],
-        transfer_spec: Any = None,  # noqa: ARG002
+        transfer_spec: Any = None,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> list[Future] | None:
         """Schedule writes unless the native io_uring worker has failed.
@@ -586,7 +956,47 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             RuntimeError: If no event loop exists.
             ValueError: If keys and objects have different lengths.
         """
+        with self._put_lock:
+            if self._sealed:
+                logger.warning(
+                    "RustRawBlockBackend on %s is shutting down and admits no "
+                    "further stores",
+                    self.device_path,
+                )
+                return None
+            self._active_operations += 1
+        try:
+            return self._submit_put_tasks(
+                keys, objs, transfer_spec, on_complete_callback
+            )
+        finally:
+            with self._put_lock:
+                self._active_operations -= 1
+
+    def _submit_put_tasks(
+        self,
+        keys: Sequence[CacheEngineKey],
+        objs: List[MemoryObj],
+        transfer_spec: Any,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]],
+    ) -> list[Future] | None:
+        if self._storage_pd_mode:
+            return self._batched_submit_pd_request(
+                keys,
+                objs,
+                transfer_spec,
+                on_complete_callback,
+            )
         del transfer_spec
+        if self._role == "reader":
+            if not self._warned_reader_put:
+                self._warned_reader_put = True
+                logger.warning(
+                    "RustRawBlockBackend: reader role on %s stores nothing; "
+                    "puts are dropped",
+                    self.device_path,
+                )
+            return None
         loop = self.loop
         if loop is None:
             raise RuntimeError("RustRawBlockBackend requires an asyncio event loop")
@@ -664,6 +1074,148 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                     self._put_tasks.discard(key)
             raise
 
+    def _batched_submit_pd_request(
+        self,
+        keys: Sequence[CacheEngineKey],
+        objs: List[MemoryObj],
+        transfer_spec: Any,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]],
+    ) -> list[Future] | None:
+        """Submit one storage-P/D batch and return request-level completion."""
+        if self._role == "reader":
+            if not self._warned_reader_put:
+                self._warned_reader_put = True
+                logger.warning(
+                    "RustRawBlockBackend: reader role on %s stores nothing; "
+                    "puts are dropped",
+                    self.device_path,
+                )
+            return None
+        if self._pd_tracker is None:
+            raise RuntimeError("raw-block P/D request tracker is unavailable")
+        if transfer_spec is None:
+            raise ValueError("storage P/D puts require transfer_spec")
+        if len(keys) != len(objs):
+            raise ValueError("storage P/D keys and objects must have equal length")
+
+        req_id = str(getattr(transfer_spec, "req_id", "") or "")
+        expected_chunks = int(getattr(transfer_spec, "total_chunks", 0) or 0)
+        is_last_batch = bool(getattr(transfer_spec, "is_last_prefill", False))
+        if not req_id:
+            raise ValueError("storage P/D requires a non-empty request id")
+        if expected_chunks <= 0:
+            raise ValueError("storage P/D requires total_chunks > 0")
+        specs = [encode_legacy_key(key) for key in keys]
+        encoded_keys = [spec.encoded for spec in specs]
+        if len(set(encoded_keys)) != len(encoded_keys):
+            terminal = self._pd_tracker.register_batch(
+                req_id,
+                list(dict.fromkeys(encoded_keys)),
+                expected_chunks=expected_chunks,
+                is_last_batch=is_last_batch,
+            )
+            self._pd_tracker.fail_request(
+                req_id,
+                RuntimeError("storage P/D batch contains duplicate keys"),
+            )
+            return [terminal]
+
+        pending: list[tuple[CacheEngineKey, RawBlockKeySpec, MemoryObj]] = []
+        completed_keys: list[str] = []
+        dependencies: list[RawBlockKeySpec] = []
+        reserved_keys: set[CacheEngineKey] = set()
+        self._core.protect_publication(req_id, encoded_keys)
+        try:
+            for key, spec, obj in zip(keys, specs, objs, strict=True):
+                with self._put_lock:
+                    already_scheduled = key in self._put_tasks
+                    if not already_scheduled:
+                        self._put_tasks.add(key)
+                        reserved_keys.add(key)
+                if already_scheduled or self._core.exists_inflight(spec.encoded):
+                    if not already_scheduled:
+                        with self._put_lock:
+                            self._put_tasks.discard(key)
+                            reserved_keys.discard(key)
+                    dependencies.append(spec)
+                    continue
+                if self._core.contains_key(spec.encoded, lock=False):
+                    completed_keys.append(spec.encoded)
+                    with self._put_lock:
+                        self._put_tasks.discard(key)
+                        reserved_keys.discard(key)
+                    continue
+                obj.ref_count_up()
+                pending.append((key, spec, obj))
+            terminal = self._pd_tracker.register_batch(
+                req_id,
+                encoded_keys,
+                expected_chunks=expected_chunks,
+                is_last_batch=is_last_batch,
+                completed_keys=completed_keys,
+            )
+        except BaseException as exc:
+            # Admission is request-wide: earlier batches cannot publish once
+            # this batch is abandoned and its replacement protection is gone.
+            self._pd_tracker.fail_request(req_id, exc)
+            self._core.release_publication_protection(req_id)
+            self._release_unscheduled_puts(pending)
+            with self._put_lock:
+                self._put_tasks.difference_update(reserved_keys)
+            raise
+
+        if terminal.done():
+            self._release_unscheduled_puts(pending)
+            return [terminal]
+
+        if on_complete_callback is not None:
+            callback_keys = list(keys)
+
+            def complete_callbacks(done: Future) -> None:
+                try:
+                    done.result()
+                except BaseException:
+                    return
+                for key in callback_keys:
+                    try:
+                        on_complete_callback(key)
+                    except Exception as exc:
+                        logger.warning(
+                            "on_complete_callback failed for key %s: %s",
+                            key,
+                            exc,
+                        )
+
+            terminal.add_done_callback(complete_callbacks)
+
+        if not pending and not dependencies:
+            return [terminal]
+
+        loop = self.loop
+        if loop is None:
+            self._release_unscheduled_puts(pending)
+            self._pd_tracker.fail_request(
+                req_id,
+                RuntimeError("RustRawBlockBackend requires an asyncio event loop"),
+            )
+            return [terminal]
+        dependency_admitted = False
+        if dependencies:
+            with self._put_lock:
+                self._active_operations += 1
+            dependency_admitted = True
+        coro = self._submit_pd_request_work(req_id, pending, dependencies)
+        try:
+            asyncio.run_coroutine_threadsafe(coro, loop)
+        except Exception as exc:
+            coro.close()
+            if dependency_admitted:
+                with self._put_lock:
+                    self._active_operations -= 1
+            self._release_unscheduled_puts(pending)
+            self._pd_tracker.fail_request(req_id, exc)
+        return [terminal]
+
     def _release_unscheduled_puts(
         self,
         pending: Sequence[tuple[CacheEngineKey, RawBlockKeySpec, MemoryObj]],
@@ -674,30 +1226,532 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             with self._put_lock:
                 self._put_tasks.discard(key)
 
-    def _outcome_is_unknown(self) -> bool:
-        """Whether the worker or the core has stopped being able to say.
+    async def _submit_pd_put_many(
+        self,
+        req_id: str,
+        pending: Sequence[tuple[CacheEngineKey, RawBlockKeySpec, MemoryObj]],
+    ) -> None:
+        """Persist a P/D batch and report only whole-batch success."""
+        specs = [item[1] for item in pending]
+        memory_objs = [item[2] for item in pending]
+        io_task, io_finished = self._start_put_many(
+            specs, memory_objs, request_id=req_id
+        )
+        try:
+            put_result = await asyncio.shield(io_task)
+            if len(put_result.results) != len(pending) or not all(put_result.results):
+                failed = [
+                    spec.encoded
+                    for spec, ok in zip(specs, put_result.results, strict=False)
+                    if not ok
+                ]
+                raise RuntimeError(
+                    "storage P/D failed to persist request keys: "
+                    + ", ".join(failed or ["unknown completion mismatch"])
+                )
+            assert self._pd_tracker is not None
+            self._pd_tracker.complete_batch(
+                req_id,
+                [spec.encoded for spec in specs],
+            )
+        except BaseException as exc:
+            assert self._pd_tracker is not None
+            self._pd_tracker.fail_request(req_id, exc)
+        finally:
+            self._settle_put_owners(pending, io_task, io_finished)
+            with self._put_lock:
+                for key, _spec, _obj in pending:
+                    self._put_tasks.discard(key)
 
-        The core is asked first. It keeps the answer once it has adopted it,
-        and asking it costs nothing, whereas reaching the device can reopen
-        one -- or be refused outright for exactly the reason being asked
-        about.
+    async def _submit_pd_request_work(
+        self,
+        req_id: str,
+        pending: Sequence[tuple[CacheEngineKey, RawBlockKeySpec, MemoryObj]],
+        dependencies: Sequence[RawBlockKeySpec],
+    ) -> None:
+        work = []
+        if pending:
+            work.append(self._submit_pd_put_many(req_id, pending))
+        if dependencies:
+            work.append(self._complete_pd_dependencies(req_id, dependencies))
+        await asyncio.gather(*work)
+
+    async def _complete_pd_dependencies(
+        self,
+        req_id: str,
+        dependencies: Sequence[RawBlockKeySpec],
+    ) -> None:
+        """Complete logical shared keys after their physical writer settles."""
+        deadline = time.monotonic() + self._pd_dependency_timeout_s
+        try:
+            while True:
+                with self._put_lock:
+                    pending = {
+                        encode_legacy_key(key).encoded for key in self._put_tasks
+                    }
+                    sealed = self._sealed
+                unsettled = [
+                    spec
+                    for spec in dependencies
+                    if spec.encoded in pending
+                    or self._core.exists_inflight(spec.encoded)
+                ]
+                if not unsettled:
+                    break
+                if sealed:
+                    raise RuntimeError(
+                        "storage P/D backend closed while shared writes were pending"
+                    )
+                if time.monotonic() >= deadline:
+                    raise LMCacheTimeoutError(
+                        "storage P/D timed out waiting for shared physical writes: "
+                        + ", ".join(spec.encoded for spec in unsettled)
+                    )
+                await asyncio.sleep(0.001)
+
+            missing = [
+                spec.encoded
+                for spec in dependencies
+                if not self._core.contains_key(spec.encoded, lock=False)
+            ]
+            if missing:
+                raise RuntimeError(
+                    "storage P/D shared physical writes did not commit: "
+                    + ", ".join(missing)
+                )
+            self._core.record_deduplicated_hits([spec.encoded for spec in dependencies])
+            assert self._pd_tracker is not None
+            self._pd_tracker.complete_batch(
+                req_id,
+                [spec.encoded for spec in dependencies],
+            )
+        except BaseException as exc:
+            assert self._pd_tracker is not None
+            self._pd_tracker.fail_request(req_id, exc)
+        finally:
+            with self._put_lock:
+                self._active_operations -= 1
+
+    async def _submit_put_one(
+        self,
+        key: CacheEngineKey,
+        spec: RawBlockKeySpec,
+        memory_obj: MemoryObj,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]],
+    ) -> None:
+        pending = [(key, spec, memory_obj)]
+        io_task, io_finished = self._start_put_many([spec], [memory_obj])
+        try:
+            put_result = await asyncio.shield(io_task)
+            if len(put_result.results) != 1 or not put_result.results[0]:
+                raise RuntimeError(f"Failed to persist raw-block key {spec.encoded}")
+            if self._publish_after_put:
+                await asyncio.to_thread(self._core.publish_index)
+            if on_complete_callback is not None:
+                try:
+                    on_complete_callback(key)
+                except Exception as e:
+                    logger.warning("on_complete_callback failed for key %s: %s", key, e)
+        finally:
+            self._settle_put_owners(pending, io_task, io_finished)
+            with self._put_lock:
+                for key, _spec, _obj in pending:
+                    self._put_tasks.discard(key)
+
+    async def _submit_put_many(
+        self,
+        pending: Sequence[tuple[CacheEngineKey, RawBlockKeySpec, MemoryObj]],
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]],
+    ) -> None:
+        """Persist multiple legacy raw-block keys in one background batch.
+
+        Args:
+            pending: Ordered ``(key, spec, memory_obj)`` tuples to persist.
+            on_complete_callback: Optional per-key completion callback.
+
+        Raises:
+            RuntimeError: If any key fails to persist.
+            Exception: Propagates raw-device write failures from the core.
         """
-        if _probe_says_unknown(
-            getattr(self._core, "is_poisoned", None),
-            "raw-block core",
-        ):
-            return True
-        return self._native_outcome_is_unknown()
+        keys = [item[0] for item in pending]
+        specs = [item[1] for item in pending]
+        memory_objs = [item[2] for item in pending]
+        # The generic cache path has no peer-visible request name: these keys
+        # were stored because the engine chose to, not because a peer asked
+        # for a request by name. Attribution rows for them say so rather
+        # than borrowing a name from somewhere else.
+        io_task, io_finished = self._start_put_many(specs, memory_objs)
+        try:
+            put_result = await asyncio.shield(io_task)
+            if len(put_result.results) != len(pending):
+                raise RuntimeError(
+                    "Raw-block write completion count does not match batch"
+                )
+            if not all(put_result.results):
+                failed = []
 
-    def _native_outcome_is_unknown(self) -> bool:
-        """Ask the existing device without opening a new one during teardown."""
-        raw = getattr(self._core, "_raw", None)
-        return _probe_says_unknown(getattr(raw, "is_poisoned", None), "native engine")
+                for key, spec, ok in zip(keys, specs, put_result.results, strict=False):
+                    if ok:
+                        if on_complete_callback is not None:
+                            try:
+                                on_complete_callback(key)
+                            except Exception as e:
+                                logger.warning(
+                                    "on_complete_callback failed for key %s: %s", key, e
+                                )
+                    else:
+                        failed.append(spec.encoded)
+
+                if failed:
+                    raise RuntimeError(
+                        "Failed to persist raw-block keys: " + ", ".join(failed)
+                    )
+            if self._publish_after_put:
+                await asyncio.to_thread(self._core.publish_index)
+            if on_complete_callback is not None:
+                for key in keys:
+                    try:
+                        on_complete_callback(key)
+                    except Exception as e:
+                        logger.warning(
+                            "on_complete_callback failed for key %s: %s", key, e
+                        )
+        finally:
+            self._settle_put_owners(pending, io_task, io_finished)
+            with self._put_lock:
+                for key, _spec, _obj in pending:
+                    self._put_tasks.discard(key)
+
+    def _observed_key_derivation(
+        self, key_namespace: str
+    ) -> RawBlockDerivationDescriptor:
+        """Read this process's actual key derivation, not its intent.
+
+        The configured algorithm is what was asked for; the token database's
+        resolved function and chain root are what the keys are actually built
+        from, and the two differ when a named algorithm silently falls back.
+        Recording the request rather than the result would put a descriptor
+        on the device that does not describe it.
+
+        The chain root is a module global that building a token database
+        sets, so it is read by building one -- twice. Measured: with
+        ``PYTHONHASHSEED`` unset, every construction produces a *different*
+        root, because the value is derived through the interpreter's
+        randomized hash of fresh input. A root like that describes nothing:
+        the engine that recorded it will not reproduce it, and two engines
+        in one process refuse each other. That is refused here, with the
+        variable named, rather than written to a device for a reader to
+        discover as a mismatch.
+
+        A derivation that cannot be established is refused for the same
+        reason. Recording "unresolved" would let two engines that both
+        failed to resolve anything match each other and read each other's
+        keys, which is agreement between two fallbacks rather than
+        agreement about how keys are built.
+        """
+        # First Party
+        from lmcache.v1 import token_database as token_database_module
+
+        requested = str(getattr(self.config, "pre_caching_hash_algorithm", "") or "")
+        try:
+            database = token_database_module.ChunkedTokenDatabase(
+                self.config, self.metadata
+            )
+            resolved = getattr(database, "hash_func", None)
+            module = getattr(resolved, "__module__", None)
+            name = getattr(resolved, "__name__", None)
+            if not callable(resolved) or not module or not name:
+                raise ValueError("the token database has no identifiable hash function")
+            implementation = f"{module}.{name}"
+            first_root = str(token_database_module.NONE_HASH)
+            token_database_module.ChunkedTokenDatabase(self.config, self.metadata)
+            second_root = str(token_database_module.NONE_HASH)
+        except Exception as exc:
+            raise ValueError(
+                "raw-block storage P/D cannot describe this process's key "
+                "derivation: the effective hash function could not be "
+                f"resolved ({exc}). Two engines that both failed to resolve "
+                "one would record the same unresolved marker and read each "
+                "other's keys on the strength of it."
+            ) from exc
+        if not requested:
+            raise ValueError(
+                "raw-block storage P/D publishes keys for another engine to "
+                "read, so it must name the algorithm they are derived with; "
+                "set pre_caching_hash_algorithm (sha256_cbor) on every node "
+                "that shares this namespace"
+            )
+        if first_root != second_root:
+            raise ValueError(
+                "raw-block storage P/D cannot describe this process's key "
+                f"derivation: the chain root moved from {first_root} to "
+                f"{second_root} between two token databases built from the "
+                "same configuration, so it is not a property of the "
+                "configuration and no two engines can agree on it. Set "
+                "PYTHONHASHSEED to the same value on every node, or "
+                "configure a deterministic pre-caching hash algorithm."
+            )
+        return RawBlockDerivationDescriptor(
+            hash_algorithm=requested,
+            hash_implementation=implementation,
+            hash_seed=str(os.environ.get("PYTHONHASHSEED", "")),
+            chain_root=first_root,
+            key_namespace=key_namespace,
+        )
+
+    def _build_ack_receiver(
+        self, extra: Mapping[str, Any]
+    ) -> Optional[StoragePDAckServer]:
+        """Answer read acknowledgements, or say what not answering costs.
+
+        A port of zero means the operator has not configured one. That is
+        allowed for a diagnostic run, and it is stated rather than assumed,
+        because the consequence is that no extent this writer publishes is
+        ever reclaimed. Where reuse is required it is an initialization
+        error instead: a writer that cannot be acknowledged cannot recycle,
+        and discovering that from a slow leak is worse than not starting.
+
+        The bind address and the advertised address are separate. A
+        wildcard says where to listen and is not an address a consumer can
+        reply to.
+        """
+        host = str(extra.get("rust_raw_block.ack_listen_host", "0.0.0.0") or "")
+        advertise = str(extra.get("rust_raw_block.ack_advertise_host", "") or "") or (
+            "127.0.0.1" if host in ("0.0.0.0", "::", "*") else host
+        )
+        base_port = int(extra.get("rust_raw_block.ack_listen_port", 0) or 0)
+        reuse_required = bool(extra.get("rust_raw_block.require_extent_reuse", False))
+        if base_port <= 0:
+            if reuse_required:
+                raise ValueError(
+                    "raw-block storage P/D requires extent reuse, so it "
+                    "needs an acknowledgement port: set "
+                    "rust_raw_block.ack_listen_port"
+                )
+            logger.warning(
+                "Raw-block storage P/D has no acknowledgement listener "
+                "(rust_raw_block.ack_listen_port is unset). Published "
+                "extents stay leased for the life of this writer."
+            )
+            return None
+        # One port per rank, so tensor-parallel writers on one host do not
+        # contend for a single listener.
+        port = base_port + self._ack_tp_rank
+        try:
+            server = StoragePDAckServer(
+                self._answer_read_ack,
+                claim_handler=self._answer_read_claim,
+                unread_handler=self._answer_unread_publication,
+                bind_host=host,
+                port=port,
+                advertise_host=advertise,
+            )
+        except Exception:
+            if reuse_required:
+                raise
+            logger.exception(
+                "Raw-block storage P/D could not listen for acknowledgements "
+                "on %s:%d; published extents will stay leased",
+                host,
+                port,
+            )
+            return None
+        logger.info(
+            "Raw-block storage P/D answers read acknowledgements on %s (bound on %s)",
+            server.endpoint,
+            server.bind_endpoint,
+        )
+        return server
+
+    def _answer_read_claim(
+        self, request: StoragePDClaimRequest
+    ) -> StoragePDClaimAnswer:
+        """Say whether this consumer may read the publication it names.
+
+        Asked before any bytes move, so this is what settles which
+        incarnation will be allowed to acknowledge. Everything in the
+        request came off a network; the tracker checks it against what this
+        writer is actually holding and grants nothing it cannot match.
+        """
+        if self._pd_tracker is None:
+            return StoragePDClaimAnswer(False, "this engine holds no publications")
+        read = request.read
+        if self._pd_session_id and request.session_id != self._pd_session_id:
+            return StoragePDClaimAnswer(
+                False, "the claim names another producer/consumer session"
+            )
+        outcome = self._pd_tracker.claim_read(
+            ReadAckIdentity(
+                req_id=read.req_id,
+                consumer_instance_id=read.consumer_instance_id,
+                tp_rank=read.tp_rank,
+                writer_epoch=read.writer_epoch,
+                checkpoint_seq=read.checkpoint_seq,
+                manifest_digest=read.manifest_digest,
+            ),
+            expected_writer_epoch=self._core.writer_epoch,
+            expected_tp_rank=self._ack_tp_rank,
+            session_id=request.session_id,
+        )
+        logger.debug(
+            "Raw-block storage P/D read claim for %s by %s: granted=%s %s",
+            read.req_id,
+            read.consumer_instance_id,
+            outcome.granted,
+            outcome.reason,
+        )
+        return StoragePDClaimAnswer(outcome.granted, outcome.reason, outcome.final)
+
+    def _answer_unread_publication(
+        self, request: StoragePDUnreadRequest
+    ) -> StoragePDUnreadAnswer:
+        """Resolve a publication the caller says was never given a reader.
+
+        Everything in the request came off a network. What makes it safe to
+        honour is checked here rather than trusted: the tracker releases
+        nothing a consumer claimed, so a caller that is wrong about the
+        reader assignment cannot reclaim an extent somebody is reading.
+        """
+        if self._pd_tracker is None:
+            return StoragePDUnreadAnswer(False, "this engine holds no publications")
+        status = request.status
+        if self._pd_session_id and request.session_id != self._pd_session_id:
+            return StoragePDUnreadAnswer(
+                False, "this names another producer/consumer session"
+            )
+        if status.tp_rank != self._ack_tp_rank:
+            return StoragePDUnreadAnswer(
+                False, "this names another tensor-parallel rank"
+            )
+        try:
+            receipt = status.publication_receipt()
+        except ValueError as exc:
+            return StoragePDUnreadAnswer(False, str(exc))
+        outcome = self._pd_tracker.release_unread(
+            status.req_id,
+            receipt,
+            expected_writer_epoch=self._core.writer_epoch,
+            tp_rank=self._ack_tp_rank,
+            session_id=request.session_id,
+            reason=request.reason,
+        )
+        return StoragePDUnreadAnswer(outcome.released, outcome.reason, outcome.final)
+
+    def release_unread_publication(
+        self,
+        req_id: str,
+        receipt: RawBlockPublicationReceipt,
+        *,
+        reason: str = "",
+    ) -> bool:
+        """Resolve one of this engine's own publications that has no reader.
+
+        For the configuration that runs without a consumer at all: nobody
+        was ever told about these publications, so nothing will acknowledge
+        them, and this engine can say so about itself.
+        """
+        if self._pd_tracker is None:
+            return False
+        return self._pd_tracker.release_unread(
+            req_id,
+            receipt,
+            expected_writer_epoch=self._core.writer_epoch,
+            tp_rank=self._ack_tp_rank,
+            session_id=self._pd_session_id,
+            reason=reason,
+        ).released
+
+    def _answer_read_ack(self, request: StoragePDAckRequest) -> tuple[str, str]:
+        """Apply one acknowledgement and say what happened.
+
+        Everything in the request came off a network. The tracker re-checks
+        it against what this writer actually published and releases nothing
+        it cannot match, so this routes and reports. The answer is what the
+        consumer retires its obligation on, which is why it is produced
+        after the release rather than alongside it.
+        """
+        if self._pd_tracker is None:
+            return ACK_REJECTED, "this engine holds no leases"
+        ack = request.ack
+        if self._pd_session_id and request.session_id != self._pd_session_id:
+            return (
+                ACK_REJECTED,
+                "the acknowledgement names another producer/consumer session",
+            )
+        outcome = self._pd_tracker.apply_read_ack(
+            ReadAckIdentity(
+                req_id=ack.req_id,
+                consumer_instance_id=ack.consumer_instance_id,
+                tp_rank=ack.tp_rank,
+                writer_epoch=ack.writer_epoch,
+                checkpoint_seq=ack.checkpoint_seq,
+                manifest_digest=ack.manifest_digest,
+            ),
+            expected_writer_epoch=self._core.writer_epoch,
+            expected_tp_rank=self._ack_tp_rank,
+            session_id=request.session_id,
+        )
+        logger.debug(
+            "Raw-block storage P/D read ack for %s: %s", ack.req_id, outcome.value
+        )
+        if outcome is ReadAckOutcome.UNRESOLVED:
+            return ACK_UNRESOLVED, "this writer could not establish the outcome"
+        return outcome.value, ""
+
+    def ack_endpoint(self) -> str:
+        """Where a consumer should send this writer's acknowledgements."""
+        return self._ack_receiver.endpoint if self._ack_receiver else ""
+
+    def live_lease_count(self) -> int:
+        """Count extents held pending acknowledgement."""
+        return self._pd_tracker.live_lease_count() if self._pd_tracker else 0
+
+    def report_status(self) -> dict[str, Any]:
+        """Return a live control-plane and device-I/O evidence receipt."""
+        core_status = self._core.report_status()
+        with self._put_lock:
+            pending_put_task_count = len(self._put_tasks)
+            active_operation_count = self._active_operations
+            quarantined_owner_batch_count = len(self._pending_put_owners)
+            sealed = self._sealed
+        return {
+            "type": "RustRawBlockBackend",
+            "role": self._role,
+            "run_id": self._run_id,
+            "pd_session_id": self._pd_session_id,
+            "ack_endpoint": self.ack_endpoint(),
+            "live_lease_count": self.live_lease_count(),
+            "pd_tracker": (
+                self._pd_tracker.report_status() if self._pd_tracker else None
+            ),
+            "pending_put_task_count": pending_put_task_count,
+            "active_operation_count": active_operation_count,
+            "quarantined_owner_batch_count": quarantined_owner_batch_count,
+            "sealed": sealed,
+            "core": core_status,
+        }
+
+    def _io_context(self, request_id: str = "") -> RawBlockIoContext:
+        """Who this engine's next batch of I/O is for.
+
+        Built here and handed to the core with the job, because the fields
+        that identify it -- the run, the request as the *peer* names it, this
+        rank and this writer's incarnation -- are known at submission time
+        and nowhere near the thread that reaps the completion.
+        """
+        return RawBlockIoContext(
+            run_id=self._run_id,
+            request_id=request_id,
+            tp_rank=self._ack_tp_rank,
+            incarnation=self._core.writer_epoch or STORAGE_PD_INCARNATION,
+        )
 
     def _start_put_many(
         self,
         specs: Sequence[RawBlockKeySpec],
         memory_objs: Sequence[MemoryObj],
+        *,
+        request_id: str = "",
     ) -> tuple["asyncio.Future[Any]", threading.Event]:
         """Start a batched write on a worker thread and track it honestly.
 
@@ -707,10 +1761,13 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         buffers. The returned event is set by the thread itself and can.
         """
         io_finished = threading.Event()
+        io_context = self._io_context(request_id)
 
         def _run_put() -> RawBlockPutManyResult:
             try:
-                return self._core.put_many(list(specs), list(memory_objs))
+                return self._core.put_many(
+                    list(specs), list(memory_objs), io_context=io_context
+                )
             finally:
                 io_finished.set()
 
@@ -790,126 +1847,11 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
 
         io_task.add_done_callback(_settle)
 
-    def _withhold_unproven_reads(
-        self,
-        unproven: Sequence[RawBlockKeySpec],
-        targets: Sequence[MemoryObj],
-        locked_specs: list[RawBlockKeySpec],
-    ) -> list[RawBlockKeySpec]:
-        """Keep a read nobody can vouch for out of everyone's reach.
-
-        Such a read may still be landing. Its destination buffers cannot go
-        back to the allocator, where the next request would be handed memory
-        the device is writing into; and its source extents cannot be
-        unlocked, because an unlocked entry can be evicted and its slot given
-        to a write while the read is still reading it. Neither is released
-        again for the life of this engine.
-
-        The keys are added to the pinned set, which is what already tells a
-        later prefix lookup not to take a lock reference this backend is
-        holding, so nothing re-locks or re-serves them either.
-
-        Returns the list the caller's ``finally`` may unlock. It is a return
-        value rather than a mutation so that there is no way to unlock what
-        this withheld by forgetting to look.
-        """
-        withheld = {spec.encoded for spec in unproven}
-        self._quarantined_objs.extend(targets)
-        with self._pin_lock:
-            self._pinned_keys |= withheld
-        logger.error(
-            "Raw-block read outcome is unknown for %d key(s); withholding "
-            "%d destination buffer(s) and keeping those keys locked. This "
-            "engine will not serve or reuse them again.",
-            len(withheld),
-            len(targets),
-        )
-        return [spec for spec in locked_specs if spec.encoded not in withheld]
-
-    async def _submit_put_one(
-        self,
-        key: CacheEngineKey,
-        spec: RawBlockKeySpec,
-        memory_obj: MemoryObj,
-        on_complete_callback: Optional[Callable[[CacheEngineKey], None]],
-    ) -> None:
-        pending = [(key, spec, memory_obj)]
-        io_task, io_finished = self._start_put_many([spec], [memory_obj])
-        try:
-            put_result = await asyncio.shield(io_task)
-            if len(put_result.results) != 1 or not put_result.results[0]:
-                raise RuntimeError(f"Failed to persist raw-block key {spec.encoded}")
-            if on_complete_callback is not None:
-                try:
-                    on_complete_callback(key)
-                except Exception as e:
-                    logger.warning("on_complete_callback failed for key %s: %s", key, e)
-        finally:
-            self._settle_put_owners(pending, io_task, io_finished)
-            with self._put_lock:
-                self._put_tasks.discard(key)
-
-    async def _submit_put_many(
-        self,
-        pending: Sequence[tuple[CacheEngineKey, RawBlockKeySpec, MemoryObj]],
-        on_complete_callback: Optional[Callable[[CacheEngineKey], None]],
-    ) -> None:
-        """Persist multiple legacy raw-block keys in one background batch.
-
-        Args:
-            pending: Ordered ``(key, spec, memory_obj)`` tuples to persist.
-            on_complete_callback: Optional per-key completion callback.
-
-        Raises:
-            RuntimeError: If any key fails to persist.
-            Exception: Propagates raw-device write failures from the core.
-        """
-        keys = [item[0] for item in pending]
-        specs = [item[1] for item in pending]
-        memory_objs = [item[2] for item in pending]
-        io_task, io_finished = self._start_put_many(specs, memory_objs)
-        try:
-            put_result = await asyncio.shield(io_task)
-            if len(put_result.results) != len(pending):
-                raise RuntimeError(
-                    "Raw-block write completion count does not match batch"
-                )
-            if not all(put_result.results):
-                failed = []
-
-                for key, spec, ok in zip(keys, specs, put_result.results, strict=False):
-                    if ok:
-                        if on_complete_callback is not None:
-                            try:
-                                on_complete_callback(key)
-                            except Exception as e:
-                                logger.warning(
-                                    "on_complete_callback failed for key %s: %s", key, e
-                                )
-                    else:
-                        failed.append(spec.encoded)
-
-                if failed:
-                    raise RuntimeError(
-                        "Failed to persist raw-block keys: " + ", ".join(failed)
-                    )
-            if on_complete_callback is not None:
-                for key in keys:
-                    try:
-                        on_complete_callback(key)
-                    except Exception as e:
-                        logger.warning(
-                            "on_complete_callback failed for key %s: %s", key, e
-                        )
-        finally:
-            self._settle_put_owners(pending, io_task, io_finished)
-            for key, _spec, _memory_obj in pending:
-                with self._put_lock:
-                    self._put_tasks.discard(key)
-
     def _batched_get_prefix(
         self,
         keys: Sequence[CacheEngineKey],
+        *,
+        io_context: Optional[RawBlockIoContext] = None,
     ) -> list[MemoryObj]:
         # Include preparation and cleanup, not just the native read: the
         # allocator is already in use while a destination is being built.
@@ -918,7 +1860,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                 return []
             self._active_operations += 1
         try:
-            return self._load_prefix(keys)
+            return self._load_prefix(keys, io_context=io_context)
         finally:
             with self._put_lock:
                 self._active_operations -= 1
@@ -926,6 +1868,8 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
     def _load_prefix(
         self,
         keys: Sequence[CacheEngineKey],
+        *,
+        io_context: Optional[RawBlockIoContext] = None,
     ) -> list[MemoryObj]:
         if not keys:
             return []
@@ -974,6 +1918,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             load_results = self._core.load_many_into(
                 [spec.encoded for spec in load_specs],
                 allocated,
+                io_context=io_context,
             )
             loaded_count = 0
             for ok in load_results:
@@ -1010,6 +1955,42 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         finally:
             self._core.unlock_many([spec.encoded for spec in locked_specs])
 
+    def _withhold_unproven_reads(
+        self,
+        unproven: Sequence[RawBlockKeySpec],
+        targets: Sequence[MemoryObj],
+        locked_specs: list[RawBlockKeySpec],
+    ) -> list[RawBlockKeySpec]:
+        """Keep a read nobody can vouch for out of everyone's reach.
+
+        Such a read may still be landing. Its destination buffers cannot go
+        back to the allocator, where the next request would be handed memory
+        the device is writing into; and its source extents cannot be
+        unlocked, because an unlocked entry can be evicted and its slot given
+        to a write while the read is still reading it. Neither is released
+        again for the life of this engine.
+
+        The keys are added to the pinned set, which is what already tells a
+        later prefix lookup not to take a lock reference this backend is
+        holding, so nothing re-locks or re-serves them either.
+
+        Returns the list the caller's ``finally`` may unlock. It is a return
+        value rather than a mutation so that there is no way to unlock what
+        this withheld by forgetting to look.
+        """
+        withheld = {spec.encoded for spec in unproven}
+        self._quarantined_objs.extend(targets)
+        with self._pin_lock:
+            self._pinned_keys |= withheld
+        logger.error(
+            "Raw-block read outcome is unknown for %d key(s); withholding "
+            "%d destination buffer(s) and keeping those keys locked. This "
+            "engine will not serve or reuse them again.",
+            len(withheld),
+            len(targets),
+        )
+        return [spec for spec in locked_specs if spec.encoded not in withheld]
+
     def get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         loaded = self._batched_get_prefix([key])
         return loaded[0] if loaded else None
@@ -1033,6 +2014,46 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         if not keys:
             return []
         loaded = self._batched_get_prefix(keys)
+        return [*loaded, *([None] * (len(keys) - len(loaded)))]
+
+    def batched_get_for_publication(
+        self,
+        keys: List[CacheEngineKey],
+        context: RawBlockReadContext,
+    ) -> List[Optional[MemoryObj]]:
+        """Load a prefix with the identity captured for this restore.
+
+        Args:
+            keys: Ordered legacy cache keys to load.
+            context: Request identity and receipt already adopted by the caller.
+
+        Returns:
+            Loaded objects for the hit prefix and None for its missing suffix.
+
+        Raises:
+            ValueError: If the context has no request or writer identity.
+            RuntimeError: If this backend is not a reader of that namespace.
+        """
+        if not context.request_id or not context.receipt.writer_epoch:
+            raise ValueError("publication reads require request and writer identities")
+        if (
+            self._role != "reader"
+            or context.receipt.namespace_identity != self._core.namespace_identity
+        ):
+            raise RuntimeError("publication read does not name this reader's namespace")
+        io_context = RawBlockIoContext(
+            run_id=self._run_id,
+            request_id=context.request_id,
+            tp_rank=self._ack_tp_rank,
+            incarnation=context.receipt.writer_epoch,
+            consumer_request_id=context.consumer_request_id,
+            restore_attempt_id=context.restore_attempt_id,
+            checkpoint_seq=context.receipt.checkpoint_seq,
+            manifest_digest=context.receipt.manifest_digest,
+            namespace_identity=context.receipt.namespace_identity,
+            adopted_checkpoint_seq=context.adopted_checkpoint_seq,
+        )
+        loaded = self._batched_get_prefix(keys, io_context=io_context)
         return [*loaded, *([None] * (len(keys) - len(loaded)))]
 
     async def batched_async_contains(
@@ -1150,8 +2171,12 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         )
 
     def close(self) -> None:
+        # Seal admission before waiting for anything. A wait that runs while
+        # new work is still being taken on is a wait with no end, and the
+        # only reason to wait is to reach a state nothing can leave again.
         with self._put_lock:
             if self._closed_once:
+                logger.warning("Raw-block backend close was already run")
                 return
             self._closed_once = True
             self._sealed = True
@@ -1160,33 +2185,137 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         while True:
             with self._put_lock:
                 pending = len(self._put_tasks) + self._active_operations
-                retained_batches = len(self._pending_put_owners)
-            if pending + retained_batches == 0 or time.monotonic() >= deadline:
+            if pending == 0 or time.monotonic() >= deadline:
                 break
             time.sleep(0.01)
-        if pending or retained_batches:
-            # A deadline is not a fence for a caller still preparing I/O.
+
+        report_status = getattr(self._core, "report_status", None)
+        if pending == 0 and callable(report_status):
+            try:
+                status = report_status()
+                evidence = {
+                    key: status.get(key)
+                    for key in (
+                        "bytes_deduplicated",
+                        "payload_writes",
+                        "payload_reads",
+                        "io_by_kind_and_path",
+                        "io_by_request",
+                    )
+                }
+                logger.info("Raw-block I/O evidence before close: %s", evidence)
+            except Exception:
+                logger.exception("Raw-block I/O evidence could not be collected")
+
+        # The control handler reaches the core -- releasing a hold unlocks
+        # keys through it -- so it stops first. A timed join that returns is
+        # not proof a handler stopped touching the core, and the server says
+        # which happened; an unconfirmed stop means the core is destroyed
+        # under something that may still be using it, so nothing after this
+        # can be released on evidence.
+        control_quiesced = True
+        if self._ack_receiver is not None:
+            control_quiesced = self._ack_receiver.close()
+
+        # Publication runs on the tracker's own thread and reaches the core,
+        # so it stops here -- while the native worker is still alive, and
+        # before the core is closed underneath it. A publication queued
+        # before this point and started after would otherwise open a fresh
+        # device and write an index into it. The core refuses a publication
+        # once it is shutting down, which is the backstop; stopping the
+        # thread is what makes the refusal unnecessary.
+        publication_quiesced = True
+        if self._pd_tracker is not None:
+            try:
+                publication_quiesced = self._pd_tracker.close()
+            except Exception as e:
+                publication_quiesced = False
+                logger.error("Raw-block P/D tracker close raised: %s", e)
+
+        # Everything below either releases a resource the device may still be
+        # using or asks a question that could reopen the device, so the state
+        # is sampled once, first. A deadline is not a fence: leaving that loop
+        # with work still counted says the wait gave up, not that the device
+        # did.
+        with self._put_lock:
+            retained_batches = len(self._pending_put_owners)
+        unknown = (
+            pending > 0
+            or retained_batches > 0
+            or bool(self._quarantined_objs)
+            or not control_quiesced
+            or not publication_quiesced
+            or self._outcome_is_unknown()
+        )
+
+        if (
+            pending > 0
+            or retained_batches > 0
+            or not control_quiesced
+            or not publication_quiesced
+        ):
+            # Something that reaches the core could not be confirmed
+            # stopped. Closing the core now destroys it underneath a live
+            # handler, and retaining the memory afterwards does not undo a
+            # handler that already touched a device freed beneath it. So
+            # this teardown does not complete: the whole graph is kept, the
+            # core included, and nothing is released.
             self._retain_whole_graph(retained_batches)
             return
 
-        unknown = bool(self._quarantined_objs) or self._outcome_is_unknown()
+        # The local close comes next, because its result is what says
+        # whether the memory behind this device is free. Asking afterwards is
+        # asking a device that no longer exists.
         try:
             outcome = self._core.close()
-        except Exception:
-            logger.exception("Raw-block core close could not prove quiescence")
+        except Exception as e:
             unknown = True
-        else:
-            if outcome is None or not outcome.may_release_backing_resources:
-                unknown = True
+            outcome = None
+            logger.error("Raw-block core close raised: %s", e)
+        if outcome is None or not outcome.may_release_backing_resources:
+            unknown = True
+
+        if self._pd_tracker is not None:
+            # Two different decisions, and only the first is ours to make
+            # here: local quiescence says the memory behind this device is
+            # free, and says nothing about a reader elsewhere still holding
+            # a lease. So the tracker's own close above kept every hold, and
+            # releasing them needs the operator's assertion that the whole
+            # group has stopped -- which is a statement about other machines
+            # that nothing in this process can observe.
+            if self._pd_group_quiesced_teardown and not unknown:
+                released = self._pd_tracker.release_quiesced_leases()
+                logger.warning(
+                    "Raw-block storage P/D released %d lease(s) on an "
+                    "operator-declared quiesced teardown; this is correct "
+                    "only if every engine that could read this namespace "
+                    "has stopped.",
+                    released,
+                )
+
         if unknown:
             self._retain_whole_graph(retained_batches)
-        elif self._gpu_allocator is not None:
-            # Native close fenced all registered transfers before exported
-            # handles or the staging arena can be released.
-            self._gpu_allocator.close()
+            return
+        if self._gpu_allocator is None:
+            return
+        close_gpu_allocator = getattr(self._gpu_allocator, "close", None)
+        if callable(close_gpu_allocator):
+            close_gpu_allocator()
 
     def _retain_whole_graph(self, retained_batches: int) -> None:
-        """Keep owners alive and prevent an explicit allocator close as well."""
+        """Keep everything this teardown could not account for, and say so.
+
+        Closing the allocator calls os.close() on every exported dma-buf and
+        lets the arena behind it be reused. A command may still be landing in
+        it, so the allocator, its exports and the withheld buffers are kept
+        for the life of the process -- and kept referenced here, so no
+        finalizer reaches close() either.
+
+        One owner for the whole graph, the core included: the native engine
+        is retaining owners of its own, and dropping the core runs the
+        destructor that frees them. Two retentions that cannot see each other
+        are one retention.
+        """
         if self.local_cpu_backend is not None:
             self.local_cpu_backend.retain_backing_resources()
         _RETAINED_AFTER_UNKNOWN_OUTCOME.append(
@@ -1196,11 +2325,14 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                 self._gpu_allocator,
                 self._quarantined_objs,
                 self._pending_put_owners,
+                self._pd_tracker,
             )
         )
         logger.error(
-            "Raw-block backend retaining backing memory, %d buffer owner(s) "
-            "and %d abandoned batch(es): native quiescence was not proven",
+            "Raw-block backend retaining its native device, its GPU "
+            "allocator, %d exported buffer owner(s) and %d abandoned "
+            "batch(es) at shutdown: what the device is doing with them "
+            "could not be established.",
             len(self._quarantined_objs),
             retained_batches,
         )
