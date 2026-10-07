@@ -2933,3 +2933,84 @@ def test_batched_write_rejects_misaligned_total_len():
                 dev.batched_write([0], [buf], [1])  # total_len 1 is not aligned
         finally:
             dev.close()
+
+
+@pytest.mark.skipif(
+    not _has_ext(), reason="lmcache_rust_raw_block_io extension not installed"
+)
+def test_pointer_only_buffers_require_dmabuf_registration():
+    """A device pointer must never fall through to host-memory dereference."""
+    # Third Party
+    from lmcache_rust_raw_block_io import RawBlockDevice
+
+    class PointerOnlyBuffer:
+        nbytes = 4096
+
+        @staticmethod
+        def data_ptr() -> int:
+            return 0x1000
+
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+
+        dev = RawBlockDevice(
+            dev_path,
+            writable=True,
+            use_odirect=False,
+            alignment=4096,
+            io_engine="io_uring",
+        )
+        try:
+            pointer = PointerOnlyBuffer()
+            with pytest.raises(ValueError, match="dma-buf registration"):
+                dev.batched_write([0], [pointer], [4096])
+            with pytest.raises(ValueError, match="dma-buf registration"):
+                dev.batched_read([0], [pointer], [4096])
+        finally:
+            dev.close()
+
+
+@pytest.mark.skipif(
+    not _has_ext(), reason="lmcache_rust_raw_block_io extension not installed"
+)
+def test_dmabuf_registration_rejects_ranges_outside_exported_extent():
+    """Registration validates every pointer range before touching io_uring."""
+    # Third Party
+    from lmcache_rust_raw_block_io import RawBlockDevice
+
+    with tempfile.TemporaryDirectory() as td:
+        dev_path = os.path.join(td, "dev.bin")
+        dmabuf_path = os.path.join(td, "dmabuf.bin")
+        with open(dev_path, "wb") as f:
+            f.truncate(8 * 1024 * 1024)
+        with open(dmabuf_path, "wb") as f:
+            f.truncate(4096)
+
+        dmabuf_fd = os.open(dmabuf_path, os.O_RDWR)
+        dev = RawBlockDevice(
+            dev_path,
+            writable=True,
+            use_odirect=False,
+            alignment=4096,
+            io_engine="io_uring",
+        )
+        try:
+            with pytest.raises(ValueError, match="exceeds.*extent"):
+                dev.register_fixed_dmabufs(
+                    [0x1000],
+                    [8192],
+                    [dmabuf_fd],
+                    [0x1000],
+                )
+            with pytest.raises(ValueError, match="inconsistent bases"):
+                dev.register_fixed_dmabufs(
+                    [0x1000, 0x2000],
+                    [4096, 4096],
+                    [dmabuf_fd, dmabuf_fd],
+                    [0x1000, 0x2000],
+                )
+        finally:
+            dev.close()
+            os.close(dmabuf_fd)

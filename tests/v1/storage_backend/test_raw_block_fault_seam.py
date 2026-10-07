@@ -996,6 +996,52 @@ SCRIPTED_SYNCHRONOUS_UNANSWERED = SCRIPTED_PREAMBLE + textwrap.dedent(
 )
 
 
+SCRIPTED_DMABUF_SHORT_TERMINAL = SCRIPTED_PREAMBLE + textwrap.dedent(
+    """
+    import ctypes
+
+    dev = device()
+    payload = bytearray(b"x" * 8192)
+    address = ctypes.addressof((ctypes.c_char * len(payload)).from_buffer(payload))
+    # A nonzero offset inside the registration, which is the case a
+    # remainder would get wrong: the SQE address of a registered dma-buf
+    # transfer is an offset into the registration, not a process address.
+    base = address - 4096
+    dev.register_fixed_dmabufs([address], [len(payload)], [7], [base])
+    registrations = dev.fake_registrations()
+
+    batch = dev.batched_write([0], [payload], [8192], [None])
+    assert wait_until(lambda: len(dev.fake_owned()) == 1)
+    submitted = dev.fake_owned_sqes()
+
+    # Half the bytes, and known to be half: a positive short completion.
+    dev.fake_complete(submitted[0]["user_data"], 4096)
+
+    # Look at the ring before waiting on the batch. A remainder nobody is
+    # going to answer for makes that wait never return, and a test that
+    # times out has reported nothing at all.
+    remainder = wait_until(
+        lambda: bool(dev.fake_resident()) or bool(dev.fake_owned()), seconds=2
+    )
+    report = {
+        "registrations": registrations,
+        "submitted": submitted,
+        "remainder_appeared": remainder,
+        "resident_after": dev.fake_resident_sqes(),
+        "owned_after": dev.fake_owned_sqes(),
+    }
+    if not remainder:
+        results, errors = dev.wait_iouring(batch)
+        report["results"] = list(results)
+        report["errors"] = [str(e) for _, e in errors]
+    report["poisoned"] = dev.is_poisoned()
+    report["quarantined_owners"] = dev.quarantined_owner_count()
+    report["violations"] = dev.fake_violations()
+    print(json.dumps(report))
+    """
+)
+
+
 def test_a_fatal_submit_answers_work_the_kernel_already_took(tmp_path) -> None:
     """A fatal submit is not news about one batch.
 
@@ -1055,6 +1101,51 @@ def test_a_synchronous_write_nobody_answered_for_is_woken_and_kept(tmp_path) -> 
     assert report["quarantined_owners"] >= 1, report
     assert report["close"] == "RuntimeError", report
     assert report["retained"] >= 1, report
+
+
+def test_a_short_registered_dmabuf_transfer_ends_there(tmp_path) -> None:
+    """A registered dma-buf transfer has no remainder to retry.
+
+    The SQE address of one is a byte offset inside the registration rather
+    than a process address, so advancing it by the bytes transferred aims
+    the next submission at an offset nobody registered. There is also no
+    bounce buffer to fall back to: the whole point of the registration is
+    that the device reaches that memory directly.
+
+    So a known short completion ends the operation. The registration here
+    is explicitly synthetic -- no descriptor reached a kernel -- which makes
+    this evidence about the engine's own decision and about nothing else.
+    """
+    device = tmp_path / "dev.bin"
+    with open(device, "wb") as handle:
+        handle.truncate(16 * 1024 * 1024)
+    report = _run_scenario(SCRIPTED_DMABUF_SHORT_TERMINAL, device)
+
+    assert report["violations"] == []
+    # The registration really went through the shared path: a sparse table
+    # and one dma-buf slot.
+    kinds = [record["kind"] for record in report["registrations"]]
+    assert kinds == [1, 2], report
+
+    # The submission carried the registration, at a nonzero offset inside
+    # it, with the registered index rather than a process address.
+    assert len(report["submitted"]) == 1, report
+    sqe = report["submitted"][0]
+    assert sqe["fixed_index"] == 0, report
+    assert sqe["dmabuf_offset"] == 4096, report
+    assert sqe["addr"] == 4096, report
+    assert sqe["len"] == 8192, report
+
+    # It ended there: no remainder was submitted and none is waiting to be.
+    assert report["remainder_appeared"] is False, report
+    assert report["resident_after"] == [], report
+    assert report["owned_after"] == [], report
+    assert report["results"] == [False], report
+    assert report["errors"], report
+    # A known short completion is a known outcome. The device answered for
+    # this request, so nothing is withheld on its account.
+    assert report["poisoned"] is False, report
+    assert report["quarantined_owners"] == 0, report
 
 
 SCRIPTED_SHORT_REMAINDER_RETRIED = SCRIPTED_PREAMBLE + textwrap.dedent(
@@ -1370,12 +1461,18 @@ SCRIPTED_REJECTED_WRITE = SCRIPTED_PREAMBLE + textwrap.dedent(
     class Payload(bytearray):
         pass
 
+    class PointerPayload:
+        nbytes = 4096
+
+        def data_ptr(self):
+            return 0x100000
+
     dev = RawBlockDevice(
         sys.argv[2], writable=True, use_iouring=True,
         use_odirect=CASE in ("offset", "length"), alignment=4096,
         iouring_queue_depth=8, fake_ring_capacity=8,
     )
-    payload = Payload(b"x" * 4096)
+    payload = PointerPayload() if CASE == "pointer" else Payload(b"x" * 4096)
     alive = weakref.ref(payload)
     offset = 1 if CASE == "offset" else 0
     payload_len = 4097 if CASE == "capacity" else 4096
@@ -1415,6 +1512,7 @@ SCRIPTED_REJECTED_WRITE = SCRIPTED_PREAMBLE + textwrap.dedent(
         ("short_total", "total_len must be >= payload_len"),
         ("offset", "O_DIRECT requires aligned offset"),
         ("length", "O_DIRECT requires aligned total_len"),
+        ("pointer", "pointer-only buffer is not fully covered"),
         ("placement", "placement"),
         ("allocation", "posix_memalign failed"),
     ],
