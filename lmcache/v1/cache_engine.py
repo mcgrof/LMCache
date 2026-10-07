@@ -565,8 +565,16 @@ class LMCacheEngine:
         if not memory_objs:
             return
 
-        with store_stats.profile_from_gpu():
-            self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
+        try:
+            with store_stats.profile_from_gpu():
+                self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
+        except BaseException:
+            # Connector synchronization failures retain independent references
+            # before raising. Release the engine's allocation references on
+            # every failure, including reuse of a pooled object after __del__.
+            for memory_obj in memory_objs:
+                memory_obj.ref_count_down()
+            raise
 
         with store_stats.profile_put():
             transfer_spec = kwargs.get("transfer_spec", None)
@@ -878,90 +886,95 @@ class LMCacheEngine:
                         **kwargs,
                     )
 
-        if self.save_only_first_rank:
-            with retrieve_stats.profile_broadcast():
-                with torch_dev.stream(self.broadcast_stream):
-                    self._broadcast_or_receive_memory_objs(
-                        reordered_chunks,
-                        ret_mask,
-                    )
-
-                # if self.gpu_connector has load_stream, self.broadcast_stream is equals
-                # to self.gpu_connector.load_stream, the broadcast and to_gpu operation
-                # will execute sequentially within the stream.
-                # if self.gpu_connector does not have load_stream, self.broadcast_stream
-                # is created by torch_dev.Stream(), we need to synchronize broadcast
-                # operation, and then process to_cpu operation.
-                if not hasattr(self.gpu_connector, "load_stream"):
-                    self.broadcast_stream.synchronize()
-
-        # NOTE(Jiayi): memory_obj doesn't have to be a pinned
-        # cpu tensor for the sake of performance.
-        # For example, disk->gpu is faster than disk->cpu->gpu.
-        # RDMA is another example.
-        if len(reordered_chunks) > 0:
-            with retrieve_stats.profile_to_gpu():
-                _, memory_objs, starts, ends = zip(*reordered_chunks, strict=False)
-                # When save_only_first_rank is enabled, the leader rank's
-                # memory_objs from L1 are CPU-resident. The broadcast above
-                # already created GPU-resident copies on the leader to use as
-                # the NCCL send buffer. Substitute those here so this kernel
-                # reads from HBM rather than re-reading the same L1 bytes
-                # over PCIe via zero-copy mapped pinned memory. Without this
-                # swap, batched_to_gpu on the leader takes ~9 ms (PCIe-bound)
-                # while passive ranks take ~0.5 ms (HBM-bound) — a structural
-                # asymmetry on the critical path of every retrieve.
-                if self.save_only_first_rank and self.metadata.is_first_rank():
-                    if len(self._leader_gpu_substitute_objs) == len(memory_objs):
-                        memory_objs_for_togpu = self._leader_gpu_substitute_objs
-                    else:
-                        # Substitute list should always match memory_objs after
-                        # _broadcast_or_receive_memory_objs has run on the
-                        # leader.  A mismatch indicates a bug or stale state;
-                        # fall back to the CPU L1 source so retrieval is still
-                        # correct, but warn so the issue is visible.
-                        logger.warning(
-                            "Leader rank: GPU substitute count (%d) does not "
-                            "match memory_objs count (%d); falling back to "
-                            "CPU L1 source for batched_to_gpu (PCIe-bound, "
-                            "~9 ms slower).",
-                            len(self._leader_gpu_substitute_objs),
-                            len(memory_objs),
+        retrieve_completed = False
+        try:
+            if self.save_only_first_rank:
+                with retrieve_stats.profile_broadcast():
+                    with torch_dev.stream(self.broadcast_stream):
+                        self._broadcast_or_receive_memory_objs(
+                            reordered_chunks,
+                            ret_mask,
                         )
-                        memory_objs_for_togpu = list(memory_objs)
-                else:
-                    memory_objs_for_togpu = list(memory_objs)
-                try:
-                    self.gpu_connector.batched_to_gpu(
-                        memory_objs_for_togpu, list(starts), list(ends), **kwargs
-                    )
-                finally:
-                    # Release GPU substitute references so the temporary
-                    # buffers can be freed; original memory_objs in
-                    # reordered_chunks are still tracked for the cleanup
-                    # loop below. Done in `finally` so a raise from
-                    # batched_to_gpu (e.g. CUDA OOM) does not leave the
-                    # references dangling on this long-lived engine.
-                    if self.save_only_first_rank and self.metadata.is_first_rank():
-                        self._leader_gpu_substitute_objs = []
 
-        # TODO(Jiayi): Remove the following for loop with batched operations
-        # TODO(Jiayi): Need to refactor the `remove_after_retrieve` logic.
-        for key, memory_obj, _, _ in reordered_chunks:
-            if self.remove_after_retrieve and not self._is_passive():
-                assert self.storage_manager is not None
-                self.storage_manager.remove(key, self.retrieve_locations)
-                # Sync PDBackend.remove() does NOT call ref_count_down() internally
-                # (unlike async PD and other backends), so we must call it manually.
-                # See pd_backend.py line 605 TODO comment.
-                if self._is_sync_pd_backend():
+                    # A shared load stream orders broadcast before scatter.
+                    # Other connectors need the broadcast to finish explicitly.
+                    if not hasattr(self.gpu_connector, "load_stream"):
+                        self.broadcast_stream.synchronize()
+
+            # NOTE(Jiayi): memory_obj doesn't have to be a pinned
+            # cpu tensor for the sake of performance.
+            # For example, disk->gpu is faster than disk->cpu->gpu.
+            # RDMA is another example.
+            if len(reordered_chunks) > 0:
+                with retrieve_stats.profile_to_gpu():
+                    _, memory_objs, starts, ends = zip(*reordered_chunks, strict=False)
+                    # When save_only_first_rank is enabled, the leader rank's
+                    # memory_objs from L1 are CPU-resident. The broadcast above
+                    # already created GPU-resident copies on the leader to use as
+                    # the NCCL send buffer. Substitute those here so this kernel
+                    # reads from HBM rather than re-reading the same L1 bytes
+                    # over PCIe via zero-copy mapped pinned memory. Without this
+                    # swap, batched_to_gpu on the leader takes ~9 ms (PCIe-bound)
+                    # while passive ranks take ~0.5 ms (HBM-bound) — a structural
+                    # asymmetry on the critical path of every retrieve.
+                    if self.save_only_first_rank and self.metadata.is_first_rank():
+                        if len(self._leader_gpu_substitute_objs) == len(memory_objs):
+                            memory_objs_for_togpu = self._leader_gpu_substitute_objs
+                        else:
+                            # Substitute list should always match memory_objs after
+                            # _broadcast_or_receive_memory_objs has run on the
+                            # leader.  A mismatch indicates a bug or stale state;
+                            # fall back to the CPU L1 source so retrieval is still
+                            # correct, but warn so the issue is visible.
+                            logger.warning(
+                                "Leader rank: GPU substitute count (%d) does not "
+                                "match memory_objs count (%d); falling back to "
+                                "CPU L1 source for batched_to_gpu (PCIe-bound, "
+                                "~9 ms slower).",
+                                len(self._leader_gpu_substitute_objs),
+                                len(memory_objs),
+                            )
+                            memory_objs_for_togpu = list(memory_objs)
+                    else:
+                        memory_objs_for_togpu = list(memory_objs)
+                    try:
+                        self.gpu_connector.batched_to_gpu(
+                            memory_objs_for_togpu, list(starts), list(ends), **kwargs
+                        )
+                    finally:
+                        # Release GPU substitute references so the temporary
+                        # buffers can be freed; original memory_objs in
+                        # reordered_chunks are still tracked for the cleanup
+                        # loop below. Done in `finally` so a raise from
+                        # batched_to_gpu (e.g. CUDA OOM) does not leave the
+                        # references dangling on this long-lived engine.
+                        if self.save_only_first_rank and self.metadata.is_first_rank():
+                            self._leader_gpu_substitute_objs = []
+            retrieve_completed = True
+        finally:
+            # TODO(Jiayi): Remove the following for loop with batched operations
+            # TODO(Jiayi): Need to refactor the `remove_after_retrieve` logic.
+            for key, memory_obj, _, _ in reordered_chunks:
+                if (
+                    retrieve_completed
+                    and self.remove_after_retrieve
+                    and not self._is_passive()
+                ):
+                    assert self.storage_manager is not None
+                    self.storage_manager.remove(key, self.retrieve_locations)
+                    # Sync PDBackend.remove() does NOT call ref_count_down() internally
+                    # (unlike async PD and other backends), so we must call it manually.
+                    # See pd_backend.py line 605 TODO comment.
+                    if self._is_sync_pd_backend():
+                        memory_obj.ref_count_down()
+                else:
+                    # Blocking gets acquire references, not ownership of lookup pins.
+                    # The lookup owner releases those pins through lookup_unpin().
+                    if (
+                        self.async_loading or self._is_passive()
+                    ) and memory_obj.is_pinned:
+                        memory_obj.unpin()
                     memory_obj.ref_count_down()
-            else:
-                # Blocking gets acquire references, not ownership of lookup pins.
-                # The lookup owner releases those pins through lookup_unpin().
-                if (self.async_loading or self._is_passive()) and memory_obj.is_pinned:
-                    memory_obj.unpin()
-                memory_obj.ref_count_down()
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(
