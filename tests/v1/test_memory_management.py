@@ -10,6 +10,7 @@ import torch
 # First Party
 from lmcache import torch_dev, torch_device_type
 from lmcache.observability import LMCStatsMonitor
+from lmcache.v1 import memory_management
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_allocators.gpu_memory_allocator import GPUMemoryAllocator
 from lmcache.v1.memory_allocators.host_memory_allocator import HostMemoryAllocator
@@ -31,6 +32,29 @@ from lmcache.v1.memory_management import (
 from lmcache.v1.pin_monitor import PinMonitor
 
 HUGEPAGE_SIZE = 2 * 1024 * 1024  # MAP_HUGE_2MB
+
+
+def test_gpu_allocator_close_releases_exported_dmabufs_once(monkeypatch) -> None:
+    allocator = GPUMemoryAllocator(4096, device="cpu")
+    allocator._dmabuf_regions = [(7, allocator.tensor.data_ptr(), 4096)]
+    released = []
+    inner_close_count = 0
+
+    def release(tensor) -> None:
+        released.append(tensor.data_ptr())
+
+    def close_inner() -> None:
+        nonlocal inner_close_count
+        inner_close_count += 1
+
+    monkeypatch.setattr(memory_management, "release_device_dmabufs", release)
+    monkeypatch.setattr(allocator.allocator, "close", close_inner)
+
+    allocator.close()
+    allocator.close()
+
+    assert released == [allocator.tensor.data_ptr()]
+    assert inner_close_count == 1
 
 
 def check_allocator(allocator, max_size):

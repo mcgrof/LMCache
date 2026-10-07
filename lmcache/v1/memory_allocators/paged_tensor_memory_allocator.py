@@ -93,6 +93,7 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
                 raw_data=buf,
                 metadata=metadata,
                 parent_allocator=self,
+                physical_data=buf,
             )
             self.free_blocks.append(mem_obj)
 
@@ -130,8 +131,13 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
 
         Returns:
             A page-backed tensor memory object, or ``None`` if no page is free.
+
+        Raises:
+            ValueError: The logical layout exceeds one pool page.
         """
         shapes, dtypes = self._adapt_shapes_and_dtypes(shapes, dtypes)
+        if get_size_bytes(shapes, dtypes) > self.align_bytes:
+            raise ValueError("logical layout exceeds the paged allocation size")
 
         try:
             free_block = self.free_blocks.popleft()
@@ -143,22 +149,7 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
             )
             return None
 
-        # TODO (Jiayi): This is a bit redundant.
-        free_block.meta.shape = shapes[0]
-        free_block.meta.dtype = dtypes[0]
-        free_block.meta.shapes = shapes
-        free_block.meta.dtypes = dtypes
-        free_block.meta.fmt = fmt
-        free_block.meta.ref_count = 1
-        # Reset any narrowed-size override left over from the previous
-        # owner of this block, so get_size() returns the layout-derived
-        # size for the fresh allocation.
-        free_block._used_size_override = None
-        free_block.reset_l1_manager()
-
-        if shapes != self.shapes:
-            size_in_bytes = get_size_bytes(shapes, dtypes)
-            free_block.raw_data = free_block.raw_data[:size_in_bytes]
+        free_block.rebind_layout(shapes, dtypes, fmt)
 
         # TODO (Jiayi): need a flag to drop these debug ops
         # NOTE (Jiayi): the following code is not thread-safe but
@@ -181,10 +172,24 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         allocator_type: Optional[str] = None,
     ) -> Optional[List[TensorMemoryObj]]:
-        """
-        Batched allocate tensor memory objs with pre-defined equal sizes.
+        """Allocate equal logical layouts in distinct physical pool pages.
+
+        Args:
+            shapes: Logical tensor shape or shapes for every allocation.
+            dtypes: Logical dtype or matching group dtypes.
+            batch_size: Number of objects to allocate.
+            fmt: Memory format for every allocated object.
+            allocator_type: Optional allocator type string.
+
+        Returns:
+            The allocated objects, or ``None`` if too few pages are free.
+
+        Raises:
+            ValueError: The logical layout exceeds one pool page.
         """
         shapes, dtypes = self._adapt_shapes_and_dtypes(shapes, dtypes)
+        if get_size_bytes(shapes, dtypes) > self.align_bytes:
+            raise ValueError("logical layout exceeds the paged allocation size")
 
         allocated_blocks: list[TensorMemoryObj] = []
         for i in range(batch_size):
@@ -199,21 +204,7 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
                 self.batched_free(allocated_blocks, update_stats=False)
                 return None
 
-            # FIXME: think about whether parent_allocator
-            # should be updated here.
-            free_block.meta.shape = shapes[0]
-            free_block.meta.dtype = dtypes[0]
-            free_block.meta.shapes = shapes
-            free_block.meta.dtypes = dtypes
-            free_block.meta.fmt = fmt
-            free_block.meta.ref_count = 1
-            # Reset narrowed-size override (see notes in ``allocate``).
-            free_block._used_size_override = None
-            free_block.reset_l1_manager()
-
-            if shapes != self.shapes:
-                size_in_bytes = get_size_bytes(shapes, dtypes)
-                free_block.raw_data = free_block.raw_data[:size_in_bytes]
+            free_block.rebind_layout(shapes, dtypes, fmt)
 
             allocated_blocks.append(free_block)
 
