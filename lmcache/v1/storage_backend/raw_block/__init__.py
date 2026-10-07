@@ -9,7 +9,12 @@ from lmcache.v1.storage_backend.raw_block.core import (
     RawBlockCloseOutcome,
     RawBlockCore,
     RawBlockCoreConfig,
+    RawBlockDerivationDescriptor,
+    RawBlockIoAttribution,
+    RawBlockIoContext,
+    RawBlockPublicationReceipt,
     RawBlockPutManyResult,
+    RawBlockReadContext,
     normalize_raw_block_io_engine,
     normalize_raw_block_placement_ids,
     round_up,
@@ -25,6 +30,13 @@ from lmcache.v1.storage_backend.raw_block.key_codec import (
     object_key_to_string,
     slot_identity_from_encoded_key,
 )
+from lmcache.v1.storage_backend.raw_block.pd import (
+    RawBlockPDRequestTracker,
+    ReadAckIdentity,
+    ReadAckOutcome,
+    ReadClaimOutcome,
+    UnreadReleaseOutcome,
+)
 
 __all__ = [
     "IncompatibleKeyDerivation",
@@ -37,6 +49,16 @@ __all__ = [
     "RawBlockKeyNamespace",
     "RawBlockKeySpec",
     "RawBlockPutManyResult",
+    "RawBlockDerivationDescriptor",
+    "RawBlockPublicationReceipt",
+    "RawBlockReadContext",
+    "RawBlockIoAttribution",
+    "RawBlockIoContext",
+    "RawBlockPDRequestTracker",
+    "ReadAckIdentity",
+    "ReadAckOutcome",
+    "ReadClaimOutcome",
+    "UnreadReleaseOutcome",
     "decode_legacy_key",
     "normalize_raw_block_placement_ids",
     "decode_object_key",

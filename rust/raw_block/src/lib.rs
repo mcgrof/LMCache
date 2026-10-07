@@ -2033,6 +2033,7 @@ struct NativeIoEvent {
     /// "submitted", "completed", "short" or "failed".
     outcome: &'static str,
     bytes: i64,
+    offset: u64,
 }
 
 /// How many operation records the native journal keeps before dropping the
@@ -2084,6 +2085,7 @@ impl NativeIoJournal {
             path: NativeIoPath::of(sub).name(),
             outcome: "submitted",
             bytes: sub.len as i64,
+            offset: sub.offset,
         });
     }
 
@@ -2112,6 +2114,7 @@ impl NativeIoJournal {
             path: NativeIoPath::of(sub).name(),
             outcome,
             bytes,
+            offset: sub.offset,
         });
     }
 
@@ -4442,6 +4445,7 @@ impl RawBlockDevice {
                 row.insert("path".to_string(), event.path.to_string());
                 row.insert("outcome".to_string(), event.outcome.to_string());
                 row.insert("bytes".to_string(), event.bytes.to_string());
+                row.insert("offset".to_string(), event.offset.to_string());
                 row
             })
             .collect();
@@ -5381,6 +5385,28 @@ impl RawBlockDevice {
         view.release();
         res?;
         Ok(())
+    }
+
+    /// Flush completed writes and device caches to persistent storage.
+    ///
+    /// Callers must await completion of every write this barrier must make
+    /// durable. Unrelated I/O may run concurrently; this does not substitute
+    /// for waiting on those operations. The kernel performs the file or block
+    /// device fsync without the GIL. Storage must honor flush commands for
+    /// the resulting durability guarantee to hold.
+    ///
+    /// Raises RuntimeError for closed or poisoned devices, and OSError
+    /// if the kernel cannot complete the flush.
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        self.ensure_io_available(false)?;
+        py.allow_threads(|| loop {
+            if unsafe { libc::fsync(self.fd) } == 0 {
+                return Ok(());
+            }
+            if errno() != libc::EINTR {
+                return Err(os_err("fsync failed"));
+            }
+        })
     }
 
     /// Close the device after draining accepted I/O, without holding the GIL.

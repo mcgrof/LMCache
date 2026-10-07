@@ -115,6 +115,38 @@ fn placement_id_to_u16_rejects_reserved_and_out_of_range_values() {
 }
 
 #[test]
+fn flush_propagates_kernel_errors() {
+    pyo3::prepare_freethreaded_python();
+    Python::with_gil(|py| {
+        let device = RawBlockDevice::new_internal(
+            "/dev/null".to_string(),
+            true,
+            false,
+            4096,
+            false,
+            false,
+            Some("posix".to_string()),
+            1,
+            0,
+        )
+        .unwrap();
+        let device = Bound::new(py, device).unwrap();
+        let error = device.call_method0("flush").unwrap_err();
+        assert!(error.is_instance_of::<pyo3::exceptions::PyOSError>(py));
+        assert_eq!(
+            error
+                .value(py)
+                .getattr("errno")
+                .unwrap()
+                .extract::<i32>()
+                .unwrap(),
+            libc::EINVAL
+        );
+        device.call_method0("close").unwrap();
+    });
+}
+
+#[test]
 fn close_releases_gil_while_draining() {
     assert_shutdown_releases_gil(ShutdownMethod::Close, ShutdownWait::Drain);
 }
