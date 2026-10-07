@@ -183,8 +183,8 @@ already admitted) and stale (an incarnation it had already moved past).
    Registering a recorded server replaces a live one's registration, and
    the coordinator would address the live server at the recorded address.
 
-Options
-~~~~~~~
+Event replay options
+~~~~~~~~~~~~~~~~~~~~
 
 .. list-table::
    :header-rows: 1
