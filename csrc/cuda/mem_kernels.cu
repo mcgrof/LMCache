@@ -211,11 +211,11 @@ __global__ void single_layer_kv_transfer_kernel(
 }
 
 template <EngineKVFormat format>
-__device__ __forceinline__ int64_t
-page_buffer_offset(const int k_or_v, const int token_idx,
-                   const int scalar_offset, const int scalars_per_token,
-                   const int page_buffer_size, const int block_size,
-                   const int head_size, const int64_t block_stride_xwords) {
+__device__ __forceinline__ int64_t page_buffer_offset(
+    const int k_or_v, const int token_idx, const int scalar_offset,
+    const int scalars_per_token, const int page_buffer_size,
+    const int block_size, const int head_size,
+    const int64_t block_stride_xwords, const int kv_planes = 1) {
   /*
   logical semantics of arguments (agnostic to physical format):
   k_or_v:            0 for key, 1 for value
@@ -230,6 +230,11 @@ page_buffer_offset(const int k_or_v, const int token_idx,
   block_stride_xwords: physical per-block step (xword units) — only used by
   blocks-first cross-layer formats, whose block step spans every layer's
   bytes (and, in HMA-shared pools, other groups' bytes too)
+  kv_planes:         planes in the *offload* buffer: 1 when it holds the
+  engine's content as-is (MLA, or a fused buffer), 2 for KV_2LTD. With a
+  fused engine layout and 2 planes, scalars_per_token counts one plane
+  (NH*HS) while the engine packs NH*2*HS per token, so those formats walk
+  the engine at its own width and split each head's content into K and V.
 
   The job of page_buffer_offset is to translate these logical arguments into a
   physical address based on the EngineKVFormat.
@@ -297,6 +302,22 @@ page_buffer_offset(const int k_or_v, const int token_idx,
     const int hs2 = 2 * head_size;  // packed K+V width per head (xword units)
     const int block_idx = token_idx / block_size;
     const int block_offset = token_idx % block_size;
+    if (kv_planes == 2) {
+      // Split offload buffer: one pass per plane, engine walked at its full
+      // fused width, K in the first half of each head's content, V in the
+      // second.
+      const int split_heads = scalars_per_token / head_size;
+      const int split_head_idx = scalar_offset / head_size;
+      const int split_head_offset = scalar_offset % head_size;
+      const int64_t split_step =
+          block_stride_xwords > 0
+              ? block_stride_xwords
+              : static_cast<int64_t>(split_heads) * block_size * hs2;
+      return block_idx * split_step +
+             static_cast<int64_t>(split_head_idx) * block_size * hs2 +
+             static_cast<int64_t>(block_offset) * hs2 + k_or_v * head_size +
+             split_head_offset;
+    }
     const int head_idx = scalar_offset / hs2;
     const int head_offset = scalar_offset % hs2;
     const int num_heads = scalars_per_token / hs2;
@@ -311,6 +332,23 @@ page_buffer_offset(const int k_or_v, const int token_idx,
                        format == EngineKVFormat::NL_X_NB_BS_NH_CS) {
     const int block_idx = token_idx / block_size;
     const int block_offset = token_idx % block_size;
+    if (kv_planes == 2) {
+      // Split offload buffer: see the HND case above.
+      const int hs2 = 2 * head_size;
+      const int split_heads = scalars_per_token / head_size;
+      const int split_head_idx = scalar_offset / head_size;
+      const int split_head_offset = scalar_offset % head_size;
+      const int64_t engine_scalars_per_token =
+          static_cast<int64_t>(split_heads) * hs2;
+      const int64_t split_step =
+          block_stride_xwords > 0
+              ? block_stride_xwords
+              : static_cast<int64_t>(block_size) * engine_scalars_per_token;
+      return block_idx * split_step +
+             static_cast<int64_t>(block_offset) * engine_scalars_per_token +
+             static_cast<int64_t>(split_head_idx) * hs2 + k_or_v * head_size +
+             split_head_offset;
+    }
     // vLLM blocks-first pools pass the real per-block step; 0 means tight.
     const int64_t block_step =
         block_stride_xwords > 0
@@ -432,6 +470,7 @@ __global__ void load_and_reshape_multi_layer_fused_kernel(
     const int scalars_per_token, const int num_tokens, const int num_layers,
     const int page_buffer_size, const int block_size, const int head_size,
     const int64_t block_stride_xwords) {
+  const int kv_planes = k_or_v_size;
   const int token_id = blockIdx.x;
   const int layer_id = blockIdx.y;
   const int chunk_id = blockIdx.z / k_or_v_size;
@@ -455,7 +494,7 @@ __global__ void load_and_reshape_multi_layer_fused_kernel(
                          num_tokens, num_layers);
     const int64_t vllm_offset = page_buffer_offset<format>(
         k_or_v, slot_idx, i, scalars_per_token, page_buffer_size, block_size,
-        head_size, block_stride_xwords);
+        head_size, block_stride_xwords, kv_planes);
     if (DIRECTION)
       chunk.key_value[lmcache_offset] = paged_buffer_ptr[vllm_offset];
     else
@@ -483,7 +522,8 @@ __global__ void load_and_reshape_multi_layer_kernel(
     const int64_t* __restrict__ slot_mapping,   // [num_tokens]
     const int scalars_per_token, const int num_tokens, const int num_layers,
     const int page_buffer_size, const int block_size, const int head_size,
-    const int skip_prefix_n_tokens, const int64_t block_stride_xwords) {
+    const int skip_prefix_n_tokens, const int64_t block_stride_xwords,
+    const int kv_planes) {
   const int token_id = blockIdx.x;
   const int layer_id = blockIdx.y;
   const int k_or_v = blockIdx.z;
@@ -506,7 +546,7 @@ __global__ void load_and_reshape_multi_layer_kernel(
 
     const int64_t vllm_offset = page_buffer_offset<format>(
         k_or_v, slot_idx, i, scalars_per_token, page_buffer_size, block_size,
-        head_size, block_stride_xwords);
+        head_size, block_stride_xwords, kv_planes);
 
     if (DIRECTION)  // 1 is paged buffer to LMCache
       key_value[lmcache_offset] = paged_buffer_ptr[vllm_offset];
@@ -613,12 +653,13 @@ T* get_kernel_ptr(TENSOR_TYPE& tensor) {
  *  - direction: H2D  means LMCache to PagedBuffer, D2H  means PagedBuffer to
  * LMCache
  */
-#define LAUNCH_KERNEL_WITH_FORMAT(T, DIRECTION, FORMAT)                  \
-  lmc::load_and_reshape_multi_layer_kernel<T, DIRECTION, FORMAT>         \
-      <<<grid, block, 0, stream>>>(                                      \
-          key_value_ptr, page_buffer_ptrs, slot_mapping_ptr, num_xwords, \
-          num_tokens, num_layers, page_buffer_size, block_size,          \
-          head_size_xword, skip_prefix_n_tokens, block_stride_xwords);   \
+#define LAUNCH_KERNEL_WITH_FORMAT(T, DIRECTION, FORMAT)                      \
+  lmc::load_and_reshape_multi_layer_kernel<T, DIRECTION, FORMAT>             \
+      <<<grid, block, 0, stream>>>(key_value_ptr, page_buffer_ptrs,          \
+                                   slot_mapping_ptr, num_xwords, num_tokens, \
+                                   num_layers, page_buffer_size, block_size, \
+                                   head_size_xword, skip_prefix_n_tokens,    \
+                                   block_stride_xwords, k_or_v_size);        \
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
 template <typename T>
@@ -666,10 +707,14 @@ void multi_layer_kv_transfer_templated(
     return;
   }
 
-  // Fused packs K+V in the trailing dim (kv_size == 1, like MLA): single pass.
-  int k_or_v_size =
-      (::is_mla(engine_kv_format) || ::is_fused_packed(engine_kv_format)) ? 1
-                                                                          : 2;
+  // MLA is a single plane. For a fused engine layout the offload buffer
+  // decides: a single-plane buffer takes the packed content as-is, while a
+  // KV_2LTD buffer keeps K and V apart and needs one pass per plane.
+  int k_or_v_size = ::is_mla(engine_kv_format)
+                        ? 1
+                        : (::is_fused_packed(engine_kv_format)
+                               ? static_cast<int>(key_value.size(0))
+                               : 2);
 
   dim3 grid(num_transfer_tokens, num_layers, k_or_v_size);
   dim3 block(std::min(num_xwords, 128));
