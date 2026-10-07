@@ -454,6 +454,7 @@ def test_partial_dmabuf_registration_cleanup_controls_reuse(
                 lambda: dev.register_fixed_buffers([4096], [4096]),
                 lambda: dev.register_fixed_dmabufs([4096], [4096], [7], [0]),
                 lambda: dev.batched_write([0], [bytearray(4096)], [4096]),
+                dev.flush,
             ):
                 try:
                     call()
@@ -487,7 +488,7 @@ def test_partial_dmabuf_registration_cleanup_controls_reuse(
     if cleanup_fails:
         assert "unregister also failed" in report["error"]
         assert [record["kind"] for record in report["table"]] == [1, 2]
-        assert report["refused"] == [True] * 3
+        assert report["refused"] == [True] * 4
         assert report["close_retained"] == [True, True]
         assert report["table_after_close"] == report["table"]
     else:
@@ -530,6 +531,35 @@ def test_registered_table_cannot_be_replaced_or_registered_after_close(
     assert len(report["errors"]) == 3
     assert all("already registered" in error for error in report["errors"][:2])
     assert "closed" in report["errors"][2]
+
+
+def test_flush_allows_unrelated_io_and_requires_an_open_device(tmp_path: Path) -> None:
+    """A completed request may be flushed while another request is active."""
+    scenario = SCRIPTED_PREAMBLE + textwrap.dedent(
+        """
+        dev = device()
+        batch = dev.batched_write([0], [bytearray(4096)], [4096])
+        assert wait_until(lambda: bool(dev.fake_owned()))
+        errors = []
+        dev.flush()
+        assert dev.fake_owned()
+        dev.fake_complete(dev.fake_owned()[0], 4096)
+        result = dev.wait_iouring(batch)
+        dev.flush()
+        dev.close()
+        try:
+            dev.flush()
+        except RuntimeError as exc:
+            errors.append(str(exc))
+        print(json.dumps({"errors": errors, "result": result}))
+        """
+    )
+    target = tmp_path / "device.bin"
+    target.write_bytes(bytes(8192))
+    report = _run_scenario(scenario, target)
+    assert report["result"] == [[True], []]
+    assert len(report["errors"]) == 1
+    assert "closed" in report["errors"][0]
 
 
 @pytest.mark.parametrize("direction", ["read", "write"])

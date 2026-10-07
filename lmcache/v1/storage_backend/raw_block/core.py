@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 # Standard
-from collections.abc import Sequence
+from collections import OrderedDict
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Optional
 import ctypes
 import enum
+import hashlib
 import json
 import os
 import re
@@ -17,6 +19,7 @@ import stat
 import struct
 import threading
 import time
+import uuid
 import zlib
 
 # Third Party
@@ -36,6 +39,7 @@ from lmcache.v1.storage_backend.raw_block.key_codec import (
     decode_legacy_key,
     slot_identity_from_encoded_key,
 )
+from lmcache.v1.storage_backend.storage_pd_trace import trace_storage_pd_event
 
 logger = init_logger(__name__)
 
@@ -58,9 +62,7 @@ _MAX_FDP_PLACEMENT_ID = 0xFFFF
 # default NVMe write behavior; a positive identifier emits an FDP directive.
 PlacementId = int | None
 
-# Slot-header validation issues many small pread calls during POSIX restart
-# recovery. Use a conservative reader count to expose device parallelism without
-# relying on high thread counts; io_uring recovery should use batched reads.
+# Bound POSIX header readers independently from checkpoint size.
 DEFAULT_RECOVERY_READ_THREADS = 8
 
 
@@ -172,114 +174,714 @@ def _resolve_sysfs_queue_dir(device_path: str) -> Optional[str]:
     return None
 
 
-def _read_sysfs_int(path: str) -> Optional[int]:
-    """Read an integer value from sysfs and return None on failure."""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return int(f.read().strip())
-    except Exception:
-        return None
+# A block namespace that exposes no hardware identity gets one built from
+# its device numbers. Those are assigned by the local kernel, so they say
+# nothing about which device another node would reach by the same numbers.
+_LOCAL_BLOCK_IDENTITY_PREFIX = "block-local:"
 
 
-def _device_payload_tensor(memory_obj: MemoryObj) -> Optional[torch.Tensor]:
-    """Return the flat device tensor behind a memory object, or None on CPU.
-
-    A memory object whose storage lives on a GPU has no buffer-protocol view,
-    so ``byte_array`` cannot describe it.  The Rust engine accepts any object
-    exposing ``data_ptr()`` and ``nbytes`` in place of a buffer, and a paged
-    GPU allocator registers its slots with io_uring as dma-bufs, so a device
-    object hands the engine the physical uint8 tensor the allocator carved
-    it from and the read or write moves VRAM to NVMe with no host copy.
-    """
-    raw = memory_obj.physical_tensor
-    if not isinstance(raw, torch.Tensor) or raw.device.type == "cpu":
-        return None
-    if not raw.is_contiguous():
-        raise RuntimeError(
-            "RawBlockCore: device memory object is not contiguous; the engine "
-            "needs one flat region to hand to io_uring"
-        )
-    return raw.view(-1).view(torch.uint8)
+# Bumped when the bytes of a key, or the way one is derived, change in a way
+# that makes an older namespace unreadable. It is part of the descriptor
+# rather than implied by the metadata version because two writers can agree
+# on every geometry field and still derive different keys.
+KEY_CODEC_VERSION = 1
 
 
-class UnsupportedDevicePayload(Exception):
-    """A device object this lane cannot describe a transfer for.
+@dataclass(frozen=True)
+class RawBlockDerivationDescriptor:
+    """How the keys in a namespace were derived.
 
-    Raised while planning, before any slot is reserved, so a caller turns it
-    into a failed result for that key rather than abandoning storage it has
-    already allocated.
+    Two writers can agree on every geometry field in a checkpoint and still
+    produce different keys: a different hash function, a different seed, a
+    different chain root or a different key encoding all change the bytes
+    while leaving the layout identical. A reader that adopts such a namespace
+    does not fail loudly -- it misses every key, which looks like a cold
+    cache.
+
+    So this travels with the namespace and is compared before adoption. It is
+    deliberately not part of the geometry checks: those treat a mismatch as
+    "ignore this metadata and start empty", and starting empty is exactly the
+    wrong response to a namespace someone else is writing with a different
+    derivation.
     """
 
+    hash_algorithm: str
+    hash_implementation: str
+    hash_seed: str
+    chain_root: str
+    key_codec_version: int = KEY_CODEC_VERSION
+    key_namespace: str = ""
 
-def _logical_payload_len(memory_obj: MemoryObj) -> int:
-    """Return the logical payload length of a memory object in bytes.
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "hash_algorithm": self.hash_algorithm,
+            "hash_implementation": self.hash_implementation,
+            "hash_seed": self.hash_seed,
+            "chain_root": self.chain_root,
+            "key_codec_version": int(self.key_codec_version),
+            "key_namespace": self.key_namespace,
+        }
 
-    Device objects have no ``byte_array`` (it would need a host copy), so
-    their logical size comes from the metadata instead.
-    """
-    if _device_payload_tensor(memory_obj) is not None:
-        # Paged objects refresh their logical layout when reused; the public
-        # size accessor includes that layout and any explicit used-byte limit.
-        # Grouped device representations remain outside this lane's contract.
-        meta = memory_obj.metadata
-        shapes = getattr(meta, "shapes", None)
-        if shapes is not None and len(shapes) > 1:
-            raise UnsupportedDevicePayload(
-                f"a device object with {len(shapes)} representation groups "
-                "is not supported by the raw-block lane; its logical length "
-                "is the sum over the groups, not the scalar shape"
+    @classmethod
+    def from_payload(cls, payload: Any) -> Optional["RawBlockDerivationDescriptor"]:
+        if not isinstance(payload, dict):
+            return None
+        try:
+            return cls(
+                hash_algorithm=str(payload["hash_algorithm"]),
+                hash_implementation=str(payload["hash_implementation"]),
+                hash_seed=str(payload["hash_seed"]),
+                chain_root=str(payload["chain_root"]),
+                key_codec_version=int(payload["key_codec_version"]),
+                key_namespace=str(payload.get("key_namespace", "")),
             )
-        return int(memory_obj.get_size())
-    return len(memory_obj.byte_array)
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def uses_the_interpreter_hash(self) -> bool:
+        """Whether keys are hashed by the interpreter's own ``hash``.
+
+        That is the only case in which the process hash seed can reach a key,
+        and then only through a string: measured on this interpreter,
+        ``hash((0, (1, 2, 3), ()))`` is identical under seeds 0, 12345 and
+        99, while the same tuple carrying a string differs under each.
+        """
+        return "builtin" in self.hash_implementation.lower()
+
+    def compared_fields(self, other: "RawBlockDerivationDescriptor") -> tuple[str, ...]:
+        """Which fields have to agree for two engines to read one namespace.
+
+        The seed is recorded always and compared only where it can matter.
+        Comparing it unconditionally refuses a namespace two nodes derive
+        identically, which is an availability failure invented by the check
+        rather than found by it: a cryptographic hash does not consult the
+        seed, and neither does the interpreter's for a key of integers.
+        """
+        fields = [
+            "hash_algorithm",
+            "hash_implementation",
+            "chain_root",
+            "key_codec_version",
+            "key_namespace",
+        ]
+        if self.uses_the_interpreter_hash() or other.uses_the_interpreter_hash():
+            fields.append("hash_seed")
+        return tuple(fields)
+
+    def describe_mismatch(self, other: "RawBlockDerivationDescriptor") -> list[str]:
+        """Name every field on which two derivations disagree."""
+        return [
+            f"{field}: ours={getattr(self, field)!r} theirs={getattr(other, field)!r}"
+            for field in self.compared_fields(other)
+            if getattr(self, field) != getattr(other, field)
+        ]
 
 
-@dataclass(frozen=True)
-class RawBlockCoreConfig:
-    """Configuration for RawBlockCore device layout, I/O, and checkpoints."""
+# What a byte moving through this engine was for. A header commits a slot
+# and a checkpoint commits an index; neither is cache payload, and adding
+# them together produces a number that answers no question -- "did the
+# direct path carry the KV" least of all.
+IO_KIND_PAYLOAD = "payload"
+IO_KIND_SLOT_HEADER = "slot_header"
+IO_KIND_CHECKPOINT = "checkpoint"
 
-    device_path: str
-    capacity_bytes: int
-    block_align: int
-    header_bytes: int
-    slot_bytes: int
-    use_odirect: bool
-    enable_zero_copy: bool
-    meta_total_bytes: int
-    meta_magic: bytes
-    meta_version: int
-    meta_checkpoint_interval_sec: int
-    meta_idle_quiet_ms: int
-    meta_enable_periodic: bool
-    meta_verify_on_load: bool
-    max_data_transfer_size: int = 0
-    load_checkpoint_on_init: bool = True
-    io_engine: str = "posix"
-    iouring_queue_depth: int = DEFAULT_IOURING_QUEUE_DEPTH
-    use_uring_cmd: bool = False
-    meta_checkpoint_placement_id: PlacementId = None
-    fdp_slot_affinity_enabled: bool = False
+# Which route actually carried it. Recorded where the route is chosen
+# rather than where it was asked for, because what an operator needs to
+# know is which path ran, not which one the configuration implies.
+IO_PATH_SYNC = "sync"
+IO_PATH_IOURING_BATCHED = "iouring_batched"
+IO_PATH_IOURING_BOUNDED = "iouring_bounded"
+IO_PATH_IOURING_PER_WRITE = "iouring_per_write"
 
 
 @dataclass
-class _Entry:
-    offset: int
-    size: int
-    meta: DiskCacheMetadata
+class RawBlockIoTally:
+    """One direction, one kind and one path, counted at two granularities.
 
+    A logical request is what a caller asked this engine to move. A
+    physical operation is one transfer handed to the device, and a route
+    that splits a request issues several for one of them -- so the two are
+    named apart rather than compared as though they were the same unit. The
+    bytes belong to the logical side, because a split does not move more of
+    them.
 
-@dataclass
-class _Inflight:
-    offset: int
-    meta: DiskCacheMetadata
-    canceled: bool = False
+    ``submitted`` is what this engine handed over; it is deliberately not
+    called "accepted", because whether the kernel took an entry is the
+    kernel's answer and not this count. ``completed`` is what the device
+    reported finishing successfully. The difference between those two is
+    the whole question: a submission with no completion is an operation
+    whose outcome nobody established.
+    """
+
+    logical_requests: int = 0
+    logical_bytes: int = 0
+    padded_bytes: int = 0
+    submitted_operations: int = 0
+    submitted_padded_bytes: int = 0
+    completed_operations: int = 0
+    completed_padded_bytes: int = 0
+
+    def as_payload(self) -> dict[str, int]:
+        return {
+            "logical_requests": self.logical_requests,
+            "logical_bytes": self.logical_bytes,
+            "padded_bytes": self.padded_bytes,
+            "submitted_operations": self.submitted_operations,
+            "submitted_padded_bytes": self.submitted_padded_bytes,
+            "completed_operations": self.completed_operations,
+            "completed_padded_bytes": self.completed_padded_bytes,
+        }
 
 
 @dataclass(frozen=True)
-class RawBlockPutManyResult:
-    """Result of a RawBlockCore batched write."""
+class RawBlockIoContext:
+    """Immutable identity for the work one batch of I/O belongs to.
 
-    results: list[bool]
-    stored_keys: list[str]
+    Carried with the job rather than looked up when a completion is reaped.
+    A "current request" global, thread-local or otherwise, is read on
+    whichever thread happens to be reaping -- the executor thread that
+    submitted is already gone by then, and the I/O worker never had the
+    context at all -- so an attribution built that way names whoever was
+    most recently active instead of whoever the bytes are for.
+
+    ``request_id`` is the name the *peer* knows this request by, because
+    that is what a receipt, a READY status and an acknowledgement all carry;
+    an engine-local name correlates with nothing on the other side.
+    """
+
+    run_id: str = ""
+    request_id: str = ""
+    tp_rank: int = -1
+    incarnation: str = ""
+    work_kind: str = IO_KIND_PAYLOAD
+    consumer_request_id: str = ""
+    restore_attempt_id: str = ""
+    checkpoint_seq: int = -1
+    manifest_digest: str = ""
+    namespace_identity: str = ""
+    adopted_checkpoint_seq: int = -1
+
+    def tag(self) -> str:
+        """One opaque string, stable for the life of this request."""
+        if not self.request_id:
+            return ""
+        rank = "?" if self.tp_rank < 0 else str(self.tp_rank)
+        tag = f"{self.run_id}/{self.request_id}/r{rank}/{self.incarnation}"
+        if self.restore_attempt_id:
+            tag += f"/a{self.restore_attempt_id}"
+        return tag
+
+    def as_payload(self) -> dict[str, Any]:
+        """Structured identity behind the opaque native request tag."""
+        return {
+            "run_id": self.run_id,
+            "request_id": self.request_id,
+            "tp_rank": self.tp_rank,
+            "writer_epoch": self.incarnation,
+            "work_kind": self.work_kind,
+            "consumer_request_id": self.consumer_request_id,
+            "restore_attempt_id": self.restore_attempt_id,
+            "advertised_checkpoint_seq": self.checkpoint_seq,
+            "manifest_digest": self.manifest_digest,
+            "namespace_identity": self.namespace_identity,
+            "adopted_checkpoint_seq": self.adopted_checkpoint_seq,
+        }
+
+
+class RawBlockIoAttribution:
+    """What each request's operations did, by the path they actually took.
+
+    Separate from the ledger because it answers a different question. The
+    ledger says how much a route moved; this says which request moved it,
+    over which buffer path the device really used, and whether every
+    operation was answered for.
+
+    The "path" here is the native engine's own choice -- registered dma-buf,
+    classic host-fixed, bounce or ordinary -- not the Python helper route
+    that led there. A configured dma-buf pool whose buffers miss the
+    registration map issues ordinary SQEs, and the configuration cannot tell
+    you that.
+
+    Bound both remembered requests and events. Engine metadata shares one
+    long-lived tag, so a request bound alone cannot limit its journal. The
+    default event bound matches the native journal capacity. Eviction is
+    counted, so a reader can see that a sum is incomplete.
+    """
+
+    _OUTCOMES = ("submitted", "completed", "short", "failed")
+
+    def __init__(self, max_requests: int = 4096, max_events: int = 16384) -> None:
+        if max_requests <= 0 or max_events <= 0:
+            raise ValueError(
+                "an attribution record needs positive request and event bounds"
+            )
+        self._lock = threading.RLock()
+        self._max_requests = max_requests
+        self._max_events = max_events
+        self._rows: OrderedDict[tuple[str, str, str], dict[str, int]] = OrderedDict()
+        self._tags: OrderedDict[str, None] = OrderedDict()
+        self._contexts: dict[str, dict[str, Any]] = {}
+        self._registered_contexts: dict[str, dict[str, Any]] = {}
+        self._events: dict[str, list[dict[str, Any]]] = {}
+        self._seen_events: set[tuple[Any, ...]] = set()
+        self.dropped_rows = 0
+        self.evicted_requests = 0
+        self.untagged_operations = 0
+        self.malformed_rows = 0
+        self.duplicate_rows = 0
+        self.context_conflicts = 0
+        self.collection_failures = 0
+
+    def record_collection_failure(self) -> None:
+        """Remember that a native journal drain could not be accounted for."""
+        with self._lock:
+            self.collection_failures += 1
+
+    def register_context(self, context: RawBlockIoContext) -> str:
+        """Remember the structured identity carried by one native tag."""
+        tag = context.tag()
+        if not tag:
+            return ""
+        with self._lock:
+            payload = context.as_payload()
+            registered = self._registered_contexts.get(tag)
+            if registered is None:
+                self._registered_contexts[tag] = payload
+                self._contexts[tag] = dict(payload)
+            elif registered != payload:
+                self.context_conflicts += 1
+            self._touch_locked(tag)
+            self._evict_locked()
+        return tag
+
+    def context_for_tag(self, tag: str) -> dict[str, Any] | None:
+        """Return a copy of the immutable identity behind one native tag."""
+        with self._lock:
+            context = self._contexts.get(tag)
+            return dict(context) if context is not None else None
+
+    def link_publication(
+        self,
+        request_id: str,
+        receipt: "RawBlockPublicationReceipt",
+    ) -> None:
+        """Attach the receipt minted after a writer's payload I/O completed."""
+        with self._lock:
+            for context in self._contexts.values():
+                if (
+                    context["request_id"] == request_id
+                    and context["writer_epoch"] == receipt.writer_epoch
+                ):
+                    context["advertised_checkpoint_seq"] = receipt.checkpoint_seq
+                    context["manifest_digest"] = receipt.manifest_digest
+                    context["namespace_identity"] = receipt.namespace_identity
+
+    def _touch_locked(self, tag: str) -> None:
+        self._tags.pop(tag, None)
+        self._tags[tag] = None
+
+    def _evict_locked(self) -> None:
+        while (
+            len(self._tags) > self._max_requests
+            or len(self._seen_events) > self._max_events
+        ):
+            evicted, _ = self._tags.popitem(last=False)
+            for key in [key for key in self._rows if key[0] == evicted]:
+                del self._rows[key]
+            self._contexts.pop(evicted, None)
+            self._registered_contexts.pop(evicted, None)
+            self._events.pop(evicted, None)
+            self._seen_events = {
+                event for event in self._seen_events if event[0] != evicted
+            }
+            self.evicted_requests += 1
+
+    def record(
+        self,
+        rows: Sequence[Mapping[str, str]],
+        dropped: int = 0,
+    ) -> None:
+        """Take a drained native journal, one row per operation event."""
+        with self._lock:
+            self.dropped_rows += int(dropped)
+            for row in rows:
+                outcome = str(row.get("outcome", ""))
+                if outcome not in self._OUTCOMES:
+                    self.malformed_rows += 1
+                    continue
+                tag = str(row.get("request_tag", ""))
+                if not tag:
+                    # An operation nobody named. Counted rather than
+                    # attributed to a neighbour, because guessing which
+                    # request it belonged to is what this record exists to
+                    # avoid.
+                    self.untagged_operations += 1
+                    continue
+                try:
+                    numeric_fields = ("batch_id", "operation_id", "attempt", "bytes")
+                    if any(
+                        not isinstance(row[field], str)
+                        or str(int(row[field])) != row[field]
+                        for field in numeric_fields
+                    ) or not isinstance(row["device_instance_id"], str):
+                        raise ValueError("native journal identity is not canonical")
+                    normalized: dict[str, Any] = {
+                        "device_instance_id": str(row["device_instance_id"]),
+                        "batch_id": int(row["batch_id"]),
+                        "operation_id": int(row["operation_id"]),
+                        "attempt": int(row["attempt"]),
+                        "direction": str(row["direction"]),
+                        "path": str(row["path"]),
+                        "outcome": outcome,
+                        "bytes": int(row["bytes"]),
+                    }
+                    valid = (
+                        bool(normalized["device_instance_id"])
+                        and normalized["batch_id"] >= 0
+                        and normalized["operation_id"] >= 0
+                        and normalized["attempt"] >= 0
+                        and normalized["direction"] in ("read", "write")
+                        and normalized["path"]
+                        in (
+                            "regular",
+                            "bounce",
+                            "host_fixed",
+                            "dmabuf_fixed",
+                            "uring_cmd",
+                            "uring_cmd_fixed",
+                        )
+                        and (outcome == "failed" or normalized["bytes"] >= 0)
+                    )
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    valid = False
+                if not valid:
+                    self.malformed_rows += 1
+                    continue
+                event_key = (
+                    tag,
+                    normalized["device_instance_id"],
+                    normalized["batch_id"],
+                    normalized["operation_id"],
+                    normalized["attempt"],
+                    normalized["direction"],
+                    normalized["path"],
+                    normalized["outcome"],
+                    normalized["bytes"],
+                )
+                if event_key in self._seen_events:
+                    self.duplicate_rows += 1
+                    continue
+                self._seen_events.add(event_key)
+                self._events.setdefault(tag, []).append(normalized)
+                key = (tag, str(row.get("direction", "")), str(row.get("path", "")))
+                counts = self._rows.get(key)
+                if counts is None:
+                    counts = dict.fromkeys(self._OUTCOMES, 0)
+                    counts["bytes"] = 0
+                    self._rows[key] = counts
+                counts[outcome] += 1
+                if outcome in ("completed", "short"):
+                    counts["bytes"] += max(0, normalized["bytes"])
+                self._touch_locked(tag)
+            self._evict_locked()
+
+    def snapshot(self) -> dict[str, dict[str, int]]:
+        """Every attributed row, keyed "request/direction/native-path"."""
+        with self._lock:
+            return {
+                f"{tag}/{direction}/{path}": dict(counts)
+                for (tag, direction, path), counts in sorted(self._rows.items())
+            }
+
+    def unanswered(self) -> dict[str, int]:
+        """Rows where operations were submitted and never answered for.
+
+        A nonzero entry here is a failed evidence gate: the bytes of that
+        request cannot be accounted for, and no total that happens to add up
+        changes that.
+        """
+        with self._lock:
+            gaps: dict[str, int] = {}
+            for (tag, direction, path), counts in sorted(self._rows.items()):
+                answered = sum(
+                    counts[outcome] for outcome in ("completed", "short", "failed")
+                )
+                outstanding = counts["submitted"] - answered
+                if outstanding:
+                    gaps[f"{tag}/{direction}/{path}"] = outstanding
+            return gaps
+
+    def as_payload(self) -> dict[str, Any]:
+        """Everything a receipt needs, including what makes it incomplete."""
+        with self._lock:
+            operation_join, join_failures = self.operation_join()
+            return {
+                "rows": self.snapshot(),
+                "unanswered": self.unanswered(),
+                "contexts": self.contexts(),
+                "operations": operation_join,
+                "evidence_failures": join_failures,
+                "untagged_operations": self.untagged_operations,
+                "dropped_rows": self.dropped_rows,
+                "evicted_requests": self.evicted_requests,
+                "malformed_rows": self.malformed_rows,
+                "duplicate_rows": self.duplicate_rows,
+                "context_conflicts": self.context_conflicts,
+                "collection_failures": self.collection_failures,
+            }
+
+    def contexts(self) -> dict[str, dict[str, Any]]:
+        """Return the publication and restore identity for each native tag."""
+        with self._lock:
+            return {
+                tag: dict(context) for tag, context in sorted(self._contexts.items())
+            }
+
+    def operation_join(self) -> tuple[list[dict[str, Any]], list[str]]:
+        """Join submissions to CQEs without turning short I/O into success."""
+        with self._lock:
+            events = {
+                tag: [{**event, "request_tag": tag} for event in rows]
+                for tag, rows in self._events.items()
+            }
+            contexts = {tag: dict(context) for tag, context in self._contexts.items()}
+            counters = (
+                self.dropped_rows,
+                self.evicted_requests,
+                self.untagged_operations,
+                self.malformed_rows,
+                self.duplicate_rows,
+                self.context_conflicts,
+                self.collection_failures,
+            )
+        failures: list[str] = []
+        labels = (
+            "dropped",
+            "evicted",
+            "untagged",
+            "malformed",
+            "duplicate",
+            "context_conflict",
+            "collection_failure",
+        )
+        for label, count in zip(labels, counters, strict=True):
+            if count:
+                failures.append(f"{label}_rows={count}")
+        operations: list[dict[str, Any]] = []
+        grouped: dict[tuple[str, int], list[dict[str, Any]]] = {}
+        for rows in events.values():
+            for event in rows:
+                key = (event["device_instance_id"], event["operation_id"])
+                grouped.setdefault(key, []).append(event)
+        for key, rows in sorted(grouped.items()):
+            device, operation_id = key
+            first = rows[0]
+            tag, direction, path = (
+                first["request_tag"],
+                first["direction"],
+                first["path"],
+            )
+            by_attempt: dict[int, list[dict[str, Any]]] = {}
+            for row in rows:
+                by_attempt.setdefault(row["attempt"], []).append(row)
+            op_failures: list[str] = []
+            identity_fields = ("request_tag", "batch_id", "direction", "path")
+            if any(
+                row[field] != first[field] for row in rows for field in identity_fields
+            ):
+                op_failures.append("operation_identity_changed")
+            if tag not in contexts:
+                op_failures.append("operation_has_no_context")
+            completed_bytes = 0
+            requested_bytes = 0
+            attempts: list[dict[str, Any]] = []
+            attempt_numbers = sorted(by_attempt)
+            if attempt_numbers != list(range(len(attempt_numbers))):
+                op_failures.append("attempt_sequence_has_gaps")
+            for number in attempt_numbers:
+                attempt_rows = by_attempt[number]
+                submitted = [
+                    row for row in attempt_rows if row["outcome"] == "submitted"
+                ]
+                terminal = [
+                    row for row in attempt_rows if row["outcome"] != "submitted"
+                ]
+                if len(submitted) != 1:
+                    op_failures.append(
+                        f"attempt_{number}_has_{len(submitted)}_submissions"
+                    )
+                if len(terminal) != 1:
+                    op_failures.append(f"attempt_{number}_has_{len(terminal)}_cqes")
+                submitted_bytes = submitted[0]["bytes"] if len(submitted) == 1 else 0
+                if submitted_bytes <= 0:
+                    op_failures.append(f"attempt_{number}_invalid_submission_size")
+                if number == 0:
+                    requested_bytes = submitted_bytes
+                outcome = terminal[0]["outcome"] if len(terminal) == 1 else "unanswered"
+                terminal_bytes = terminal[0]["bytes"] if len(terminal) == 1 else 0
+                credited_bytes = (
+                    max(0, terminal_bytes) if outcome in ("completed", "short") else 0
+                )
+                completed_bytes += credited_bytes
+                if number != attempt_numbers[-1] and outcome != "short":
+                    op_failures.append(f"attempt_{number}_unexpected_remainder")
+                if outcome == "failed":
+                    op_failures.append(f"attempt_{number}_failed")
+                elif outcome == "completed" and terminal_bytes != submitted_bytes:
+                    op_failures.append(f"attempt_{number}_completion_size_mismatch")
+                elif outcome == "short":
+                    if not 0 < terminal_bytes < submitted_bytes:
+                        op_failures.append(f"attempt_{number}_invalid_short_size")
+                    if path == "dmabuf_fixed":
+                        op_failures.append(f"attempt_{number}_short_dmabuf_is_terminal")
+                    elif number + 1 not in by_attempt:
+                        op_failures.append(f"attempt_{number}_short_has_no_remainder")
+                    elif len(submitted) == 1:
+                        next_submitted = [
+                            row
+                            for row in by_attempt[number + 1]
+                            if row["outcome"] == "submitted"
+                        ]
+                        remainder = submitted_bytes - max(0, terminal_bytes)
+                        if (
+                            len(next_submitted) != 1
+                            or next_submitted[0]["bytes"] != remainder
+                        ):
+                            op_failures.append(
+                                f"attempt_{number}_remainder_size_mismatch"
+                            )
+                attempts.append(
+                    {
+                        "attempt": number,
+                        "submitted_bytes": submitted_bytes,
+                        "outcome": outcome,
+                        "completed_bytes": credited_bytes,
+                    }
+                )
+            if attempts and attempts[-1]["outcome"] != "completed":
+                op_failures.append("operation_has_no_final_completion")
+            if completed_bytes != requested_bytes:
+                op_failures.append("operation_byte_total_mismatch")
+            identity = f"{tag}/{device}/{operation_id}/{direction}/{path}"
+            failures.extend(f"{identity}: {failure}" for failure in op_failures)
+            operations.append(
+                {
+                    "request_tag": tag,
+                    "device_instance_id": device,
+                    "operation_id": operation_id,
+                    "batch_id": first["batch_id"],
+                    "context": contexts.get(tag),
+                    "direction": direction,
+                    "path": path,
+                    "requested_bytes": requested_bytes,
+                    "completed_bytes": completed_bytes,
+                    "attempts": attempts,
+                    "complete": not op_failures,
+                }
+            )
+        return operations, failures
+
+
+class RawBlockIoLedger:
+    """Count what each route moved, exactly enough to subtract two runs.
+
+    Every update takes the lock. These are small integer additions on a
+    path that already performs a device I/O, and the alternative -- lost
+    concurrent increments -- makes a delta approximate, which is exactly
+    what cannot be used to certify that a fallback path carried nothing.
+    A total that is only nearly right cannot answer "was it zero".
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._tallies: dict[tuple[str, str, str], RawBlockIoTally] = {}
+
+    def _tally_locked(self, key: tuple[str, str, str]) -> RawBlockIoTally:
+        tally = self._tallies.get(key)
+        if tally is None:
+            tally = RawBlockIoTally()
+            self._tallies[key] = tally
+        return tally
+
+    def logical_request(
+        self,
+        direction: str,
+        path: str,
+        kinds: Sequence[str],
+        payload_lens: Sequence[int],
+        total_lens: Sequence[int],
+    ) -> None:
+        """Record what a caller asked this engine to move, once per request."""
+        with self._lock:
+            for kind, payload_len, total_len in zip(
+                kinds, payload_lens, total_lens, strict=True
+            ):
+                tally = self._tally_locked((direction, kind, path))
+                tally.logical_requests += 1
+                tally.logical_bytes += int(payload_len)
+                tally.padded_bytes += int(total_len)
+
+    def submitted(
+        self,
+        direction: str,
+        path: str,
+        kinds: Sequence[str],
+        total_lens: Sequence[int],
+    ) -> None:
+        """Record physical operations handed to the device, one per transfer.
+
+        Counted at the granularity the device sees, which is what makes it
+        comparable with the completions. It says these were handed over; it
+        does not say the kernel took them, which is the kernel's answer.
+        """
+        with self._lock:
+            for kind, total_len in zip(kinds, total_lens, strict=True):
+                tally = self._tally_locked((direction, kind, path))
+                tally.submitted_operations += 1
+                tally.submitted_padded_bytes += int(total_len)
+
+    def completed(
+        self,
+        direction: str,
+        path: str,
+        kinds: Sequence[str],
+        total_lens: Sequence[int],
+        succeeded: Sequence[bool],
+    ) -> None:
+        """Record operations the device reported finishing."""
+        with self._lock:
+            for kind, total_len, ok in zip(kinds, total_lens, succeeded, strict=False):
+                if not ok:
+                    continue
+                tally = self._tally_locked((direction, kind, path))
+                tally.completed_operations += 1
+                tally.completed_padded_bytes += int(total_len)
+
+    def snapshot(self) -> dict[str, dict[str, int]]:
+        """Take every tally as flat rows, keyed "direction/kind/path"."""
+        with self._lock:
+            return {
+                f"{direction}/{kind}/{path}": tally.as_payload()
+                for (direction, kind, path), tally in sorted(self._tallies.items())
+            }
+
+    def totals(self, *, direction: str = "", kind: str = "") -> RawBlockIoTally:
+        """Add up the rows matching a direction and kind, or all of them."""
+        summed = RawBlockIoTally()
+        with self._lock:
+            for (row_direction, row_kind, _path), tally in self._tallies.items():
+                if direction and row_direction != direction:
+                    continue
+                if kind and row_kind != kind:
+                    continue
+                summed.logical_requests += tally.logical_requests
+                summed.logical_bytes += tally.logical_bytes
+                summed.padded_bytes += tally.padded_bytes
+                summed.submitted_operations += tally.submitted_operations
+                summed.submitted_padded_bytes += tally.submitted_padded_bytes
+                summed.completed_operations += tally.completed_operations
+                summed.completed_padded_bytes += tally.completed_padded_bytes
+        return summed
 
 
 def device_has_nothing_outstanding(device: Any) -> bool:
@@ -386,13 +988,248 @@ class RawBlockCloseOutcome:
     def may_release_backing_resources(self) -> bool:
         """Whether the memory and descriptors behind this device are free.
 
-        Only a proven native close authorizes releasing the registered arena.
+        Local quiescence only. It says nothing about a reader elsewhere still
+        holding a lease, which is a separate decision with a separate owner.
         """
         return self.quiescence is NativeQuiescence.PROVEN and not self.poisoned
 
 
 class IncompatibleKeyDerivation(RuntimeError):
-    """A checkpoint uses a key namespace this engine cannot reproduce."""
+    """A namespace's keys were derived in a way this engine cannot reproduce."""
+
+
+def namespace_identity_is_shareable(identity: str) -> bool:
+    """Return whether an identity names the same namespace on another node."""
+    return bool(identity) and not identity.startswith(_LOCAL_BLOCK_IDENTITY_PREFIX)
+
+
+def _resolve_namespace_identity(device_path: str) -> str:
+    """Return a stable-enough identity for checkpoint and handoff receipts."""
+    try:
+        device_stat = os.stat(device_path)
+    except OSError:
+        # Unit-test fakes and file-backed development targets may not exist
+        # until the native engine opens them.  A canonical path is sufficient
+        # to fence two such endpoints; production block devices still require
+        # a persistent hardware identity below.
+        return f"path:{os.path.realpath(device_path)}"
+    if stat.S_ISREG(device_stat.st_mode):
+        return f"file:{device_stat.st_dev}:{device_stat.st_ino}"
+    if stat.S_ISBLK(device_stat.st_mode):
+        major = os.major(device_stat.st_rdev)
+        minor = os.minor(device_stat.st_rdev)
+        sysfs_device = f"/sys/dev/block/{major}:{minor}"
+        for field in ("wwid", "uuid", "nguid", "eui"):
+            for candidate in (
+                os.path.join(sysfs_device, field),
+                os.path.join(sysfs_device, "device", field),
+            ):
+                try:
+                    with open(candidate, "r", encoding="utf-8") as identity_file:
+                        value = identity_file.read().strip()
+                except OSError:
+                    continue
+                if value:
+                    return f"block:{field}:{value}"
+        # No hardware identity is exposed for this namespace. That only
+        # matters for a target two nodes share, so name it in a way that
+        # says as much and let publication be the thing that refuses it.
+        # An ordinary local cache on such a device stays usable.
+        return f"{_LOCAL_BLOCK_IDENTITY_PREFIX}{major}:{minor}"
+    # A character device (the io_uring_cmd passthrough node) is identified by
+    # the device it refers to, not by the filesystem its node lives on:
+    # st_dev names devtmpfs and would differ between a container and its host
+    # for the same namespace.
+    return f"device:{os.major(device_stat.st_rdev)}:{os.minor(device_stat.st_rdev)}"
+
+
+def _read_sysfs_int(path: str) -> Optional[int]:
+    """Read an integer value from sysfs and return None on failure."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def _device_payload_tensor(memory_obj: MemoryObj) -> Optional[torch.Tensor]:
+    """Return the flat device tensor behind a memory object, or None on CPU.
+
+    A memory object whose storage lives on a GPU has no buffer-protocol view,
+    so ``byte_array`` cannot describe it.  The Rust engine accepts any object
+    exposing ``data_ptr()`` and ``nbytes`` in place of a buffer, and a paged
+    GPU allocator registers its slots with io_uring as dma-bufs, so a device
+    object hands the engine the physical uint8 tensor the allocator carved
+    it from and the read or write moves VRAM to NVMe with no host copy.
+    """
+    raw = memory_obj.physical_tensor
+    if not isinstance(raw, torch.Tensor) or raw.device.type == "cpu":
+        return None
+    if not raw.is_contiguous():
+        raise RuntimeError(
+            "RawBlockCore: device memory object is not contiguous; the engine "
+            "needs one flat region to hand to io_uring"
+        )
+    return raw.view(-1).view(torch.uint8)
+
+
+class UnsupportedDevicePayload(Exception):
+    """A device object this lane cannot describe a transfer for.
+
+    Raised while planning, before any slot is reserved, so a caller turns it
+    into a failed result for that key rather than abandoning storage it has
+    already allocated.
+    """
+
+
+def _logical_payload_len(memory_obj: MemoryObj) -> int:
+    """Return the logical payload length of a memory object in bytes.
+
+    Device objects have no ``byte_array`` (it would need a host copy), so
+    their logical size comes from the metadata instead.
+    """
+    if _device_payload_tensor(memory_obj) is not None:
+        # Paged objects refresh their logical layout when reused; the public
+        # size accessor includes that layout and any explicit used-byte limit.
+        # Grouped device representations remain outside this lane's contract.
+        meta = memory_obj.metadata
+        shapes = getattr(meta, "shapes", None)
+        if shapes is not None and len(shapes) > 1:
+            raise UnsupportedDevicePayload(
+                f"a device object with {len(shapes)} representation groups "
+                "is not supported by the raw-block lane; its logical length "
+                "is the sum over the groups, not the scalar shape"
+            )
+        return int(memory_obj.get_size())
+    return len(memory_obj.byte_array)
+
+
+@dataclass(frozen=True)
+class RawBlockCoreConfig:
+    """Configuration for RawBlockCore device layout, I/O, and checkpoints."""
+
+    device_path: str
+    capacity_bytes: int
+    block_align: int
+    header_bytes: int
+    slot_bytes: int
+    use_odirect: bool
+    enable_zero_copy: bool
+    meta_total_bytes: int
+    meta_magic: bytes
+    meta_version: int
+    meta_checkpoint_interval_sec: int
+    meta_idle_quiet_ms: int
+    meta_enable_periodic: bool
+    meta_verify_on_load: bool
+    max_data_transfer_size: int = 0
+    load_checkpoint_on_init: bool = True
+    io_engine: str = "posix"
+    iouring_queue_depth: int = DEFAULT_IOURING_QUEUE_DEPTH
+    use_uring_cmd: bool = False
+    meta_checkpoint_placement_id: PlacementId = None
+    fdp_slot_affinity_enabled: bool = False
+    # "writer" owns the device: it allocates slots, stores objects and writes
+    # the on-device index checkpoints.  "reader" shares the same device from
+    # another process or host, never writes, and adopts the writer's index
+    # through refresh_index_from_device().  This is how a prefill node hands
+    # KV chunks to a decode node over a shared NVMe namespace.
+    role: str = "writer"
+    # Read each slot's header alongside its payload and reject the load when
+    # the header names a different key: protects a reader from a slot the
+    # writer has since reused.
+    verify_slot_header_on_load: bool = False
+    # Minimum spacing between two publish_index() checkpoints, so a writer
+    # that publishes after every put batch does not rewrite the index more
+    # often than this.
+    publish_min_interval_ms: int = 0
+    # Refuse startup unless every staging buffer is registered through the
+    # dma-buf io_uring path. This is used by correctness runs that must not
+    # silently fall back to classic fixed or per-command mapped buffers.
+    require_dmabuf_registration: bool = False
+    # Reclaim the oldest unlocked indexed extent when the bounded namespace
+    # is full. Shared-storage P/D enables this because its request leases say
+    # exactly when a reader can no longer be using an extent. Other users keep
+    # the historical explicit-delete behavior.
+    evict_unlocked_on_full: bool = False
+    # Unique writer incarnation carried in every checkpoint. An empty value
+    # creates a fresh UUID for a writer and is populated from checkpoints by a
+    # reader.
+    writer_epoch: str = ""
+    # Persistent namespace identity carried in request receipts. When omitted,
+    # regular files use device/inode identity and block devices use sysfs WWID,
+    # UUID, NGUID, or EUI data. Setting it is an operator's assertion that
+    # every node using this string reaches the same namespace; nothing here
+    # verifies that, so two nodes given the same string for different
+    # devices will read each other's receipts as their own.
+    namespace_identity: str = ""
+    # Whether close writes one last checkpoint. The strict shared-storage
+    # lane sets this false: every successful READY already required its own
+    # completed forced publication, so a close-time generation can only
+    # make an unfinished request look complete -- and writing one needs the
+    # device at exactly the moment teardown is trying to settle it.
+    close_writes_final_checkpoint: bool = True
+    # Refuse to run unless the native engine can be asked whether anything
+    # is outstanding. An older build cannot, and the health question it can
+    # answer is a weaker one; accepting that silently in the lane whose
+    # whole point is knowing would qualify a build on a question it never
+    # asked.
+    require_native_idle_capability: bool = False
+    # How this engine derives its keys. Required where a namespace is shared,
+    # because two engines agreeing on every field above can still derive
+    # different keys and read nothing of each other's. Absent elsewhere, and
+    # nothing is compared then.
+    derivation: Optional[RawBlockDerivationDescriptor] = None
+
+
+@dataclass
+class _Entry:
+    offset: int
+    size: int
+    meta: DiskCacheMetadata
+
+
+@dataclass
+class _Inflight:
+    offset: int
+    meta: DiskCacheMetadata
+    canceled: bool = False
+
+
+@dataclass(frozen=True)
+class RawBlockPutManyResult:
+    """Result of a RawBlockCore batched write."""
+
+    results: list[bool]
+    stored_keys: list[str]
+
+
+@dataclass(frozen=True)
+class RawBlockPublicationReceipt:
+    """Identify one published request manifest."""
+
+    writer_epoch: str
+    checkpoint_seq: int
+    key_count: int
+    manifest_digest: str
+    namespace_identity: str = ""
+    total_logical_bytes: int = 0
+    total_padded_bytes: int = 0
+    # Where the writer that produced this listens for the acknowledgement
+    # that releases its extents. Empty means it is not listening, so a
+    # consumer cannot release anything by replying.
+    ack_endpoint: str = ""
+
+
+@dataclass(frozen=True)
+class RawBlockReadContext:
+    """Identify the adopted publication a particular restore reads."""
+
+    request_id: str
+    receipt: RawBlockPublicationReceipt
+    consumer_request_id: str = ""
+    restore_attempt_id: str = ""
+    adopted_checkpoint_seq: int = -1
 
 
 class RawBlockCore:
@@ -402,6 +1239,49 @@ class RawBlockCore:
     This class owns the raw-device I/O path, slot allocation, checkpoint/recovery,
     and lock refcounts that protect slots from deletion while in use.
     """
+
+    # Declared on the class so it exists however the core was built. Several
+    # tests construct one through __new__ without running __init__, and a
+    # guard that only the initializer installs is a guard that is sometimes
+    # absent from the very paths it protects.
+    require_dmabuf_registration: bool = False
+    require_native_idle_capability: bool = False
+    _poisoned: bool = False
+    # Whether close has decided this device's fate. Declared here for the
+    # same reason: a reopen guard that only the initializer installs is
+    # absent from a core built another way.
+    _terminal: bool = False
+    # Slots withheld because the device may still be writing them. A class
+    # default keeps it readable on a core built without __init__; the first
+    # quarantine replaces it with an instance dict.
+    _quarantined_slots: Optional[dict[int, None]] = None
+    # Byte counters, declared here for the same reason: they are metrics, and
+    # a core built without __init__ must still be able to add to them.
+    # Bytes this engine never had to write because the key was already on
+    # the device. Not an I/O quantity, so it is not in the ledger.
+    _bytes_deduplicated: int = 0
+    # The attribution record, declared on the class for the same reason as
+    # the ledger below: a core built without __init__ must still be able to
+    # attribute an operation.
+    _io_attribution_instance: Optional["RawBlockIoAttribution"] = None
+    # This engine's own metadata traffic: index checkpoints and slot headers
+    # it reads to validate. Named rather than left unattributed, because an
+    # unnamed operation is a gap in a request's accounting and these are not
+    # that -- they belong to no request, which is a different statement.
+    _metadata_io_context = RawBlockIoContext(
+        request_id="<engine-metadata>", work_kind=IO_KIND_CHECKPOINT
+    )
+    # The I/O ledger, declared on the class so it exists however the core
+    # was built. Several tests construct one through __new__ without
+    # running __init__, and accounting that only exists when the
+    # initializer ran is accounting missing from paths that use it. It
+    # cannot be a shared class-level instance: two cores would add into
+    # one ledger, so it is created per instance on first use.
+    _io_ledger_instance: Optional["RawBlockIoLedger"] = None
+    _io_ledger_creation_lock = threading.Lock()
+    # What the first close established. Read by a repeat close, which must
+    # not reach the device accessor and open one that knows nothing.
+    _close_outcome: Optional["RawBlockCloseOutcome"] = None
 
     def __init__(
         self,
@@ -441,6 +1321,60 @@ class RawBlockCore:
         self.meta_enable_periodic = bool(config.meta_enable_periodic)
         self.load_checkpoint_on_init = bool(config.load_checkpoint_on_init)
         self.meta_verify_on_load = bool(config.meta_verify_on_load)
+        self.close_writes_final_checkpoint = bool(config.close_writes_final_checkpoint)
+        self.require_native_idle_capability = bool(
+            config.require_native_idle_capability
+        )
+        self.role = str(getattr(config, "role", "writer") or "writer")
+        if self.role not in ("writer", "reader"):
+            raise ValueError(
+                f"RawBlockCore role must be 'writer' or 'reader', got {self.role!r}"
+            )
+        self.verify_slot_header_on_load = bool(
+            getattr(config, "verify_slot_header_on_load", False)
+        )
+        self.publish_min_interval_ms = int(
+            getattr(config, "publish_min_interval_ms", 0) or 0
+        )
+        self.require_dmabuf_registration = bool(
+            getattr(config, "require_dmabuf_registration", False)
+        )
+        self.evict_unlocked_on_full = bool(
+            getattr(config, "evict_unlocked_on_full", False)
+        )
+        self._last_publish_ts: float = 0.0
+        self._buffer_registration_mode = "none"
+        # Set when the native engine could not establish what the device was
+        # doing. Separate from ``_closed``: marking the core closed would make
+        # ``close()`` return without draining or unregistering, and the point
+        # is to hold resources rather than release them.
+        self._poisoned = False
+        # Set once close has decided this device's fate. Separate from
+        # ``_closed``, which is set on the way in so nothing new is
+        # admitted: close's own final checkpoint still runs between the two,
+        # and it needs the device it is checkpointing.
+        self._terminal = False
+        # Supplied by whoever knows the token database's effective settings.
+        # Absent outside the strict shared-storage lane, where nothing else
+        # is reading these keys.
+        self._derivation: Optional[RawBlockDerivationDescriptor] = getattr(
+            config, "derivation", None
+        )
+        configured_namespace = str(getattr(config, "namespace_identity", "") or "")
+        self.namespace_identity = configured_namespace or _resolve_namespace_identity(
+            self.device_path
+        )
+        configured_epoch = str(getattr(config, "writer_epoch", "") or "")
+        self._writer_epoch = (
+            configured_epoch
+            if configured_epoch
+            else str(uuid.uuid4())
+            if self.role == "writer"
+            else ""
+        )
+        self._published_keys: frozenset[str] = frozenset()
+        self._published_manifest: dict[str, dict[str, Any]] = {}
+        self._published_writer_epoch = ""
         self.io_engine = normalize_raw_block_io_engine(config.io_engine)
         self.iouring_queue_depth = int(config.iouring_queue_depth)
         self.use_uring_cmd = bool(config.use_uring_cmd)
@@ -494,6 +1428,29 @@ class RawBlockCore:
         )
         if self.use_uring_cmd and self.io_engine != "io_uring":
             raise ValueError("use_uring_cmd requires io_uring as io_engine")
+        if self.require_dmabuf_registration:
+            if self.io_engine != "io_uring":
+                raise ValueError(
+                    "require_dmabuf_registration requires io_engine='io_uring'"
+                )
+            if not self.use_odirect:
+                raise ValueError(
+                    "require_dmabuf_registration requires use_odirect=true"
+                )
+            if self.use_uring_cmd:
+                raise ValueError(
+                    "require_dmabuf_registration is incompatible with use_uring_cmd"
+                )
+            try:
+                target_mode = os.stat(self.device_path).st_mode
+            except OSError as exc:
+                raise ValueError(
+                    "require_dmabuf_registration requires an existing block device"
+                ) from exc
+            if not stat.S_ISBLK(target_mode):
+                raise ValueError(
+                    "require_dmabuf_registration requires a block-device target"
+                )
         if self.use_uring_cmd:
             try:
                 mode = os.stat(self.device_path).st_mode
@@ -539,12 +1496,26 @@ class RawBlockCore:
             )
 
         self._lock = threading.Lock()
+        self._checkpoint_lock = threading.Lock()
         self._index: dict[str, _Entry] = {}
         self._lock_refcnt: dict[str, int] = {}
         self._inflight: dict[str, _Inflight] = {}
 
         self._next_slot: int = 0
         self._free_slots: dict[int, None] = {}
+        self._quarantined_slots = {}
+        # Four different questions, kept apart because one number cannot
+        # answer them. Logical is what callers handed over; deduplicated is
+        # what was already on the device and so was never written again;
+        # submitted is the physical length given to the ring, which includes
+        # block padding; completed is what the device reported finishing.
+        # Reporting any one of these as "bytes written" overstates or
+        # understates a different one.
+        self._bytes_deduplicated = 0
+        self._capacity_evictions = 0
+        self._publication_protected_keys: dict[str, set[str]] = {}
+        self._publication_protection_refcnt: dict[str, int] = {}
+        self._io_ledger_instance = RawBlockIoLedger()
         self._free_slots_by_placement_id: dict[int, dict[int, None]] = {}
         self._slot_placement_ids: dict[int, int] = {}
         self._fdp_slot_affinity_hit_count: int = 0
@@ -555,10 +1526,6 @@ class RawBlockCore:
 
         self._raw = None
         self._closed = False
-        self._poisoned = False
-        self._terminal = False
-        self._close_outcome: Optional[RawBlockCloseOutcome] = None
-        self._quarantined_slots: dict[int, None] = {}
 
         self._meta_seq: int = 0
         self._meta_dirty_total: int = 0
@@ -566,6 +1533,12 @@ class RawBlockCore:
         self._inflight_io_count: int = 0
         self._last_io_ts: float = time.monotonic()
         self._meta_stop_evt = threading.Event()
+        # A core that did not load the device's index must still number its
+        # checkpoints after whatever is already on the device: readers adopt
+        # only a higher sequence number, so a writer restarting at 0 would be
+        # ignored until it caught up with its previous life.  Resolved at the
+        # first checkpoint write so opening and storing do no extra reads.
+        self._meta_seq_resume_pending = not bool(config.load_checkpoint_on_init)
         self._meta_thread: Optional[threading.Thread] = None
 
         try:
@@ -574,8 +1547,14 @@ class RawBlockCore:
                 self._load_checkpoint_from_device()
             else:
                 logger.info("RawBlockCore: skipping on-device metadata checkpoint load")
+                # Whether to *use* the index is a performance choice; whether
+                # this engine may write into this namespace at all is not.
+                # Skipping the load would otherwise open a namespace somebody
+                # else is writing, under a derivation whose keys this engine
+                # cannot read, as a fresh empty cache.
+                self._require_namespace_authority()
 
-            if self.meta_enable_periodic:
+            if self.meta_enable_periodic and self.role == "writer":
                 self._meta_thread = threading.Thread(
                     target=self._checkpoint_loop,
                     daemon=True,
@@ -673,7 +1652,26 @@ class RawBlockCore:
     def _rawdev(self) -> Any:
         """Return the lazily opened Rust raw-block device binding."""
         if self._terminal:
-            raise RuntimeError("RawBlockCore is closed")
+            # Close has made its decision about this device, and that
+            # decision is what the caller's own teardown acted on -- freeing
+            # the memory behind it, or deliberately keeping it. Handing out a
+            # device here would either open a fresh one that knows nothing
+            # about the old one, or hand back a handle that was retained
+            # precisely so nobody would touch it again.
+            raise RuntimeError(
+                f"raw-block device {self.device_path} is closed; it will not "
+                "be reopened for work that arrived afterwards"
+            )
+        if self._raw is None and self._poisoned:
+            # Opening a fresh device here would answer every question about
+            # quiescence with a confident "nothing outstanding", which is
+            # exactly wrong after this core stopped being able to say. Being
+            # merely closed is not the same thing and keeps its old
+            # behaviour.
+            raise RuntimeError(
+                f"raw-block device {self.device_path} could not establish "
+                "what it was doing; it will not be reopened"
+            )
         self.raise_if_failed()
         if self._raw is None:
             try:
@@ -686,7 +1684,7 @@ class RawBlockCore:
                 ) from e
             self._raw = RawBlockDevice(
                 self.device_path,
-                writable=True,
+                writable=self.role == "writer",
                 use_odirect=self.use_odirect,
                 alignment=self.block_align,
                 io_engine=self.io_engine,
@@ -694,6 +1692,19 @@ class RawBlockCore:
                 use_uring_cmd=self.use_uring_cmd,
             )
         self.raise_if_failed()
+        if self.require_native_idle_capability and not hasattr(self._raw, "is_idle"):
+            # This lane publishes an index for another engine to read,
+            # and what makes that safe is being able to ask whether the
+            # device has answered for everything it was handed. A build
+            # that cannot be asked can only answer the weaker health
+            # question, and accepting that silently would qualify this
+            # engine on a question it never asked.
+            raise RuntimeError(
+                f"raw-block device {self.device_path} is backed by a "
+                "native engine that cannot report whether anything is "
+                "outstanding; rebuild the rust_raw_block_io extension "
+                "from this tree"
+            )
         return self._raw
 
     def raw_device(self) -> Any:
@@ -743,6 +1754,10 @@ class RawBlockCore:
             return
         paged_buffers = getattr(memory_allocator, "get_paged_buffers", None)
         if not callable(paged_buffers):
+            if self.require_dmabuf_registration:
+                raise RuntimeError(
+                    "strict dma-buf mode requires an allocator with paged buffers"
+                )
             logger.warning(
                 "RawBlockCore: allocator does not expose paged buffers; "
                 "io_uring fixed-buffer zero-copy is disabled"
@@ -750,6 +1765,10 @@ class RawBlockCore:
             return
         buffers = paged_buffers()
         if not buffers:
+            if self.require_dmabuf_registration:
+                raise RuntimeError(
+                    "strict dma-buf mode requires non-empty paged buffers"
+                )
             logger.warning(
                 "RawBlockCore: allocator returned no paged buffers; "
                 "io_uring fixed-buffer zero-copy is disabled"
@@ -786,11 +1805,16 @@ class RawBlockCore:
                     len(buffers),
                     len({fd for fd, _base in regions}),
                 )
+                self._buffer_registration_mode = "dmabuf"
                 return
             except Exception as exc:
                 if device_buffers:
                     raise RuntimeError(
                         "GPU staging requires successful DMA-BUF registration"
+                    ) from exc
+                if self.require_dmabuf_registration:
+                    raise RuntimeError(
+                        "strict dma-buf fixed-buffer registration failed"
                     ) from exc
                 logger.warning(
                     "RawBlockCore: dma-buf fixed-buffer registration refused "
@@ -799,7 +1823,12 @@ class RawBlockCore:
                 )
         if device_buffers:
             raise RuntimeError("GPU staging requires complete DMA-BUF exports")
+        if self.require_dmabuf_registration:
+            raise RuntimeError(
+                "strict dma-buf mode requires dma-buf regions for every paged buffer"
+            )
         self._rawdev().register_fixed_buffers(buffer_ptrs, buffer_sizes)
+        self._buffer_registration_mode = "classic"
         logger.info(
             "RawBlockCore: registered %d paged buffers for io_uring fixed I/O",
             len(buffers),
@@ -912,6 +1941,17 @@ class RawBlockCore:
         with self._lock:
             return len(self._index)
 
+    def record_deduplicated_hits(self, encoded_keys: Sequence[str]) -> int:
+        """Count logical stores satisfied by existing physical extents."""
+        with self._lock:
+            reused = sum(
+                int(entry.size)
+                for encoded_key in encoded_keys
+                if (entry := self._index.get(encoded_key)) is not None
+            )
+            self._bytes_deduplicated += reused
+            return reused
+
     def snapshot_indexed_keys(self) -> list[str]:
         """Return a detached snapshot of encoded keys currently in the index."""
         with self._lock:
@@ -943,6 +1983,8 @@ class RawBlockCore:
         keys: Sequence[RawBlockKeySpec],
         objs: Sequence[MemoryObj],
         placement_ids: Sequence[PlacementId] | None = None,
+        *,
+        io_context: Optional[RawBlockIoContext] = None,
     ) -> RawBlockPutManyResult:
         """Persist a batch of memory objects into raw-block slots.
 
@@ -974,6 +2016,11 @@ class RawBlockCore:
                 match, or a placement identifier is 0.
             RuntimeError: If the native io_uring worker has permanently failed.
         """
+        if self.role == "reader":
+            raise RuntimeError(
+                "RawBlockCore: refusing to store on a reader core; "
+                "only the writer owns the device"
+            )
         if not keys or not objs:
             raise ValueError("keys and objs must be non-empty")
         if len(keys) != len(objs):
@@ -986,18 +2033,23 @@ class RawBlockCore:
         self.raise_if_failed()
 
         if self.io_engine == "io_uring" and len(keys) > 1:
-            return self._put_many_batch_io(keys, objs, per_key_placement_ids)
+            return self._put_many_batch_io(
+                keys, objs, per_key_placement_ids, io_context=io_context
+            )
 
         results = [False] * len(keys)
         stored_keys: list[str] = []
 
         for i, (key, obj) in enumerate(zip(keys, objs, strict=False)):
             placement_id = per_key_placement_ids[i]
-            if self._closed:
-                break
-
             with self._lock:
+                if self._closed or self._poisoned:
+                    break
                 if key.encoded in self._index:
+                    # Already here: a hit, not a write. Counting these as
+                    # bytes stored would report device traffic that never
+                    # happened.
+                    self._bytes_deduplicated += int(self._index[key.encoded].size)
                     results[i] = True
                     continue
                 if key.encoded in self._inflight:
@@ -1034,7 +2086,9 @@ class RawBlockCore:
                 )
                 self._inflight[key.encoded] = _Inflight(offset=offset, meta=meta)
 
-            success = self._write_one(key, obj, offset, placement_id=placement_id)
+            success = self._write_one(
+                key, obj, offset, placement_id=placement_id, io_context=io_context
+            )
 
             with self._lock:
                 inflight = self._inflight.pop(key.encoded, None)
@@ -1042,7 +2096,7 @@ class RawBlockCore:
                     results[i] = False
                     continue
                 if inflight.canceled or not success:
-                    self._append_free_slot_locked(
+                    self._release_submitted_slot_locked(
                         self._offset_to_slot(int(inflight.offset))
                     )
                     self._meta_dirty_total += 1
@@ -1096,6 +2150,8 @@ class RawBlockCore:
         self,
         encoded_keys: Sequence[str],
         objs: Sequence[MemoryObj],
+        *,
+        io_context: Optional[RawBlockIoContext] = None,
     ) -> list[bool]:
         """Load raw-block payloads into caller-provided memory objects.
 
@@ -1118,6 +2174,12 @@ class RawBlockCore:
         if len(encoded_keys) != len(objs):
             raise ValueError("encoded_keys and objs must have the same length")
         self.raise_if_failed()
+        if self._poisoned:
+            # Both write paths refuse here; a read has the same problem. It
+            # would hand the device fresh destination buffers on an engine
+            # that has already stopped being able to say when it is finished
+            # with the ones it has.
+            return [False] * len(encoded_keys)
 
         with self._lock:
             if self._closed or self.is_poisoned():
@@ -1135,6 +2197,7 @@ class RawBlockCore:
             read_buffers: list[Any] = []
             read_payload_lens: list[int] = []
             read_total_lens: list[int] = []
+            read_kinds: list[str] = []
 
             for i, (encoded_key, entry) in enumerate(items):
                 if entry is None:
@@ -1186,20 +2249,61 @@ class RawBlockCore:
                     read_buffers.append(read_buffer)
                     read_payload_lens.append(read_payload_len)
                     read_total_lens.append(total_len)
+                    read_kinds.append(IO_KIND_PAYLOAD)
                 except Exception as e:
                     logger.error("RawBlockCore load failed for %s: %s", encoded_key, e)
 
             if read_indices:
+                # With header verification each payload read is paired with a
+                # read of its slot header in the same batch; the header must
+                # still name this key with this size, or the writer reused
+                # the slot after we adopted its index and the load is a miss.
+                header_bufs: list[bytearray] = []
+                if self.verify_slot_header_on_load:
+                    for item_idx in read_indices:
+                        entry = items[item_idx][1]
+                        assert entry is not None
+                        hdr = bytearray(self.header_bytes)
+                        header_bufs.append(hdr)
+                        read_offsets.append(entry.offset)
+                        read_buffers.append(hdr)
+                        read_payload_lens.append(self.header_bytes)
+                        read_total_lens.append(self.header_bytes)
+                        read_kinds.append(IO_KIND_SLOT_HEADER)
                 try:
                     io_results = self._read_buffers(
                         read_offsets,
                         read_buffers,
                         read_payload_lens,
                         read_total_lens,
+                        read_kinds,
+                        io_context=io_context,
                     )
                 except Exception as e:
                     logger.error("RawBlockCore batched load failed: %s", e)
-                    io_results = [False] * len(read_indices)
+                    io_results = [False] * len(read_offsets)
+                if header_bufs:
+                    n = len(read_indices)
+                    payload_ok = list(io_results[:n])
+                    header_ok = list(io_results[n:])
+                    for pos, item_idx in enumerate(read_indices):
+                        if not payload_ok[pos] or not header_ok[pos]:
+                            payload_ok[pos] = False
+                            continue
+                        encoded_key, entry = items[item_idx]
+                        assert entry is not None
+                        decoded = self._decode_slot_header(bytes(header_bufs[pos]))
+                        expected = slot_identity_from_encoded_key(
+                            encoded_key, self.key_namespace
+                        )
+                        if decoded is None or decoded != (expected, int(entry.size)):
+                            logger.warning(
+                                "RawBlockCore: slot header for %s no longer matches "
+                                "(slot reused by the writer); treating as a miss",
+                                encoded_key,
+                            )
+                            payload_ok[pos] = False
+                    io_results = payload_ok
 
                 for item_idx, ok in zip(read_indices, io_results, strict=True):
                     if not ok:
@@ -1232,6 +2336,35 @@ class RawBlockCore:
                 else:
                     self._lock_refcnt[encoded_key] = refcnt - 1
 
+    def protect_publication(
+        self,
+        request_id: str,
+        encoded_keys: Sequence[str],
+    ) -> None:
+        """Keep request keys out of replacement until publication pins them."""
+        if not request_id:
+            raise ValueError("publication protection requires a request id")
+        with self._lock:
+            protected = self._publication_protected_keys.setdefault(request_id, set())
+            for encoded_key in encoded_keys:
+                if encoded_key in protected:
+                    continue
+                protected.add(encoded_key)
+                self._publication_protection_refcnt[encoded_key] = (
+                    self._publication_protection_refcnt.get(encoded_key, 0) + 1
+                )
+
+    def release_publication_protection(self, request_id: str) -> None:
+        """Release pre-publication replacement protection for one request."""
+        with self._lock:
+            protected = self._publication_protected_keys.pop(request_id, set())
+            for encoded_key in protected:
+                refcnt = self._publication_protection_refcnt.get(encoded_key, 0)
+                if refcnt <= 1:
+                    self._publication_protection_refcnt.pop(encoded_key, None)
+                else:
+                    self._publication_protection_refcnt[encoded_key] = refcnt - 1
+
     def delete_many(
         self,
         encoded_keys: Sequence[str],
@@ -1248,6 +2381,11 @@ class RawBlockCore:
         Returns:
             A list of per-key deletion booleans aligned with ``encoded_keys``.
         """
+        if self.role == "reader":
+            raise RuntimeError(
+                "RawBlockCore: refusing to delete on a reader core; "
+                "only the writer owns the device"
+            )
         deleted: list[bool] = []
         with self._lock:
             for encoded_key in encoded_keys:
@@ -1263,7 +2401,7 @@ class RawBlockCore:
                     inflight.canceled = True
                 self._lock_refcnt.pop(encoded_key, None)
                 if removed_entry is not None:
-                    self._append_free_slot_locked(
+                    self._release_submitted_slot_locked(
                         self._offset_to_slot(int(removed_entry.offset))
                     )
                     self._meta_dirty_total += 1
@@ -1282,13 +2420,252 @@ class RawBlockCore:
             usable_capacity = self._max_slots * self.slot_bytes
             if usable_capacity <= 0:
                 return (-1.0, -1.0)
-            used_slots = len(self._index) + len(self._inflight)
+            # A withheld extent is occupied, not free. Leaving it out of
+            # both terms would report capacity this engine will never hand
+            # out again as available.
+            used_slots = (
+                len(self._index)
+                + len(self._inflight)
+                + len(self._quarantined_slots or {})
+            )
             usage = (used_slots * self.slot_bytes) / usable_capacity
             return (usage, usage)
 
     def checkpoint_now(self) -> None:
         """Synchronously write a metadata checkpoint."""
         self._checkpoint_once(force=True)
+
+    def publish_index(self) -> bool:
+        """Write the index checkpoint so a reader core can adopt it.
+
+        A writer calls this after a put batch completes.  The checkpoint is
+        the whole index serialized as JSON (about 200 bytes per entry) mirrored
+        into the metadata area, so back-to-back calls are spaced by
+        ``publish_min_interval_ms``.  Returns True when a checkpoint was
+        written.
+        """
+        if self.role != "writer":
+            return False
+        with self._checkpoint_lock:
+            now = time.monotonic()
+            if (now - self._last_publish_ts) * 1000.0 < self.publish_min_interval_ms:
+                return False
+            written = self._checkpoint_once_locked(force=True)
+            if written:
+                self._last_publish_ts = now
+            return written
+
+    @property
+    def writer_epoch(self) -> str:
+        """This engine's producer incarnation.
+
+        A writer mints one when it is constructed and keeps it for life; a
+        reader adopts the epoch of the checkpoint it loaded, which names
+        somebody else's publication and so is not an identity this engine
+        can be addressed by. Empty where there is none.
+        """
+        return self._writer_epoch if self.role == "writer" else ""
+
+    def publish_request(
+        self, encoded_keys: Sequence[str]
+    ) -> RawBlockPublicationReceipt:
+        """Publish and identify a checkpoint containing all request keys.
+
+        Args:
+            encoded_keys: Ordered keys that form the request manifest.
+
+        Returns:
+            A receipt that a reader can match against the same ordered keys.
+
+        Raises:
+            RuntimeError: If called on a reader, a key is absent, or the
+                checkpoint cannot be written.
+            OSError: If either persistence barrier fails. No receipt is issued.
+
+        Notes:
+            Strict publications flush prior KV and checkpoint payload writes
+            before writing the commit header, then flush that header before
+            returning. The storage stack must honor flush completion.
+        """
+        if self.role != "writer":
+            raise RuntimeError("only a writer core can publish a request")
+        if self._closed:
+            # A publication queued before shutdown and started after it
+            # would reopen a device the caller's teardown has already
+            # accounted for, and name extents in an index written by a core
+            # nobody is watching any more.
+            raise RuntimeError(
+                "raw-block core cannot publish: it is shutting down and "
+                "stopped admitting publications"
+            )
+        if self._poisoned:
+            # A receipt tells a reader where to look. This core can no longer
+            # say what the device is doing with the extents it would name.
+            raise RuntimeError(
+                "raw-block core cannot publish: the native engine could not "
+                "establish what the device is still doing"
+            )
+        if not encoded_keys:
+            raise ValueError("request publication requires at least one key")
+        with self._checkpoint_lock:
+            if (
+                self._manifest_digest_from_records(
+                    encoded_keys,
+                    self._manifest_from_index(),
+                )
+                is None
+            ):
+                raise RuntimeError("request publication contains an uncommitted key")
+            # Write a fresh generation for every request rather than reuse one
+            # that already names these keys. Membership does not mean the
+            # mapping is the same: a key can be published at one extent,
+            # deleted, and written again somewhere else, and the earlier
+            # checkpoint still advertises the extent it had then. A reader
+            # adopting that receipt would be sent to storage the writer has
+            # since given to something else, and the holds this request takes
+            # protect where the key is now, not where the old checkpoint says
+            # it was.
+            #
+            # The cost falls only on a request whose keys were all already
+            # published, since any new key forced a checkpoint anyway. The
+            # cheaper alternative is to record the extent each key occupied
+            # when it was published and reuse the generation only while every
+            # requested key still sits where it did, which is a physical
+            # identity check and deliberately not part of the content digest.
+            # That needs keeping the extra map correct at every site that
+            # republishes, and a single missed site restores this bug
+            # silently, so it is not what this milestone does.
+            if not self._checkpoint_once_locked(force=True, rewrite_clean=True):
+                raise RuntimeError("failed to publish the request checkpoint")
+            if not set(encoded_keys).issubset(self._published_keys):
+                raise RuntimeError("published checkpoint is missing request keys")
+            digest = self._published_manifest_digest(encoded_keys)
+            if digest is None:
+                raise RuntimeError(
+                    "published checkpoint is missing request manifest metadata"
+                )
+            if self._derivation is None:
+                raise IncompatibleKeyDerivation(
+                    "raw-block storage P/D publishes keys for another engine "
+                    "to read, so it must state how they were derived; "
+                    "configure the key derivation descriptor"
+                )
+            if not namespace_identity_is_shareable(self.namespace_identity):
+                raise ValueError(
+                    "raw-block storage P/D requires a persistent block "
+                    "namespace identity; this device exposes none, so "
+                    "configure rust_raw_block.namespace_identity with an "
+                    "identity that names the same namespace on every node "
+                    "that shares it"
+                )
+            self._last_publish_ts = time.monotonic()
+            manifest_records = [
+                self._published_manifest[encoded_key] for encoded_key in encoded_keys
+            ]
+            total_logical_bytes = sum(
+                int(record["size"]) for record in manifest_records
+            )
+            return RawBlockPublicationReceipt(
+                writer_epoch=self._writer_epoch,
+                checkpoint_seq=self._meta_seq,
+                key_count=len(encoded_keys),
+                manifest_digest=digest,
+                namespace_identity=self.namespace_identity,
+                total_logical_bytes=total_logical_bytes,
+                total_padded_bytes=sum(
+                    round_up(int(record["size"]), self.block_align)
+                    for record in manifest_records
+                ),
+            )
+
+    def publication_matches(
+        self,
+        receipt: RawBlockPublicationReceipt,
+        encoded_keys: Sequence[str],
+    ) -> bool:
+        """Return whether the adopted checkpoint contains a request receipt."""
+        if len(encoded_keys) != receipt.key_count:
+            return False
+        if receipt.namespace_identity != self.namespace_identity:
+            return False
+        if self._writer_epoch != receipt.writer_epoch:
+            return False
+        if self._meta_seq < receipt.checkpoint_seq:
+            return False
+        digest = self._published_manifest_digest(encoded_keys)
+        return digest == receipt.manifest_digest
+
+    def refresh_until_publication(
+        self,
+        receipt: RawBlockPublicationReceipt,
+        encoded_keys: Sequence[str],
+        *,
+        timeout_ms: int,
+        refresh_interval_ms: int,
+    ) -> bool:
+        """Wait until a reader adopts the advertised or a compatible checkpoint."""
+        if self.role != "reader":
+            raise RuntimeError("only a reader core can adopt a publication receipt")
+        deadline = time.monotonic() + max(timeout_ms, 0) / 1000.0
+        while True:
+            if self.publication_matches(receipt, encoded_keys):
+                return True
+            self.refresh_index_from_device()
+            if self.publication_matches(receipt, encoded_keys):
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(remaining, max(refresh_interval_ms, 1) / 1000.0))
+
+    def _max_checkpoint_seq_on_device(self) -> int:
+        """Highest checkpoint sequence number in any valid header, or 0."""
+        best = 0
+        for offset in self._meta_container_offsets():
+            header = self._read_meta_header(offset)
+            if header is not None:
+                best = max(best, int(header["seq"]))
+        return best
+
+    def refresh_index_from_device(self) -> bool:
+        """Adopt the newest on-device index checkpoint if it is newer than ours.
+
+        Only the checkpoint headers are read until a newer sequence number
+        shows up; then the payload is loaded and replaces the index wholesale,
+        so entries the writer dropped disappear here too.  Per-slot header
+        validation is skipped: with ``verify_slot_header_on_load`` each load
+        checks the slot it reads instead.  Returns True when the index changed.
+        """
+        best: Optional[dict[str, int]] = None
+        for offset in self._meta_container_offsets():
+            header = self._read_meta_header(offset)
+            if header is None:
+                continue
+            if best is None or int(header["seq"]) > int(best["seq"]):
+                best = header
+        if best is None or int(best["seq"]) <= self._meta_seq:
+            return False
+        payload = self._load_meta_payload(best)
+        if payload is None:
+            return False
+        try:
+            data = json.loads(payload.decode("utf-8"))
+        except Exception:
+            logger.warning("RawBlockCore: failed to decode refreshed metadata payload")
+            return False
+        if not self._apply_loaded_state(data, verify=False):
+            logger.warning("RawBlockCore: refreshed metadata payload rejected")
+            return False
+        self._meta_seq = int(best["seq"])
+        self._published_keys = frozenset(self._index)
+        self._published_manifest = self._manifest_from_index()
+        self._published_writer_epoch = self._writer_epoch
+        logger.debug(
+            "RawBlockCore adopted checkpoint seq=%d entries=%d",
+            self._meta_seq,
+            len(self._index),
+        )
+        return True
 
     def apply_loaded_state(self, data: dict[str, Any]) -> bool:
         """Validate and apply a recovered metadata checkpoint payload.
@@ -1302,11 +2679,196 @@ class RawBlockCore:
         """
         return self._apply_loaded_state(data)
 
+    def _require_namespace_authority(self) -> None:
+        """Validate a strict namespace even when its index load is deferred."""
+        if self._derivation is None:
+            return
+        header, payload = self._select_latest_checkpoint()
+        if header is None or payload is None:
+            return
+        try:
+            data = json.loads(payload.decode("utf-8"))
+        except (ValueError, UnicodeError) as exc:
+            raise RuntimeError("strict raw-block checkpoint is not valid JSON") from exc
+        self._require_strict_checkpoint_layout(data)
+        if self.role == "writer":
+            raise RuntimeError(
+                "strict raw-block writer cannot skip a populated checkpoint; "
+                "load its index to preserve existing extents"
+            )
+
+    def _require_strict_checkpoint_layout(self, data: Any) -> None:
+        """Refuse incompatible persisted state before it can look empty."""
+        if self._derivation is None:
+            return
+        if not isinstance(data, dict):
+            raise RuntimeError("strict raw-block checkpoint must be an object")
+        self._require_matching_key_namespace(data.get("key_namespace"))
+        self._require_compatible_derivation(data.get("derivation"))
+        expected = {
+            "version": 1,
+            "key_namespace": self.key_namespace,
+            "block_align": self.block_align,
+            "header_bytes": self.header_bytes,
+            "slot_bytes": self.slot_bytes,
+            "meta_total_bytes": self.meta_total_bytes,
+            "meta_magic": self.meta_magic_text,
+            "meta_version": self.meta_version,
+            "data_base_offset": self._data_base_offset,
+        }
+        for name, value in expected.items():
+            if data.get(name) != value:
+                raise RuntimeError(
+                    f"strict raw-block checkpoint {name} mismatch: "
+                    f"{data.get(name)!r} != {value!r}"
+                )
+        if data.get("device_path") != self.device_path:
+            raise RuntimeError("strict raw-block checkpoint device_path mismatch")
+        if not isinstance(data.get("writer_epoch"), str):
+            raise RuntimeError("strict raw-block checkpoint writer_epoch is invalid")
+        next_slot = data.get("next_slot")
+        if type(next_slot) is not int or not 0 <= next_slot <= self._max_slots:
+            raise RuntimeError("strict raw-block checkpoint next_slot is invalid")
+        if not isinstance(data.get("entries"), dict):
+            raise RuntimeError("strict raw-block checkpoint entries must be an object")
+        tensor_integer = torch.iinfo(torch.int64)
+        used_offsets: set[int] = set()
+        for key, entry in data["entries"].items():
+            if not isinstance(entry, dict):
+                raise RuntimeError("strict raw-block checkpoint entry is invalid")
+            offset, size = entry.get("offset"), entry.get("size")
+            if (
+                type(offset) is not int
+                or type(size) is not int
+                or not self._is_valid_checkpoint_entry(offset, size)
+                or self._offset_to_slot(offset) >= next_slot
+                or offset in used_offsets
+            ):
+                raise RuntimeError("strict raw-block checkpoint extent is invalid")
+            shape = entry.get("shape")
+            positions = entry.get("cached_positions")
+            if (
+                shape is not None
+                and (
+                    not isinstance(shape, list)
+                    or any(
+                        type(size) is not int or not 0 <= size <= tensor_integer.max
+                        for size in shape
+                    )
+                )
+            ) or (
+                positions is not None
+                and (
+                    not isinstance(positions, list)
+                    or any(
+                        type(position) is not int
+                        or not tensor_integer.min <= position <= tensor_integer.max
+                        for position in positions
+                    )
+                )
+            ):
+                raise RuntimeError(
+                    "strict raw-block checkpoint tensor metadata is invalid"
+                )
+            if self._recover_checkpoint_dtype(str(key), entry.get("dtype")) is None:
+                raise RuntimeError("strict raw-block checkpoint dtype is invalid")
+            fmt = entry.get("fmt")
+            if fmt is not None and (
+                not isinstance(fmt, str) or fmt not in MemoryFormat.__members__
+            ):
+                raise RuntimeError("strict raw-block checkpoint format is invalid")
+            used_offsets.add(offset)
+
     def is_poisoned(self) -> bool:
         """Return the sticky verdict that native completion is unproven."""
         if self._raw is not None:
             self._adopt_native_poison(self._raw, "health check")
         return self._poisoned
+
+    @property
+    def _io_attribution(self) -> "RawBlockIoAttribution":
+        """This core's request attribution, created on first use."""
+        record = self._io_attribution_instance
+        if record is None:
+            with RawBlockCore._io_ledger_creation_lock:
+                record = self._io_attribution_instance
+                if record is None:
+                    record = RawBlockIoAttribution()
+                    self._io_attribution_instance = record
+        return record
+
+    def _collect_native_io_journal(self) -> None:
+        """Take what the device recorded and attribute it.
+
+        Drained rather than read, so no row is counted twice, and drained
+        wherever this engine is already waiting on the device: the native
+        record is bounded, and leaving it to fill means losing the oldest
+        rows of the very request being measured.
+        """
+        # Asked of the device this core has, if it has one. A core built
+        # without an initializer -- as several tests do -- has none, and the
+        # accessor would open one just to be asked for a journal.
+        raw = getattr(self, "_raw", None)
+        if raw is None:
+            return
+        take = getattr(raw, "take_io_journal", None)
+        if take is None:
+            if self.io_engine == "io_uring":
+                self._io_attribution.record_collection_failure()
+            return
+        try:
+            rows, dropped = take()
+            if rows or dropped:
+                self._io_attribution.record(rows, dropped)
+                for row in rows:
+                    if row.get("outcome") not in ("completed", "short", "failed"):
+                        continue
+                    context = self._io_attribution.context_for_tag(
+                        str(row.get("request_tag", ""))
+                    )
+                    if context is None or context.get("work_kind") != IO_KIND_PAYLOAD:
+                        continue
+                    trace_storage_pd_event(
+                        "io_cqe",
+                        **context,
+                        direction=str(row.get("direction", "")),
+                        path=str(row.get("path", "")),
+                        outcome=str(row.get("outcome", "")),
+                        device_instance_id=str(row.get("device_instance_id", "")),
+                        batch_id=str(row.get("batch_id", "")),
+                        operation_id=str(row.get("operation_id", "")),
+                        attempt=str(row.get("attempt", "")),
+                        completed_bytes=int(row.get("bytes", 0) or 0),
+                    )
+        except Exception:
+            self._io_attribution.record_collection_failure()
+            logger.warning("RawBlockCore could not read the native I/O journal")
+
+    def _io_tag(self, io_context: Optional[RawBlockIoContext]) -> str:
+        """Register and return the immutable identity carried to native I/O."""
+        if io_context is None:
+            return ""
+        return self._io_attribution.register_context(io_context)
+
+    def link_io_publication(
+        self,
+        request_id: str,
+        receipt: RawBlockPublicationReceipt,
+    ) -> None:
+        """Join payload operations to the receipt minted after they finish."""
+        self._io_attribution.link_publication(request_id, receipt)
+
+    @property
+    def _io_ledger(self) -> "RawBlockIoLedger":
+        """This core's I/O ledger, created on first use."""
+        ledger = self._io_ledger_instance
+        if ledger is None:
+            with RawBlockCore._io_ledger_creation_lock:
+                ledger = self._io_ledger_instance
+                if ledger is None:
+                    ledger = RawBlockIoLedger()
+                    self._io_ledger_instance = ledger
+        return ledger
 
     def raise_if_failed(self) -> None:
         """Reject work after a terminal native io_uring submission failure.
@@ -1325,22 +2887,23 @@ class RawBlockCore:
             raise RuntimeError(worker_error)
 
     def report_status(self) -> dict:
-        """Return health, terminal worker error, layout, and in-flight counters.
+        """Return raw-block health, layout, metadata, and I/O accounting.
 
-        Returns:
-            Status dictionary with ``is_healthy=False`` after close or terminal
-            worker failure, and the failure reason in ``worker_error`` when
-            available. Inspecting status never opens a new native device.
+        The payload rows are summed outside this core's lock because the
+        ledger has its own; taking both in one order here and the other way
+        anywhere else is how a deadlock is built.
         """
+        self._collect_native_io_journal()
+        payload_writes = self._io_ledger.totals(direction="write", kind=IO_KIND_PAYLOAD)
+        payload_reads = self._io_ledger.totals(direction="read", kind=IO_KIND_PAYLOAD)
         with self._lock:
             worker_error = self._worker_error()
             return {
                 "is_healthy": not self._closed
-                and not self.is_poisoned()
+                and not self._poisoned
                 and worker_error is None,
-                "poisoned": self._poisoned,
-                "quarantined_slot_count": len(self._quarantined_slots),
                 "worker_error": worker_error,
+                "poisoned": self._poisoned,
                 "type": "RawBlockCore",
                 "key_namespace": self.key_namespace,
                 "device_path": self.device_path,
@@ -1354,10 +2917,21 @@ class RawBlockCore:
                 "locked_key_count": sum(
                     1 for refcnt in self._lock_refcnt.values() if refcnt > 0
                 ),
+                "publication_protected_key_count": len(
+                    self._publication_protection_refcnt
+                ),
                 "free_slot_count": len(self._free_slots),
+                "quarantined_slot_count": len(self._quarantined_slots or {}),
+                "bytes_deduplicated": self._bytes_deduplicated,
+                "capacity_evictions": self._capacity_evictions,
+                "payload_writes": payload_writes.as_payload(),
+                "payload_reads": payload_reads.as_payload(),
+                "io_by_kind_and_path": self._io_ledger.snapshot(),
+                "io_by_request": self._io_attribution.as_payload(),
                 "next_slot": self._next_slot,
                 "max_slots": self._max_slots,
                 "metadata_seq": self._meta_seq,
+                "writer_epoch": self._writer_epoch,
                 "metadata_dirty_total": self._meta_dirty_total,
                 "metadata_persisted": self._meta_persisted,
                 "inflight_io_count": self._inflight_io_count,
@@ -1366,6 +2940,8 @@ class RawBlockCore:
                 "io_engine": self.io_engine,
                 "iouring_queue_depth": self.iouring_queue_depth,
                 "use_uring_cmd": self.use_uring_cmd,
+                "buffer_registration_mode": self._buffer_registration_mode,
+                "require_dmabuf_registration": self.require_dmabuf_registration,
                 "fdp_slot_affinity_enabled": self.fdp_slot_affinity_enabled,
                 "fdp_slot_affinity_hit_count": (self._fdp_slot_affinity_hit_count),
                 "fdp_slot_affinity_fallback_count": (
@@ -1418,9 +2994,20 @@ class RawBlockCore:
         self._poisoned = unknown
 
         checkpointed = False
-        if not unknown:
+        if self.role == "writer" and not self.close_writes_final_checkpoint:
+            # Nothing to do and nothing lost: every published request wrote
+            # its own forced checkpoint when it was published, so the last
+            # generation on the device already names every request that
+            # completed. A close-time checkpoint here could only add a
+            # generation naming a request that did not.
+            logger.info(
+                "RawBlockCore %s: writing no close-time checkpoint; each "
+                "published request already has its own generation.",
+                self.device_path,
+            )
+        elif self.role == "writer" and not unknown:
             # A writer that cannot say what the device holds must not
-            # publish an index naming it. ordinary submission already refuses
+            # publish an index naming it. publish_request already refuses
             # while running, and shutdown is not an exemption.
             try:
                 # The helper's own answer: it returns false for state that
@@ -1429,7 +3016,7 @@ class RawBlockCore:
                 checkpointed = bool(self._checkpoint_once(force=True))
             except Exception as e:
                 logger.warning("RawBlockCore final checkpoint failed: %s", e)
-        else:
+        elif self.role == "writer":
             logger.error(
                 "RawBlockCore %s: skipping the final checkpoint because this "
                 "writer cannot establish what the device holds. The last "
@@ -1756,6 +3343,9 @@ class RawBlockCore:
         payload_lens: Sequence[int],
         total_lens: Sequence[int],
         placement_ids: Sequence[PlacementId] | None = None,
+        kinds: Sequence[str] | None = None,
+        *,
+        io_context: Optional[RawBlockIoContext] = None,
     ) -> None:
         """Write buffers as chunks bounded by ``max_data_transfer_size``.
 
@@ -1777,19 +3367,31 @@ class RawBlockCore:
         chunk_buffers: list[Any] = []
         chunk_lens: list[int] = []
         chunk_placement_ids: list[PlacementId] = []
+        # One entry per chunk, so a completion bitmap that is per chunk can
+        # still be attributed to the logical write's kind.
+        chunk_kinds: list[str] = []
         keepalive: list[Any] = []
         per_write_placement_ids = normalize_raw_block_placement_ids(
             placement_ids,
             len(offsets),
             field_name="placement_ids",
         )
+        write_kinds = self._normalize_io_kinds(kinds, len(offsets))
+        self._io_ledger.logical_request(
+            "write",
+            IO_PATH_IOURING_BOUNDED,
+            write_kinds,
+            payload_lens,
+            total_lens,
+        )
 
-        for offset, buf, payload_len, total_len, placement_id in zip(
+        for offset, buf, payload_len, total_len, placement_id, kind in zip(
             offsets,
             buffers,
             payload_lens,
             total_lens,
             per_write_placement_ids,
+            write_kinds,
             strict=True,
         ):
             offset = int(offset)
@@ -1818,24 +3420,35 @@ class RawBlockCore:
                 chunk_buffers.append(view[cursor : cursor + chunk_len])
                 chunk_lens.append(chunk_len)
                 chunk_placement_ids.append(placement_id)
+                chunk_kinds.append(kind)
                 cursor += chunk_len
 
         if not chunk_offsets:
             return
+        self._io_ledger.submitted(
+            "write", IO_PATH_IOURING_BOUNDED, chunk_kinds, chunk_lens
+        )
         batch_id = raw_dev.batched_write(
             chunk_offsets,
             chunk_buffers,
             chunk_lens,
             chunk_placement_ids,
+            request_tag=self._io_tag(io_context),
         )
-        if not all(
-            self._wait_iouring_results(
-                raw_dev,
-                batch_id,
-                len(chunk_offsets),
-                "bounded io_uring write",
-            )
-        ):
+        completed = self._wait_iouring_results(
+            raw_dev,
+            batch_id,
+            len(chunk_offsets),
+            "bounded io_uring write",
+        )
+        self._io_ledger.completed(
+            "write",
+            IO_PATH_IOURING_BOUNDED,
+            chunk_kinds,
+            chunk_lens,
+            completed,
+        )
+        if not all(completed):
             raise RuntimeError("raw-block bounded io_uring write failed")
         keepalive.clear()
 
@@ -1845,6 +3458,9 @@ class RawBlockCore:
         buffers: Sequence[Any],
         payload_lens: Sequence[int],
         total_lens: Sequence[int],
+        kinds: Sequence[str] | None = None,
+        *,
+        io_context: Optional[RawBlockIoContext] = None,
     ) -> list[bool]:
         """Read buffers as bounded NVMe raw-command chunks.
 
@@ -1868,6 +3484,14 @@ class RawBlockCore:
         chunk_statuses: list[list[bool]] = [[] for _ in offsets]
         copy_back_targets: dict[int, tuple[memoryview, memoryview, int]] = {}
         keepalive: list[Any] = []
+        read_kinds = self._normalize_io_kinds(kinds, len(offsets))
+        self._io_ledger.logical_request(
+            "read",
+            IO_PATH_IOURING_BOUNDED,
+            read_kinds,
+            payload_lens,
+            total_lens,
+        )
 
         for logical_idx, (offset, buf, payload_len, total_len) in enumerate(
             zip(offsets, buffers, payload_lens, total_lens, strict=True)
@@ -1914,11 +3538,16 @@ class RawBlockCore:
         if not chunk_offsets:
             return results
 
+        chunk_kinds = [read_kinds[idx] for idx in chunk_logical_indices]
+        self._io_ledger.submitted(
+            "read", IO_PATH_IOURING_BOUNDED, chunk_kinds, chunk_lens
+        )
         try:
             batch_id = raw_dev.batched_read(
                 chunk_offsets,
                 chunk_buffers,
                 chunk_lens,
+                request_tag=self._io_tag(io_context),
             )
             chunk_results = self._wait_iouring_results(
                 raw_dev,
@@ -1929,6 +3558,13 @@ class RawBlockCore:
         except Exception:
             return results
 
+        self._io_ledger.completed(
+            "read",
+            IO_PATH_IOURING_BOUNDED,
+            chunk_kinds,
+            chunk_lens,
+            chunk_results,
+        )
         for chunk_idx, logical_idx in enumerate(chunk_logical_indices):
             ok = chunk_idx < len(chunk_results) and bool(chunk_results[chunk_idx])
             chunk_statuses[logical_idx].append(ok)
@@ -1951,6 +3587,9 @@ class RawBlockCore:
         payload_lens: Sequence[int],
         total_lens: Sequence[int],
         placement_ids: Sequence[PlacementId] | None = None,
+        kinds: Sequence[str] | None = None,
+        *,
+        io_context: Optional[RawBlockIoContext] = None,
     ) -> None:
         """Write one or more buffers through the configured Rust I/O path.
 
@@ -1972,12 +3611,23 @@ class RawBlockCore:
             len(offsets),
             field_name="placement_ids",
         )
+        write_kinds = self._normalize_io_kinds(kinds, len(offsets))
 
         if self.io_engine != "io_uring":
-            for offset, buf, payload_len, total_len in zip(
-                offsets, buffers, payload_lens, total_lens, strict=True
+            # Recorded against the route that is about to run, so the row
+            # names what carried the bytes. A synchronous write returning
+            # is its completion: there is no separate reported outcome.
+            self._io_ledger.logical_request(
+                "write", IO_PATH_SYNC, write_kinds, payload_lens, total_lens
+            )
+            self._io_ledger.submitted("write", IO_PATH_SYNC, write_kinds, total_lens)
+            for offset, buf, payload_len, total_len, kind in zip(
+                offsets, buffers, payload_lens, total_lens, write_kinds, strict=True
             ):
                 raw_dev.pwrite_from_buffer(offset, buf, payload_len, total_len)
+                self._io_ledger.completed(
+                    "write", IO_PATH_SYNC, [kind], [total_len], [True]
+                )
             return
 
         if self.max_data_transfer_size > 0:
@@ -1987,27 +3637,46 @@ class RawBlockCore:
                 payload_lens,
                 total_lens,
                 per_write_placement_ids,
+                write_kinds,
+                io_context=io_context,
             )
             return
 
         # batched_write takes payload_lens and total_lens separately, so it
         # handles O_DIRECT padding (payload_len < total_len) by bouncing and
         # zero-filling internally. All io_uring writes go through one batch.
+        self._io_ledger.logical_request(
+            "write",
+            IO_PATH_IOURING_BATCHED,
+            write_kinds,
+            payload_lens,
+            total_lens,
+        )
+        self._io_ledger.submitted(
+            "write", IO_PATH_IOURING_BATCHED, write_kinds, total_lens
+        )
         batch_id = raw_dev.batched_write(
             [int(offset) for offset in offsets],
             list(buffers),
             [int(total_len) for total_len in total_lens],
             per_write_placement_ids,
             [int(payload_len) for payload_len in payload_lens],
+            request_tag=self._io_tag(io_context),
         )
-        if not all(
-            self._wait_iouring_results(
-                raw_dev,
-                batch_id,
-                len(offsets),
-                "io_uring write",
-            )
-        ):
+        completed = self._wait_iouring_results(
+            raw_dev,
+            batch_id,
+            len(offsets),
+            "io_uring write",
+        )
+        self._io_ledger.completed(
+            "write",
+            IO_PATH_IOURING_BATCHED,
+            write_kinds,
+            total_lens,
+            completed,
+        )
+        if not all(completed):
             raise RuntimeError("raw-block io_uring write failed")
 
     def _read_buffers(
@@ -2016,6 +3685,9 @@ class RawBlockCore:
         buffers: Sequence[Any],
         payload_lens: Sequence[int],
         total_lens: Sequence[int],
+        kinds: Sequence[str] | None = None,
+        *,
+        io_context: Optional[RawBlockIoContext] = None,
     ) -> list[bool]:
         """Read one or more buffers through the configured Rust I/O path.
 
@@ -2035,16 +3707,24 @@ class RawBlockCore:
                 reads are submitted.
         """
         raw_dev = self._rawdev()
+        read_kinds = self._normalize_io_kinds(kinds, len(offsets))
         if self.io_engine != "io_uring":
+            self._io_ledger.logical_request(
+                "read", IO_PATH_SYNC, read_kinds, payload_lens, total_lens
+            )
+            self._io_ledger.submitted("read", IO_PATH_SYNC, read_kinds, total_lens)
             results: list[bool] = []
-            for offset, buf, payload_len, total_len in zip(
-                offsets, buffers, payload_lens, total_lens, strict=True
+            for offset, buf, payload_len, total_len, kind in zip(
+                offsets, buffers, payload_lens, total_lens, read_kinds, strict=True
             ):
                 try:
                     raw_dev.pread_into(offset, buf, payload_len, total_len)
                     results.append(True)
                 except Exception:
                     results.append(False)
+                self._io_ledger.completed(
+                    "read", IO_PATH_SYNC, [kind], [total_len], [results[-1]]
+                )
             return results
 
         if self.max_data_transfer_size > 0:
@@ -2053,19 +3733,99 @@ class RawBlockCore:
                 buffers,
                 payload_lens,
                 total_lens,
+                read_kinds,
+                io_context=io_context,
             )
 
+        self._io_ledger.logical_request(
+            "read",
+            IO_PATH_IOURING_BATCHED,
+            read_kinds,
+            payload_lens,
+            total_lens,
+        )
+        self._io_ledger.submitted(
+            "read", IO_PATH_IOURING_BATCHED, read_kinds, total_lens
+        )
         batch_id = raw_dev.batched_read(
             [int(offset) for offset in offsets],
             list(buffers),
             [int(total_len) for total_len in total_lens],
+            request_tag=self._io_tag(io_context),
         )
-        return self._wait_iouring_results(
+        results = self._wait_iouring_results(
             raw_dev,
             batch_id,
             len(offsets),
             "io_uring read",
         )
+        self._io_ledger.completed(
+            "read",
+            IO_PATH_IOURING_BATCHED,
+            read_kinds,
+            total_lens,
+            results,
+        )
+        return results
+
+    @staticmethod
+    def _normalize_io_kinds(
+        kinds: Sequence[str] | None,
+        count: int,
+    ) -> list[str]:
+        """Give every operation a kind, defaulting to payload.
+
+        A caller that does not say is writing or reading cache payload --
+        the header and checkpoint routes are the ones that have to be
+        explicit, because they are the traffic that must not be added into
+        a payload total.
+        """
+        if kinds is None:
+            return [IO_KIND_PAYLOAD] * count
+        classified = list(kinds)
+        if len(classified) != count:
+            raise ValueError("io kinds must align with the operations")
+        return classified
+
+    def _require_matching_key_namespace(self, theirs: Any) -> None:
+        """Refuse recovery under a different slot-header identity scheme.
+
+        Otherwise header validation treats every live entry as stale and
+        makes those slots available for writes over the original cache.
+        Older checkpoints lack this field, so preserve their recovery behavior.
+        """
+        if theirs is None or str(theirs) == self.key_namespace:
+            return
+        raise IncompatibleKeyDerivation(
+            f"raw-block checkpoint uses key namespace {theirs!r}, "
+            f"not {self.key_namespace!r}; refusing to recycle its live extents"
+        )
+
+    def _require_compatible_derivation(self, payload: Any) -> None:
+        """Refuse a namespace whose keys this engine cannot reproduce.
+
+        Only the strict lane carries a descriptor. Where one is configured,
+        an absent descriptor on the device is as incompatible as a differing
+        one: it names a writer that made no statement about its derivation,
+        so nothing can be concluded about the keys already there.
+        """
+        if self._derivation is None:
+            return
+        theirs = RawBlockDerivationDescriptor.from_payload(payload)
+        if theirs is None:
+            raise IncompatibleKeyDerivation(
+                f"raw-block namespace {self.namespace_identity} carries no key "
+                "derivation descriptor, and this engine requires one. Its "
+                "existing keys cannot be shown to be readable here; refusing "
+                "rather than adding ours beside them."
+            )
+        mismatches = self._derivation.describe_mismatch(theirs)
+        if mismatches:
+            raise IncompatibleKeyDerivation(
+                f"raw-block namespace {self.namespace_identity} derives keys "
+                "differently from this engine, so neither can read the "
+                "other's: " + "; ".join(mismatches)
+            )
 
     def _adopt_native_poison(
         self,
@@ -2104,21 +3864,6 @@ class RawBlockCore:
         )
         return True
 
-    def _quarantine_slot_locked(self, slot: int) -> None:
-        """Withhold a slot from allocation for this engine's lifetime.
-
-        Nothing takes a slot out of quarantine. Reuse needs proof that the
-        device is done with it, which this engine cannot obtain once its
-        worker has reported an outcome it could not determine.
-        """
-        if self._quarantined_slots is None:
-            self._quarantined_slots = {}
-        if slot in self._quarantined_slots:
-            return
-        self._quarantined_slots[slot] = None
-        self._free_slots.pop(slot, None)
-        self._remove_slot_from_affinity_pool_locked(slot)
-
     def _wait_iouring_results(
         self,
         raw_dev: Any,
@@ -2137,6 +3882,11 @@ class RawBlockCore:
         finally:
             self._adopt_native_poison(raw_dev, operation, batch_id)
         results = list(results)
+        # Here, because this is where the engine is already waiting on the
+        # device. The native record is bounded, so leaving it to fill means
+        # losing the oldest rows of the very request being measured.
+        self._collect_native_io_journal()
+        self._adopt_native_poison(raw_dev, operation, batch_id)
         for operation_index, error in completion_errors:
             logger.error(
                 "RawBlockCore %s batch %d operation %d failed: %s",
@@ -2162,6 +3912,7 @@ class RawBlockCore:
         offset: int,
         *,
         placement_id: PlacementId = None,
+        io_context: Optional[RawBlockIoContext] = None,
     ) -> bool:
         """Write one object header and payload into a raw-block slot.
 
@@ -2205,6 +3956,8 @@ class RawBlockCore:
                     ],
                     [hdr_total, total_len],
                     [placement_id, placement_id],
+                    [IO_KIND_SLOT_HEADER, IO_KIND_PAYLOAD],
+                    io_context=io_context,
                 )
             finally:
                 with self._lock:
@@ -2220,6 +3973,8 @@ class RawBlockCore:
         keys: Sequence[RawBlockKeySpec],
         objs: Sequence[MemoryObj],
         placement_ids: Sequence[PlacementId],
+        *,
+        io_context: Optional[RawBlockIoContext] = None,
     ) -> RawBlockPutManyResult:
         """Persist objects using bounded io_uring batch submissions.
 
@@ -2248,7 +4003,9 @@ class RawBlockCore:
                 have the same length.
         """
         if len(keys) <= _MAX_PUT_MANY_IO_URING_BATCH_KEYS:
-            return self._put_many_batch_io_chunk(keys, objs, placement_ids)
+            return self._put_many_batch_io_chunk(
+                keys, objs, placement_ids, io_context=io_context
+            )
 
         results = [False] * len(keys)
         stored_keys: list[str] = []
@@ -2275,6 +4032,7 @@ class RawBlockCore:
                 [key for _, key, _, _ in chunk],
                 [obj for _, _, obj, _ in chunk],
                 [placement_id for _, _, _, placement_id in chunk],
+                io_context=io_context,
             )
             for local_i, (global_i, _key, _obj, _placement_id) in enumerate(chunk):
                 results[global_i] = chunk_result.results[local_i]
@@ -2290,6 +4048,8 @@ class RawBlockCore:
         keys: Sequence[RawBlockKeySpec],
         objs: Sequence[MemoryObj],
         placement_ids: Sequence[PlacementId],
+        *,
+        io_context: Optional[RawBlockIoContext] = None,
     ) -> RawBlockPutManyResult:
         """Persist one bounded chunk through a single ``_write_buffers`` call.
 
@@ -2336,10 +4096,11 @@ class RawBlockCore:
                 for i, (key, obj, placement_id) in enumerate(
                     zip(keys, objs, placement_ids, strict=True)
                 ):
-                    if self._closed:
+                    if self._closed or self._poisoned:
                         break
                     encoded_key = key.encoded
                     if encoded_key in self._index:
+                        self._bytes_deduplicated += int(self._index[encoded_key].size)
                         results[i] = True
                         continue
                     if encoded_key in planned_keys:
@@ -2406,6 +4167,7 @@ class RawBlockCore:
         payload_lens: list[int] = []
         total_lens: list[int] = []
         write_placement_ids: list[PlacementId] = []
+        write_kinds: list[str] = []
         prepared_plan: list[tuple[int, RawBlockKeySpec, MemoryObj, int]] = []
         write_succeeded = True
         for i, key, obj, offset, placement_id in write_plan:
@@ -2442,6 +4204,7 @@ class RawBlockCore:
             payload_lens.extend((hdr_total, payload_len))
             total_lens.extend((hdr_total, total_len))
             write_placement_ids.extend((placement_id, placement_id))
+            write_kinds.extend((IO_KIND_SLOT_HEADER, IO_KIND_PAYLOAD))
             prepared_plan.append((i, key, obj, offset))
 
         if prepared_plan:
@@ -2454,6 +4217,8 @@ class RawBlockCore:
                     payload_lens,
                     total_lens,
                     write_placement_ids,
+                    write_kinds,
+                    io_context=io_context,
                 )
             except Exception as e:
                 write_succeeded = False
@@ -2471,7 +4236,7 @@ class RawBlockCore:
                 if inflight is None:
                     continue
                 if not write_succeeded or inflight.canceled:
-                    self._append_free_slot_locked(
+                    self._release_submitted_slot_locked(
                         self._offset_to_slot(int(inflight.offset))
                     )
                     self._meta_dirty_total += 1
@@ -2530,6 +4295,8 @@ class RawBlockCore:
                     [buf],
                     [self.header_bytes],
                     [self.header_bytes],
+                    [IO_KIND_SLOT_HEADER],
+                    io_context=self._metadata_io_context,
                 )
             ):
                 return "unreadable", None
@@ -2605,7 +4372,45 @@ class RawBlockCore:
             self._next_slot += 1
             self._set_slot_placement_id_locked(slot, placement_id)
             return self._slot_to_offset(slot)
+        if self.evict_unlocked_on_full and self._reclaim_oldest_unlocked_slot_locked():
+            # Reclamation added exactly one known-safe slot to the normal free
+            # list. Allocate it through the regular path so FDP bookkeeping is
+            # updated in one place.
+            return self._allocate_slot_locked(placement_id)
         raise RuntimeError("No free slots available")
+
+    def _reclaim_oldest_unlocked_slot_locked(self) -> bool:
+        """Recycle one committed extent that no request lease protects.
+
+        Dict insertion order is the writer's commit order, giving bounded
+        FIFO replacement. A P/D request protects keys while it writes and
+        promotes that protection to locks before advertising its publication.
+        A read acknowledgement or exact unread-release message drops those
+        locks, so only an unprotected, unlocked extent may be reused.
+        """
+        victim_key = ""
+        victim_entry: Optional[_Entry] = None
+        for encoded_key, entry in self._index.items():
+            if self._lock_refcnt.get(encoded_key, 0) > 0:
+                continue
+            if self._publication_protection_refcnt.get(encoded_key, 0) > 0:
+                continue
+            if encoded_key in self._inflight:
+                continue
+            victim_key = encoded_key
+            victim_entry = entry
+            break
+        if victim_entry is None:
+            return False
+
+        del self._index[victim_key]
+        self._lock_refcnt.pop(victim_key, None)
+        self._release_submitted_slot_locked(
+            self._offset_to_slot(int(victim_entry.offset))
+        )
+        self._meta_dirty_total += 1
+        self._capacity_evictions += 1
+        return True
 
     def _append_free_slot_locked(self, slot: int) -> None:
         """Add a slot to the free list while ``self._lock`` is held."""
@@ -2622,6 +4427,38 @@ class RawBlockCore:
         placement_id = self._slot_placement_ids.get(slot)
         if placement_id is not None:
             self._free_slots_by_placement_id.setdefault(placement_id, {})[slot] = None
+
+    def _release_submitted_slot_locked(self, slot: int) -> None:
+        """Give back a slot the device was already told to write.
+
+        Whether that is safe is exactly the question poison answers. A
+        logical failure is not a DMA fence: if the worker could not
+        establish what happened, a later request handed this slot would be
+        given storage an earlier write may still be landing in.
+
+        Only use this where the extent reached the submission ring. A slot
+        reserved and then abandoned before submission was never the device's
+        and goes straight back to the free list.
+        """
+        if self._poisoned:
+            self._quarantine_slot_locked(slot)
+            return
+        self._append_free_slot_locked(slot)
+
+    def _quarantine_slot_locked(self, slot: int) -> None:
+        """Withhold a slot from allocation for this engine's lifetime.
+
+        Nothing takes a slot out of quarantine. Reuse needs proof that the
+        device is done with it, which this engine cannot obtain once its
+        worker has reported an outcome it could not determine.
+        """
+        if self._quarantined_slots is None:
+            self._quarantined_slots = {}
+        if slot in self._quarantined_slots:
+            return
+        self._quarantined_slots[slot] = None
+        self._free_slots.pop(slot, None)
+        self._remove_slot_from_affinity_pool_locked(slot)
 
     def _remove_slot_from_affinity_pool_locked(self, slot: int) -> None:
         """Remove an allocated slot from its PID-specific free-slot pool."""
@@ -2665,7 +4502,9 @@ class RawBlockCore:
             idx * self._meta_container_bytes for idx in range(self._meta_copy_count)
         ]
 
-    def _read_meta_header(self, container_offset: int) -> Optional[dict[str, int]]:
+    def _read_meta_header(
+        self, container_offset: int, errors: Optional[list[str]] = None
+    ) -> Optional[dict[str, int]]:
         """Read and validate a metadata checkpoint header."""
         buf = bytearray(self.block_align)
         try:
@@ -2675,19 +4514,31 @@ class RawBlockCore:
                     [buf],
                     [self.block_align],
                     [self.block_align],
+                    [IO_KIND_CHECKPOINT],
+                    io_context=self._metadata_io_context,
                 )
             ):
+                if errors is not None:
+                    errors.append("checkpoint header read failed")
                 return None
         except Exception:
+            if errors is not None:
+                errors.append("checkpoint header read failed")
             return None
 
+        if not any(buf):
+            return None
         hdr = bytes(buf[: _META_HEADER_STRUCT.size])
         magic, version, seq, payload_len, crc = _META_HEADER_STRUCT.unpack(hdr)
         if magic != self.meta_magic or version != self.meta_version:
+            if errors is not None:
+                errors.append("checkpoint header is nonblank and incompatible")
             return None
 
         payload_cap = self._meta_payload_capacity()
         if payload_len <= 0 or payload_len > payload_cap:
+            if errors is not None:
+                errors.append("checkpoint payload length is invalid")
             return None
         return {
             "seq": int(seq),
@@ -2696,7 +4547,9 @@ class RawBlockCore:
             "container_offset": int(container_offset),
         }
 
-    def _load_meta_payload(self, header: dict[str, int]) -> Optional[bytes]:
+    def _load_meta_payload(
+        self, header: dict[str, int], errors: Optional[list[str]] = None
+    ) -> Optional[bytes]:
         """Load and CRC-validate a checkpoint payload for a metadata header."""
         payload_len = int(header["payload_len"])
         payload_off = int(header["container_offset"]) + self.block_align
@@ -2704,15 +4557,28 @@ class RawBlockCore:
         buf = bytearray(total_len)
         try:
             if not all(
-                self._read_buffers([payload_off], [buf], [payload_len], [total_len])
+                self._read_buffers(
+                    [payload_off],
+                    [buf],
+                    [payload_len],
+                    [total_len],
+                    [IO_KIND_CHECKPOINT],
+                    io_context=self._metadata_io_context,
+                )
             ):
+                if errors is not None:
+                    errors.append("checkpoint payload read failed")
                 return None
         except Exception:
+            if errors is not None:
+                errors.append("checkpoint payload read failed")
             return None
 
         payload = bytes(buf[:payload_len])
         crc = zlib.crc32(payload) & 0xFFFFFFFF
         if crc != int(header["crc"]):
+            if errors is not None:
+                errors.append("checkpoint payload checksum mismatch")
             return None
         return payload
 
@@ -2722,16 +4588,22 @@ class RawBlockCore:
         """Return the newest valid checkpoint header and payload."""
         best_header: Optional[dict[str, int]] = None
         best_payload: Optional[bytes] = None
+        errors: Optional[list[str]] = [] if self._derivation is not None else None
         for offset in self._meta_container_offsets():
-            header = self._read_meta_header(offset)
+            header = self._read_meta_header(offset, errors)
             if header is None:
                 continue
-            payload = self._load_meta_payload(header)
+            payload = self._load_meta_payload(header, errors)
             if payload is None:
                 continue
             if best_header is None or int(header["seq"]) > int(best_header["seq"]):
                 best_header = header
                 best_payload = payload
+        if best_header is None and errors:
+            raise RuntimeError(
+                "strict raw-block checkpoint cannot establish an empty namespace: "
+                + "; ".join(errors)
+            )
         return best_header, best_payload
 
     def _snapshot_state(self) -> tuple[dict[str, Any], int]:
@@ -2740,7 +4612,7 @@ class RawBlockCore:
             dirty_total = self._meta_dirty_total
             snapshot = {
                 "version": 1,
-                "key_namespace": self.key_namespace,
+                "writer_epoch": self._writer_epoch,
                 "device_path": self.device_path,
                 "capacity_bytes": self.capacity_bytes,
                 "block_align": self.block_align,
@@ -2749,6 +4621,13 @@ class RawBlockCore:
                 "meta_total_bytes": self.meta_total_bytes,
                 "meta_magic": self.meta_magic_text,
                 "meta_version": self.meta_version,
+                # The namespace these keys were derived in. A core reading
+                # this device with a different one computes a different slot
+                # identity for every entry, so it reads each header as stale.
+                "key_namespace": self.key_namespace,
+                "derivation": (
+                    self._derivation.as_payload() if self._derivation else None
+                ),
                 "data_base_offset": self._data_base_offset,
                 "next_slot": self._next_slot,
                 "entries": {
@@ -2779,6 +4658,57 @@ class RawBlockCore:
             }
         return snapshot, dirty_total
 
+    @staticmethod
+    def _manifest_digest_from_records(
+        encoded_keys: Sequence[str],
+        records: Mapping[str, dict[str, Any]],
+    ) -> str | None:
+        """Hash ordered key identities and compatibility metadata."""
+        manifest: list[dict[str, Any]] = []
+        for encoded_key in encoded_keys:
+            record = records.get(encoded_key)
+            if record is None:
+                return None
+            manifest.append(record)
+        payload = json.dumps(
+            manifest,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _published_manifest_digest(self, encoded_keys: Sequence[str]) -> str | None:
+        """Hash a request against the exact serialized checkpoint generation."""
+        return self._manifest_digest_from_records(
+            encoded_keys,
+            self._published_manifest,
+        )
+
+    def _manifest_from_index_locked(self) -> dict[str, dict[str, Any]]:
+        """Build compatibility records while ``_lock`` is held."""
+        return {
+            encoded_key: {
+                "key": encoded_key,
+                "size": int(entry.meta.size),
+                "shape": list(entry.meta.shape)
+                if entry.meta.shape is not None
+                else None,
+                "dtype": self._checkpoint_dtype_name(entry.meta.dtype),
+                "fmt": entry.meta.fmt.name
+                if entry.meta.fmt is not None and hasattr(entry.meta.fmt, "name")
+                else str(entry.meta.fmt)
+                if entry.meta.fmt is not None
+                else None,
+            }
+            for encoded_key, entry in self._index.items()
+        }
+
+    def _manifest_from_index(self) -> dict[str, dict[str, Any]]:
+        """Return detached compatibility records for the current index."""
+        with self._lock:
+            return self._manifest_from_index_locked()
+
     def _checkpoint_dtype_name(self, dtype: torch.dtype | None) -> str | None:
         """Return a durable checkpoint string for a torch dtype.
 
@@ -2793,7 +4723,13 @@ class RawBlockCore:
             return None
         return TORCH_DTYPE_TO_STR_DTYPE.get(dtype, str(dtype))
 
-    def _write_checkpoint(self, payload: bytes, dirty_total_snapshot: int) -> bool:
+    def _write_checkpoint(
+        self,
+        payload: bytes,
+        dirty_total_snapshot: int,
+        published_manifest: dict[str, dict[str, Any]],
+        published_writer_epoch: str,
+    ) -> bool:
         """Write one checkpoint copy and advance persisted metadata counters."""
         payload_cap = self._meta_payload_capacity()
         if len(payload) > payload_cap:
@@ -2805,6 +4741,9 @@ class RawBlockCore:
             )
             return False
 
+        if self._meta_seq_resume_pending:
+            self._meta_seq = max(self._meta_seq, self._max_checkpoint_seq_on_device())
+            self._meta_seq_resume_pending = False
         next_seq = self._meta_seq + 1
         target_idx = int((next_seq - 1) % self._meta_copy_count)
         target = self._meta_container_offsets()[target_idx]
@@ -2824,50 +4763,84 @@ class RawBlockCore:
         )
 
         placement_id = self.meta_checkpoint_placement_id
+        # The header is the checkpoint's commit record.  Do not batch it with
+        # the payload: independent io_uring requests may complete out of order,
+        # exposing a valid new header before its payload is durable/readable.
         self._write_buffers(
-            [payload_off, target],
-            [payload, header_block],
-            [payload_len, self.block_align],
-            [payload_total_len, self.block_align],
-            [placement_id, placement_id],
+            [payload_off],
+            [payload],
+            [payload_len],
+            [payload_total_len],
+            [placement_id],
+            [IO_KIND_CHECKPOINT],
+            io_context=self._metadata_io_context,
         )
+        if self._derivation is not None:
+            # O_DIRECT completion establishes visibility, not persistence.
+            # Persist KV data and this checkpoint payload before its commit
+            # header can reach storage, then persist the header before READY.
+            self._rawdev().flush()
+        self._write_buffers(
+            [target],
+            [header_block],
+            [self.block_align],
+            [self.block_align],
+            [placement_id],
+            [IO_KIND_CHECKPOINT],
+            io_context=self._metadata_io_context,
+        )
+
+        if self._derivation is not None:
+            self._rawdev().flush()
+            self.raise_if_failed()
 
         with self._lock:
             self._meta_seq = int(next_seq)
             self._meta_persisted = max(self._meta_persisted, int(dirty_total_snapshot))
+            self._published_manifest = published_manifest
+            self._published_keys = frozenset(published_manifest)
+            self._published_writer_epoch = published_writer_epoch
         return True
 
     def _checkpoint_once(self, force: bool) -> bool:
         """Write a metadata checkpoint when dirty and sufficiently idle."""
+        with self._checkpoint_lock:
+            return self._checkpoint_once_locked(force)
+
+    def _checkpoint_once_locked(
+        self, force: bool, *, rewrite_clean: bool = False
+    ) -> bool:
+        """Write a checkpoint while ``_checkpoint_lock`` is held."""
         with self._lock:
             dirty = self._meta_dirty_total > self._meta_persisted
             idle_ok = self._inflight_io_count == 0 and (
                 time.monotonic() - self._last_io_ts
             ) >= (self.meta_idle_quiet_ms / 1000.0)
 
-        if not dirty:
+        if not dirty and not rewrite_clean:
             return False
         if not force and not idle_ok:
             return False
 
         snapshot, dirty_total_snapshot = self._snapshot_state()
+        published_manifest = {
+            str(encoded_key): {
+                "key": str(encoded_key),
+                "size": int(entry["size"]),
+                "shape": entry.get("shape"),
+                "dtype": entry.get("dtype"),
+                "fmt": entry.get("fmt"),
+            }
+            for encoded_key, entry in snapshot["entries"].items()
+        }
         payload = json.dumps(snapshot, separators=(",", ":"), ensure_ascii=True).encode(
             "utf-8"
         )
-        return self._write_checkpoint(payload, dirty_total_snapshot)
-
-    def _require_matching_key_namespace(self, theirs: Any) -> None:
-        """Refuse recovery under a different slot-header identity scheme.
-
-        Otherwise header validation treats every live entry as stale and
-        makes those slots available for writes over the original cache.
-        Older checkpoints lack this field, so preserve their recovery behavior.
-        """
-        if theirs is None or str(theirs) == self.key_namespace:
-            return
-        raise IncompatibleKeyDerivation(
-            f"raw-block checkpoint uses key namespace {theirs!r}, "
-            f"not {self.key_namespace!r}; refusing to recycle its live extents"
+        return self._write_checkpoint(
+            payload,
+            dirty_total_snapshot,
+            published_manifest,
+            str(snapshot.get("writer_epoch", "")),
         )
 
     def _is_valid_checkpoint_entry(self, offset: int, size: int) -> bool:
@@ -2882,13 +4855,33 @@ class RawBlockCore:
             return False
         return 0 < size <= (self.slot_bytes - self.header_bytes)
 
-    def _apply_loaded_state(self, data: dict[str, Any]) -> bool:
-        """Apply decoded checkpoint state after validating layout fields."""
+    def _apply_loaded_state(
+        self, data: dict[str, Any], *, verify: Optional[bool] = None
+    ) -> bool:
+        """Apply decoded checkpoint state after validating layout fields.
+
+        ``verify`` overrides ``meta_verify_on_load`` for this call.
+        """
+        self._require_strict_checkpoint_layout(data)
         if not isinstance(data, dict):
             return False
         if int(data.get("version", 0)) != 1:
             return False
+
+        # Before any geometry check, because every one of those treats a
+        # mismatch as "ignore this metadata and start empty" -- which is
+        # right for a layout this engine cannot read and wrong here. A
+        # device someone else is writing with a different derivation, or
+        # under a different key namespace, is not empty: starting empty
+        # means allocating over their live extents while their checkpoint
+        # still advertises them. These raise rather than return False.
         self._require_matching_key_namespace(data.get("key_namespace"))
+        self._require_compatible_derivation(data.get("derivation"))
+
+        writer_epoch = data.get("writer_epoch", "")
+        if not isinstance(writer_epoch, str):
+            logger.warning("Device metadata writer_epoch is invalid; ignoring metadata")
+            return False
         checkpoint_device_path = data.get("device_path")
         if checkpoint_device_path and checkpoint_device_path != self.device_path:
             logger.warning("Device metadata device_path mismatch; ignoring metadata")
@@ -2992,14 +4985,25 @@ class RawBlockCore:
             # Rebuild from committed entries instead of trusting checkpoint
             # free_slots. A crash-time checkpoint can otherwise preserve a slot
             # reserved by an uncommitted in-flight write as neither used nor free.
+            # Quarantined slots are in neither set and must stay withheld: the
+            # index no longer names them, so a plain rebuild would hand back
+            # exactly the extents whose outcome is unknown.
+            quarantined = self._quarantined_slots or {}
             self._free_slots = {
-                slot: None for slot in range(self._next_slot) if slot not in used_slots
+                slot: None
+                for slot in range(self._next_slot)
+                if slot not in used_slots and slot not in quarantined
             }
 
             self._meta_dirty_total = 0
             self._meta_persisted = 0
+            self._published_writer_epoch = writer_epoch
+            self._published_manifest = self._manifest_from_index_locked()
+            self._published_keys = frozenset(self._published_manifest)
+            if self.role == "reader":
+                self._writer_epoch = writer_epoch
 
-        if self.meta_verify_on_load:
+        if self.meta_verify_on_load if verify is None else verify:
             self._validate_loaded_entries()
         return True
 
@@ -3100,7 +5104,7 @@ class RawBlockCore:
                     # A header that arrived and is not ours is a known
                     # outcome, so ordinary recycling applies -- unless this
                     # core has stopped being able to say, which this decides.
-                    self._append_free_slot_locked(
+                    self._release_submitted_slot_locked(
                         self._offset_to_slot(int(removed_entry.offset))
                     )
             self._meta_dirty_total += 1
@@ -3149,6 +5153,37 @@ class RawBlockCore:
         offsets, start, end = work_item
         return [self._read_slot_header(offsets[i]) for i in range(start, end)]
 
+    def _is_stale_header(
+        self,
+        encoded_key: str,
+        entry: _Entry,
+        slot_hdr: Optional[tuple[int, int]],
+    ) -> bool:
+        """Return True when the recovered slot header does not match metadata."""
+        if slot_hdr is None:
+            return True
+        try:
+            expected_identity = slot_identity_from_encoded_key(
+                encoded_key,
+                self.key_namespace,
+            )
+        except Exception:
+            return True
+        slot_identity, payload_len = slot_hdr
+        return int(slot_identity) != int(expected_identity) or int(payload_len) != int(
+            entry.size
+        )
+
+    def _build_recovery_item_ranges(
+        self, item_count: int, num_ranges: int
+    ) -> list[tuple[int, int]]:
+        """Partition headers into at most one task per reader."""
+        range_size = max(1, (item_count + num_ranges - 1) // num_ranges)
+        return [
+            (start, min(start + range_size, item_count))
+            for start in range(0, item_count, range_size)
+        ]
+
     def _read_slot_headers_batched(
         self, offsets: list[int]
     ) -> list[tuple[str, Optional[tuple[int, int]]]]:
@@ -3181,6 +5216,8 @@ class RawBlockCore:
                 buffers,
                 lengths,
                 lengths,
+                [IO_KIND_SLOT_HEADER] * len(offsets),
+                io_context=self._metadata_io_context,
             )
         except RuntimeError:
             # Admission is sealed on poison. Ask the actual existing handle,
@@ -3209,39 +5246,6 @@ class RawBlockCore:
                 headers.append(self._read_slot_header(offset))
         return headers
 
-    def _is_stale_header(
-        self,
-        encoded_key: str,
-        entry: _Entry,
-        slot_hdr: Optional[tuple[int, int]],
-    ) -> bool:
-        """Return True when the recovered slot header does not match metadata."""
-        if slot_hdr is None:
-            return True
-        try:
-            expected_identity = slot_identity_from_encoded_key(
-                encoded_key,
-                self.key_namespace,
-            )
-        except Exception:
-            return True
-        slot_identity, payload_len = slot_hdr
-        return int(slot_identity) != int(expected_identity) or int(payload_len) != int(
-            entry.size
-        )
-
-    def _build_recovery_item_ranges(
-        self,
-        item_count: int,
-        num_ranges: int,
-    ) -> list[tuple[int, int]]:
-        """Build bounded work ranges for recovered checkpoint entries."""
-        range_size = max(1, (item_count + num_ranges - 1) // num_ranges)
-        return [
-            (start, min(start + range_size, item_count))
-            for start in range(0, item_count, range_size)
-        ]
-
     def _load_checkpoint_from_device(self) -> None:
         """Load the newest valid checkpoint from the raw device if present."""
         header, payload = self._select_latest_checkpoint()
@@ -3253,13 +5257,20 @@ class RawBlockCore:
             return
         try:
             data = json.loads(payload.decode("utf-8"))
-        except Exception:
+        except Exception as exc:
+            if self._derivation is not None:
+                raise RuntimeError(
+                    "strict raw-block checkpoint is not valid JSON"
+                ) from exc
             logger.warning("RawBlockCore: failed to decode metadata payload")
             return
         if not self.apply_loaded_state(data):
             logger.warning("RawBlockCore: metadata payload rejected by checks")
             return
         self._meta_seq = int(header["seq"])
+        self._published_keys = frozenset(self._index)
+        self._published_manifest = self._manifest_from_index()
+        self._published_writer_epoch = str(data.get("writer_epoch", ""))
         logger.info(
             "RawBlockCore loaded checkpoint (entries=%d next_slot=%d seq=%d device=%s)",
             len(self._index),
