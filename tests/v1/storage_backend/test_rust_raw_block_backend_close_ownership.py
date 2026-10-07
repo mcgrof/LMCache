@@ -19,6 +19,7 @@ alive is.
 from __future__ import annotations
 
 # Standard
+from pathlib import Path
 from typing import Any
 import asyncio
 import gc
@@ -807,3 +808,68 @@ def test_close_refuses_a_reader_before_allocating(
     monkeypatch.setattr(backend._core, "get_metadata_prefix", unexpected_read)
     key = CacheEngineKey("test_model", 1, 0, 9010, torch.bfloat16)
     assert backend.get_blocking(key) is None
+
+
+@pytest.mark.no_shared_allocator
+def test_optional_cpu_registration_failure_retains_poisoned_backing(
+    monkeypatch: pytest.MonkeyPatch,
+    loop_in_thread: asyncio.AbstractEventLoop,
+    tmp_path: Path,
+) -> None:
+    """Optional DMA-BUF registration cannot fall back after failed cleanup."""
+
+    class CPUOwner:
+        def __init__(self) -> None:
+            self.retained = False
+
+        def get_full_chunk_size_bytes(self) -> int:
+            return 4096
+
+        def get_memory_allocator(self) -> CPUOwner:
+            return self
+
+        def retain_backing_resources(self) -> None:
+            self.retained = True
+
+    class RegistrationCore:
+        io_engine = "io_uring"
+        use_uring_cmd = False
+        require_dmabuf_registration = False
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def register_fixed_buffers_from_allocator(self, allocator: Any) -> None:
+            raise RuntimeError("partial registration cleanup failed")
+
+        def is_poisoned(self) -> bool:
+            return True
+
+        def close(self) -> RawBlockCloseOutcome:
+            return RawBlockCloseOutcome(
+                quiescence=NativeQuiescence.RETAINED,
+                poisoned=True,
+                final_checkpoint_written=False,
+                reason="registered exports could not be released",
+            )
+
+    monkeypatch.setattr(plugin, "RawBlockCore", RegistrationCore)
+    path = tmp_path / "registration.bin"
+    with path.open("wb") as handle:
+        handle.truncate(64 * 1024 * 1024)
+    config = _config(str(path))
+    config.extra_config["rust_raw_block.gpu_buffer_bytes"] = 0
+    cpu = CPUOwner()
+    owner = weakref.ref(cpu)
+    with pytest.raises(RuntimeError, match="partial registration cleanup failed"):
+        RustRawBlockBackend(
+            config=config,
+            metadata=_METADATA,
+            local_cpu_backend=cpu,
+            loop=loop_in_thread,
+            dst_device="cpu",
+        )
+    assert cpu.retained
+    del cpu
+    gc.collect()
+    assert owner() is not None

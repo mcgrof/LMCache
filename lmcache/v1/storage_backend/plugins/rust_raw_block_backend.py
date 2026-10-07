@@ -344,6 +344,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                 if (
                     self._gpu_allocator is not None
                     or self._core.require_dmabuf_registration
+                    or self._outcome_is_unknown()
                 ):
                     try:
                         outcome = self._core.close()
@@ -953,6 +954,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
 
         Raises:
             RuntimeError: If no event loop exists.
+            ValueError: If keys and objects have different lengths.
         """
         with self._put_lock:
             if self._sealed:
@@ -1004,27 +1006,38 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             logger.exception("Skipping raw-block store after native worker failure")
             return None
 
+        if len(keys) != len(objs):
+            raise ValueError("raw-block keys and objects must have equal length")
         pending: list[tuple[CacheEngineKey, RawBlockKeySpec, MemoryObj]] = []
-        for key, obj in zip(keys, objs, strict=False):
-            with self._put_lock:
-                if self._sealed:
-                    break
-                if key in self._put_tasks:
-                    continue
-                self._put_tasks.add(key)
-
-            spec = encode_legacy_key(key)
-            exists = self._core.contains_key(
-                spec.encoded,
-                lock=False,
-            ) or self._core.exists_inflight(spec.encoded)
-            if exists:
+        reserved_keys: set[CacheEngineKey] = set()
+        try:
+            for key, obj in zip(keys, objs, strict=True):
+                spec = encode_legacy_key(key)
                 with self._put_lock:
-                    self._put_tasks.discard(key)
-                continue
+                    if self._sealed:
+                        break
+                    if key in self._put_tasks:
+                        continue
+                    self._put_tasks.add(key)
+                    reserved_keys.add(key)
 
-            obj.ref_count_up()
-            pending.append((key, spec, obj))
+                exists = self._core.contains_key(
+                    spec.encoded,
+                    lock=False,
+                ) or self._core.exists_inflight(spec.encoded)
+                if exists:
+                    with self._put_lock:
+                        self._put_tasks.discard(key)
+                        reserved_keys.discard(key)
+                    continue
+
+                obj.ref_count_up()
+                pending.append((key, spec, obj))
+        except BaseException:
+            self._release_unscheduled_puts(pending)
+            with self._put_lock:
+                self._put_tasks.difference_update(reserved_keys)
+            raise
 
         if not pending:
             return None
@@ -1330,7 +1343,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         io_task, io_finished = self._start_put_many([spec], [memory_obj])
         try:
             put_result = await asyncio.shield(io_task)
-            if not put_result.results or not put_result.results[0]:
+            if len(put_result.results) != 1 or not put_result.results[0]:
                 raise RuntimeError(f"Failed to persist raw-block key {spec.encoded}")
             if self._publish_after_put:
                 await asyncio.to_thread(self._core.publish_index)
@@ -1370,7 +1383,11 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         io_task, io_finished = self._start_put_many(specs, memory_objs)
         try:
             put_result = await asyncio.shield(io_task)
-            if len(put_result.results) != len(pending) or not all(put_result.results):
+            if len(put_result.results) != len(pending):
+                raise RuntimeError(
+                    "Raw-block write completion count does not match batch"
+                )
+            if not all(put_result.results):
                 failed = []
 
                 for key, spec, ok in zip(keys, specs, put_result.results, strict=False):
