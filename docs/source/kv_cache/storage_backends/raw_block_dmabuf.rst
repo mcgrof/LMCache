@@ -96,7 +96,7 @@ Opaque GPU pointers cannot use that CPU bounce path. Host arenas expose the
 requested logical size while the exporter owns the page-rounded mapping.
 
 ``audit_backend_enabled`` is currently incompatible with raw-block GPU staging
-alone. Configuration rejects this combination before endpoint
+and storage P/D. Configuration rejects those combinations before endpoint
 setup because the audit wrapper does not preserve their capability,
 completion and request-lifecycle contracts.
 

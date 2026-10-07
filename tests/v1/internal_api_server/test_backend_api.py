@@ -4,6 +4,7 @@ Test cases for the /backends/* API endpoints.
 
 Tests cover:
 - GET /backends  — list active backends
+- GET /backends/{name}/status — collect a live backend diagnostic receipt
 - DELETE /backends/{name} — close and remove a backend
 - POST /backends — create new backends from current config
 - POST /backends/{name}/recreate — atomic close + create
@@ -35,6 +36,9 @@ class FakeBackend:
 
     def close(self):
         self.closed = True
+
+    def report_status(self):
+        return {"is_healthy": not self.closed, "name": self._name}
 
     def __str__(self):
         return self._name
@@ -111,6 +115,47 @@ class TestListBackends:
         assert resp.status_code == 500
         data = resp.json()
         assert "boom" in data["message"]
+
+
+# ------------------------------------------------------------------ #
+#  GET /backends/{name}/status
+# ------------------------------------------------------------------ #
+
+
+class TestBackendStatus:
+    def test_status_success(self, client_with_engine):
+        resp = client_with_engine.get("/backends/RemoteBackend/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["backend"] == "RemoteBackend"
+        assert data["backend_class"] == "FakeBackend"
+        assert data["status"] == {
+            "is_healthy": True,
+            "name": "RemoteBackend",
+        }
+
+    def test_status_not_found(self, client_with_engine):
+        resp = client_with_engine.get("/backends/NonExistent/status")
+        assert resp.status_code == 404
+        assert resp.json()["status"] == "not_found"
+
+    def test_status_unsupported(self, client_with_engine, mock_storage_manager):
+        mock_storage_manager.storage_backends["NoStatus"] = object()
+        resp = client_with_engine.get("/backends/NoStatus/status")
+        assert resp.status_code == 501
+        assert resp.json()["status"] == "unsupported"
+
+    def test_status_no_engine(self, client_without_engine):
+        resp = client_without_engine.get("/backends/RemoteBackend/status")
+        assert resp.status_code == 503
+
+    def test_status_exception(self, client_with_engine, mock_storage_manager):
+        backend = MagicMock()
+        backend.report_status.side_effect = RuntimeError("status error")
+        mock_storage_manager.storage_backends["Broken"] = backend
+        resp = client_with_engine.get("/backends/Broken/status")
+        assert resp.status_code == 500
+        assert "status error" in resp.json()["message"]
 
 
 # ------------------------------------------------------------------ #

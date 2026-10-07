@@ -1114,3 +1114,54 @@ class TestStoreAndRetrieveLocationEnvConversion:
         restored = LMCacheEngineConfig.from_dict(config.to_dict())
         assert restored.retrieve_locations == ["LocalCPUBackend"]
         assert restored.store_location == "LocalDiskBackend"
+
+
+class TestPDDataPath:
+    """Which route a prefill/decode handoff takes, and what each needs."""
+
+    @staticmethod
+    def _pd_defaults(**overrides: Any) -> LMCacheEngineConfig:
+        config = LMCacheEngineConfig.from_defaults()
+        config.enable_pd = True
+        config.pd_role = "sender"
+        config.pd_buffer_size = 2**30
+        config.pd_buffer_device = "cuda"
+        for key, value in overrides.items():
+            setattr(config, key, value)
+        return config
+
+    def test_the_default_route_is_the_transfer_channel(self):
+        config = LMCacheEngineConfig.from_defaults()
+        assert config.pd_data_path == "transfer_channel"
+        assert config.pd_uses_shared_storage is False
+
+    def test_shared_storage_is_only_shared_storage_with_pd_enabled(self):
+        config = LMCacheEngineConfig.from_defaults()
+        config.pd_data_path = "raw_block"
+        assert config.pd_uses_shared_storage is False
+
+    def test_an_unknown_route_is_refused(self):
+        config = self._pd_defaults(pd_data_path="carrier_pigeon")
+        with pytest.raises(ValueError, match="pd_data_path must be"):
+            config.validate()
+
+    def test_shared_storage_needs_the_plugin_that_reaches_the_device(self):
+        config = self._pd_defaults(pd_data_path="raw_block")
+        with pytest.raises(ValueError, match="storage_plugins"):
+            config.validate()
+
+    def test_shared_storage_does_not_need_transfer_channel_buffers(self):
+        """Those settings describe a route this path does not take."""
+        config = self._pd_defaults(
+            pd_data_path="raw_block",
+            storage_plugins=["raw_block"],
+            pd_buffer_size=None,
+            pd_buffer_device=None,
+        )
+        config.validate()
+        assert config.pd_uses_shared_storage is True
+
+    def test_the_transfer_channel_still_needs_its_buffers(self):
+        config = self._pd_defaults(pd_buffer_size=None)
+        with pytest.raises(AssertionError):
+            config.validate()

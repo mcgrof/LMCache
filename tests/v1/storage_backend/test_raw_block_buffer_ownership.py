@@ -103,7 +103,7 @@ def test_unknown_read_retains_destination_and_source_extent(
     target = _make_byte_obj(32)
     monkeypatch.setattr(backend.local_cpu_backend, "allocate", lambda *args: target)
 
-    def unknown_read(*args):
+    def unknown_read(*args, **kwargs):
         backend._core._poisoned = True
         if failed_read == "exception":
             raise OSError("completion lost")
@@ -129,10 +129,10 @@ def test_cancelled_put_retains_owners_until_thread_finishes(
     finish = threading.Event()
     real_put = backend._core.put_many
 
-    def blocked_put(*args):
+    def blocked_put(*args, **kwargs):
         entered.set()
         assert finish.wait(5)
-        return real_put(*args)
+        return real_put(*args, **kwargs)
 
     monkeypatch.setattr(backend._core, "put_many", blocked_put)
     count = 2 if many else 1
