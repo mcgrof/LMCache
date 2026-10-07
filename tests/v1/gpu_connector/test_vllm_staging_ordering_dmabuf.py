@@ -100,8 +100,8 @@ def _delay(stream: torch.cuda.Stream) -> torch.cuda.Event:
     return event
 
 
-def _cpu_fixture(generation: int) -> tuple[torch.Tensor, bytes]:
-    """Create a full KV fixture and its independent token-major byte oracle."""
+def _cpu_fixture(generation: int, tokens: int) -> tuple[torch.Tensor, bytes]:
+    """Create KV bytes and an independent oracle for the selected token count."""
     source = (
         (
             (
@@ -113,18 +113,20 @@ def _cpu_fixture(generation: int) -> tuple[torch.Tensor, bytes]:
         .to(torch.float16)
         .reshape(KV_SHAPE)
     )
-    # The GPU uses slots 37..52; this CPU gather does not use the native kernel.
-    packed = source.reshape(2, 128, 64)[:, 37:53].unsqueeze(1).contiguous()
+    # This CPU gather is independent of the native transfer kernel.
+    packed = source.reshape(2, 128, 64)[:, 37 : 37 + tokens].unsqueeze(1).contiguous()
     return source, packed.view(torch.uint8).numpy().tobytes()
 
 
 @pytest.mark.no_shared_allocator
 @pytest.mark.parametrize("version", [2, 3])
-def test_native_staging_dmabuf_ordering(version: int) -> None:
+@pytest.mark.parametrize("tokens", [16, 5])
+def test_native_staging_dmabuf_ordering(version: int, tokens: int) -> None:
     """Check delayed native gathers/writes and independent reads/scatters.
 
     Args:
         version: V2 or V3 connector implementation to exercise.
+        tokens: Full or partial chunk; a five-token write must zero 2,816 tail bytes.
 
     Raises:
         AssertionError: Byte comparisons or completion/readiness contracts fail.
@@ -181,22 +183,25 @@ def test_native_staging_dmabuf_ordering(version: int) -> None:
         dtypes=[torch.float16],
         fmt=MemoryFormat.KV_2LTD,
     )
-    objects = allocator.batched_allocate(
-        [STAGING_SHAPE], [torch.float16], 2, fmt=MemoryFormat.KV_2LTD
-    )
-    assert objects is not None and len(objects) == 2
-    guard_obj, staging = objects
-    raw = staging.raw_tensor
+    guard_obj = allocator.allocate(STAGING_SHAPE, torch.float16, MemoryFormat.KV_2LTD)
+    staging_shape = torch.Size([2, 1, tokens, 64])
+    staging = allocator.allocate(staging_shape, torch.float16, MemoryFormat.KV_2LTD)
+    assert guard_obj is not None and staging is not None
+    objects = [guard_obj, staging]
+    assert staging.get_size() == tokens * 256
+    raw = staging.physical_tensor
     assert raw is not None and raw.nbytes == SLOT_BYTES and raw.is_cuda
     guard = guard_obj.raw_tensor
     assert guard is not None
     guard.fill_(0xA7)
     kv = [torch.zeros(KV_SHAPE, dtype=torch.float16, device=device)]
-    slots = torch.arange(37, 53, dtype=torch.int64, device=device)
+    slots = torch.arange(37, 37 + tokens, dtype=torch.int64, device=device)
     producer = torch.cuda.Stream(device=device)
     # Warm pointer setup and both native kernels before timed/adversarial work.
-    connector.batched_from_gpu([staging], [0], [16], kvcaches=kv, slot_mapping=slots)
-    connector.batched_to_gpu([staging], [0], [16], kvcaches=kv, slot_mapping=slots)
+    connector.batched_from_gpu(
+        [staging], [0], [tokens], kvcaches=kv, slot_mapping=slots
+    )
+    connector.batched_to_gpu([staging], [0], [tokens], kvcaches=kv, slot_mapping=slots)
     torch.cuda.current_stream(device).synchronize()
 
     fd, filename = tempfile.mkstemp(prefix="lmcache-dmabuf-ordering-", dir=directory)
@@ -236,11 +241,11 @@ def test_native_staging_dmabuf_ordering(version: int) -> None:
             f"dmabuf_offset={export_offset}"
         )
         for generation in (3, 17, 53, 97):
-            source, expected_write = _cpu_fixture(generation)
+            source, expected_write = _cpu_fixture(generation, tokens)
             prepared_source = source.to(device)
             owners += (prepared_source,)
             kv[0].fill_(-1)
-            raw.fill_(0x5C)
+            raw.fill_(0xD3)
             torch.cuda.current_stream(device).synchronize()
             gather_delay = _delay(connector.store_stream)
             producer_delay = _delay(producer)
@@ -248,7 +253,7 @@ def test_native_staging_dmabuf_ordering(version: int) -> None:
                 kv[0].copy_(prepared_source)
                 # The caller stream is the explicit producer dependency.
                 connector.batched_from_gpu(
-                    [staging], [0], [16], kvcaches=kv, slot_mapping=slots
+                    [staging], [0], [tokens], kvcaches=kv, slot_mapping=slots
                 )
             assert producer_delay.query(), "gather returned before its producer"
             assert gather_delay.query() and connector.store_stream.query(), (
@@ -263,10 +268,16 @@ def test_native_staging_dmabuf_ordering(version: int) -> None:
                 request_tag=f"ordering/v{version}/g{generation}/write",
             )
             assert raw_device.wait_iouring(batch) == ([True], [])
-            assert _host_read(host_fd, WRITE_OFFSET, SLOT_BYTES) == expected_write
+            assert _host_read(host_fd, WRITE_OFFSET, SLOT_BYTES) == (
+                expected_write + bytes(SLOT_BYTES - len(expected_write))
+            ), "stored physical padding contains bytes from a prior owner"
 
-            _, expected_read = _cpu_fixture(generation + 101)
-            _host_write(host_fd, READ_OFFSET, expected_read)
+            _, expected_read = _cpu_fixture(generation + 101, tokens)
+            _host_write(
+                host_fd,
+                READ_OFFSET,
+                expected_read + bytes(SLOT_BYTES - len(expected_read)),
+            )
             os.fdatasync(host_fd)
             raw.fill_(0x3B)
             kv[0].fill_(-2)
@@ -282,14 +293,14 @@ def test_native_staging_dmabuf_ordering(version: int) -> None:
             )
             assert raw_device.wait_iouring(batch) == ([True], [])
             connector.batched_to_gpu(
-                [staging], [0], [16], kvcaches=kv, slot_mapping=slots
+                [staging], [0], [tokens], kvcaches=kv, slot_mapping=slots
             )
             assert consumer_delay.query(), "scatter returned while still queued"
             assert connector.load_stream.query(), "scatter still running at handoff"
             # Reuse staging immediately on another stream after scatter returns.
             with torch.cuda.stream(producer):
                 raw.fill_(0xD9)
-            restored = kv[0].reshape(2, 128, 64)[:, 37:53].contiguous()
+            restored = kv[0].reshape(2, 128, 64)[:, 37 : 37 + tokens].contiguous()
             assert restored.cpu().view(torch.uint8).numpy().tobytes() == expected_read
             producer.synchronize()
             assert torch.all(guard == 0xA7).item(), "neighboring GPU slot changed"
@@ -300,11 +311,23 @@ def test_native_staging_dmabuf_ordering(version: int) -> None:
                 (4 * SLOT_BYTES, FILE_BYTES),
             ):
                 assert media[begin:end] == bytes([0xA5]) * (end - begin)
-            print(f"V{version} generation={generation}: write/read/guards PASS")
+            print(
+                f"V{version} tokens={tokens} generation={generation}: "
+                "write/read/padding/guards PASS"
+            )
         journal, dropped = raw_device.take_io_journal()
         assert dropped == 0 and journal, "native route evidence is incomplete"
         assert all(row["path"] == "dmabuf_fixed" for row in journal)
-        print(json.dumps({"version": version, "journal": journal, "dropped": dropped}))
+        print(
+            json.dumps(
+                {
+                    "version": version,
+                    "tokens": tokens,
+                    "journal": journal,
+                    "dropped": dropped,
+                }
+            )
+        )
     finally:
         try:
             if raw_device is not None:

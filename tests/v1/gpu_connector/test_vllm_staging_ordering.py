@@ -29,9 +29,11 @@ from types import SimpleNamespace
 from typing import Protocol, cast
 from unittest.mock import patch
 import ast
+import gc
 import itertools
 import os
 import unittest
+import weakref
 
 
 def _source_path() -> Path:
@@ -102,6 +104,20 @@ def _load_connector(version: int, cuda: DeferredCuda) -> type[Connector]:
                 and decorator.id == "_lmcache_nvtx_annotate"
             )
         ]
+    helpers = [
+        node
+        for node in parsed.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_check_staging_ready", "_synchronize_staging"}
+    ]
+    memory_path = (
+        Path(__file__).resolve().parents[3] / "lmcache/v1/memory_management.py"
+    )
+    retention = next(
+        node
+        for node in ast.parse(memory_path.read_text()).body
+        if isinstance(node, ast.FunctionDef) and node.name == "retain_memory_owners"
+    )
     module = ast.Module(
         body=[
             ast.ImportFrom(
@@ -109,6 +125,8 @@ def _load_connector(version: int, cuda: DeferredCuda) -> type[Connector]:
                 names=[ast.alias(name="annotations")],
                 level=0,
             ),
+            retention,
+            *helpers,
             ast.ClassDef(
                 name=name,
                 bases=[],
@@ -125,6 +143,8 @@ def _load_connector(version: int, cuda: DeferredCuda) -> type[Connector]:
         "cast": cast,
         "torch": SimpleNamespace(cuda=cuda, Tensor=Payload),
         "MemoryObj": MemoryObject,
+        "_FAILED_STAGING_CONNECTORS": {},
+        "_UNCERTAIN_MEMORY_OWNERS": [],
         "MemoryFormat": SimpleNamespace(KV_2LTD="KV_2LTD", KV_MLA_FMT="KV_MLA_FMT"),
         "device_ops": SimpleNamespace(multi_layer_kv_transfer=cuda.transfer),
         "lmcache_native": SimpleNamespace(
@@ -184,6 +204,7 @@ class DeferredStream:
         self.device = "cuda:0"
         self.operations: list[Callable[[], None]] = []
         self.completed = 0
+        self.fail_synchronization = False
 
     def enqueue(self, operation: Callable[[], None]) -> None:
         """Append work without executing it."""
@@ -203,6 +224,8 @@ class DeferredStream:
 
     def synchronize(self) -> None:
         """Complete this stream and its explicit dependencies."""
+        if self.fail_synchronization:
+            raise RuntimeError("injected synchronization failure")
         self.run_until(len(self.operations))
 
     def pending(self) -> int:
@@ -299,12 +322,32 @@ class MemoryObject:
         self.tensor = tensor
         self.raw_tensor = tensor
         self.metadata = SimpleNamespace(fmt="KV_2LTD")
+        self.padding = [0xD3] * 11
+        self.ref_count = 1
+
+    def zero_padding(self) -> None:
+        """Queue padding initialization on the selected staging stream."""
+        self.tensor.cuda.current.enqueue(
+            lambda: self.padding.__setitem__(slice(None), [0] * len(self.padding))
+        )
+
+    def ref_count_up(self) -> None:
+        """Acquire an allocation owner, preventing reuse after uncertain work."""
+        self.ref_count += 1
+
+    def ref_count_down(self) -> None:
+        """Release the caller's allocation ownership."""
+        self.ref_count -= 1
 
     def get_tensor(self, index: int) -> Payload:
         """Return the sole group, rejecting an unexpected group index."""
         if index != 0:
             raise IndexError(index)
         return self.tensor
+
+
+class SlotMapping(list[int]):
+    """A weak-referenceable source operand for the unknown-completion test."""
 
 
 class Connector(Protocol):
@@ -432,6 +475,43 @@ class TestVLLMStagingOrdering(unittest.TestCase):
                     [obj.tensor.values for obj in scenario.objects],
                     scenario.expected_chunks(),
                 )
+                self.assertEqual(
+                    [obj.padding for obj in scenario.objects],
+                    [[0] * 11] * len(scenario.objects),
+                )
+
+    def test_failed_stream_wait_retains_owners_and_refuses_reuse(self) -> None:
+        """Unknown GPU completion keeps allocation refs after caller cleanup."""
+        for version, direction in itertools.product((2, 3), ("store", "load")):
+            with self.subTest(version=version, direction=direction):
+                scenario = Scenario(version, "cuda:0", "direct", 2)
+                scenario.slots = SlotMapping(scenario.slots)
+                mapping_ref = weakref.ref(scenario.slots)
+                stream = (
+                    scenario.connector.store_stream
+                    if direction == "store"
+                    else scenario.connector.load_stream
+                )
+                stream.fail_synchronization = True
+                with self.assertRaisesRegex(RuntimeError, "synchronization failure"):
+                    if direction == "store":
+                        scenario.store("batch")
+                    else:
+                        scenario.connector.batched_to_gpu(
+                            scenario.objects,
+                            scenario.starts,
+                            scenario.ends,
+                            slot_mapping=scenario.slots,
+                        )
+                self.assertGreater(stream.pending(), 0)
+                for obj in scenario.objects:
+                    obj.ref_count_down()
+                    self.assertEqual(obj.ref_count, 1)
+                scenario.slots = []
+                gc.collect()
+                self.assertIsNotNone(mapping_ref())
+                with self.assertRaisesRegex(RuntimeError, "unknown GPU completion"):
+                    scenario.store("batch")
 
     def test_caller_can_join_another_producer_stream(self) -> None:
         """A caller-established dependency reaches the storage handoff."""

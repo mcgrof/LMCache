@@ -25,6 +25,27 @@ from lmcache.v1.system_detection import NUMAMapping
 
 logger = init_logger(__name__)
 
+_UNCERTAIN_MEMORY_OWNERS: list[tuple[list["MemoryObj"], tuple[object, ...]]] = []
+
+
+def retain_memory_owners(memory_objs: list["MemoryObj"], *owners: object) -> None:
+    """Retain allocations and their owner graphs until process exit.
+
+    Use only after a failed completion wait leaves asynchronous accesses
+    unresolved. Extra allocation references prevent ordinary caller cleanup
+    from returning their pages to a pool. Strong references keep allocator,
+    source tensor, stream, and backend objects alive as well. There is no
+    release operation because an unsuccessful wait did not prove quiescence.
+
+    Args:
+        memory_objs: Allocations which may still be accessed asynchronously.
+        *owners: Objects owning any additional resources used by those accesses.
+    """
+    retained = list(memory_objs)
+    for memory_obj in retained:
+        memory_obj.ref_count_up()
+    _UNCERTAIN_MEMORY_OWNERS.append((retained, owners))
+
 
 # Cache for ctypes ubyte-array types keyed by length.
 #
@@ -463,6 +484,21 @@ class MemoryObj(metaclass=abc.ABCMeta):
         """
         return self.raw_tensor
 
+    def zero_padding(self) -> None:
+        """Zero bytes after the logical payload within the owned allocation.
+
+        GPU zeroing is enqueued on the caller's current stream. The caller must
+        complete that stream before exposing the allocation to external I/O or
+        recycling it. Logical payload bytes and neighboring allocations are
+        unchanged; non-tensor objects have no tensor padding to initialize.
+
+        Raises:
+            RuntimeError: The tensor operation cannot be submitted.
+        """
+        physical = self.physical_tensor
+        if physical is not None and physical.nbytes > self.get_size():
+            physical.view(torch.uint8).view(-1)[self.get_size() :].zero_()
+
     @abc.abstractmethod
     def get_tensor(self, index: int) -> Optional[torch.Tensor]:
         """
@@ -774,7 +810,7 @@ def export_device_dmabufs(tensor: torch.Tensor) -> list[tuple[int, int, int]]:
     # Standard
     import os
 
-    page = 4096
+    page = os.sysconf("SC_PAGE_SIZE")
     base = tensor.data_ptr()
     size = tensor.numel() * tensor.element_size()
     if base % page or size % page:
@@ -1025,6 +1061,48 @@ class TensorMemoryObj(MemoryObj):
         if self._used_size_override is not None:
             return self._used_size_override
         return self.group_prefix_sum[-1]
+
+    def rebind_layout(
+        self,
+        shapes: list[torch.Size],
+        dtypes: list[torch.dtype],
+        fmt: MemoryFormat,
+    ) -> None:
+        """Start a recycled allocation with a new logical tensor layout.
+
+        The allocator must own the idle object exclusively and guarantee that
+        all previous GPU and I/O accesses have completed. The retained physical
+        allocation remains unchanged; logical views and group offsets describe
+        only the new payload, and any previous used-size override is removed.
+
+        Args:
+            shapes: Nonempty list of logical group shapes.
+            dtypes: Dtype for each shape, in matching order.
+            fmt: Memory format for the new allocation.
+
+        Raises:
+            ValueError: The layout is empty, mismatched, or exceeds the allocation.
+        """
+        if not shapes or len(shapes) != len(dtypes):
+            raise ValueError("shapes and dtypes must be nonempty and equally sized")
+        prefix = [0]
+        for shape, dtype in zip(shapes, dtypes, strict=True):
+            prefix.append(prefix[-1] + shape.numel() * dtype.itemsize)
+        physical = self.physical_tensor
+        if physical is None or prefix[-1] > physical.nbytes:
+            raise ValueError("logical layout exceeds the owned tensor allocation")
+        with self.lock:
+            self.meta.shape = shapes[0]
+            self.meta.dtype = dtypes[0]
+            self.meta.shapes = shapes
+            self.meta.dtypes = dtypes
+            self.meta.fmt = fmt
+            self.meta.ref_count = 1
+            self.group_prefix_sum = prefix
+            self._physical_data = physical
+            self.raw_data = physical.view(torch.uint8).view(-1)[: prefix[-1]]
+            self._used_size_override = None
+            self.reset_l1_manager()
 
     def set_used_size(self, n: int) -> None:
         """Narrow the logical size to ``n`` bytes after a write.

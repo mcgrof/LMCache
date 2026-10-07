@@ -17,8 +17,12 @@ from lmcache.v1 import memory_management
 
 
 @pytest.fixture
-def device_tensor() -> torch.Tensor:
+def device_tensor(monkeypatch: pytest.MonkeyPatch) -> torch.Tensor:
     """Describe two aligned chunks without allocating or accessing GPU memory."""
+    sysconf = os.sysconf
+    monkeypatch.setattr(
+        os, "sysconf", lambda name: 4096 if name == "SC_PAGE_SIZE" else sysconf(name)
+    )
     return cast(
         torch.Tensor,
         SimpleNamespace(
@@ -75,6 +79,52 @@ def test_failed_device_export_releases_prior_chunks(
         assert memory_management.get_dmabuf_region(base + 4096) is None
     finally:
         memory_management.release_device_dmabufs(device_tensor)
+        for fd in exported:
+            close_if_open(fd)
+
+
+@pytest.mark.parametrize("page_bytes", [4096, 65536])
+@pytest.mark.parametrize("base_delta,size", [(0, 65536), (4096, 65536), (0, 4096)])
+def test_device_export_obeys_host_page_geometry(
+    monkeypatch: pytest.MonkeyPatch, page_bytes: int, base_delta: int, size: int
+) -> None:
+    """Export validates the host page size independently of 4-KiB I/O slots."""
+    base = 0x200000000 + base_delta
+    tensor = cast(
+        torch.Tensor,
+        SimpleNamespace(
+            device=torch.device("cuda"),
+            data_ptr=lambda: base,
+            numel=lambda: size,
+            element_size=lambda: 1,
+        ),
+    )
+    sysconf = os.sysconf
+    monkeypatch.setattr(
+        os,
+        "sysconf",
+        lambda name: page_bytes if name == "SC_PAGE_SIZE" else sysconf(name),
+    )
+    exported: list[int] = []
+
+    def export_chunk(ptr: int, length: int) -> int:
+        assert ptr % page_bytes == length % page_bytes == 0
+        fd = os.memfd_create("device-page-geometry-test", os.MFD_CLOEXEC)
+        exported.append(fd)
+        return fd
+
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(memory_management, "_export_cuda_dmabuf", export_chunk)
+    try:
+        if base % page_bytes or size % page_bytes:
+            with pytest.raises(ValueError, match="not page aligned"):
+                memory_management.export_device_dmabufs(tensor)
+            assert not exported
+        else:
+            regions = memory_management.export_device_dmabufs(tensor)
+            assert regions == [(exported[0], base, size)]
+    finally:
+        memory_management.release_device_dmabufs(tensor)
         for fd in exported:
             close_if_open(fd)
 

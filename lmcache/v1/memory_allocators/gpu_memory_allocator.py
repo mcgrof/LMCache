@@ -3,6 +3,8 @@
 # Standard
 from contextlib import nullcontext
 from typing import List, Optional, Union
+import math
+import os
 import threading
 
 # Third Party
@@ -11,7 +13,7 @@ import torch
 # First Party
 from lmcache import torch_dev, torch_device_type
 from lmcache.logging import init_logger
-from lmcache.utils import _lmcache_nvtx_annotate
+from lmcache.utils import _lmcache_nvtx_annotate, get_size_bytes
 from lmcache.v1 import memory_management
 from lmcache.v1.memory_allocators.paged_tensor_memory_allocator import (
     PagedTensorMemoryAllocator,
@@ -37,9 +39,18 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
         use_paging: bool = False,
         **kwargs,
     ) -> None:
-        """
-        :param int size: The size of the GPU memory in bytes.
-        :param Optional[int] align_bytes: The byte alignment for allocations.
+        """Create a pool aligned for whole host-page DMA-BUF exports.
+
+        Args:
+            size: Minimum pool capacity in bytes. Capacity is rounded up to
+                whole host pages and, for paging, whole logical chunk slots.
+            device: Device on which the backing tensor is allocated.
+            align_bytes: Alignment for allocations when paging is disabled.
+            use_paging: Whether fixed-size chunk slots are used.
+            **kwargs: Paged pools require ``shapes``, ``dtypes``, and ``fmt``.
+
+        Raises:
+            ValueError: A required paged-pool argument is absent.
         """
         if not torch_dev.is_available():
             device = "cpu"
@@ -48,8 +59,19 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
         # exported as a dma-buf (the driver refuses a range that is not page
         # aligned).  Over-allocate by one page and slice to the first page
         # boundary; the extra page is the cost of the guarantee.
-        page = 4096
-        aligned_size = (size + page - 1) // page * page
+        page = os.sysconf("SC_PAGE_SIZE")
+        allocation_alignment = page
+        if use_paging:
+            if not all(name in kwargs for name in ("shapes", "dtypes", "fmt")):
+                raise ValueError("paged allocation requires shapes, dtypes, and fmt")
+            allocation_alignment = math.lcm(
+                page, get_size_bytes(kwargs["shapes"], kwargs["dtypes"])
+            )
+        aligned_size = (
+            (size + allocation_alignment - 1)
+            // allocation_alignment
+            * allocation_alignment
+        )
         self._backing = torch.empty(
             aligned_size + page, dtype=torch.uint8, device=device
         )
@@ -58,13 +80,6 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
 
         self.allocator: MemoryAllocatorInterface
         if use_paging:
-            assert "shapes" in kwargs, (
-                "shapes must be specified for paged memory allocator"
-            )
-            assert "dtypes" in kwargs, (
-                "dtypes must be specified for paged memory allocator"
-            )
-            assert "fmt" in kwargs, "fmt must be specified for paged memory allocator"
             self.allocator = PagedTensorMemoryAllocator(
                 tensor=self.tensor,
                 shapes=kwargs["shapes"],

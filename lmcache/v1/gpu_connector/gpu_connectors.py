@@ -34,12 +34,55 @@ from lmcache.v1.gpu_connector.utils import (
 )
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from lmcache.v1.memory_allocators.gpu_memory_allocator import GPUMemoryAllocator
-from lmcache.v1.memory_management import MemoryFormat, MemoryObj
+from lmcache.v1.memory_management import MemoryFormat, MemoryObj, retain_memory_owners
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.platform.ops_types import PageBufferShapeDesc
 import lmcache.lmcache_native as lmcache_native
 
 logger = init_logger(__name__)
+
+# A failed stream wait cannot establish whether GPU accesses have stopped.
+# Keep these connectors poisoned and alive until the process exits.
+_FAILED_STAGING_CONNECTORS: dict[int, object] = {}
+
+
+def _check_staging_ready(connector: object) -> None:
+    """Refuse transfers after a synchronization failure left ownership unknown.
+
+    Args:
+        connector: Transfer owner to check.
+
+    Raises:
+        RuntimeError: A prior transfer still has an unknown completion state.
+    """
+    if id(connector) in _FAILED_STAGING_CONNECTORS:
+        raise RuntimeError("staging connector has an unknown GPU completion state")
+
+
+def _synchronize_staging(
+    stream: torch.cuda.Stream,
+    connector: object,
+    memory_objs: List[MemoryObj],
+    operands: dict[str, object],
+) -> None:
+    """Drain staging work, retaining every owner if completion is unknown.
+
+    Args:
+        stream: Stream whose staging operations must have finished.
+        connector: Owner of the KV sources, transfer streams and scratch buffers.
+        memory_objs: Allocations accessed by the submitted batch.
+        operands: Caller-provided tensors, including the GPU slot mapping.
+
+    Raises:
+        RuntimeError: The GPU runtime could not establish completion. No buffer
+            in this batch may be recycled, and the connector cannot be reused.
+    """
+    try:
+        stream.synchronize()
+    except RuntimeError:
+        retain_memory_owners(memory_objs, connector, operands)
+        _FAILED_STAGING_CONNECTORS[id(connector)] = connector
+        raise
 
 
 class GPUConnectorInterface(metaclass=abc.ABCMeta):
@@ -290,6 +333,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         :raises AssertionError: If the memory object does not have a tensor.
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
+        _check_staging_ready(self)
         assert memory_obj.tensor is not None
 
         self.initialize_kvcaches_ptr(**kwargs)
@@ -408,6 +452,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         """
         if memory_objs is None or starts is None or ends is None:
             raise ValueError("memory_objs, starts and ends must be provided")
+        _check_staging_ready(self)
         typed_memory_objs = cast("List[MemoryObj]", memory_objs)
         if not (len(typed_memory_objs) == len(starts) == len(ends)):
             raise ValueError("memory_objs, starts and ends must have equal lengths")
@@ -420,7 +465,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                 ):
                     self.to_gpu(memory_obj, start, end, **kwargs)
         finally:
-            self.load_stream.synchronize()
+            _synchronize_staging(self.load_stream, self, typed_memory_objs, kwargs)
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_from_gpu(
@@ -440,8 +485,8 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                 with the same requirements as :meth:`from_gpu`.
 
         Returns:
-            None. All gathers are complete on successful return. An empty
-            batch performs no stream work.
+            None. All gathers and owned-padding zeroes complete before successful
+            return. An empty batch performs no stream work.
 
         Raises:
             ValueError: Batch lengths differ or transfer arguments are invalid.
@@ -457,6 +502,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         not recycle the buffers. The wait covers this batch's gather, not
         any subsequent storage I/O using the resulting staging objects.
         """
+        _check_staging_ready(self)
         typed_memory_objs = cast("List[MemoryObj]", memory_objs)
         if not (len(typed_memory_objs) == len(starts) == len(ends)):
             raise ValueError("memory_objs, starts and ends must have equal lengths")
@@ -471,10 +517,11 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                     typed_memory_objs, starts, ends, strict=True
                 ):
                     self._enqueue_from_gpu(memory_obj, start, end, **kwargs)
+                    memory_obj.zero_padding()
         finally:
             # io_uring and other storage backends cannot observe CUDA stream
             # dependencies. CPU and CUDA staging must both be ready here.
-            self.store_stream.synchronize()
+            _synchronize_staging(self.store_stream, self, typed_memory_objs, kwargs)
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         kv_size = 1 if self.use_mla else 2
@@ -655,6 +702,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
 
     @_lmcache_nvtx_annotate
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
+        _check_staging_ready(self)
         assert memory_obj.raw_tensor is not None
         assert "slot_mapping" in kwargs
         if self.use_mla:
@@ -761,6 +809,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         """
         if memory_objs is None or starts is None or ends is None:
             raise ValueError("memory_objs, starts and ends must be provided")
+        _check_staging_ready(self)
         typed_memory_objs = cast("List[MemoryObj]", memory_objs)
         if not (len(typed_memory_objs) == len(starts) == len(ends)):
             raise ValueError("memory_objs, starts and ends must have equal lengths")
@@ -773,7 +822,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 ):
                     self.to_gpu(memory_obj, start, end, **kwargs)
         finally:
-            self.load_stream.synchronize()
+            _synchronize_staging(self.load_stream, self, typed_memory_objs, kwargs)
 
     def batched_from_gpu(
         self,
@@ -792,8 +841,8 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 with the same requirements as :meth:`from_gpu`.
 
         Returns:
-            None. All gathers are complete on successful return. An empty
-            batch performs no stream work.
+            None. All gathers and owned-padding zeroes complete before successful
+            return. An empty batch performs no stream work.
 
         Raises:
             ValueError: Batch lengths differ or transfer arguments are invalid.
@@ -809,6 +858,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         not recycle the buffers. The wait covers this batch's gather, not
         any subsequent storage I/O using the resulting staging objects.
         """
+        _check_staging_ready(self)
         typed_memory_objs = cast("List[MemoryObj]", memory_objs)
         if not (len(typed_memory_objs) == len(starts) == len(ends)):
             raise ValueError("memory_objs, starts and ends must have equal lengths")
@@ -823,10 +873,11 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                     typed_memory_objs, starts, ends, strict=True
                 ):
                     self._enqueue_from_gpu(memory_obj, start, end, **kwargs)
+                    memory_obj.zero_padding()
         finally:
             # io_uring and other storage backends cannot observe CUDA stream
             # dependencies. CPU and CUDA staging must both be ready here.
-            self.store_stream.synchronize()
+            _synchronize_staging(self.store_stream, self, typed_memory_objs, kwargs)
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         raise NotImplementedError

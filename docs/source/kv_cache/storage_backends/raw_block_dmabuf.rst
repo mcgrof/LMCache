@@ -29,10 +29,10 @@ grouped device objects are refused before storage slots are reserved. Short
 registered transfers fail rather than retrying an invalid DMA-BUF offset.
 Paged partial chunks retain a full ``physical_tensor`` slot for aligned I/O
 while the connector's logical views remain narrowed to the chunk's token count.
-The current device-write path does not scrub alignment padding. Prior bytes in
-the same GPU slot can therefore be persisted beyond the logical payload. This
-is a storage-isolation limitation, not a guarantee that only logical KV bytes
-reach the target.
+Before handing a gathered slot to storage, V2/V3 zero its physical tail on the
+store stream and wait for that stream to finish. Aligned writes can therefore
+include padding, but that padding must be zero, including after pool reuse.
+The logical payload size and physical I/O size remain separate.
 GPU staging does not fall back to host-pointer registration, POSIX I/O, or
 NVMe ``io_uring_cmd``. Unsupported export or registration fails setup.
 
@@ -73,14 +73,21 @@ Example configuration
 The pool size and chunk geometry come from engine metadata, including the
 tensor-parallel shard. Each TP rank needs its own explicitly mapped storage
 target. ``max_data_transfer_size`` can cap ordinary ``io_uring`` transfers;
-alignment constraints still apply. Default slot geometry includes the header
-and a full aligned payload.
+alignment constraints still apply. This caps submitted operations; block-layer
+splitting and merging mean it does not guarantee one NVMe command per operation.
+Default slot geometry includes the header and a full aligned payload.
+GPU export alignment follows the host page size, which can differ from the
+storage block alignment. A 64 KiB alignment contract test does not qualify a
+64 KiB host's exporter or kernel; test that configuration separately.
 
 Host staging is a separate option: ``local_cpu_dmabuf: udmabuf``,
 ``system_heap``, ``cma_heap``, or an explicit ``/dev/dma_heap/<name>`` exports
 the CPU pool. Udmabuf's memfd mapping may be host registered through the
 platform interface. DMA-heap PFN mappings remain unpinned. CPU registration
 may fall back to ordinary fixed buffers; that does not qualify DMA-BUF I/O.
+If partial registration cannot be safely undone, setup fails and retains its
+owners instead of falling back. Registration establishes a kernel-owned buffer
+table; when device mappings are established depends on the kernel and importer.
 
 Validation
 ----------
@@ -91,8 +98,10 @@ allocator shutdown. They do not qualify a GPU, exporter or kernel.
 
 The explicit CUDA/ROCm hardware test uses an exclusive new regular file,
 independent per-direction CPU oracles, a nonzero GPU export offset, repeated
-generations and warm registration. It checks the native DMA-BUF I/O journal
-and rejects fallback and launch-blocking settings:
+generations and warm registration. Partial chunks start in a nonzero-filled
+slot; an independent direct read checks every padding byte on storage. The test
+checks the native DMA-BUF I/O journal and rejects fallback and launch-blocking
+settings:
 
 .. code-block:: bash
 
