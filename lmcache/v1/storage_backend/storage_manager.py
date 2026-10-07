@@ -314,8 +314,19 @@ class StorageManager:
     def _get_allocator_backend(
         self, config: LMCacheEngineConfig
     ) -> AllocatorBackendInterface:
+        gpu_endpoints = [
+            backend
+            for backend in self.storage_backends.values()
+            if getattr(backend, "is_gpu_endpoint", False)
+        ]
         if self.enable_pd:
             allocator_backend = self.storage_backends["PDBackend"]
+        elif gpu_endpoints:
+            # A backend that stages KV chunks in device memory (the raw-block
+            # backend with a GPU pool) allocates for the engine, so the GPU
+            # connector copies device-to-device and the backend moves the
+            # chunk to storage straight from VRAM.
+            allocator_backend = gpu_endpoints[0]
         elif "MaruBackend" in self.storage_backends:
             if "LocalCPUBackend" in self.storage_backends:
                 allocator_backend = self.storage_backends["LocalCPUBackend"]
@@ -457,7 +468,9 @@ class StorageManager:
                 ):
                     local_cpu_backend = self.storage_backends["LocalCPUBackend"]
                     assert isinstance(local_cpu_backend, LocalCPUBackend)
-                    local_cpu_backend.submit_put_task(key, memory_obj)
+                    self._write_back_to_local_cpu(
+                        local_cpu_backend, [key], [memory_obj]
+                    )
                 return memory_obj
 
         return None
@@ -512,9 +525,45 @@ class StorageManager:
                     # TODO (lisiG9): Refactor this write-back logic into caching
                     #  policy module
                     memory_objs_no_none = cast(List[MemoryObj], memory_objs)
-                    local_cpu_backend.batched_submit_put_task(keys, memory_objs_no_none)
+                    self._write_back_to_local_cpu(
+                        local_cpu_backend, keys, memory_objs_no_none
+                    )
                 return memory_objs
         return [None] * len(keys)
+
+    def _write_back_to_local_cpu(
+        self,
+        local_cpu_backend: LocalCPUBackend,
+        keys: Sequence[CacheEngineKey],
+        memory_objs: List[MemoryObj],
+    ) -> None:
+        """Admit objects loaded from another backend into the local CPU cache.
+
+        Objects that live in device memory (loaded by a GPU-endpoint backend)
+        are copied into local CPU objects first; admitting them as they are
+        would pin the device staging slots for as long as the CPU cache kept
+        them.
+
+        That copy is only worth paying for when the cache will keep the
+        result.  With the hot cache off the backend drops every admission, so
+        a load served out of device memory would otherwise copy each chunk to
+        the host on the way back and then throw it away.
+        """
+        if not local_cpu_backend.use_hot:
+            return
+        if all(
+            memory_obj.tensor is None or memory_obj.tensor.device.type == "cpu"
+            for memory_obj in memory_objs
+        ):
+            local_cpu_backend.batched_submit_put_task(keys, memory_objs)
+            return
+        host_keys, host_objs = allocate_and_copy_objects(
+            local_cpu_backend, keys, memory_objs, self.internal_copy_stream
+        )
+        if host_objs:
+            local_cpu_backend.batched_submit_put_task(host_keys, host_objs)
+        for memory_obj in host_objs:
+            memory_obj.ref_count_down()
 
     def layerwise_batched_get(
         self,
@@ -1396,7 +1445,10 @@ class StorageManager:
         # Consumers must settle I/O before their shared backing arenas are freed.
         backends = sorted(
             self.storage_backends.items(),
-            key=lambda item: isinstance(item[1], AllocatorBackendInterface),
+            key=lambda item: (
+                isinstance(item[1], LocalCPUBackend),
+                isinstance(item[1], AllocatorBackendInterface),
+            ),
         )
         for name, backend in backends:
             try:

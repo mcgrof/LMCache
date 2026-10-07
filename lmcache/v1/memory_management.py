@@ -452,6 +452,17 @@ class MemoryObj(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError
 
+    @property
+    def physical_tensor(self) -> Optional[torch.Tensor]:
+        """Return the owned physical tensor extent, including alignment padding.
+
+        A paged object can expose fewer logical bytes through ``raw_tensor``
+        while retaining its full allocation for registered, aligned I/O.
+        The returned extent never includes a neighboring allocation.
+        Non-tensor objects return ``None``.
+        """
+        return self.raw_tensor
+
     @abc.abstractmethod
     def get_tensor(self, index: int) -> Optional[torch.Tensor]:
         """
@@ -677,12 +688,153 @@ def _allocate_dmabuf_cpu_memory(
     return buffer
 
 
+_DMABUF_CHUNK_BYTES = 1 << 30  # the kernel registers at most 1 GiB per dma-buf
+# Offsets are keyed by the exported logical slice, not the underlying BO's
+# origin: separate allocator slices can share that origin and own distinct FDs.
+_DEVICE_DMABUF_OFFSETS: dict[int, int] = {}
+
+
+def _export_cuda_dmabuf(ptr: int, size: int) -> int:
+    """Export [ptr, ptr+size) of a CUDA allocation as a dma-buf fd.
+
+    cuMemGetHandleForAddressRange(CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD) on the
+    NVIDIA open kernel modules; the range must be host-page aligned.
+    """
+    # Standard
+    import ctypes
+
+    lib = ctypes.CDLL("libcuda.so.1")
+    lib.cuMemGetHandleForAddressRange.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.c_uint64,
+    ]
+    lib.cuMemGetHandleForAddressRange.restype = ctypes.c_int
+    fd = ctypes.c_int(-1)
+    CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD = 1
+    rc = lib.cuMemGetHandleForAddressRange(
+        ctypes.byref(fd), ptr, size, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0
+    )
+    if rc != 0:
+        raise RuntimeError(
+            f"cuMemGetHandleForAddressRange failed with CUresult {rc} "
+            "(needs the NVIDIA open kernel modules and a page-aligned range)"
+        )
+    return fd.value
+
+
+def _export_hip_dmabuf(ptr: int, size: int) -> tuple[int, int]:
+    """Export a ROCm allocation slice and return its FD and byte offset.
+
+    The driver may export a larger backing allocation than the requested
+    slice. Its offset locates ``ptr`` inside that export; zero is not required.
+    """
+    # Standard
+    import ctypes
+    import os
+
+    lib = ctypes.CDLL("libhsa-runtime64.so.1")
+    lib.hsa_amd_portable_export_dmabuf.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+    lib.hsa_amd_portable_export_dmabuf.restype = ctypes.c_int
+    fd = ctypes.c_int(-1)
+    off = ctypes.c_uint64(0)
+    rc = lib.hsa_amd_portable_export_dmabuf(
+        ptr, size, ctypes.byref(fd), ctypes.byref(off)
+    )
+    if rc != 0:
+        raise RuntimeError(f"hsa_amd_portable_export_dmabuf failed with status {rc}")
+    if off.value > ptr:
+        os.close(fd.value)
+        raise RuntimeError(
+            f"hsa_amd_portable_export_dmabuf returned an invalid offset {off.value} "
+            f"for address {ptr:#x}"
+        )
+    return fd.value, off.value
+
+
+def export_device_dmabufs(tensor: torch.Tensor) -> list[tuple[int, int, int]]:
+    """Export a device tensor's memory as dma-bufs of at most 1 GiB each.
+
+    Returns [(fd, slice_ptr, size)] and records each logical region so
+    get_dmabuf_region() resolves a pointer to its FD and zero-offset origin. The
+    base and size must be host-page aligned, which GPUMemoryAllocator guarantees by
+    over-allocating one page and slicing; any other tensor that is not aligned is
+    refused. Both a CUDA (open kernel modules) and a ROCm export are supported; the
+    ROCm offsets are preserved separately from the logical slice bounds, so a
+    larger driver export does not make neighboring allocator memory eligible.
+    A failed export closes earlier handles without publishing partial regions.
+    """
+    # Standard
+    import os
+
+    page = 4096
+    base = tensor.data_ptr()
+    size = tensor.numel() * tensor.element_size()
+    if base % page or size % page:
+        raise ValueError(
+            f"device buffer at {base:#x} of {size} bytes is not page aligned; "
+            "allocate it through the aligned GPU allocator"
+        )
+    dev = tensor.device.type
+    if dev not in ("cuda",):
+        raise ValueError(f"export_device_dmabufs: unsupported device {dev}")
+    regions = []
+    offsets = {}
+    off = 0
+    try:
+        while off < size:
+            chunk = min(_DMABUF_CHUNK_BYTES, size - off)
+            ptr = base + off
+            if torch.version.hip is not None:
+                fd, export_offset = _export_hip_dmabuf(ptr, chunk)
+            else:
+                fd, export_offset = _export_cuda_dmabuf(ptr, chunk), 0
+            regions.append((fd, base + off, chunk))
+            offsets[ptr] = export_offset
+            off += chunk
+    except BaseException:
+        for fd, _ptr, _size in regions:
+            os.close(fd)
+        raise
+    for fd, ptr, chunk in regions:
+        _DMABUF_REGIONS[ptr] = (fd, None, -1, chunk, False)
+        _DEVICE_DMABUF_OFFSETS[ptr] = offsets[ptr]
+    logger.info(
+        "Exported %d MiB of %s memory as %d dma-buf(s)", size >> 20, dev, len(regions)
+    )
+    return regions
+
+
+def release_device_dmabufs(tensor: torch.Tensor) -> None:
+    """Close the dma-bufs exported for a device tensor by export_device_dmabufs."""
+    # Standard
+    import os
+
+    base = tensor.data_ptr()
+    size = tensor.numel() * tensor.element_size()
+    for ptr in [p for p in list(_DMABUF_REGIONS) if base <= p < base + size]:
+        fd, _mm, _bfd, _sz, _host_registered = _DMABUF_REGIONS.pop(ptr)
+        _DEVICE_DMABUF_OFFSETS.pop(ptr, None)
+        os.close(fd)
+
+
 def get_dmabuf_region(ptr: int) -> Optional[tuple[int, int]]:
-    """Return (dma-buf fd, base address) for the dma-buf backed buffer that
-    contains ptr, or None when ptr is not inside one."""
+    """Resolve a logical slice to its FD and zero-offset address origin.
+
+    The origin is used only to compute an SQE byte offset; it is not an
+    address the caller may dereference. Driver-exported neighboring memory
+    remains outside the registered logical slice.
+    """
     for base, (fd, _mm, _bfd, size, _host_registered) in _DMABUF_REGIONS.items():
         if base <= ptr < base + size:
-            return fd, base
+            return fd, base - _DEVICE_DMABUF_OFFSETS.get(base, 0)
     return None
 
 
@@ -809,10 +961,21 @@ class TensorMemoryObj(MemoryObj):
         raw_data: torch.Tensor,
         metadata: MemoryObjMetadata,
         parent_allocator: Optional["MemoryAllocatorInterface"],
-    ):
+        physical_data: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Wrap logical bytes and optionally retain their owned physical extent.
+
+        Args:
+            raw_data: Tensor backing the object's logical representation.
+            metadata: Shape, dtype, ownership and allocation metadata.
+            parent_allocator: Allocator responsible for releasing the object.
+            physical_data: Full owned page when the allocator narrows
+                ``raw_data`` for a partial chunk; never a neighboring page.
+        """
         assert metadata.dtype is not None, "dtype must be specified for TensorMemoryObj"
         super().__init__(metadata)
         self.raw_data = raw_data
+        self._physical_data = physical_data
         self.valid = True
         self.lock = threading.Lock()
         self.parent_allocator = parent_allocator
@@ -1073,6 +1236,13 @@ class TensorMemoryObj(MemoryObj):
             logger.warning("Trying to access an invalidated MemoryObj")
             return None
         return self.raw_data
+
+    @property
+    def physical_tensor(self) -> Optional[torch.Tensor]:
+        """Return the retained page, or the raw tensor for unpaged objects."""
+        if not self.valid:
+            return None
+        return self._physical_data if self._physical_data is not None else self.raw_data
 
     def get_tensor(self, index: int) -> Optional[torch.Tensor]:
         if not self.valid:

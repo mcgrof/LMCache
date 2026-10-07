@@ -203,16 +203,41 @@ def test_cpu_close_honors_storage_retention():
     cpu.clear.assert_not_called()
 
 
-def test_manager_closes_consumers_before_cpu_arena():
+@pytest.mark.parametrize("allocator_consumer", [False, True])
+def test_manager_closes_consumers_before_cpu_arena(allocator_consumer):
     order = []
     cpu = object.__new__(LocalCPUBackend)
     cpu.close = lambda: order.append("allocator")
+    consumer = (
+        object.__new__(plugin.RustRawBlockBackend)
+        if allocator_consumer
+        else SimpleNamespace()
+    )
+    consumer.close = lambda: order.append("consumer")
     manager = object.__new__(StorageManager)
     manager.storage_backends = {
         "LocalCPUBackend": cpu,
-        "RawBlock": SimpleNamespace(close=lambda: order.append("consumer")),
+        "RawBlock": consumer,
     }
     manager.loop = SimpleNamespace(is_running=lambda: False)
     manager.thread = SimpleNamespace(is_alive=lambda: False)
     manager.close()
     assert order == ["consumer", "allocator"]
+
+
+@pytest.mark.parametrize("unknown", [False, True])
+def test_gpu_arena_release_requires_proven_native_close(backend, monkeypatch, unknown):
+    gpu = Mock()
+    backend._gpu_allocator = gpu
+    if unknown:
+        raw = backend._core.raw_device()
+        monkeypatch.setattr(raw, "is_idle", lambda: False, raising=False)
+    backend.close()
+    if unknown:
+        gpu.close.assert_not_called()
+        assert any(
+            any(owner is gpu for owner in graph)
+            for graph in plugin._RETAINED_AFTER_UNKNOWN_OUTCOME
+        )
+    else:
+        gpu.close.assert_called_once_with()

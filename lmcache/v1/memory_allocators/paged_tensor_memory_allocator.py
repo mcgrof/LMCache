@@ -93,6 +93,7 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
                 raw_data=buf,
                 metadata=metadata,
                 parent_allocator=self,
+                physical_data=buf,
             )
             self.free_blocks.append(mem_obj)
 
