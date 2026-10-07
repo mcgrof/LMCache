@@ -76,6 +76,8 @@ class _RecordingUringCmdRawDevice:
         buffers: list[memoryview],
         lengths: list[int],
         placement_ids: list[int | None] | None = None,
+        payload_lens: Sequence[int] | None = None,
+        request_tag: str | None = None,
     ) -> int:
         del placement_ids
         self.offsets = offsets
@@ -480,32 +482,26 @@ class _RecordingRawDevice:
         placement_ids: Sequence[int | None] | None = None,
         payload_lens: Sequence[int] | None = None,
     ) -> int:
-        resolved_payload_lens = (
-            [int(p) for p in payload_lens]
-            if payload_lens is not None
-            else [int(total) for total in total_lens]
-        )
+        logical_lens = list(total_lens if payload_lens is None else payload_lens)
         self.batched_write_calls.append(
             _BatchedWriteCall(
                 offsets=[int(off) for off in offsets],
                 buffer_byte_lens=[len(bytes(buf)) for buf in buffers],
                 total_lens=[int(total) for total in total_lens],
                 placement_ids=list(placement_ids or [None] * len(offsets)),
-                payload_lens=resolved_payload_lens,
+                payload_lens=logical_lens,
             )
         )
         if self.fail_batched_write:
             raise RuntimeError("injected batched_write failure")
         for i, (off, buf, total, payload) in enumerate(
-            zip(offsets, buffers, total_lens, resolved_payload_lens, strict=True)
+            zip(offsets, buffers, total_lens, logical_lens, strict=True)
         ):
             if (
                 self.fail_after_write_entries is not None
                 and i >= self.fail_after_write_entries
             ):
                 raise RuntimeError("injected partial batched_write failure")
-            # Mirror the Rust bounce: store only the valid payload, zero-padded
-            # up to total so round-trip reads observe the padded transfer.
             self.store[int(off)] = bytes(buf)[: int(payload)].ljust(int(total), b"\x00")
         return self._submit_batch(len(offsets))
 
@@ -1333,7 +1329,8 @@ class _FakeRawDevice:
         buffers: list[bytearray],
         total_lens: list[int],
         placement_ids: list[int | None] | None = None,
-        payload_lens: list[int] | None = None,
+        payload_lens: Sequence[int] | None = None,
+        request_tag: str | None = None,
     ) -> int:
         del buffers, payload_lens
         self.batched_write_calls.append((offsets, total_lens, placement_ids))
@@ -2047,6 +2044,230 @@ def test_validate_loaded_entries_iouring_multi_entry_uses_batched_reader(
     batched_mock.assert_called_once_with(expected_offsets)
     read_mock.assert_not_called()
     assert list(core._index) == [spec.encoded for spec in specs]
+
+
+def test_paged_memory_object_reports_its_own_shape_not_the_pool_slot() -> None:
+    """Rebinding a pooled object refreshes its public logical byte count."""
+    # Third Party
+    import torch
+
+    # First Party
+    from lmcache.v1.memory_management import MemoryFormat, MemoryObjMetadata
+
+    full_shape = torch.Size([2, 16, 256, 512])
+    tail_shape = torch.Size([2, 16, 9, 512])
+    dtype = torch.bfloat16
+    physical_bytes = full_shape.numel() * dtype.itemsize
+    metadata = MemoryObjMetadata(
+        shape=full_shape,
+        dtype=dtype,
+        address=0,
+        phy_size=physical_bytes,
+        ref_count=1,
+        fmt=MemoryFormat.KV_2LTD,
+        shapes=[full_shape],
+        dtypes=[dtype],
+    )
+    obj = TensorMemoryObj(
+        torch.empty(physical_bytes, dtype=torch.uint8, device="meta"),
+        metadata,
+        parent_allocator=None,
+    )
+    obj.rebind_layout([tail_shape], [dtype], MemoryFormat.KV_2LTD)
+    assert obj.get_size() == tail_shape.numel() * dtype.itemsize
+    assert obj.get_physical_size() == physical_bytes
+    assert obj.physical_tensor is not None
+    assert obj.physical_tensor.nbytes == physical_bytes
+
+
+def _grouped_device_obj(tail_tokens=9, with_override=False):
+    """A device object this lane cannot describe: two representation groups.
+
+    ``meta`` device tensors stand in for GPU memory: they are not CPU, so the
+    device payload path selects them, and planning refuses them before any
+    transfer is attempted.
+    """
+    # Third Party
+    import torch
+
+    # First Party
+    from lmcache.v1.memory_management import MemoryFormat, MemoryObjMetadata
+
+    kv, layers, hidden, dtype = 2, 16, 512, torch.bfloat16
+    shape = torch.Size([kv, layers, tail_tokens, hidden])
+    meta = MemoryObjMetadata(
+        shape=shape,
+        dtype=dtype,
+        address=0,
+        phy_size=shape.numel() * dtype.itemsize,
+        ref_count=1,
+        fmt=MemoryFormat.KV_2LTD,
+        shapes=[shape, shape],
+        dtypes=[dtype, dtype],
+    )
+
+    class _Grouped:
+        metadata = meta
+        raw_data = torch.zeros(shape.numel(), dtype=dtype, device="meta").view(-1)
+        physical_tensor = raw_data
+        _used_size_override = shape.numel() * dtype.itemsize if with_override else None
+
+        def get_size(self):
+            return meta.get_size()
+
+    return _Grouped()
+
+
+@pytest.mark.parametrize("with_override", [False, True])
+def test_raw_block_core_refuses_a_grouped_device_object(tmp_path, with_override):
+    """An unsupported representation fails its key and reserves nothing.
+
+    An explicit used-length override narrows a length; it does not make a
+    grouped object single-group, so it must not let one through.  The refusal
+    happens while planning, so no slot may be left reserved and the capacity
+    must remain usable by a later put.
+    """
+    # First Party
+    from lmcache.v1.storage_backend.raw_block.core import (
+        UnsupportedDevicePayload,
+        _logical_payload_len,
+    )
+
+    obj = _grouped_device_obj(with_override=with_override)
+
+    # Pin the refusal itself, not just its consequence: a grouped object that
+    # carries an override was previously returned before the representation
+    # was examined, and a meta tensor fails at the transfer either way, so the
+    # public result alone cannot tell the two apart.
+    with pytest.raises(UnsupportedDevicePayload):
+        _logical_payload_len(obj)
+
+    path = make_raw_block_file(tmp_path)
+    config = make_raw_block_core_config(path)
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        spec = encode_object_key(make_object_key(41))
+        result = core.put_many([spec], [obj])
+
+        assert result.results == [False]
+        assert result.stored_keys == []
+        assert not core.exists_inflight(spec.encoded)
+
+        # The refused key cost no capacity: an ordinary put still succeeds.
+        good = encode_object_key(make_object_key(42))
+        assert core.put_many([good], [make_memory_obj(b"after-refusal")]).results == [
+            True
+        ]
+    finally:
+        core.close()
+
+
+@pytest.mark.parametrize("with_override", [False, True])
+@pytest.mark.parametrize("unsupported_first", [False, True])
+def test_raw_block_core_batch_with_one_unsupported_object(
+    tmp_path, with_override, unsupported_first
+):
+    """One unsupported object fails its own key and strands nothing.
+
+    Planning walks a batch in order and reserves a slot per key as it goes.
+    A refusal partway through therefore has reservations behind it when the
+    unsupported object comes second, and none when it comes first, so both
+    orderings have to be driven. The supported key still stores, the
+    unsupported one still fails, nothing is left in flight, and the capacity
+    the refusal touched is usable afterwards.
+    """
+    path = make_raw_block_file(tmp_path)
+    config = make_raw_block_core_config(path)
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        good_spec = encode_object_key(make_object_key(51))
+        bad_spec = encode_object_key(make_object_key(52))
+        good_obj = make_memory_obj(b"supported-payload")
+        bad_obj = _grouped_device_obj(with_override=with_override)
+
+        if unsupported_first:
+            specs = [bad_spec, good_spec]
+            objs = [bad_obj, good_obj]
+            expected = [False, True]
+        else:
+            specs = [good_spec, bad_spec]
+            objs = [good_obj, bad_obj]
+            expected = [True, False]
+
+        result = core.put_many(specs, objs)
+
+        assert result.results == expected
+        assert result.stored_keys == [good_spec.encoded]
+        assert not core.exists_inflight(good_spec.encoded)
+        assert not core.exists_inflight(bad_spec.encoded)
+        assert core.contains_key(good_spec.encoded)
+        assert not core.contains_key(bad_spec.encoded)
+
+        # The refused key cost no capacity: a later put still succeeds.
+        after = encode_object_key(make_object_key(53))
+        assert core.put_many([after], [make_memory_obj(b"after-mixed")]).results == [
+            True
+        ]
+    finally:
+        core.close()
+
+
+def test_raw_block_core_planning_exception_returns_the_slot_it_reserved(tmp_path):
+    """An ordinary planning failure must give back the slots it took.
+
+    Planning reserves a slot per key as it walks a batch, and records each
+    reservation by its byte offset. The free list is keyed by slot index. The
+    catch-all unwind passed the offset straight through, so the range check
+    dropped it and the slot was lost for the life of the process; with other
+    geometry the same value would have named an unrelated slot.
+
+    The unsupported-format cases never reach this path: they are refused per
+    key and planning continues. This drives the exception that unwinds the
+    whole batch after a reservation has already been made.
+    """
+    # First Party
+    from lmcache.v1.storage_backend.raw_block import core as core_module
+
+    path = make_raw_block_file(tmp_path)
+    # The catch-all unwind only exists on the batched io_uring path, which
+    # put_many selects for more than one key. The default POSIX config stores
+    # each key independently and never reaches it.
+    config = replace(make_raw_block_core_config(path), io_engine="io_uring")
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        first = encode_object_key(make_object_key(71))
+        second = encode_object_key(make_object_key(72))
+        payload = make_memory_obj(b"planning-unwind")
+
+        real_len = core_module._logical_payload_len
+        calls = {"n": 0}
+
+        def raise_on_second(obj):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("injected planning failure")
+            return real_len(obj)
+
+        core_module._logical_payload_len = raise_on_second
+        try:
+            with pytest.raises(RuntimeError, match="injected planning failure"):
+                core.put_many([first, second], [payload, payload])
+        finally:
+            core_module._logical_payload_len = real_len
+
+        # The reservation is gone and its slot is back on the free list.
+        assert not core.exists_inflight(first.encoded)
+        assert not core.exists_inflight(second.encoded)
+        assert core._free_slots, "the reserved slot was lost, not freed"
+        freed_slot = next(iter(core._free_slots))
+        freed_offset = core._data_base_offset + freed_slot * core.slot_bytes
+
+        # And it is genuinely reusable: the next put lands in it.
+        after = encode_object_key(make_object_key(73))
+        assert core.put_many([after], [make_memory_obj(b"reused")]).results == [True]
+        assert core._index[after.encoded].offset == freed_offset
+    finally:
+        core.close()
 
 
 def test_validate_loaded_entries_uring_cmd_uses_batched_reader(
