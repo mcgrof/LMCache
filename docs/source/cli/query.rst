@@ -370,8 +370,8 @@ to it.
    lmcache query coordinator --api metrics | promtool check metrics
    lmcache query coordinator --api metrics | grep lmcache_coordinator
 
-Options
-~~~~~~~
+Coordinator options
+~~~~~~~~~~~~~~~~~~~
 
 .. list-table::
    :header-rows: 1

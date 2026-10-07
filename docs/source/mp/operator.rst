@@ -275,8 +275,8 @@ ignores the extra mount).  It fails open
 (``failurePolicy: Ignore``) and is idempotent (re-admitted pods carrying the
 ``lmcache.ai/lmcache-injected`` stamp are allowed unchanged).
 
-Prerequisites
-~~~~~~~~~~~~~
+Connection injection prerequisites
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 - **cert-manager** + ``make deploy`` (not ``make run``, which is
   controller-only and disables the webhook via ``ENABLE_WEBHOOKS=false``) --
@@ -1203,8 +1203,8 @@ emits a ``my-cacheblend-connection`` ConfigMap with the ``CBKVConnector``
 ``kv-transfer-config`` (the operator wires the node-local Service host/port and
 the ``cb.*`` tunables).
 
-Opting a vLLM Pod In
-~~~~~~~~~~~~~~~~~~~~~
+Opting a vLLM Pod into CacheBlend
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Label the pod template for the webhook and bind it to an engine by name.  Launch
 vLLM via the image **ENTRYPOINT** (args only) -- a
@@ -1246,8 +1246,8 @@ private-image pull secret, and the required CacheBlend vLLM flags
 ``--pipeline-parallel-size 1``, ``--no-enable-chunked-prefill``,
 ``--enforce-eager``).  You supply only the model and your non-CacheBlend flags.
 
-Verifying Injection
-~~~~~~~~~~~~~~~~~~~~~
+Verifying CacheBlend Injection
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The webhook mutates **Pods**, not the Deployment, so inspect a pod:
 

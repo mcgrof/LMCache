@@ -1,5 +1,5 @@
 Controller WebUI
-===============
+================
 
 .. warning::
 
@@ -32,7 +32,7 @@ After starting the controller, access the WebUI at:
     http://localhost:9000/
 
 Configuration Options
--------------------
+---------------------
 
 - ``--host``: Bind address for the API server (default: 0.0.0.0)
 - ``--port``: Port for the API server (default: 9000)
@@ -52,7 +52,12 @@ The Controller Dashboard provides:
 - Environment variables inspection
 
 Related Documentation
---------------------
+---------------------
+
+.. toctree::
+   :hidden:
+
+   freeze_mode
 
 - :doc:`../api_reference/configurations` - Complete configuration reference
 - :doc:`../kv_cache_management/index` - KV cache management guide
