@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import cache, wraps
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union, cast
 import abc
 import ctypes
 import os
@@ -591,14 +591,138 @@ def _read_hugepage_info() -> Optional[Tuple[int, int, int]]:
         return None
 
 
+# Host or device buffers exported as dma-bufs, keyed by base address:
+# (dma-buf fd, mmap object, backing fd, size, host-registered). Heap dma-buf
+# mappings are CPU-addressable but use PFN-mapped VMAs that device runtimes do
+# not accept for host registration. A udmabuf mapping uses the underlying
+# memfd VMA and can be registered through the platform abstraction.
+_DMABUF_REGIONS: dict[int, tuple[int, Any, int, int, bool]] = {}
+
+_UDMABUF_CREATE = 0x40187542  # _IOW('u', 0x42, struct udmabuf_create)
+_UDMABUF_FLAGS_CLOEXEC = 0x01
+_DMA_HEAP_IOCTL_ALLOC = 0xC0184800  # _IOWR('H', 0, struct dma_heap_allocation_data)
+_MFD_ALLOW_SEALING = 0x0002
+_MFD_HUGETLB = 0x0004
+_MFD_HUGE_2MB = 21 << 26
+_F_SEAL_SHRINK = 0x0002
+_F_ADD_SEALS = 1033
+
+
+def _allocate_dmabuf_cpu_memory(
+    size: int, kind: str, use_hugepages: bool
+) -> torch.Tensor:
+    """Export a host arena and keep its mapping and descriptors until release.
+
+    Udmabuf maps its backing memfd, which the device runtime can register for
+    host copies. DMA heaps expose PFN-mapped VMAs, so their mappings remain
+    unpinned. No region is visible to storage until setup has completed.
+    """
+    # Standard
+    import fcntl
+    import mmap
+    import struct
+
+    page = 2 * 1024 * 1024 if use_hugepages else 4096
+    size = (size + page - 1) // page * page
+    backing_fd = -1
+    dmabuf_fd = -1
+    mm = None
+    try:
+        if kind == "udmabuf":
+            flags = _MFD_ALLOW_SEALING
+            if use_hugepages:
+                flags |= _MFD_HUGETLB | _MFD_HUGE_2MB
+            backing_fd = os.memfd_create("lmcache-kv", flags)
+            os.ftruncate(backing_fd, size)
+            fcntl.fcntl(backing_fd, _F_ADD_SEALS, _F_SEAL_SHRINK)
+            dev = os.open("/dev/udmabuf", os.O_RDWR | os.O_CLOEXEC)
+            try:
+                # This ioctl returns the export fd, not a populated fd field.
+                request = bytearray(
+                    struct.pack("IIQQ", backing_fd, _UDMABUF_FLAGS_CLOEXEC, 0, size)
+                )
+                dmabuf_fd = cast(int, fcntl.ioctl(dev, _UDMABUF_CREATE, request))
+            finally:
+                os.close(dev)
+            mm = mmap.mmap(backing_fd, size, flags=mmap.MAP_SHARED)
+        elif kind in ("system_heap", "cma_heap") or kind.startswith("/dev/dma_heap/"):
+            heap_path = {
+                "system_heap": "/dev/dma_heap/system",
+                "cma_heap": "/dev/dma_heap/reserved",
+            }.get(kind, kind)
+            heap = os.open(heap_path, os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                request = bytearray(
+                    struct.pack("QIIQ", size, 0, os.O_RDWR | os.O_CLOEXEC, 0)
+                )
+                fcntl.ioctl(heap, _DMA_HEAP_IOCTL_ALLOC, request)
+                dmabuf_fd = struct.unpack("QIIQ", bytes(request))[1]
+            finally:
+                os.close(heap)
+            mm = mmap.mmap(dmabuf_fd, size, flags=mmap.MAP_SHARED)
+        else:
+            raise ValueError(f"unknown dma-buf source {kind!r}")
+
+        buffer = torch.frombuffer(mm, dtype=torch.uint8)
+        ptr = buffer.data_ptr()
+        host_registered = False
+        if current_device_spec.is_pin_supported and kind == "udmabuf":
+            host_registered = bool(current_device_spec.pin_memory(ptr, size))
+            if not host_registered:
+                logger.warning(
+                    "Host registration of the dma-buf backed buffer failed; "
+                    "device copies will not be pinned"
+                )
+        elif current_device_spec.is_pin_supported:
+            logger.info(
+                "Leaving %s dma-buf mapping unpinned because host registration "
+                "does not support DMA-heap PFN mappings",
+                kind,
+            )
+    except BaseException:
+        if mm is not None:
+            mm.close()
+        if dmabuf_fd >= 0:
+            os.close(dmabuf_fd)
+        if backing_fd >= 0:
+            os.close(backing_fd)
+        raise
+
+    _DMABUF_REGIONS[ptr] = (dmabuf_fd, mm, backing_fd, size, host_registered)
+    logger.info(
+        "Allocated %d MiB of dma-buf backed host memory from %s (fd %d)",
+        size >> 20,
+        kind,
+        dmabuf_fd,
+    )
+    return buffer
+
+
+def get_dmabuf_region(ptr: int) -> Optional[tuple[int, int]]:
+    """Return (dma-buf fd, base address) for the dma-buf backed buffer that
+    contains ptr, or None when ptr is not inside one."""
+    for base, (fd, _mm, _bfd, size, _host_registered) in _DMABUF_REGIONS.items():
+        if base <= ptr < base + size:
+            return fd, base
+    return None
+
+
 def _allocate_cpu_memory(
     size: int,
     numa_mapping: Optional[NUMAMapping] = None,
     shm_name: Optional[str] = None,
     use_hugepages: bool = False,
+    dmabuf: Optional[str] = None,
 ) -> torch.Tensor:
     if size == 0:
         return torch.empty(0, dtype=torch.uint8)
+
+    if dmabuf:
+        if shm_name or numa_mapping:
+            raise ValueError(
+                "dma-buf backed host memory is not supported with shm or NUMA mapping"
+            )
+        return _allocate_dmabuf_cpu_memory(size, dmabuf, use_hugepages)
 
     resolved = _resolve_pinned_alloc_free(
         numa_mapping,
@@ -651,6 +775,22 @@ def _free_cpu_memory(
 ) -> None:
     if torch_dev.is_available():
         torch_dev.synchronize()
+
+    if buffer.numel() and buffer.data_ptr() in _DMABUF_REGIONS:
+        # Standard
+        import os
+
+        ptr = buffer.data_ptr()
+        fd, mm, backing_fd, region_size, host_registered = _DMABUF_REGIONS[ptr]
+        if host_registered and not current_device_spec.unpin_memory(ptr):
+            raise RuntimeError("Cannot release DMA-BUF memory: host unregister failed")
+        _DMABUF_REGIONS.pop(ptr)
+        del buffer
+        mm.close()
+        os.close(fd)
+        if backing_fd >= 0:
+            os.close(backing_fd)
+        return
 
     resolved = _resolve_pinned_alloc_free(
         numa_mapping,
