@@ -35,6 +35,7 @@ fn assert_shutdown_releases_gil(method: ShutdownMethod, wait: ShutdownWait) {
             false,
             Some("posix".to_string()),
             1,
+            0,
         )
         .unwrap();
         device.use_iouring = true;
@@ -311,6 +312,7 @@ fn terminal_worker_failure_is_visible_to_python_before_cleanup() {
             false,
             Some("posix".to_string()),
             1,
+            0,
         )
         .unwrap();
         assert!(device.worker_error().is_none());
@@ -367,6 +369,7 @@ fn normal_shutdown_does_not_report_a_terminal_worker_error() {
             false,
             Some("posix".to_string()),
             1,
+            0,
         )
         .unwrap();
         let device = Bound::new(py, device).unwrap();
