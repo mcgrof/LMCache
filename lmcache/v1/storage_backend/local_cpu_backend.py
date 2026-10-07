@@ -978,7 +978,14 @@ class LocalCPUBackend(AllocatorBackendInterface):
     def get_memory_allocator(self):
         return self.memory_allocator
 
+    def retain_backing_resources(self) -> None:
+        """Keep the arena when a consumer cannot prove native I/O has stopped."""
+        self._backing_resources_retained = True
+
     def close(self) -> None:
+        if getattr(self, "_backing_resources_retained", False):
+            logger.error("Retaining CPU allocator: a storage consumer is not quiescent")
+            return
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
         self.memory_allocator.close()
