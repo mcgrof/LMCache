@@ -1746,11 +1746,8 @@ impl RawBlockDevice {
                     match ring {
                         IoUringWrapper::Big(ring) => {
                             let mut ring = ring.lock().unwrap();
-                            unsafe {
-                                ring.submission()
-                                    .push(&sqe128)
-                                    .expect("failed to push sqe128");
-                            }
+                            unsafe { ring.submission().push(&sqe128) }
+                                .map_err(|_| PyRuntimeError::new_err("submission queue full"))?;
                         }
                         IoUringWrapper::Standard(_) => {
                             return Err(PyRuntimeError::new_err(
@@ -1790,15 +1787,13 @@ impl RawBlockDevice {
                         IoUringWrapper::Big(ring) => {
                             let mut ring = ring.lock().unwrap();
                             let sqe128: Entry128 = sqe.into();
-                            unsafe {
-                                ring.submission().push(&sqe128).expect("failed to push sqe");
-                            }
+                            unsafe { ring.submission().push(&sqe128) }
+                                .map_err(|_| PyRuntimeError::new_err("submission queue full"))?;
                         }
                         IoUringWrapper::Standard(ring) => {
                             let mut ring = ring.lock().unwrap();
-                            unsafe {
-                                ring.submission().push(&sqe).expect("failed to push sqe");
-                            }
+                            unsafe { ring.submission().push(&sqe) }
+                                .map_err(|_| PyRuntimeError::new_err("submission queue full"))?;
                         }
                     }
                 }
@@ -2069,7 +2064,8 @@ impl RawBlockDevice {
                             let batch: Vec<IoSubmission> = std::mem::take(&mut *q);
                             let batch_len = batch.len();
 
-                            let available = ring_size - ring_clone.submission_len();
+                            // Accepted requests still occupy completion capacity.
+                            let available = ring_size.saturating_sub(in_flight.len());
                             let to_submit_count = std::cmp::min(available, batch_len);
 
                             if to_submit_count < batch_len {
