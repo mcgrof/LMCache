@@ -1391,8 +1391,12 @@ class StorageManager:
     def close(self):
         logger.info("Closing StorageManager...")
 
-        # Close all backends
-        for name, backend in self.storage_backends.items():
+        # Consumers must settle I/O before their shared backing arenas are freed.
+        backends = sorted(
+            self.storage_backends.items(),
+            key=lambda item: isinstance(item[1], AllocatorBackendInterface),
+        )
+        for name, backend in backends:
             try:
                 logger.info("Closing storage backend: %s", name)
                 backend.close()

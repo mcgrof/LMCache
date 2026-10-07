@@ -210,10 +210,17 @@ def _make_fdp_adapter(
     config: RawBlockL2AdapterConfig,
 ) -> RawBlockL2Adapter:
     fake_core.meta_checkpoint_placement_id = config.meta_checkpoint_placement_id
-    with patch(
-        "lmcache.v1.distributed.l2_adapters.raw_block_l2_adapter.RawBlockCore",
-        return_value=fake_core,
+    with (
+        patch(
+            "lmcache.v1.distributed.l2_adapters.raw_block_l2_adapter.RawBlockCore",
+            return_value=fake_core,
+        ),
+        patch(
+            "lmcache.v1.distributed.l2_adapters.raw_block_l2_adapter._validate_mp_io_mode"
+        ),
     ):
+        # Placement-policy tests use an entirely synchronous fake core. They
+        # bypass only admission; real MP asynchronous I/O remains fenced.
         return RawBlockL2Adapter(config)
 
 
@@ -905,3 +912,16 @@ def test_raw_block_fdp_requires_nonzero_device_ids() -> None:
 
     with pytest.raises(RuntimeError, match="no non-zero identifiers"):
         _make_fdp_adapter(fake_core, _make_fdp_config())
+
+
+def test_mp_uring_refuses_before_native_or_arena_setup(tmp_path: Path) -> None:
+    """MP has no unknown-I/O result/whole-arena retention contract yet."""
+    config = RawBlockL2AdapterConfig(
+        device_path=str(tmp_path / "unopened"), slot_bytes=4096, io_engine="io_uring"
+    )
+    with patch(
+        "lmcache.v1.distributed.l2_adapters.raw_block_l2_adapter.RawBlockCore"
+    ) as core:
+        with pytest.raises(ValueError, match="MP raw_block io_uring is unsupported"):
+            RawBlockL2Adapter(config)
+        core.assert_not_called()

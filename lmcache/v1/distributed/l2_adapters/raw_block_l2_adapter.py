@@ -206,6 +206,16 @@ def _local_rank_from_kv_rank(kv_rank: int) -> int:
     return int(kv_rank) & 0xFF
 
 
+def _validate_mp_io_mode(config: "RawBlockL2AdapterConfig") -> None:
+    """Refuse asynchronous MP I/O until all L1 owners can retain its arena."""
+    if config.io_engine == "io_uring":
+        raise ValueError(
+            "MP raw_block io_uring is unsupported: load results and L1 teardown "
+            "cannot retain backing resources after unknown I/O completion; "
+            "use the in-process raw_block backend or io_engine='posix'"
+        )
+
+
 def _make_bitmap(size: int) -> "Bitmap":
     # First Party
     from lmcache.lmcache_native import Bitmap
@@ -577,6 +587,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
             the exception is re-raised.
         """
         super().__init__()
+        _validate_mp_io_mode(config)
         if (
             (config.use_odirect or config.use_uring_cmd)
             and l1_memory_desc is not None

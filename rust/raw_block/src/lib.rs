@@ -15,17 +15,15 @@
 //!   submission/completion loop. All alignment checks are performed before
 //!   enqueuing; violations result in an immediate Python `ValueError`.
 
-use pyo3::exceptions::{
-    PyDeprecationWarning, PyMemoryError, PyOSError, PyRuntimeError, PyValueError,
-};
+use pyo3::exceptions::{PyMemoryError, PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyAny;
-use std::collections::{HashMap, VecDeque};
+use pyo3::types::{PyAny, PyMemoryView};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::io;
 use std::os::unix::io::RawFd;
 use std::slice;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -41,6 +39,12 @@ use io_uring::{opcode, IoUring};
 enum IoUringWrapper {
     Standard(Arc<Mutex<IoUring<SqueueEntry, Entry>>>),
     Big(Arc<Mutex<IoUring<Entry128, Entry32>>>),
+    /// A ring with no kernel behind it, for the transitions a real one
+    /// will not produce on demand. Present only in the nondefault
+    /// fault-injection build, and the drain below is a `match`, so adding
+    /// it could not silently skip a completion path.
+    #[cfg(feature = "fault-injection")]
+    Fake(FakeRing),
 }
 
 impl IoUringWrapper {
@@ -48,6 +52,8 @@ impl IoUringWrapper {
         match self {
             Self::Standard(ring) => ring.lock().unwrap().submitter().submit(),
             Self::Big(ring) => ring.lock().unwrap().submitter().submit(),
+            #[cfg(feature = "fault-injection")]
+            Self::Fake(ring) => ring.submit(),
         }
     }
 
@@ -64,6 +70,8 @@ impl IoUringWrapper {
                 let len = ring.submission().len();
                 len
             }
+            #[cfg(feature = "fault-injection")]
+            IoUringWrapper::Fake(ring) => ring.submission_len(),
         }
     }
 
@@ -78,6 +86,8 @@ impl IoUringWrapper {
                 let mut ring = ring.lock().unwrap();
                 ring.submission().sync();
             }
+            #[cfg(feature = "fault-injection")]
+            IoUringWrapper::Fake(ring) => ring.sync(),
         }
     }
 
@@ -90,6 +100,8 @@ impl IoUringWrapper {
                 .unwrap()
                 .submitter()
                 .register_sync_cancel(timeout, cancel),
+            #[cfg(feature = "fault-injection")]
+            Self::Fake(_) => Ok(()),
             Self::Big(ring) => ring
                 .lock()
                 .unwrap()
@@ -107,6 +119,8 @@ impl IoUringWrapper {
                     .submitter()
                     .enter::<libc::sigset_t>(0, 0, flags, None)
             },
+            #[cfg(feature = "fault-injection")]
+            Self::Fake(_) => Ok(0),
             Self::Big(ring) => unsafe {
                 ring.lock()
                     .unwrap()
@@ -114,6 +128,489 @@ impl IoUringWrapper {
                     .enter::<libc::sigset_t>(0, 0, flags, None)
             },
         }
+    }
+    /// Push one 128-byte passthrough SQE onto this ring.
+    ///
+    /// Only the big-entry ring can carry one: a 64-byte SQE has no room for
+    /// the NVMe command, so a standard ring refuses rather than truncating.
+    fn push_cmd(
+        &self,
+        sqe: &Entry128,
+        user_data: u64,
+        #[cfg_attr(not(feature = "fault-injection"), allow(unused_variables))]
+        descriptor: SqeDescriptor,
+    ) -> Result<(), PyErr> {
+        match self {
+            IoUringWrapper::Big(ring) => {
+                let mut ring = ring.lock().unwrap();
+                let pushed = unsafe { ring.submission().push(sqe) };
+                pushed.map_err(|_| {
+                    PyRuntimeError::new_err(format!(
+                        "submission queue full pushing request {user_data}"
+                    ))
+                })
+            }
+            IoUringWrapper::Standard(_) => Err(PyRuntimeError::new_err(
+                "io_uring_cmd requires big entries (kernel 5.19+)",
+            )),
+            #[cfg(feature = "fault-injection")]
+            IoUringWrapper::Fake(ring) => ring.push(descriptor).map_err(|()| {
+                PyRuntimeError::new_err(format!(
+                    "submission queue full pushing request {user_data}"
+                ))
+            }),
+        }
+    }
+
+    /// Push one ordinary read or write SQE onto this ring.
+    ///
+    /// A big-entry ring takes the same operation widened to 128 bytes; the
+    /// trailing space is unused for anything but a passthrough command.
+    fn push_regular(
+        &self,
+        sqe: &SqueueEntry,
+        user_data: u64,
+        #[cfg_attr(not(feature = "fault-injection"), allow(unused_variables))]
+        descriptor: SqeDescriptor,
+    ) -> Result<(), PyErr> {
+        match self {
+            IoUringWrapper::Big(ring) => {
+                let widened: Entry128 = sqe.clone().into();
+                let mut ring = ring.lock().unwrap();
+                let pushed = unsafe { ring.submission().push(&widened) };
+                pushed.map_err(|_| {
+                    PyRuntimeError::new_err(format!(
+                        "submission queue full pushing request {user_data}"
+                    ))
+                })
+            }
+            IoUringWrapper::Standard(ring) => {
+                let mut ring = ring.lock().unwrap();
+                let pushed = unsafe { ring.submission().push(sqe) };
+                pushed.map_err(|_| {
+                    PyRuntimeError::new_err(format!(
+                        "submission queue full pushing request {user_data}"
+                    ))
+                })
+            }
+            #[cfg(feature = "fault-injection")]
+            IoUringWrapper::Fake(ring) => ring.push(descriptor).map_err(|()| {
+                PyRuntimeError::new_err(format!(
+                    "submission queue full pushing request {user_data}"
+                ))
+            }),
+        }
+    }
+
+    /// Register host buffers with the kernel as this ring's fixed set.
+    fn register_host_buffers(&self, iovecs: &[libc::iovec]) -> io::Result<()> {
+        match self {
+            IoUringWrapper::Standard(ring) => {
+                let ring = ring.lock().unwrap();
+                unsafe { ring.submitter().register_buffers(iovecs) }
+            }
+            IoUringWrapper::Big(ring) => {
+                let ring = ring.lock().unwrap();
+                unsafe { ring.submitter().register_buffers(iovecs) }
+            }
+            #[cfg(feature = "fault-injection")]
+            IoUringWrapper::Fake(_) => Err(io::Error::from_raw_os_error(libc::ENOTSUP)),
+        }
+    }
+
+    /// Withdraw whatever this ring has registered.
+    ///
+    /// The one operation whose failure is an unknown outcome rather than a
+    /// refusal: a registration the kernel still holds covers memory this
+    /// process was about to forget.
+    fn unregister_buffers(&self) -> io::Result<()> {
+        match self {
+            IoUringWrapper::Standard(ring) => ring.lock().unwrap().submitter().unregister_buffers(),
+            IoUringWrapper::Big(ring) => ring.lock().unwrap().submitter().unregister_buffers(),
+            #[cfg(feature = "fault-injection")]
+            IoUringWrapper::Fake(ring) => ring.register("unregister", 0, 0),
+        }
+    }
+
+    /// Take every completion the kernel has posted on this ring.
+    ///
+    /// The two ring types carry different CQE types that agree on the only
+    /// two fields the worker reads, so they are normalised here and the
+    /// worker has one completion path instead of one per ring type.
+    ///
+    /// This is a `match` rather than a chain of `if let`, so that a ring
+    /// variant added later fails to compile here. An unmatched variant
+    /// would return no completions for a request the kernel still owns,
+    /// which presents as a hang rather than as an error.
+    fn take_completions(&self) -> Vec<RingCompletion> {
+        match self {
+            IoUringWrapper::Standard(ring) => ring
+                .lock()
+                .unwrap()
+                .completion()
+                .map(|cqe| RingCompletion {
+                    user_data: cqe.user_data(),
+                    result: cqe.result(),
+                })
+                .collect(),
+            IoUringWrapper::Big(ring) => ring
+                .lock()
+                .unwrap()
+                .completion()
+                .map(|cqe| RingCompletion {
+                    user_data: cqe.user_data(),
+                    result: cqe.result(),
+                })
+                .collect(),
+            #[cfg(feature = "fault-injection")]
+            IoUringWrapper::Fake(ring) => ring.take_completions(),
+        }
+    }
+}
+
+/// One completion, with the ring type it came from erased.
+#[derive(Clone, Copy)]
+struct RingCompletion {
+    user_data: u64,
+    result: i32,
+}
+
+/// Encode the ordinary SQE passed directly to the submission ring.
+fn build_regular_sqe(sub: &IoSubmission, user_data: u64) -> SqueueEntry {
+    let ptr = sub.ptr_addr as *mut u8;
+    let fixed_addr = ptr;
+    let sqe = if sub.is_write {
+        if let Some(idx) = sub.fixed_buffer_idx {
+            opcode::WriteFixed::new(Fd(sub.fd), fixed_addr as *const u8, sub.len as u32, idx)
+                .offset(sub.offset)
+                .build()
+        } else {
+            opcode::Write::new(Fd(sub.fd), ptr as *const u8, sub.len as u32)
+                .offset(sub.offset)
+                .build()
+        }
+    } else if let Some(idx) = sub.fixed_buffer_idx {
+        opcode::ReadFixed::new(Fd(sub.fd), fixed_addr, sub.len as u32, idx)
+            .offset(sub.offset)
+            .build()
+    } else {
+        opcode::Read::new(Fd(sub.fd), ptr, sub.len as u32)
+            .offset(sub.offset)
+            .build()
+    };
+    sqe.user_data(user_data)
+}
+
+/// What one submission asks the device to do, in terms both rings share.
+///
+/// Built where the SQE is built, so there is one description of an
+/// operation's geometry rather than one per ring type. A real ring ignores
+/// it -- the SQE it was handed is the request -- and the fault-injection
+/// ring records it, because `user_data` alone cannot tell a correct
+/// remainder from one pointed at the wrong offset, the wrong address or the
+/// wrong length. Two submissions carrying the same bytes compare equal; two
+/// carrying the same bytes from different places do not.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "fault-injection"), allow(dead_code))]
+struct SqeDescriptor {
+    user_data: u64,
+    /// A passthrough NVMe command rather than an ordinary read or write.
+    is_cmd: bool,
+    is_write: bool,
+    /// Device offset, in bytes.
+    offset: u64,
+    /// Transfer length, in bytes.
+    len: u32,
+    /// Process address encoded in the SQE.
+    addr: u64,
+    /// Registered-buffer index, or -1 when this is not a fixed operation.
+    fixed_index: i64,
+}
+
+#[cfg_attr(not(feature = "fault-injection"), allow(dead_code))]
+impl SqeDescriptor {
+    fn describe(sub: &IoSubmission, user_data: u64) -> Self {
+        let addr = sub.ptr_addr as u64;
+        SqeDescriptor {
+            user_data,
+            is_cmd: sub.nvme_cmd_data.is_some(),
+            is_write: sub.is_write,
+            offset: sub.offset,
+            len: sub.len as u32,
+            addr,
+            fixed_index: sub.fixed_buffer_idx.map_or(-1, |idx| idx as i64),
+        }
+    }
+}
+
+/// A submission and completion ring with no kernel behind it.
+///
+/// The submit seam substitutes what one *submit call reports*, before the
+/// ring, so it can never deliver a completion -- which leaves the
+/// transitions that only a completion can produce unreachable: a short
+/// read, a completion arriving after close, a request taken by the kernel
+/// and never answered for. This substitutes the ring itself, so a test can
+/// deliver a completion for a chosen request, or deliberately withhold one.
+///
+/// It is also built to refuse. Every operation checks the ownership rule it
+/// implies and records a violation rather than papering over it, so a test
+/// asserting that the violation list is empty is asserting that the engine
+/// did not take a step a real kernel would not have allowed -- completing a
+/// request the kernel does not hold, most of all.
+#[cfg(feature = "fault-injection")]
+struct FakeRingState {
+    /// How many entries fit before a push is refused, which is the only way
+    /// a real submission queue reports being full.
+    sq_capacity: usize,
+    /// Pushed and not yet taken by a submit. This is what `submission_len`
+    /// reports, and what residency means. Each entry carries the geometry it
+    /// was built with, so a remainder can be checked against where it is
+    /// meant to be reading or writing rather than only being counted.
+    resident: Vec<SqeDescriptor>,
+    /// Taken by a submit and not yet answered for. The kernel's, not ours:
+    /// anything still here when the device closes is memory the device may
+    /// still be reaching.
+    owned: Vec<SqeDescriptor>,
+    /// Completions queued for the worker to drain.
+    ready: Vec<RingCompletion>,
+    /// Completions held until the worker enters its shutdown drain.
+    shutdown_completions: Vec<RingCompletion>,
+    shutdown_started: bool,
+    shutdown_delivered: usize,
+    /// How many resident entries the next submit takes. `None` takes all of
+    /// them, which is what a healthy ring does.
+    take_next: Option<usize>,
+    /// While set, every submit takes nothing and reports that it took
+    /// nothing. A real submit reports zero when the entries it would have
+    /// flushed were not flushed, and the worker has to leave them resident
+    /// and come back. Holding it is how a test gets more than one entry
+    /// resident at the same time, which is the only way a partial take can
+    /// be more than a full take of one entry. The worker already paces
+    /// itself when the ring will not drain, so holding does not spin.
+    hold_submits: bool,
+    /// What the next submit reports instead of taking anything.
+    submit_error: Option<i32>,
+    submit_errors: Vec<i32>,
+    /// Ownership rules this ring saw broken, in the order it saw them.
+    violations: Vec<String>,
+    /// How many times the worker synced the submission queue, which a test
+    /// uses to tell a flush apart from a no-op.
+    syncs: usize,
+    /// Registrations this ring was asked to make. Synthetic: no descriptor
+    /// is passed to the kernel, and a test says so by reading them from
+    /// here rather than from a device.
+    registrations: Vec<FakeRegistration>,
+}
+
+/// One resident or owned entry, as a flat map a test can compare exactly.
+#[cfg(feature = "fault-injection")]
+fn describe_fake_sqe(entry: &SqeDescriptor) -> HashMap<String, i64> {
+    let mut described: HashMap<String, i64> = HashMap::new();
+    described.insert("user_data".to_string(), entry.user_data as i64);
+    described.insert("is_cmd".to_string(), entry.is_cmd as i64);
+    described.insert("is_write".to_string(), entry.is_write as i64);
+    described.insert("offset".to_string(), entry.offset as i64);
+    described.insert("len".to_string(), entry.len as i64);
+    described.insert("addr".to_string(), entry.addr as i64);
+    described.insert("fixed_index".to_string(), entry.fixed_index);
+    described
+}
+
+/// One synthetic buffer registration, as the fault-injection ring records it.
+#[cfg(feature = "fault-injection")]
+#[derive(Clone)]
+struct FakeRegistration {
+    /// Registration operation recorded by the synthetic ring.
+    kind: String,
+    /// How many slots the request covers.
+    count: u32,
+    /// Where in the registration table it starts.
+    offset: u32,
+}
+
+#[cfg(feature = "fault-injection")]
+#[derive(Clone)]
+struct FakeRing {
+    state: Arc<Mutex<FakeRingState>>,
+    /// The same notifier the real rings register their CQ eventfd with, so
+    /// a completion wakes the worker through the path it actually uses. A
+    /// bare fd here would be a second wake-up mechanism that only the fake
+    /// exercises, which is the opposite of the point.
+    notify: Arc<UringNotify>,
+}
+
+#[cfg(feature = "fault-injection")]
+impl FakeRing {
+    fn new(sq_capacity: usize, notify: Arc<UringNotify>) -> Self {
+        FakeRing {
+            state: Arc::new(Mutex::new(FakeRingState {
+                sq_capacity,
+                resident: Vec::new(),
+                owned: Vec::new(),
+                ready: Vec::new(),
+                shutdown_completions: Vec::new(),
+                shutdown_started: false,
+                shutdown_delivered: 0,
+                take_next: None,
+                hold_submits: false,
+                submit_error: None,
+                submit_errors: Vec::new(),
+                violations: Vec::new(),
+                syncs: 0,
+                registrations: Vec::new(),
+            })),
+            notify,
+        }
+    }
+
+    fn push(&self, sqe: SqeDescriptor) -> Result<(), ()> {
+        let mut state = self.state.lock().unwrap();
+        if state.resident.len() >= state.sq_capacity {
+            return Err(());
+        }
+        state.resident.push(sqe);
+        Ok(())
+    }
+
+    fn submit(&self) -> io::Result<usize> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(errno) = state.submit_error.take() {
+            state.submit_errors.push(errno);
+            // A submit that reports an error took nothing. Leaving the
+            // entries resident is the whole point: whether the worker then
+            // reasons about them correctly is what a test is asking.
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+        // An instruction for one submit outranks the hold, so a test can
+        // let exactly one partial take happen and have the ring stop again
+        // afterwards -- which is what makes the suffix observable instead
+        // of a race against the worker's next loop.
+        let instructed = state.take_next.take();
+        if instructed.is_none() && state.hold_submits {
+            // Took nothing and says so. Everything stays resident, which is
+            // what lets a second entry join the first.
+            return Ok(0);
+        }
+        let available = state.resident.len();
+        let taking = instructed.unwrap_or(available).min(available);
+        let taken: Vec<SqeDescriptor> = state.resident.drain(..taking).collect();
+        state.owned.extend(taken);
+        Ok(taking)
+    }
+
+    /// Record one synthetic registration, or refuse one that makes no sense.
+    ///
+    /// The descriptor validation and the registration map are built in the
+    /// shared code above; this stands in only for the syscall at the end of
+    /// it. A record here is explicitly synthetic and is never evidence that
+    /// a kernel registered anything.
+    fn register(&self, kind: &str, count: u32, offset: u32) -> io::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        if kind == "unregister" {
+            state.registrations.clear();
+            state.registrations.push(FakeRegistration {
+                kind: kind.to_string(),
+                count,
+                offset,
+            });
+            return Ok(());
+        }
+        if count == 0 {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        state.registrations.push(FakeRegistration {
+            kind: kind.to_string(),
+            count,
+            offset,
+        });
+        Ok(())
+    }
+
+    fn complete_at_shutdown(&self, user_data: u64, result: i32) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap();
+        if state.shutdown_started
+            || !state.owned.iter().any(|entry| entry.user_data == user_data)
+            || state
+                .shutdown_completions
+                .iter()
+                .any(|entry| entry.user_data == user_data)
+        {
+            let complaint = format!("cannot schedule shutdown completion for request {user_data}");
+            state.violations.push(complaint.clone());
+            return Err(complaint);
+        }
+        state
+            .shutdown_completions
+            .push(RingCompletion { user_data, result });
+        Ok(())
+    }
+
+    fn begin_shutdown(&self) {
+        let planned = {
+            let mut state = self.state.lock().unwrap();
+            state.shutdown_started = true;
+            std::mem::take(&mut state.shutdown_completions)
+        };
+        for completion in planned {
+            if self
+                .complete(completion.user_data, completion.result)
+                .is_ok()
+            {
+                self.state.lock().unwrap().shutdown_delivered += 1;
+            }
+        }
+    }
+
+    fn take_completions(&self) -> Vec<RingCompletion> {
+        let mut state = self.state.lock().unwrap();
+        std::mem::take(&mut state.ready)
+    }
+
+    fn submission_len(&self) -> usize {
+        self.state.lock().unwrap().resident.len()
+    }
+
+    fn sync(&self) {
+        self.state.lock().unwrap().syncs += 1;
+    }
+
+    /// Answer for one request the kernel took, and wake the worker.
+    ///
+    /// Refuses, loudly and in the violation list, to answer for a request
+    /// it does not hold. That is the invariant the whole fault seam exists
+    /// to protect: a completion for a request the kernel owns must come
+    /// from the kernel, and one for a request it does not own is a
+    /// fabrication.
+    fn complete(&self, user_data: u64, result: i32) -> Result<(), String> {
+        {
+            let mut state = self.state.lock().unwrap();
+            match state
+                .owned
+                .iter()
+                .position(|held| held.user_data == user_data)
+            {
+                Some(at) => {
+                    state.owned.remove(at);
+                    state.ready.push(RingCompletion { user_data, result });
+                }
+                None => {
+                    let resident = state
+                        .resident
+                        .iter()
+                        .any(|entry| entry.user_data == user_data);
+                    let complaint = format!(
+                        "completion for request {user_data} which this ring \
+                         does not hold (resident: {resident})"
+                    );
+                    state.violations.push(complaint.clone());
+                    return Err(complaint);
+                }
+            }
+        }
+        // Through the notifier the real rings use, so the worker is woken
+        // the way it is woken in production.
+        self.notify.signal_producer();
+        Ok(())
     }
 }
 
@@ -258,6 +755,108 @@ type IoUringBatchResults = (Vec<bool>, IoUringCompletionErrors);
 // Small helper used to align sizes for O_DIRECT I/O.
 fn round_up(x: usize, align: usize) -> usize {
     (x + align - 1) / align * align
+}
+
+/// A regular read/write can be retried only after making positive progress.
+///
+/// A zero completion has no remaining-range advance. Retrying it would
+/// resubmit the same request indefinitely.
+fn is_retryable_regular_short_io(cqe_result: i32, len: usize, is_uring_cmd: bool) -> bool {
+    cqe_result > 0 && (cqe_result as usize) < len && !is_uring_cmd
+}
+
+/// Move batch owners somewhere no allocator can reach them.
+///
+/// `batch_id: None` takes every outstanding batch. Moving handles between
+/// Rust collections performs no reference-count operation, so this needs no
+/// GIL and is safe to call from the worker thread.
+///
+/// The two locks are taken and released in sequence, never nested: the
+/// worker holds neither when it calls this, and nesting them would be the
+/// only ordering hazard here.
+fn drain_batch_owners<T>(
+    batched: &Mutex<HashMap<u64, Vec<T>>>,
+    quarantined: &Mutex<Vec<T>>,
+    batch_id: Option<u64>,
+) -> usize {
+    let taken: Vec<T> = {
+        let mut batched = batched.lock().unwrap();
+        match batch_id {
+            Some(id) => batched.remove(&id).unwrap_or_default(),
+            None => batched.drain().flat_map(|(_id, owners)| owners).collect(),
+        }
+    };
+    let moved = taken.len();
+    if moved > 0 {
+        quarantined.lock().unwrap().extend(taken);
+    }
+    moved
+}
+
+/// A submit outcome a test asks the worker to see instead of the kernel's.
+///
+/// Reaching the fatal and partial-submit transitions otherwise needs a device
+/// that fails on demand. This replaces what one submit call reports, before
+/// the ring is consulted, so the worker runs its ordinary code against an
+/// outcome it cannot otherwise be given. No completion is ever synthesised:
+/// a request the kernel owns is never claimed to have finished.
+#[cfg(feature = "fault-injection")]
+#[derive(Clone, Copy, Debug)]
+enum SubmitFault {
+    /// The call reports taking nothing, and nothing was taken.
+    ///
+    /// This is the only count the seam can state truthfully. Substituting
+    /// before the ring means no entry was ever offered, so every entry is
+    /// still resident and still the worker's -- which is exactly what a
+    /// real submit returning zero leaves behind.
+    ReportsZeroTaken,
+    /// Retryable: the ring is unchanged and the work is still ours.
+    Retryable(i32),
+    /// Fatal: what the kernel took is unknowable from here.
+    Fatal(i32),
+}
+
+/// Faults keyed by which submit call they apply to.
+///
+/// Keying on the call ordinal rather than on time is what makes a plan
+/// reproducible: a test names the third submit, and gets the third submit,
+/// however fast or slow the run is.
+#[cfg(feature = "fault-injection")]
+#[derive(Default)]
+struct FaultPlan {
+    submits: Mutex<HashMap<u64, SubmitFault>>,
+    submit_calls: AtomicU64,
+}
+
+#[cfg(feature = "fault-injection")]
+impl FaultPlan {
+    /// Take the fault for this submit call, if the plan names one.
+    fn take_submit_fault(&self) -> Option<SubmitFault> {
+        let ordinal = self.submit_calls.fetch_add(1, Ordering::SeqCst);
+        self.submits.lock().unwrap().remove(&ordinal)
+    }
+}
+
+/// Submit the ring, or report what a plan says this call reports.
+fn submit_ring(
+    ring: &IoUringWrapper,
+    #[cfg(feature = "fault-injection")] plan: &Option<Arc<FaultPlan>>,
+) -> io::Result<usize> {
+    #[cfg(feature = "fault-injection")]
+    if let Some(plan) = plan {
+        if let Some(fault) = plan.take_submit_fault() {
+            // Deliberately before the ring: the entries stay exactly where
+            // they were, so the worker's own bookkeeping is what is under
+            // test and the kernel is never told anything.
+            return match fault {
+                SubmitFault::ReportsZeroTaken => Ok(0),
+                SubmitFault::Retryable(errno) | SubmitFault::Fatal(errno) => {
+                    Err(io::Error::from_raw_os_error(errno))
+                }
+            };
+        }
+    }
+    ring.submit()
 }
 
 // Fetch errno for the last libc call on this thread.
@@ -826,6 +1425,16 @@ fn prepare_iouring_write_buffer(
     })
 }
 
+/// Keep an export, not just the exporter, while a batched I/O owns its address.
+/// A reference to bytearray alone does not prevent resize from freeing memory.
+fn batch_buffer_owner(obj: &Bound<'_, PyAny>, host_accessible: bool) -> PyResult<Py<PyAny>> {
+    if host_accessible {
+        Ok(PyMemoryView::from(obj)?.into_any().unbind())
+    } else {
+        Ok(obj.clone().unbind())
+    }
+}
+
 // Acquire a Python buffer view with the requested mutability.
 fn get_pybuffer<'py>(
     py: Python<'py>,
@@ -1122,6 +1731,172 @@ struct IoSubmission {
     payload_len: Option<usize>,         // For bounce buffer reads
     batch_id: u64,                      // Batch ID for per-batch tracking
     nvme_cmd_data: Option<NvmeCmdData>, // NVMe command data for io_uring_cmd
+    // Who this operation is for, as the caller named it when it handed the
+    // batch over. Immutable and carried with the submission rather than
+    // looked up later: the completion is reaped on the worker thread, long
+    // after whatever "current request" a thread-local could have named.
+    request_tag: Option<Arc<str>>,
+    /// Zero for the initial SQE; incremented for each short-I/O remainder.
+    attempt: u64,
+}
+
+/// Which buffer path a submission actually took.
+///
+/// Not which route the Python helper chose, and not what the engine was
+/// configured to prefer: this is the flavour of SQE that was built, decided
+/// by whether the buffer was found in the registration map and what kind of
+/// registration it was. Missed registrations issue ordinary SQEs rather
+/// than the fixed-buffer operations a caller may have expected.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeIoPath {
+    /// A passthrough NVMe command.
+    UringCmd,
+    /// A passthrough NVMe command against a registered buffer.
+    UringCmdFixed,
+    /// Read/write against a classic registered host buffer.
+    HostFixed,
+    /// Read/write through an aligned copy this engine owns.
+    Bounce,
+    /// Read/write against an ordinary process address.
+    Regular,
+}
+
+impl NativeIoPath {
+    fn of(sub: &IoSubmission) -> Self {
+        if sub.nvme_cmd_data.is_some() {
+            if sub.fixed_buffer_idx.is_some() {
+                return NativeIoPath::UringCmdFixed;
+            }
+            return NativeIoPath::UringCmd;
+        }
+        if sub.fixed_buffer_idx.is_some() {
+            return NativeIoPath::HostFixed;
+        }
+        if sub.bounce.is_some() {
+            return NativeIoPath::Bounce;
+        }
+        NativeIoPath::Regular
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            NativeIoPath::UringCmd => "uring_cmd",
+            NativeIoPath::UringCmdFixed => "uring_cmd_fixed",
+            NativeIoPath::HostFixed => "host_fixed",
+            NativeIoPath::Bounce => "bounce",
+            NativeIoPath::Regular => "regular",
+        }
+    }
+}
+
+/// What one physical operation did, and who it was for.
+///
+/// Recorded after the SQE enters the ring and again when the device answers, so a
+/// reader can join the two and see an operation nobody answered for rather
+/// than inferring it from a total that happens to match. The request tag is
+/// the caller's own immutable identity for the work, carried on the
+/// submission: a "current request" global would be read on the worker
+/// thread, which is nobody's request.
+#[derive(Clone)]
+struct NativeIoEvent {
+    device_instance_id: u64,
+    request_tag: Option<Arc<str>>,
+    batch_id: u64,
+    operation_id: u64,
+    attempt: u64,
+    is_write: bool,
+    path: &'static str,
+    /// "submitted", "completed", "short" or "failed".
+    outcome: &'static str,
+    bytes: i64,
+}
+
+/// How many operation records the native journal keeps before dropping the
+/// oldest. One entry is a few words; this bounds the diagnostic at roughly a
+/// megabyte while covering far more operations than any single request.
+const NATIVE_IO_JOURNAL_CAPACITY: usize = 16384;
+static NEXT_RAW_BLOCK_DEVICE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// A bounded record of what the device was asked to do, and what it did.
+///
+/// Bounded because it is a diagnostic, not a log of record: an engine that
+/// kept one entry per operation forever would run out of memory on a long
+/// serving run. Dropping is counted, so a reader can see that the record is
+/// incomplete rather than trusting a sum that silently lost rows.
+struct NativeIoJournal {
+    device_instance_id: u64,
+    events: Mutex<VecDeque<NativeIoEvent>>,
+    capacity: usize,
+    dropped: AtomicU64,
+}
+
+impl NativeIoJournal {
+    fn new(capacity: usize) -> Self {
+        NativeIoJournal {
+            device_instance_id: NEXT_RAW_BLOCK_DEVICE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            events: Mutex::new(VecDeque::with_capacity(capacity.min(1024))),
+            capacity,
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, event: NativeIoEvent) {
+        let mut events = self.events.lock().unwrap();
+        if events.len() >= self.capacity {
+            events.pop_front();
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        events.push_back(event);
+    }
+
+    fn record_submission(&self, sub: &IoSubmission, operation_id: u64) {
+        self.record(NativeIoEvent {
+            device_instance_id: self.device_instance_id,
+            request_tag: sub.request_tag.clone(),
+            batch_id: sub.batch_id,
+            operation_id,
+            attempt: sub.attempt,
+            is_write: sub.is_write,
+            path: NativeIoPath::of(sub).name(),
+            outcome: "submitted",
+            bytes: sub.len as i64,
+        });
+    }
+
+    fn record_completion(&self, sub: &IoSubmission, operation_id: u64, result: i32) {
+        // NVMe passthrough CQEs carry command status, not a byte count.
+        let (outcome, bytes) = if sub.nvme_cmd_data.is_some() {
+            if result == 0 {
+                ("completed", sub.len as i64)
+            } else {
+                ("failed", 0)
+            }
+        } else if result < 0 {
+            ("failed", result as i64)
+        } else if (result as usize) < sub.len {
+            ("short", result as i64)
+        } else {
+            ("completed", result as i64)
+        };
+        self.record(NativeIoEvent {
+            device_instance_id: self.device_instance_id,
+            request_tag: sub.request_tag.clone(),
+            batch_id: sub.batch_id,
+            operation_id,
+            attempt: sub.attempt,
+            is_write: sub.is_write,
+            path: NativeIoPath::of(sub).name(),
+            outcome,
+            bytes,
+        });
+    }
+
+    fn drain(&self) -> (Vec<NativeIoEvent>, u64) {
+        let mut events = self.events.lock().unwrap();
+        // Keep lost rows in the same snapshot as the rows they displaced.
+        let dropped = self.dropped.swap(0, Ordering::Relaxed);
+        (events.drain(..).collect(), dropped)
+    }
 }
 
 fn enqueue_if_running(
@@ -1217,11 +1992,22 @@ impl SubmissionRetry {
     }
 }
 
-fn submit_pending(ring: &IoUringWrapper, pending: &mut VecDeque<u64>) -> io::Result<usize> {
+fn submit_pending(
+    ring: &IoUringWrapper,
+    pending: &mut VecDeque<u64>,
+    #[cfg(feature = "fault-injection")] fault_plan: &Option<Arc<FaultPlan>>,
+) -> io::Result<usize> {
     if pending.is_empty() {
         return Ok(0);
     }
-    record_submission_result(pending, ring.submit())
+    record_submission_result(
+        pending,
+        submit_ring(
+            ring,
+            #[cfg(feature = "fault-injection")]
+            fault_plan,
+        ),
+    )
 }
 
 fn record_submission_result(
@@ -1329,6 +2115,8 @@ impl Default for IoSubmission {
             payload_len: None,
             batch_id: 0,
             nvme_cmd_data: None,
+            request_tag: None,
+            attempt: 0,
         }
     }
 }
@@ -1387,6 +2175,35 @@ struct RawBlockDevice {
     batched_completions: Arc<Mutex<HashMap<u64, Vec<Arc<IoCompletion>>>>>,
     // Counter for generating unique batch IDs
     next_batch_id: Arc<AtomicU64>,
+    // Batches for which no statement can be made about the device's access.
+    // The worker records these before it wakes their waiter, so the waiter
+    // sees the unknown outcome rather than a plain failure and can keep the
+    // batch's owners instead of releasing them.
+    quarantined_batches: Arc<Mutex<HashSet<u64>>>,
+    // Set once any outcome has been unknown. Sticky for this incarnation:
+    // an engine that cannot say what the kernel is doing cannot serve.
+    // Deliberately separate from `closed`, because marking the device closed
+    // would make `close()` return without draining or unregistering.
+    poisoned: Arc<AtomicBool>,
+    // Owners transferred out of `batched_buffer_objs` for a quarantined
+    // batch. Never cleared: the Python objects behind them must stay alive
+    // while the device may still reach the memory they describe.
+    quarantined_owners: Arc<Mutex<Vec<Py<PyAny>>>>,
+    // How many owners the terminal retention has taken. It takes them by
+    // forgetting the vector, so their count has to be recorded before it
+    // becomes unreadable.
+    retained_owners: Arc<AtomicUsize>,
+    // The scripted ring's state, held apart from `ring` itself. The
+    // terminal retention takes the ring and forgets it, and a test asking
+    // afterwards whether the engine broke an ownership rule on its way out
+    // must still get an answer.
+    // What the device was actually asked to do, and what it did, recorded
+    // per physical operation. Bounded: a diagnostic, not a log of record.
+    io_journal: Arc<NativeIoJournal>,
+    #[cfg(feature = "fault-injection")]
+    fake_state: Option<Arc<Mutex<FakeRingState>>>,
+    #[cfg(feature = "fault-injection")]
+    fault_plan: Option<Arc<FaultPlan>>,
 }
 
 /// RAII guard for a raw file descriptor
@@ -1426,7 +2243,51 @@ impl Drop for FdGuard {
 }
 
 impl RawBlockDevice {
+    fn ensure_io_available(&self, needs_worker: bool) -> PyResult<()> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(PyRuntimeError::new_err("device is closed"));
+        }
+        if self.outcome_is_unknown() {
+            return Err(PyRuntimeError::new_err(
+                "device has an unknown I/O outcome and cannot accept new work",
+            ));
+        }
+        if needs_worker
+            && self
+                .shutdown
+                .as_ref()
+                .is_some_and(|shutdown| shutdown.load(Ordering::Relaxed))
+        {
+            return Err(PyRuntimeError::new_err("io_uring worker stopped"));
+        }
+        if needs_worker && self.worker.is_none() {
+            return Err(PyRuntimeError::new_err("io_uring worker has stopped"));
+        }
+        Ok(())
+    }
+
     /// Internal constructor performs all low level setup.
+    #[allow(clippy::too_many_arguments)]
+    /// The scripted ring behind this device, or a refusal.
+    #[cfg(feature = "fault-injection")]
+    fn scripted_ring(&self) -> PyResult<&FakeRing> {
+        match &self.ring {
+            Some(IoUringWrapper::Fake(ring)) => Ok(ring),
+            _ => Err(PyRuntimeError::new_err(
+                "this device has no scripted ring to drive (it was not \
+                 built with one, or a refused close has retained it)",
+            )),
+        }
+    }
+
+    /// The scripted ring's state, which outlives the ring.
+    #[cfg(feature = "fault-injection")]
+    fn scripted_state(&self) -> PyResult<&Arc<Mutex<FakeRingState>>> {
+        self.fake_state.as_ref().ok_or_else(|| {
+            PyRuntimeError::new_err("this device was not built with a scripted ring")
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new_internal(
         path: String,
@@ -1437,7 +2298,17 @@ impl RawBlockDevice {
         use_uring_cmd: bool,
         io_engine: Option<String>,
         iouring_queue_depth: usize,
+        fake_ring_capacity: usize,
     ) -> PyResult<Self> {
+        if fake_ring_capacity > 0 && !cfg!(feature = "fault-injection") {
+            // Said rather than ignored: a caller asking for a scripted ring
+            // on a serving build is measuring nothing, and silence would
+            // let it believe otherwise.
+            return Err(PyValueError::new_err(
+                "fake_ring_capacity needs the nondefault fault-injection \
+                 feature; this build does not carry it",
+            ));
+        }
         let use_iouring = parse_use_iouring(io_engine, use_iouring)?;
         let iouring_queue_depth = iouring_queue_depth.max(1);
         // use_uring_cmd requires use_iouring to be enabled
@@ -1507,6 +2378,16 @@ impl RawBlockDevice {
         };
 
         let worker_error = Arc::new(Mutex::new(None));
+        // Created before the branch so that the worker closure and the
+        // struct can share one plan without threading it through the tuple.
+        #[cfg(feature = "fault-injection")]
+        let fault_plan: Option<Arc<FaultPlan>> = Some(Arc::new(FaultPlan::default()));
+
+        // Shared with the worker, because the two halves of an operation are
+        // recorded in different places: the submission where the SQE is
+        // built, the outcome where the completion is reaped.
+        let io_journal = Arc::new(NativeIoJournal::new(NATIVE_IO_JOURNAL_CAPACITY));
+
         let (
             ring_opt,
             queue_opt,
@@ -1519,70 +2400,102 @@ impl RawBlockDevice {
             batched_completions_opt,
             next_batch_id_opt,
             batch_in_flight_opt,
+            quarantined_batches_opt,
+            poisoned_opt,
+            quarantined_owners_opt,
         ) = if use_iouring {
-            let notify = UringNotify::new()
-                .map_err(|e| PyRuntimeError::new_err(format!("UringNotify init failed: {}", e)))?;
+            let notify =
+                Arc::new(UringNotify::new().map_err(|e| {
+                    PyRuntimeError::new_err(format!("UringNotify init failed: {}", e))
+                })?);
+            // A scripted ring, when one was asked for. It takes the same
+            // notifier the real rings register their CQ eventfd with, so a
+            // completion wakes the worker through the path production uses.
+            #[cfg(feature = "fault-injection")]
+            let scripted = if fake_ring_capacity > 0 {
+                Some(IoUringWrapper::Fake(FakeRing::new(
+                    fake_ring_capacity,
+                    Arc::clone(&notify),
+                )))
+            } else {
+                None
+            };
+            #[cfg(not(feature = "fault-injection"))]
+            let scripted: Option<IoUringWrapper> = None;
             // Try to create IoUring with big entries (Entry128/Entry32) first
             // This is required for io_uring_cmd support (kernel 5.19+)
             // If that fails, fall back to standard entries (Entry/Entry) for kernel 5.4-5.18
-            let ring = match IoUring::<Entry128, Entry32>::builder()
-                .build(iouring_queue_depth as u32)
-            {
-                Ok(big_ring) => {
-                    // Big entries supported - io_uring_cmd can be used
-                    if use_uring_cmd {
-                        // Validate that device is a character device (required for io_uring_cmd)
-                        let is_char_dev = is_character_device(&path)?;
-                        if !is_char_dev {
-                            return Err(PyValueError::new_err(
+            let ring = match scripted {
+                Some(scripted) => scripted,
+                None => match IoUring::<Entry128, Entry32>::builder()
+                    .build(iouring_queue_depth as u32)
+                {
+                    Ok(big_ring) => {
+                        // Big entries supported - io_uring_cmd can be used
+                        if use_uring_cmd {
+                            // Validate that device is a character device (required for io_uring_cmd)
+                            let is_char_dev = is_character_device(&path)?;
+                            if !is_char_dev {
+                                return Err(PyValueError::new_err(
                                 "use_uring_cmd requires an NVMe namespace character device (e.g., /dev/ng0n1)",
                             ));
+                            }
                         }
+                        // Register the CQ eventfd with the ring so the kernel writes to it
+                        // whenever a CQE is posted. Must happen before the ring is wrapped
+                        // in a Mutex / handed to the worker.
+                        big_ring
+                            .submitter()
+                            .register_eventfd(notify.cq_efd)
+                            .map_err(|e| {
+                                PyRuntimeError::new_err(format!("register_eventfd failed: {}", e))
+                            })?;
+                        let big_ring = Arc::new(Mutex::new(big_ring));
+                        IoUringWrapper::Big(big_ring)
                     }
-                    // Register the CQ eventfd with the ring so the kernel writes to it
-                    // whenever a CQE is posted. Must happen before the ring is wrapped
-                    // in a Mutex / handed to the worker.
-                    big_ring
-                        .submitter()
-                        .register_eventfd(notify.cq_efd)
-                        .map_err(|e| {
-                            PyRuntimeError::new_err(format!("register_eventfd failed: {}", e))
-                        })?;
-                    let big_ring = Arc::new(Mutex::new(big_ring));
-                    IoUringWrapper::Big(big_ring)
-                }
-                Err(_) => {
-                    // Big entries not supported (kernel < 5.19), fall back to standard entries
-                    // io_uring_cmd is not available on these kernels
-                    if use_uring_cmd {
-                        return Err(PyRuntimeError::new_err(
+                    Err(_) => {
+                        // Big entries not supported (kernel < 5.19), fall back to standard entries
+                        // io_uring_cmd is not available on these kernels
+                        if use_uring_cmd {
+                            return Err(PyRuntimeError::new_err(
                             "io_uring_cmd requires kernel 5.19 or later (big SQE/CQE entries not supported)",
                         ));
+                        }
+                        let std_ring = IoUring::<SqueueEntry, Entry>::builder()
+                            .build(iouring_queue_depth as u32)
+                            .map_err(|e| {
+                                PyRuntimeError::new_err(format!("io_uring init failed: {}", e))
+                            })?;
+                        // Register the CQ eventfd with the ring so the kernel writes to it
+                        // whenever a CQE is posted. Must happen before the ring is wrapped
+                        // in a Mutex / handed to the worker.
+                        std_ring
+                            .submitter()
+                            .register_eventfd(notify.cq_efd)
+                            .map_err(|e| {
+                                PyRuntimeError::new_err(format!("register_eventfd failed: {}", e))
+                            })?;
+                        let std_ring = Arc::new(Mutex::new(std_ring));
+                        IoUringWrapper::Standard(std_ring)
                     }
-                    let std_ring = IoUring::<SqueueEntry, Entry>::builder()
-                        .build(iouring_queue_depth as u32)
-                        .map_err(|e| {
-                            PyRuntimeError::new_err(format!("io_uring init failed: {}", e))
-                        })?;
-                    // Register the CQ eventfd with the ring so the kernel writes to it
-                    // whenever a CQE is posted. Must happen before the ring is wrapped
-                    // in a Mutex / handed to the worker.
-                    std_ring
-                        .submitter()
-                        .register_eventfd(notify.cq_efd)
-                        .map_err(|e| {
-                            PyRuntimeError::new_err(format!("register_eventfd failed: {}", e))
-                        })?;
-                    let std_ring = Arc::new(Mutex::new(std_ring));
-                    IoUringWrapper::Standard(std_ring)
-                }
+                },
             };
             let queue = Arc::new(Mutex::new(Vec::<IoSubmission>::new()));
             let shutdown = Arc::new(AtomicBool::new(false));
-            let batch_ready = Arc::new(notify);
+            let batch_ready = notify;
             let in_flight_count = Arc::new(AtomicU64::new(0));
             let in_flight_cvar = Arc::new(Condvar::new());
             let batched_buffer_objs = Arc::new(Mutex::new(HashMap::<u64, Vec<Py<PyAny>>>::new()));
+            let quarantined_owners = Arc::new(Mutex::new(Vec::<Py<PyAny>>::new()));
+            let batched_buffer_objs_worker = Arc::clone(&batched_buffer_objs);
+            let quarantined_owners_worker = Arc::clone(&quarantined_owners);
+            let quarantined_batches = Arc::new(Mutex::new(HashSet::<u64>::new()));
+            let poisoned = Arc::new(AtomicBool::new(false));
+            let quarantined_batches_worker = Arc::clone(&quarantined_batches);
+            let poisoned_worker = Arc::clone(&poisoned);
+            let io_journal_worker = Arc::clone(&io_journal);
+            #[cfg(feature = "fault-injection")]
+            let fault_plan_worker = fault_plan.clone();
             let batched_completions =
                 Arc::new(Mutex::new(HashMap::<u64, Vec<Arc<IoCompletion>>>::new()));
             let next_batch_id = Arc::new(AtomicU64::new(1));
@@ -1707,11 +2620,11 @@ impl RawBlockDevice {
             // Helper function to build and submit an SQE for a submission
             fn build_and_submit_sqe(
                 ring: &IoUringWrapper,
+                journal: &NativeIoJournal,
                 sub: &IoSubmission,
                 user_data: u64,
             ) -> Result<(), PyErr> {
                 let ptr = sub.ptr_addr as *mut u8;
-
                 // Check if this is an io_uring_cmd submission
                 if let Some(nvme_data) = &sub.nvme_cmd_data {
                     // Prepare NVMe uring command
@@ -1735,68 +2648,17 @@ impl RawBlockDevice {
                     let mut uring_cmd =
                         opcode::UringCmd80::new(Fd(sub.fd), NVME_URING_CMD_IO).cmd(cmd_bytes);
 
-                    // Set buf_index if using fixed buffers
                     if let Some(idx) = sub.fixed_buffer_idx {
                         uring_cmd = uring_cmd.buf_index(Some(idx));
                     }
 
                     let sqe128 = uring_cmd.build().user_data(user_data);
-
-                    // Push the big SQE entry (128 bytes)
-                    match ring {
-                        IoUringWrapper::Big(ring) => {
-                            let mut ring = ring.lock().unwrap();
-                            unsafe { ring.submission().push(&sqe128) }
-                                .map_err(|_| PyRuntimeError::new_err("submission queue full"))?;
-                        }
-                        IoUringWrapper::Standard(_) => {
-                            return Err(PyRuntimeError::new_err(
-                                "io_uring_cmd requires big entries (kernel 5.19+)",
-                            ));
-                        }
-                    }
+                    ring.push_cmd(&sqe128, user_data, SqeDescriptor::describe(sub, user_data))?;
                 } else {
-                    // Regular read/write operations
-                    let sqe = if sub.is_write {
-                        if let Some(idx) = sub.fixed_buffer_idx {
-                            opcode::WriteFixed::new(
-                                Fd(sub.fd),
-                                ptr as *const u8,
-                                sub.len as u32,
-                                idx,
-                            )
-                            .offset(sub.offset)
-                            .build()
-                        } else {
-                            opcode::Write::new(Fd(sub.fd), ptr as *const u8, sub.len as u32)
-                                .offset(sub.offset)
-                                .build()
-                        }
-                    } else if let Some(idx) = sub.fixed_buffer_idx {
-                        opcode::ReadFixed::new(Fd(sub.fd), ptr, sub.len as u32, idx)
-                            .offset(sub.offset)
-                            .build()
-                    } else {
-                        opcode::Read::new(Fd(sub.fd), ptr, sub.len as u32)
-                            .offset(sub.offset)
-                            .build()
-                    };
-                    let sqe = sqe.user_data(user_data);
-                    // Convert to appropriate entry type based on ring type
-                    match ring {
-                        IoUringWrapper::Big(ring) => {
-                            let mut ring = ring.lock().unwrap();
-                            let sqe128: Entry128 = sqe.into();
-                            unsafe { ring.submission().push(&sqe128) }
-                                .map_err(|_| PyRuntimeError::new_err("submission queue full"))?;
-                        }
-                        IoUringWrapper::Standard(ring) => {
-                            let mut ring = ring.lock().unwrap();
-                            unsafe { ring.submission().push(&sqe) }
-                                .map_err(|_| PyRuntimeError::new_err("submission queue full"))?;
-                        }
-                    }
+                    let sqe = build_regular_sqe(sub, user_data);
+                    ring.push_regular(&sqe, user_data, SqeDescriptor::describe(sub, user_data))?;
                 }
+                journal.record_submission(sub, user_data);
                 Ok(())
             }
 
@@ -1824,6 +2686,51 @@ impl RawBlockDevice {
                     let mut pending = VecDeque::with_capacity(ring_size);
                     let mut next_user_data: u64 = 1;
                     let mut submission_retry = SubmissionRetry::default();
+                    // Operations whose access by the device was never shown to
+                    // have ended. Quarantining the whole submission keeps every
+                    // owner it holds alive, not just its bounce allocation, and
+                    // they outlive the worker rather than return anything to an
+                    // allocator while the kernel may still act on it.
+                    let mut quarantined: Vec<IoSubmission> = Vec::new();
+                    // Record a batch as unknown-outcome, and poison the device,
+                    // BEFORE its waiter is woken. The waiter reads this to
+                    // decide whether it may release the batch's owners, so the
+                    // order matters: waking first would let it release them
+                    // while the device may still reach that memory.
+                    // Record a batch as unknown-outcome, poison the device,
+                    // and take the batch's Python owners out of reach --
+                    // here, when the worker learns, rather than whenever
+                    // somebody happens to ask. A caller that never polls is
+                    // the case that made the difference: owners sat in
+                    // `batched_buffer_objs` until `wait_iouring` moved them,
+                    // so a close after an unknown outcome dropped them and
+                    // returned their pool slices to an allocator while the
+                    // device may still have been writing.
+                    let mark_unknown = |batch_id: u64| {
+                        poisoned_worker.store(true, Ordering::SeqCst);
+                        quarantined_batches_worker.lock().unwrap().insert(batch_id);
+                        drain_batch_owners(
+                            &batched_buffer_objs_worker,
+                            &quarantined_owners_worker,
+                            Some(batch_id),
+                        );
+                    };
+                    // The whole unknown-outcome sequence, in the only order
+                    // that is safe, so no site has to remember it: put the
+                    // submission's owners out of reach, record the batch as
+                    // unknown and poison the device, and only then tell
+                    // anyone. A waiter reads the poison flag to decide
+                    // whether it may release what it holds, and a
+                    // synchronous caller waits on the completion directly
+                    // rather than on the batch counter, so setting the
+                    // completion first reads to it as "failed, and nothing
+                    // is otherwise wrong".
+                    let fail_unknown =
+                        |sub: &IoSubmission, quarantined: &mut Vec<IoSubmission>, err: PyErr| {
+                            quarantined.push(sub.clone());
+                            mark_unknown(sub.batch_id);
+                            sub.completion.set(Err(err));
+                        };
 
                     while !shutdown_clone.load(Ordering::Relaxed) {
                         // This drains all completed I/O operations from the completion queue (CQ).
@@ -1833,192 +2740,87 @@ impl RawBlockDevice {
                         //   - Decrement the in_flight_count atomic
                         //   - Wake up any threads waiting for all I/O to complete
                         {
-                            // Process completions for standard ring
-                            if let IoUringWrapper::Standard(ring) = &ring_clone {
-                                let completions: Vec<_> = {
-                                    let mut ring = ring.lock().unwrap();
-                                    ring.completion().collect()
-                                };
-                                for cqe in completions {
-                                    let user_data = cqe.user_data();
-                                    if let Some(mut sub) = in_flight.remove(&user_data) {
-                                        submission_retry.reset();
-                                        let batch_id = sub.batch_id;
-                                        let cqe_result = cqe.result();
+                            for cqe in ring_clone.take_completions() {
+                                let user_data = cqe.user_data;
+                                if let Some(mut sub) = in_flight.remove(&user_data) {
+                                    submission_retry.reset();
+                                    let batch_id = sub.batch_id;
+                                    let cqe_result = cqe.result;
+                                    io_journal_worker
+                                        .record_completion(&sub, user_data, cqe_result);
 
-                                        // Handle short I/O with resubmission (only for regular I/O, not io_uring_cmd)
-                                        if cqe_result > 0
-                                            && (cqe_result as usize) < sub.len
-                                            && sub.nvme_cmd_data.is_none()
-                                        {
-                                            let bytes_transferred = cqe_result as usize;
-                                            // Update offset and length for resubmission
-                                            sub.offset += bytes_transferred as u64;
-                                            sub.len -= bytes_transferred;
-                                            // Update buffer pointer for writes and direct reads
-                                            if sub.is_write || sub.bounce.is_none() {
-                                                sub.ptr_addr += bytes_transferred;
-                                            }
-                                            // For read with bounce buffer, copy partial data back
-                                            if !sub.is_write {
-                                                if let (
-                                                    Some(bounce),
-                                                    Some(orig_ptr),
-                                                    Some(payload_len),
-                                                ) = (
-                                                    sub.bounce.as_ref(),
-                                                    sub.original_ptr,
-                                                    sub.payload_len,
-                                                ) {
-                                                    copy_from_bounce_buffer(
-                                                        bounce,
-                                                        orig_ptr,
-                                                        bytes_transferred.min(payload_len),
-                                                    );
-                                                    sub.original_ptr =
-                                                        Some(orig_ptr + bytes_transferred);
-                                                    sub.payload_len = Some(
-                                                        payload_len
-                                                            .saturating_sub(bytes_transferred),
-                                                    );
-                                                }
-                                            }
-                                            // Re-insert into in_flight with updated values
-                                            // Don't decrement in_flight_count since we're resubmitting
-                                            in_flight.insert(user_data, sub.clone());
-                                            // Push a new SQE for the remaining data
-                                            if ring_clone.submission_len() < ring_size {
-                                                match build_and_submit_sqe(
-                                                    &ring_clone,
-                                                    &sub,
-                                                    user_data,
-                                                ) {
-                                                    Ok(()) => pending.push_back(user_data),
-                                                    Err(error) => {
-                                                        in_flight.remove(&user_data);
-                                                        sub.completion.set(Err(error));
-                                                        decrement_in_flight(
-                                                            &in_flight_count_clone,
-                                                            &in_flight_cvar_clone,
-                                                            &batch_in_flight_clone,
-                                                            batch_id,
-                                                        );
-                                                    }
-                                                }
-                                            } else {
-                                                in_flight.remove(&user_data);
-                                                let mut queue = queue_clone.lock().unwrap();
-                                                queue.push(sub);
-                                            }
-                                            continue;
+                                    if is_retryable_regular_short_io(
+                                        cqe_result,
+                                        sub.len,
+                                        sub.nvme_cmd_data.is_some(),
+                                    ) {
+                                        let bytes_transferred = cqe_result as usize;
+                                        sub.offset += bytes_transferred as u64;
+                                        sub.len -= bytes_transferred;
+                                        sub.attempt += 1;
+                                        // Update buffer pointer for writes and direct reads
+                                        if sub.is_write || sub.bounce.is_none() {
+                                            sub.ptr_addr += bytes_transferred;
                                         }
-
-                                        // Handle completion result
-                                        let result =
-                                            handle_completion_result(&mut sub, cqe_result, false);
-                                        sub.completion.set(result);
-
-                                        // Decrement in-flight counts and notify
-                                        decrement_in_flight(
-                                            &in_flight_count_clone,
-                                            &in_flight_cvar_clone,
-                                            &batch_in_flight_clone,
-                                            batch_id,
-                                        );
-                                    }
-                                }
-                            } else if let IoUringWrapper::Big(ring) = &ring_clone {
-                                let completions: Vec<_> = {
-                                    let mut ring = ring.lock().unwrap();
-                                    ring.completion().collect()
-                                };
-                                for cqe in completions {
-                                    let user_data = cqe.user_data();
-                                    if let Some(mut sub) = in_flight.remove(&user_data) {
-                                        submission_retry.reset();
-                                        let batch_id = sub.batch_id;
-                                        let cqe_result = cqe.result();
-
-                                        // Handle short I/O with resubmission (only for regular I/O, not io_uring_cmd)
-                                        if cqe_result > 0
-                                            && (cqe_result as usize) < sub.len
-                                            && sub.nvme_cmd_data.is_none()
-                                        {
-                                            let bytes_transferred = cqe_result as usize;
-                                            // Update offset and length for resubmission
-                                            sub.offset += bytes_transferred as u64;
-                                            sub.len -= bytes_transferred;
-                                            // Update buffer pointer for writes and direct reads
-                                            if sub.is_write || sub.bounce.is_none() {
-                                                sub.ptr_addr += bytes_transferred;
+                                        if !sub.is_write {
+                                            if let (
+                                                Some(bounce),
+                                                Some(orig_ptr),
+                                                Some(payload_len),
+                                            ) = (
+                                                sub.bounce.as_ref(),
+                                                sub.original_ptr,
+                                                sub.payload_len,
+                                            ) {
+                                                copy_from_bounce_buffer(
+                                                    bounce,
+                                                    orig_ptr,
+                                                    bytes_transferred.min(payload_len),
+                                                );
+                                                sub.original_ptr =
+                                                    Some(orig_ptr + bytes_transferred);
+                                                sub.payload_len = Some(
+                                                    payload_len.saturating_sub(bytes_transferred),
+                                                );
                                             }
-                                            // For read with bounce buffer, copy partial data back
-                                            if !sub.is_write {
-                                                if let (
-                                                    Some(bounce),
-                                                    Some(orig_ptr),
-                                                    Some(payload_len),
-                                                ) = (
-                                                    sub.bounce.as_ref(),
-                                                    sub.original_ptr,
-                                                    sub.payload_len,
-                                                ) {
-                                                    copy_from_bounce_buffer(
-                                                        bounce,
-                                                        orig_ptr,
-                                                        bytes_transferred.min(payload_len),
-                                                    );
-                                                    sub.original_ptr =
-                                                        Some(orig_ptr + bytes_transferred);
-                                                    sub.payload_len = Some(
-                                                        payload_len
-                                                            .saturating_sub(bytes_transferred),
-                                                    );
-                                                }
-                                            }
-                                            // Re-insert into in_flight with updated values
-                                            // Don't decrement in_flight_count since we're resubmitting
-                                            in_flight.insert(user_data, sub.clone());
-                                            // Push a new SQE for the remaining data
-                                            if ring_clone.submission_len() < ring_size {
-                                                match build_and_submit_sqe(
-                                                    &ring_clone,
-                                                    &sub,
-                                                    user_data,
-                                                ) {
-                                                    Ok(()) => pending.push_back(user_data),
-                                                    Err(error) => {
-                                                        in_flight.remove(&user_data);
-                                                        sub.completion.set(Err(error));
-                                                        decrement_in_flight(
-                                                            &in_flight_count_clone,
-                                                            &in_flight_cvar_clone,
-                                                            &batch_in_flight_clone,
-                                                            batch_id,
-                                                        );
-                                                    }
-                                                }
-                                            } else {
-                                                in_flight.remove(&user_data);
-                                                let mut queue = queue_clone.lock().unwrap();
-                                                queue.push(sub);
-                                            }
-                                            continue;
                                         }
-
-                                        // Handle completion result
-                                        let result =
-                                            handle_completion_result(&mut sub, cqe_result, false);
-                                        sub.completion.set(result);
-
-                                        // Decrement in-flight counts and notify
-                                        decrement_in_flight(
-                                            &in_flight_count_clone,
-                                            &in_flight_cvar_clone,
-                                            &batch_in_flight_clone,
-                                            batch_id,
-                                        );
+                                        in_flight.insert(user_data, sub.clone());
+                                        if ring_clone.submission_len() < ring_size {
+                                            match build_and_submit_sqe(
+                                                &ring_clone,
+                                                &io_journal_worker,
+                                                &sub,
+                                                user_data,
+                                            ) {
+                                                Ok(()) => pending.push_back(user_data),
+                                                Err(error) => {
+                                                    in_flight.remove(&user_data);
+                                                    sub.completion.set(Err(error));
+                                                    decrement_in_flight(
+                                                        &in_flight_count_clone,
+                                                        &in_flight_cvar_clone,
+                                                        &batch_in_flight_clone,
+                                                        batch_id,
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            in_flight.remove(&user_data);
+                                            let mut queue = queue_clone.lock().unwrap();
+                                            queue.push(sub);
+                                        }
+                                        continue;
                                     }
+
+                                    let result =
+                                        handle_completion_result(&mut sub, cqe_result, false);
+                                    sub.completion.set(result);
+                                    decrement_in_flight(
+                                        &in_flight_count_clone,
+                                        &in_flight_cvar_clone,
+                                        &batch_in_flight_clone,
+                                        batch_id,
+                                    );
                                 }
                             }
                             ring_clone.submission_sync();
@@ -2036,7 +2838,7 @@ impl RawBlockDevice {
                         // signal_producer(): eventfd is a counter, so a wake-up between the
                         // check and wait() is buffered, not lost.
                         if pending.is_empty() && !in_flight.is_empty() {
-                            let _ = ring_clone.submit();
+                            let _ = ring_clone.reap_without_submitting();
                         }
                         if !shutdown_clone.load(Ordering::Relaxed)
                             && pending.is_empty()
@@ -2064,7 +2866,8 @@ impl RawBlockDevice {
                             let batch: Vec<IoSubmission> = std::mem::take(&mut *q);
                             let batch_len = batch.len();
 
-                            // Accepted requests still occupy completion capacity.
+                            // Bound both resident and accepted operations: CQ
+                            // capacity must cover every request still owned.
                             let available = ring_size.saturating_sub(in_flight.len());
                             let to_submit_count = std::cmp::min(available, batch_len);
 
@@ -2080,7 +2883,12 @@ impl RawBlockDevice {
                             for sub in batch.iter().take(to_submit_count) {
                                 let user_data = next_user_data;
                                 next_user_data = next_user_data.wrapping_add(1);
-                                match build_and_submit_sqe(&ring_clone, sub, user_data) {
+                                match build_and_submit_sqe(
+                                    &ring_clone,
+                                    &io_journal_worker,
+                                    sub,
+                                    user_data,
+                                ) {
                                     Ok(()) => {
                                         pending.push_back(user_data);
                                         in_flight.insert(user_data, sub.clone());
@@ -2100,7 +2908,12 @@ impl RawBlockDevice {
                             drop(q);
                         }
                         if !pending.is_empty() {
-                            let result = submit_pending(&ring_clone, &mut pending);
+                            let result = submit_pending(
+                                &ring_clone,
+                                &mut pending,
+                                #[cfg(feature = "fault-injection")]
+                                &fault_plan_worker,
+                            );
                             if let Err(error) =
                                 submission_retry.record_result(result, Instant::now())
                             {
@@ -2110,6 +2923,22 @@ impl RawBlockDevice {
                                     &worker_error_clone,
                                     error,
                                 );
+                                for (_, sub) in in_flight.drain() {
+                                    fail_unknown(
+                                        &sub,
+                                        &mut quarantined,
+                                        PyRuntimeError::new_err(
+                                            "io_uring submission failed; outcome is unknown",
+                                        ),
+                                    );
+                                    decrement_in_flight(
+                                        &in_flight_count_clone,
+                                        &in_flight_cvar_clone,
+                                        &batch_in_flight_clone,
+                                        sub.batch_id,
+                                    );
+                                }
+                                pending.clear();
                             }
                         }
                     }
@@ -2135,71 +2964,112 @@ impl RawBlockDevice {
                         }
                     }
 
+                    // Drain what the kernel still owns rather than guess at
+                    // a duration. A submitted request points the device at this
+                    // process's memory, so releasing that memory on a timer can
+                    // let a late completion land in a buffer already reused.
+                    #[cfg(feature = "fault-injection")]
+                    if let IoUringWrapper::Fake(ring) = &ring_clone {
+                        ring.begin_shutdown();
+                    }
+                    // Unaccepted SQEs stay in the ring. Their allocations must
+                    // stay owned until the ring itself can be safely torn down.
+                    // Do not submit new device work after the admission boundary.
                     for user_data in pending.drain(..) {
-                        if let Some(mut sub) = in_flight.remove(&user_data) {
-                            let batch_id = sub.batch_id;
-                            let _ = sub.bounce.take();
-                            sub.completion.set(Err(PyRuntimeError::new_err(
-                                "io_uring worker stopped before submission",
-                            )));
+                        if let Some(sub) = in_flight.remove(&user_data) {
+                            fail_unknown(
+                                &sub,
+                                &mut quarantined,
+                                PyRuntimeError::new_err(
+                                    "io_uring stopped with resident work; outcome is unknown",
+                                ),
+                            );
                             decrement_in_flight(
                                 &in_flight_count_clone,
                                 &in_flight_cvar_clone,
                                 &batch_in_flight_clone,
-                                batch_id,
+                                sub.batch_id,
                             );
                         }
                     }
                     if !in_flight.is_empty() {
                         let _ = ring_clone.cancel_submitted();
                     }
-                    while !in_flight.is_empty() {
+                    let drain_deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
                         let _ = ring_clone.reap_without_submitting();
-                        // Process completions for standard ring
-                        if let IoUringWrapper::Standard(ring) = &ring_clone {
-                            let completions: Vec<_> = {
-                                let mut ring = ring.lock().unwrap();
-                                ring.completion().collect()
-                            };
-                            for cqe in completions {
-                                let user_data = cqe.user_data();
-                                if let Some(mut sub) = in_flight.remove(&user_data) {
-                                    let batch_id = sub.batch_id;
-                                    let result =
-                                        handle_completion_result(&mut sub, cqe.result(), true);
-                                    sub.completion.set(result);
-                                    decrement_in_flight(
-                                        &in_flight_count_clone,
-                                        &in_flight_cvar_clone,
-                                        &batch_in_flight_clone,
-                                        batch_id,
-                                    );
-                                }
-                            }
-                        } else if let IoUringWrapper::Big(ring) = &ring_clone {
-                            let completions: Vec<_> = {
-                                let mut ring = ring.lock().unwrap();
-                                ring.completion().collect()
-                            };
-                            for cqe in completions {
-                                let user_data = cqe.user_data();
-                                if let Some(mut sub) = in_flight.remove(&user_data) {
-                                    let batch_id = sub.batch_id;
-                                    let result =
-                                        handle_completion_result(&mut sub, cqe.result(), true);
-                                    sub.completion.set(result);
-                                    decrement_in_flight(
-                                        &in_flight_count_clone,
-                                        &in_flight_cvar_clone,
-                                        &batch_in_flight_clone,
-                                        batch_id,
-                                    );
-                                }
+                        let completions = ring_clone.take_completions();
+                        let reaped = completions.len();
+                        for RingCompletion {
+                            user_data,
+                            result: cqe_result,
+                        } in completions
+                        {
+                            if let Some(mut sub) = in_flight.remove(&user_data) {
+                                let batch_id = sub.batch_id;
+                                io_journal_worker.record_completion(&sub, user_data, cqe_result);
+                                let result = handle_completion_result(&mut sub, cqe_result, true);
+                                sub.completion.set(result);
+                                decrement_in_flight(
+                                    &in_flight_count_clone,
+                                    &in_flight_cvar_clone,
+                                    &batch_in_flight_clone,
+                                    batch_id,
+                                );
                             }
                         }
-                        if !in_flight.is_empty() {
+                        ring_clone.submission_sync();
+                        if in_flight.is_empty() || Instant::now() >= drain_deadline {
+                            break;
+                        }
+                        if reaped == 0 {
                             thread::sleep(Duration::from_millis(1));
                         }
+                    }
+
+                    // Whatever is still outstanding was never reported complete.
+                    // The drain above had a deadline, and a deadline is not a
+                    // fence: reaching it says the worker stopped waiting, not
+                    // that the device stopped. Tell each waiter its operation
+                    // did not finish, which is a statement about the logical
+                    // result, and quarantine the submission, which is a
+                    // statement about who may touch its memory and its extent.
+                    // Neither is a claim that the operation was cancelled.
+                    for (_user_data, sub) in in_flight.drain() {
+                        let batch_id = sub.batch_id;
+                        fail_unknown(
+                            &sub,
+                            &mut quarantined,
+                            PyRuntimeError::new_err(
+                                "io_uring worker shut down before this request \
+                                 completed; its outcome is unknown",
+                            ),
+                        );
+                        decrement_in_flight(
+                            &in_flight_count_clone,
+                            &in_flight_cvar_clone,
+                            &batch_in_flight_clone,
+                            batch_id,
+                        );
+                    }
+
+                    if !quarantined.is_empty() {
+                        // Deliberately never dropped. Each submission keeps its
+                        // bounce allocation and its completion. The Python object
+                        // behind a zero-copy target is held per batch, and the
+                        // batch was marked unknown before its waiter was woken,
+                        // so the waiter transfers those owners to quarantine too
+                        // rather than releasing them. The device is poisoned for
+                        // this incarnation, so nothing further is admitted; the
+                        // extents these name are withheld by the core, which the
+                        // worker cannot reach from here.
+                        eprintln!(
+                            "raw_block: quarantining {} operation(s) whose completion \
+                             was never observed; their buffers and extents are not \
+                             safe to reuse in this process",
+                            quarantined.len()
+                        );
+                        std::mem::forget(quarantined);
                     }
 
                     // Final notification in case any thread is waiting on in_flight_count
@@ -2219,10 +3089,13 @@ impl RawBlockDevice {
                 Some(batched_completions),
                 Some(next_batch_id),
                 Some(batch_in_flight),
+                Some(quarantined_batches),
+                Some(poisoned),
+                Some(quarantined_owners),
             )
         } else {
             (
-                None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
             )
         };
 
@@ -2242,6 +3115,11 @@ impl RawBlockDevice {
             nvme_nsid,
             nvme_lba_shift,
             nvme_lba_size,
+            #[cfg(feature = "fault-injection")]
+            fake_state: match &ring_opt {
+                Some(IoUringWrapper::Fake(ring)) => Some(Arc::clone(&ring.state)),
+                _ => None,
+            },
             ring: ring_opt,
             queue: queue_opt,
             worker: worker_opt,
@@ -2259,6 +3137,15 @@ impl RawBlockDevice {
             next_batch_id: next_batch_id_opt.unwrap_or_else(|| Arc::new(AtomicU64::new(1))),
             batch_in_flight: batch_in_flight_opt
                 .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new()))),
+            quarantined_batches: quarantined_batches_opt
+                .unwrap_or_else(|| Arc::new(Mutex::new(HashSet::new()))),
+            poisoned: poisoned_opt.unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+            retained_owners: Arc::new(AtomicUsize::new(0)),
+            io_journal,
+            quarantined_owners: quarantined_owners_opt
+                .unwrap_or_else(|| Arc::new(Mutex::new(Vec::new()))),
+            #[cfg(feature = "fault-injection")]
+            fault_plan,
         })
     }
 
@@ -2293,7 +3180,8 @@ impl RawBlockDevice {
             use_uring_cmd = false,
             alignment = 4096,
             io_engine = None,
-            iouring_queue_depth = RING_SIZE
+            iouring_queue_depth = RING_SIZE,
+            fake_ring_capacity = 0
         )
     )]
     #[allow(clippy::too_many_arguments)]
@@ -2306,6 +3194,7 @@ impl RawBlockDevice {
         alignment: usize,
         io_engine: Option<String>,
         iouring_queue_depth: usize,
+        fake_ring_capacity: usize,
     ) -> PyResult<Self> {
         Self::new_internal(
             path,
@@ -2316,6 +3205,7 @@ impl RawBlockDevice {
             use_uring_cmd,
             io_engine,
             iouring_queue_depth,
+            fake_ring_capacity,
         )
     }
 
@@ -2416,17 +3306,8 @@ impl RawBlockDevice {
                     iov_len: *size,
                 });
             }
-            unsafe {
-                let result = match ring {
-                    IoUringWrapper::Standard(ring) => {
-                        let ring = ring.lock().unwrap();
-                        ring.submitter().register_buffers(&iovecs)
-                    }
-                    IoUringWrapper::Big(ring) => {
-                        let ring = ring.lock().unwrap();
-                        ring.submitter().register_buffers(&iovecs)
-                    }
-                };
+            {
+                let result = ring.register_host_buffers(&iovecs);
                 match result {
                     Ok(_) => {
                         self.fixed_buffers_registered.store(true, Ordering::Relaxed);
@@ -2452,18 +3333,16 @@ impl RawBlockDevice {
     /// `payload_lens` makes it equal to `total_lens`. Each source buffer is
     /// read only within its bounds and is never modified, and the
     /// padding region `[payload_len, total_len)` is always written as zeroes.
+    /// Host buffer exports remain pinned until the batch is polled after a
+    /// known completion. Unknown outcomes retain those exports permanently.
+    /// Callers must not modify source contents before completion.
     ///
     /// Returns a batch ID that must be passed to `wait_iouring()` to wait for
     /// completion and obtain a success bitmap plus sparse completion errors.
     /// Validation or request-preparation errors are raised instead of returning
     /// a batch ID.
-    #[pyo3(signature = (
-        offsets,
-        buffers,
-        total_lens,
-        placement_ids = None,
-        payload_lens = None,
-    ))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (offsets, buffers, total_lens, placement_ids = None, payload_lens = None, request_tag = None))]
     fn batched_write(
         &self,
         py: Python<'_>,
@@ -2472,20 +3351,13 @@ impl RawBlockDevice {
         total_lens: Vec<usize>,
         placement_ids: Option<Vec<Option<i32>>>,
         payload_lens: Option<Vec<usize>>,
+        request_tag: Option<String>,
     ) -> PyResult<u64> {
+        let request_tag: Option<Arc<str>> = request_tag.map(|tag| Arc::from(tag.as_str()));
         if !self.use_iouring {
             return Err(PyRuntimeError::new_err("io_uring not enabled"));
         }
-        if self.closed.load(Ordering::Relaxed) {
-            return Err(PyRuntimeError::new_err("device is closed"));
-        }
-        if self
-            .shutdown
-            .as_ref()
-            .is_some_and(|shutdown| shutdown.load(Ordering::Relaxed))
-        {
-            return Err(PyRuntimeError::new_err("io_uring worker stopped"));
-        }
+        self.ensure_io_available(true)?;
 
         let n = offsets.len();
         if n == 0 {
@@ -2544,7 +3416,15 @@ impl RawBlockDevice {
         // Acquire buffer views to keep them alive until wait_iouring() completes
         let mut views = Vec::with_capacity(n);
         for buffer in &buffers {
-            let view = get_pybuffer(py, buffer, false)?;
+            let view = match get_pybuffer(py, buffer, false) {
+                Ok(view) => view,
+                Err(error) => {
+                    for acquired in views {
+                        release_pybuffer(acquired);
+                    }
+                    return Err(error);
+                }
+            };
             if view.buf.is_null() {
                 for v in views {
                     release_pybuffer(v);
@@ -2574,6 +3454,19 @@ impl RawBlockDevice {
             )));
         }
 
+        let mut owners = Vec::with_capacity(n);
+        for buffer in &buffers {
+            match batch_buffer_owner(buffer, true) {
+                Ok(owner) => owners.push(owner),
+                Err(error) => {
+                    for view in views {
+                        release_pybuffer(view);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
         // Generate a unique batch ID for this batch
         let batch_id = self.next_batch_id.fetch_add(1, Ordering::Relaxed);
 
@@ -2589,10 +3482,7 @@ impl RawBlockDevice {
         // Store buffer objects to keep them alive until they are complete
         {
             let mut stored_objs = self.batched_buffer_objs.lock().unwrap();
-            let batch_buffers = stored_objs.entry(batch_id).or_default();
-            for buffer in &buffers {
-                batch_buffers.push(buffer.clone().unbind());
-            }
+            stored_objs.insert(batch_id, owners);
         }
 
         // Extract pointers and capacities as usize before releasing GIL (raw
@@ -2697,6 +3587,8 @@ impl RawBlockDevice {
                     payload_len: None,
                     batch_id,
                     nvme_cmd_data,
+                    request_tag: request_tag.clone(),
+                    attempt: 0,
                 };
 
                 submissions.push((sub, comp));
@@ -2758,6 +3650,40 @@ impl RawBlockDevice {
         Ok(batch_id)
     }
 
+    /// Whether any outcome on this device has been unknown.
+    ///
+    /// Sticky for the life of this device: once the engine cannot say what
+    /// the kernel is doing, it cannot say it later either. Callers use this
+    /// to refuse further strict work rather than recompute or fall back.
+    fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::SeqCst)
+    }
+
+    /// How many batches are held because their outcome was never established.
+    fn quarantined_batch_count(&self) -> usize {
+        self.quarantined_batches.lock().unwrap().len()
+    }
+
+    /// How many Python buffer owners are retained for those batches.
+    ///
+    /// Live count only: the terminal retention takes the vector, so after
+    /// a refused close this reads zero. `retained_owner_count()` is the
+    /// one that survives it, and a caller sampling after a close wants
+    /// that.
+    fn quarantined_owner_count(&self) -> usize {
+        self.quarantined_owners.lock().unwrap().len()
+    }
+
+    /// How many buffer owners a refused close retained, for the process.
+    ///
+    /// Recorded when the retention takes them, because it takes them by
+    /// forgetting the vector and a length read afterwards is zero. A
+    /// counter that reports nothing retained, on the one path whose whole
+    /// purpose is retaining, is worse than no counter.
+    fn retained_owner_count(&self) -> usize {
+        self.retained_owners.load(Ordering::SeqCst)
+    }
+
     /// Wait for all in-flight I/O for a specific batch to complete.
     /// The method waits on a per-batch condition variable that gets signaled
     /// when the batch's in-flight count reaches 0.
@@ -2790,9 +3716,7 @@ impl RawBlockDevice {
                     let batch_completions = completions.remove(&batch_id);
                     drop(completions);
                     let results = collect_iouring_completion_results(batch_completions);
-                    // Clear stored buffer objects for this batch
-                    let mut stored_objs = self.batched_buffer_objs.lock().unwrap();
-                    stored_objs.remove(&batch_id);
+                    self.retire_batch_owners(batch_id);
                     return Ok(results);
                 }
             }
@@ -2816,9 +3740,8 @@ impl RawBlockDevice {
         drop(completions);
         let results = collect_iouring_completion_results(batch_completions);
 
-        // Clear stored buffer objects for this batch now that I/O is complete
-        let mut stored_objs = self.batched_buffer_objs.lock().unwrap();
-        stored_objs.remove(&batch_id);
+        // Release this batch's owners, or keep them if its outcome is unknown.
+        self.retire_batch_owners(batch_id);
 
         // Clean up per-batch tracking
         let mut batch_map = self.batch_in_flight.lock().unwrap();
@@ -2830,165 +3753,305 @@ impl RawBlockDevice {
     /// Synchronous read using io_uring.
     ///
     /// Deprecated: use ``batched_read()`` followed by ``wait_iouring()`` instead.
+    /// Whether this build carries the test-only fault seam.
+    ///
+    /// A serving build answers false. A test asks before installing a plan so
+    /// that it fails with a clear reason rather than silently measuring
+    /// nothing on an ordinary artifact.
+    #[staticmethod]
+    fn has_fault_injection() -> bool {
+        cfg!(feature = "fault-injection")
+    }
+
+    /// Make one submit call report the named outcome instead of the kernel's.
+    ///
+    /// `faults` maps a submit-call ordinal to one of `reports_zero_taken`,
+    /// `retryable:<errno>` or `fatal:<errno>`. Keying on the ordinal is what
+    /// makes a plan reproducible: a test names the third submit and gets the
+    /// third submit, however fast the run is.
+    ///
+    /// The substitution happens before the ring, so the entries stay exactly
+    /// where they were and the kernel is told nothing. No completion is ever
+    /// synthesised for a request the kernel owns. That is also why there is
+    /// no way to state a non-zero partial take here -- see the refusal
+    /// below.
+    #[cfg(feature = "fault-injection")]
+    fn inject_submit_faults(&self, faults: Vec<(u64, String)>) -> PyResult<()> {
+        let plan = self
+            .fault_plan
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("device has no fault plan"))?;
+        let mut submits = plan.submits.lock().unwrap();
+        for (ordinal, spec) in faults {
+            let fault = if spec == "reports_zero_taken" {
+                SubmitFault::ReportsZeroTaken
+            } else if spec.starts_with("partially_taken") {
+                return Err(PyValueError::new_err(
+                    "partially_taken cannot be expressed by this seam: the \
+                     substitution happens before the ring, so no entry was \
+                     offered to the kernel and any non-zero count would be \
+                     a claim about entries that never moved. Use \
+                     reports_zero_taken for the resident case; a genuine \
+                     partial take comes from filling the submission queue.",
+                ));
+            } else if let Some(n) = spec.strip_prefix("retryable:") {
+                SubmitFault::Retryable(
+                    n.parse()
+                        .map_err(|_| PyValueError::new_err(format!("bad errno in {spec}")))?,
+                )
+            } else if let Some(n) = spec.strip_prefix("fatal:") {
+                SubmitFault::Fatal(
+                    n.parse()
+                        .map_err(|_| PyValueError::new_err(format!("bad errno in {spec}")))?,
+                )
+            } else {
+                return Err(PyValueError::new_err(format!("unknown fault {spec}")));
+            };
+            submits.insert(ordinal, fault);
+        }
+        Ok(())
+    }
+
+    /// Take what the device was asked to do, and what it did, as rows.
+    ///
+    /// Each row names the request the operation was for, the batch it
+    /// belonged to, the buffer path it actually took, the outcome and the
+    /// byte count. A submitted row means the SQE entered the ring, which
+    /// does not yet prove kernel acceptance. Pair it with a completion by
+    /// operation_id and attempt: a short transfer starts another attempt
+    /// with the same operation_id. An operation nobody answered for
+    /// shows up as the submission with no outcome beside it, rather than
+    /// having to be inferred from totals that happen to agree.
+    ///
+    /// Draining is deliberate. These are consumed by whoever is summing
+    /// them, and a reader that took them twice would count them twice.
+    /// ``dropped`` is how many rows the bound discarded before this call,
+    /// so a sum known to be incomplete says so.
+    fn take_io_journal(&self) -> PyResult<(Vec<HashMap<String, String>>, u64)> {
+        let (events, dropped) = self.io_journal.drain();
+        let rows = events
+            .into_iter()
+            .map(|event| {
+                let mut row: HashMap<String, String> = HashMap::new();
+                row.insert(
+                    "device_instance_id".to_string(),
+                    event.device_instance_id.to_string(),
+                );
+                row.insert(
+                    "request_tag".to_string(),
+                    event
+                        .request_tag
+                        .as_ref()
+                        .map_or_else(String::new, |tag| tag.to_string()),
+                );
+                row.insert("batch_id".to_string(), event.batch_id.to_string());
+                row.insert("operation_id".to_string(), event.operation_id.to_string());
+                row.insert("attempt".to_string(), event.attempt.to_string());
+                row.insert(
+                    "direction".to_string(),
+                    if event.is_write { "write" } else { "read" }.to_string(),
+                );
+                row.insert("path".to_string(), event.path.to_string());
+                row.insert("outcome".to_string(), event.outcome.to_string());
+                row.insert("bytes".to_string(), event.bytes.to_string());
+                row
+            })
+            .collect();
+        Ok((rows, dropped))
+    }
+
+    /// Entries pushed and not yet taken by a submit.
+    #[cfg(feature = "fault-injection")]
+    fn fake_resident(&self) -> PyResult<Vec<u64>> {
+        Ok(self
+            .scripted_state()?
+            .lock()
+            .unwrap()
+            .resident
+            .iter()
+            .map(|entry| entry.user_data)
+            .collect())
+    }
+
+    /// Requests a submit handed over and that have not been answered for.
+    ///
+    /// Anything here when the device closes is memory the device may still
+    /// be reaching, which is the state the whole retention rule exists for.
+    #[cfg(feature = "fault-injection")]
+    fn fake_owned(&self) -> PyResult<Vec<u64>> {
+        Ok(self
+            .scripted_state()?
+            .lock()
+            .unwrap()
+            .owned
+            .iter()
+            .map(|entry| entry.user_data)
+            .collect())
+    }
+
+    /// The geometry of every entry still resident, in submission order.
+    ///
+    /// Counting entries cannot tell a correct remainder from one aimed at
+    /// the wrong offset, address or length -- and repeated payload bytes
+    /// make a readback comparison agree with either. This is what the
+    /// submission actually asks the device to do.
+    #[cfg(feature = "fault-injection")]
+    fn fake_resident_sqes(&self) -> PyResult<Vec<HashMap<String, i64>>> {
+        let state = self.scripted_state()?;
+        let state = state.lock().unwrap();
+        Ok(state.resident.iter().map(describe_fake_sqe).collect())
+    }
+
+    /// The geometry of every entry the ring handed to its imaginary kernel.
+    #[cfg(feature = "fault-injection")]
+    fn fake_owned_sqes(&self) -> PyResult<Vec<HashMap<String, i64>>> {
+        let state = self.scripted_state()?;
+        let state = state.lock().unwrap();
+        Ok(state.owned.iter().map(describe_fake_sqe).collect())
+    }
+
+    /// Make every submit take nothing and report zero, until released.
+    ///
+    /// A real submit reports zero when the entries it would have flushed
+    /// were not flushed, and the worker has to leave them resident and come
+    /// back. Holding it is how more than one entry becomes resident at the
+    /// same time, which is the only way a partial take is more than a full
+    /// take of one entry.
+    #[cfg(feature = "fault-injection")]
+    fn fake_hold_submits(&self, held: bool) -> PyResult<()> {
+        self.scripted_state()?.lock().unwrap().hold_submits = held;
+        Ok(())
+    }
+
+    /// Synthetic registrations this ring was asked to make, in order.
+    ///
+    /// Explicitly synthetic: no descriptor reached a kernel, so a record
+    /// here is evidence about the engine's own registration path and about
+    /// nothing else.
+    #[cfg(feature = "fault-injection")]
+    fn fake_registrations(&self) -> PyResult<Vec<HashMap<String, i64>>> {
+        let state = self.scripted_state()?;
+        let state = state.lock().unwrap();
+        Ok(state
+            .registrations
+            .iter()
+            .map(|record| {
+                let mut described: HashMap<String, i64> = HashMap::new();
+                described.insert("count".to_string(), record.count as i64);
+                described.insert("offset".to_string(), record.offset as i64);
+                described.insert(
+                    "kind".to_string(),
+                    match record.kind.as_str() {
+                        "host" => 0,
+                        "sparse" => 1,
+                        _ => 3,
+                    },
+                );
+                described
+            })
+            .collect())
+    }
+
+    /// Ownership rules this ring saw broken, in order.
+    ///
+    /// A test asserting this is empty is asserting that the engine took no
+    /// step a real kernel would have refused -- answering for a request the
+    /// kernel holds, above all.
+    #[cfg(feature = "fault-injection")]
+    fn fake_violations(&self) -> PyResult<Vec<String>> {
+        Ok(self.scripted_state()?.lock().unwrap().violations.clone())
+    }
+
+    /// How many times the worker synced the submission queue.
+    #[cfg(feature = "fault-injection")]
+    fn fake_syncs(&self) -> PyResult<usize> {
+        Ok(self.scripted_state()?.lock().unwrap().syncs)
+    }
+
+    /// Answer for one request the ring handed to its imaginary kernel.
+    ///
+    /// Refuses a request the ring does not hold, and records the attempt,
+    /// because a completion for a request the kernel owns can only come
+    /// from the kernel and one for a request it does not own is invented.
+    #[cfg(feature = "fault-injection")]
+    fn fake_complete(&self, user_data: u64, result: i32) -> PyResult<()> {
+        self.scripted_ring()?
+            .complete(user_data, result)
+            .map_err(PyValueError::new_err)
+    }
+
+    /// Deliver a held request's completion when the worker starts draining.
+    ///
+    /// Schedule it before calling close: close holds the device's mutable
+    /// Python borrow, so another Python thread cannot inject a completion
+    /// while it runs. Delivery uses the same ownership check as fake_complete.
+    #[cfg(feature = "fault-injection")]
+    fn fake_complete_at_shutdown(&self, user_data: u64, result: i32) -> PyResult<()> {
+        self.scripted_ring()?
+            .complete_at_shutdown(user_data, result)
+            .map_err(PyValueError::new_err)
+    }
+
+    /// Count scheduled completions delivered inside the shutdown drain.
+    #[cfg(feature = "fault-injection")]
+    fn fake_shutdown_delivered(&self) -> PyResult<usize> {
+        Ok(self.scripted_state()?.lock().unwrap().shutdown_delivered)
+    }
+
+    /// Make the next submit take only the first `count` resident entries.
+    ///
+    /// This is the partial take the submit seam cannot express: the ring
+    /// really does hand over a prefix, and the suffix really does stay
+    /// resident and still belong to the worker.
+    #[cfg(feature = "fault-injection")]
+    fn fake_submit_takes(&self, count: usize) -> PyResult<()> {
+        self.scripted_state()?.lock().unwrap().take_next = Some(count);
+        Ok(())
+    }
+
+    /// Make the next submit report an error and take nothing.
+    #[cfg(feature = "fault-injection")]
+    fn fake_submit_fails(&self, errno: i32) -> PyResult<()> {
+        self.scripted_state()?.lock().unwrap().submit_error = Some(errno);
+        Ok(())
+    }
+
+    /// Errors actually returned by the scripted ring's submit calls.
+    #[cfg(feature = "fault-injection")]
+    fn fake_submit_errors(&self) -> PyResult<Vec<i32>> {
+        Ok(self.scripted_state()?.lock().unwrap().submit_errors.clone())
+    }
+
+    /// How many submit calls the worker has made, for a test to key a plan on.
+    #[cfg(feature = "fault-injection")]
+    fn submit_call_count(&self) -> u64 {
+        self.fault_plan
+            .as_ref()
+            .map(|plan| plan.submit_calls.load(Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
+    /// Refused: a synchronous read owns nothing it could retain.
+    ///
+    /// This path registered no owner for its destination and could not carry
+    /// one through an unknown outcome, so on a device whose worker has given
+    /// up it handed the buffer back while a read may still have been landing
+    /// in it. `batched_read()` followed by `wait_iouring()` owns its
+    /// destinations and withholds them; use those.
     #[pyo3(signature = (offset, data, payload_len, total_len = None))]
     fn read_uring(
         &self,
-        py: Python<'_>,
         offset: u64,
         data: &Bound<'_, PyAny>,
         payload_len: usize,
         total_len: Option<usize>,
     ) -> PyResult<()> {
-        PyErr::warn(
-            py,
-            &py.get_type::<PyDeprecationWarning>(),
-            c"RawBlockDevice.read_uring() is deprecated; \
-              use batched_read() followed by wait_iouring() instead.",
-            1,
-        )?;
-
-        if !self.use_iouring {
-            return Err(PyRuntimeError::new_err("io_uring not enabled"));
-        }
-        if self.closed.load(Ordering::Relaxed) {
-            return Err(PyRuntimeError::new_err("device is closed"));
-        }
-        if self
-            .shutdown
-            .as_ref()
-            .is_some_and(|shutdown| shutdown.load(Ordering::Relaxed))
-        {
-            return Err(PyRuntimeError::new_err("io_uring worker stopped"));
-        }
-
-        let view = get_pybuffer(py, data, true)?;
-        if view.readonly != 0 {
-            release_pybuffer(view);
-            return Err(PyValueError::new_err("output buffer is readonly"));
-        }
-        let ptr = view.buf as *mut u8;
-        if ptr.is_null() {
-            release_pybuffer(view);
-            return Err(PyValueError::new_err("null buffer pointer"));
-        }
-
-        let cap = view.len as usize;
-        let total_len = total_len.unwrap_or(payload_len);
-        if cap < payload_len {
-            release_pybuffer(view);
-            return Err(PyValueError::new_err(format!(
-                "output buffer too small: cap={cap} need={payload_len}"
-            )));
-        }
-        if total_len < payload_len {
-            release_pybuffer(view);
-            return Err(PyValueError::new_err("total_len must be >= payload_len"));
-        }
-
-        let align = self.alignment;
-        if self.use_odirect {
-            #[allow(clippy::manual_is_multiple_of)]
-            if (offset as usize) % align != 0 {
-                release_pybuffer(view);
-                return Err(PyValueError::new_err("O_DIRECT requires aligned offset"));
-            }
-            #[allow(clippy::manual_is_multiple_of)]
-            if total_len % align != 0 {
-                release_pybuffer(view);
-                return Err(PyValueError::new_err("O_DIRECT requires aligned total_len"));
-            }
-        }
-
-        // O_DIRECT and NVMe io_uring_cmd both require a page-aligned ptr for
-        // multi-page transfers (kernel / PRP list entries).
-        let needs_align = self.use_odirect || self.use_uring_cmd;
-        let ptr_aligned = if needs_align {
-            (ptr as usize).is_multiple_of(align)
-        } else {
-            true
-        };
-
-        // Fixed buffers are pre-registered with io_uring, enabling true zero-copy I/O
-        let use_fixed = self.fixed_buffers_registered.load(Ordering::Relaxed);
-        let fixed_idx = if use_fixed && ptr_aligned {
-            let map = self.fixed_buffer_map.lock().unwrap();
-            let ptr_addr = ptr as usize;
-            map.get(&ptr_addr).map(|(idx, _)| *idx)
-        } else {
-            None
-        };
-
-        // Use bounce buffer if:
-        // Buffer is not aligned (O_DIRECT or io_uring_cmd PRP requirement)
-        // Buffer capacity is less than total_len
-        let use_bounce = !ptr_aligned || cap < total_len;
-
-        let res = if !use_bounce {
-            let comp = Arc::new(IoCompletion::new());
-            let sub = IoSubmission {
-                fd: self.fd,
-                offset,
-                len: total_len,
-                ptr_addr: ptr as usize,
-                is_write: false,
-                completion: comp.clone(),
-                fixed_buffer_idx: fixed_idx,
-                bounce: None,
-                original_ptr: None,
-                payload_len: None,
-                batch_id: 0,
-                nvme_cmd_data: self._build_nvme_cmd_data(0, 0)?,
-            };
-            if let Err(error) = enqueue_if_running(
-                self.queue.as_ref().expect("queue must exist"),
-                self.shutdown.as_ref().expect("shutdown must exist"),
-                &self.in_flight_count,
-                sub,
-            ) {
-                release_pybuffer(view);
-                return Err(error);
-            }
-            if let Some(batch_ready) = &self.batch_ready {
-                batch_ready.signal_producer();
-            }
-            py.allow_threads(move || comp.wait())
-        } else {
-            let bounce = AlignedBuf::new(total_len, align)?;
-            let bounce_arc = std::sync::Arc::new(bounce);
-            let bounce_ptr = bounce_arc.as_mut_ptr();
-            let comp = Arc::new(IoCompletion::new());
-            let sub = IoSubmission {
-                fd: self.fd,
-                offset,
-                len: total_len,
-                ptr_addr: bounce_ptr as usize,
-                is_write: false,
-                completion: comp.clone(),
-                fixed_buffer_idx: None,
-                bounce: Some(bounce_arc),
-                original_ptr: Some(ptr as usize),
-                payload_len: Some(payload_len),
-                batch_id: 0,
-                nvme_cmd_data: self._build_nvme_cmd_data(0, 0)?,
-            };
-            if let Err(error) = enqueue_if_running(
-                self.queue.as_ref().expect("queue must exist"),
-                self.shutdown.as_ref().expect("shutdown must exist"),
-                &self.in_flight_count,
-                sub,
-            ) {
-                release_pybuffer(view);
-                return Err(error);
-            }
-            if let Some(batch_ready) = &self.batch_ready {
-                batch_ready.signal_producer();
-            }
-            py.allow_threads(move || comp.wait())
-        };
-
-        release_pybuffer(view);
-        res?;
-        Ok(())
+        let _ = (offset, data, payload_len, total_len);
+        Err(PyRuntimeError::new_err(
+            "RawBlockDevice.read_uring() is not supported; use \
+             batched_read() followed by wait_iouring(), which retains its \
+             destination buffers when an outcome cannot be established",
+        ))
     }
 
     /// Synchronous write using io_uring.
@@ -2996,7 +4059,11 @@ impl RawBlockDevice {
     /// `total_len` defaults to `payload_len`. The source buffer is read only
     /// within its bounds and is never modified, and the padding region
     /// `[payload_len, total_len)` is always written as zeroes.
-    #[pyo3(signature = (offset, data, payload_len, total_len = None, placement_id = None))]
+    /// The argument list mirrors one SQE's worth of parameters plus the
+    /// attribution the caller carries, which is what it takes to describe
+    /// one padded placement-directed write without a side channel.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (offset, data, payload_len, total_len = None, placement_id = None, request_tag = None))]
     fn write_uring(
         &self,
         py: Python<'_>,
@@ -3005,20 +4072,18 @@ impl RawBlockDevice {
         payload_len: usize,
         total_len: Option<usize>,
         placement_id: Option<i32>,
+        request_tag: Option<String>,
     ) -> PyResult<()> {
+        let request_tag: Option<Arc<str>> = request_tag.map(|tag| Arc::from(tag.as_str()));
         if !self.use_iouring {
             return Err(PyRuntimeError::new_err("io_uring not enabled"));
         }
-        if self.closed.load(Ordering::Relaxed) {
-            return Err(PyRuntimeError::new_err("device is closed"));
-        }
-        if self
-            .shutdown
-            .as_ref()
-            .is_some_and(|shutdown| shutdown.load(Ordering::Relaxed))
-        {
-            return Err(PyRuntimeError::new_err("io_uring worker stopped"));
-        }
+        self.ensure_io_available(true)?;
+        let placement_id_u16 = placement_id.map(placement_id_to_u16).transpose()?;
+        let nvme_cmd_data = self._build_nvme_cmd_data(
+            if placement_id_u16.is_some() { 0x2 } else { 0x0 },
+            placement_id_u16.unwrap_or(0),
+        )?;
 
         let view = get_pybuffer(py, data, false)?;
         let ptr = view.buf as *const u8;
@@ -3071,8 +4136,7 @@ impl RawBlockDevice {
             None
         };
 
-        let placement_id_u16 = placement_id.map(placement_id_to_u16).transpose()?;
-        let prepared = prepare_iouring_write_buffer(
+        let prepared = match prepare_iouring_write_buffer(
             ptr as usize,
             cap,
             payload_len,
@@ -3080,76 +4144,66 @@ impl RawBlockDevice {
             self.use_odirect,
             align,
             fixed_idx,
-        )?;
-
-        let res = if prepared.bounce.is_none() {
-            let comp = Arc::new(IoCompletion::new());
-            let sub = IoSubmission {
-                fd: self.fd,
-                offset,
-                len: total_len,
-                ptr_addr: prepared.ptr_addr,
-                is_write: true,
-                completion: comp.clone(),
-                fixed_buffer_idx: prepared.fixed_buffer_idx,
-                bounce: None,
-                original_ptr: None,
-                payload_len: None,
-                batch_id: 0,
-                nvme_cmd_data: self._build_nvme_cmd_data(
-                    if placement_id_u16.is_some() { 0x2 } else { 0x0 },
-                    placement_id_u16.unwrap_or(0),
-                )?,
-            };
-            if let Err(error) = enqueue_if_running(
-                self.queue.as_ref().expect("queue must exist"),
-                self.shutdown.as_ref().expect("shutdown must exist"),
-                &self.in_flight_count,
-                sub,
-            ) {
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
                 release_pybuffer(view);
                 return Err(error);
             }
-            if let Some(batch_ready) = &self.batch_ready {
-                batch_ready.signal_producer();
-            }
-            py.allow_threads(move || comp.wait())
-        } else {
-            let bounce = prepared.bounce;
-            let comp = Arc::new(IoCompletion::new());
-            let sub = IoSubmission {
-                fd: self.fd,
-                offset,
-                len: total_len,
-                ptr_addr: prepared.ptr_addr,
-                is_write: true,
-                completion: comp.clone(),
-                fixed_buffer_idx: None,
-                bounce,
-                original_ptr: None,
-                payload_len: Some(payload_len),
-                batch_id: 0,
-                nvme_cmd_data: self._build_nvme_cmd_data(
-                    if placement_id_u16.is_some() { 0x2 } else { 0x0 },
-                    placement_id_u16.unwrap_or(0),
-                )?,
-            };
-            if let Err(error) = enqueue_if_running(
-                self.queue.as_ref().expect("queue must exist"),
-                self.shutdown.as_ref().expect("shutdown must exist"),
-                &self.in_flight_count,
-                sub,
-            ) {
-                release_pybuffer(view);
-                return Err(error);
-            }
-            if let Some(batch_ready) = &self.batch_ready {
-                batch_ready.signal_producer();
-            }
-            py.allow_threads(move || comp.wait())
         };
+        let use_bounce = prepared.bounce.is_some();
 
-        release_pybuffer(view);
+        // Publish ownership only after preparation succeeds. A rejected write
+        // has no completion that could retire its buffer owner.
+        let batch_id = self.next_batch_id.fetch_add(1, Ordering::Relaxed);
+        self.batched_buffer_objs
+            .lock()
+            .unwrap()
+            .insert(batch_id, vec![data.clone().unbind()]);
+        let comp = Arc::new(IoCompletion::new());
+        let sub = IoSubmission {
+            fd: self.fd,
+            offset,
+            len: total_len,
+            ptr_addr: prepared.ptr_addr,
+            is_write: true,
+            completion: comp.clone(),
+            fixed_buffer_idx: prepared.fixed_buffer_idx,
+            bounce: prepared.bounce,
+            original_ptr: None,
+            payload_len: if use_bounce { Some(payload_len) } else { None },
+            batch_id,
+            request_tag,
+            attempt: 0,
+            nvme_cmd_data,
+        };
+        if let Err(error) = enqueue_if_running(
+            self.queue.as_ref().expect("queue must exist"),
+            self.shutdown.as_ref().expect("shutdown must exist"),
+            &self.in_flight_count,
+            sub,
+        ) {
+            self.retire_batch_owners(batch_id);
+            release_pybuffer(view);
+            return Err(error);
+        }
+        if let Some(batch_ready) = &self.batch_ready {
+            batch_ready.signal_producer();
+        }
+        let res = py.allow_threads(move || comp.wait());
+
+        self.retire_batch_owners(batch_id);
+        // Releasing the export calls PyBuffer_Release, which lets the
+        // caller's buffer be reused. The device may still be reading a
+        // quarantined batch's buffer, so its export is never released: the
+        // memory stays pinned for this engine's lifetime, which is the
+        // price of not being able to say when the write finished. Py_buffer
+        // has no automatic release, so
+        // withholding that call is the whole of the retention.
+        let withheld = self.quarantined_batches.lock().unwrap().contains(&batch_id);
+        if !withheld {
+            release_pybuffer(view);
+        }
         res?;
         Ok(())
     }
@@ -3158,31 +4212,28 @@ impl RawBlockDevice {
     /// All reads are queued to the worker thread, which processes them
     /// in batches to maximize throughput.
     ///
+    /// Host buffer exports remain pinned until the batch is polled after a
+    /// known completion. Unknown outcomes retain those exports permanently.
+    /// Callers must not access destination contents before completion.
+    ///
     /// Returns a batch ID that must be passed to `wait_iouring()` to wait for
     /// completion and obtain a success bitmap plus sparse completion errors.
     /// Validation or request-preparation errors are raised instead of returning
     /// a batch ID.
-    #[pyo3(signature = (offsets, buffers, total_lens))]
+    #[pyo3(signature = (offsets, buffers, total_lens, request_tag = None))]
     fn batched_read(
         &self,
         py: Python<'_>,
         offsets: Vec<u64>,
         buffers: Vec<Bound<'_, PyAny>>,
         total_lens: Vec<usize>,
+        request_tag: Option<String>,
     ) -> PyResult<u64> {
+        let request_tag: Option<Arc<str>> = request_tag.map(|tag| Arc::from(tag.as_str()));
         if !self.use_iouring {
             return Err(PyRuntimeError::new_err("io_uring not enabled"));
         }
-        if self.closed.load(Ordering::Relaxed) {
-            return Err(PyRuntimeError::new_err("device is closed"));
-        }
-        if self
-            .shutdown
-            .as_ref()
-            .is_some_and(|shutdown| shutdown.load(Ordering::Relaxed))
-        {
-            return Err(PyRuntimeError::new_err("io_uring worker stopped"));
-        }
+        self.ensure_io_available(true)?;
 
         let n = offsets.len();
         if n == 0 {
@@ -3197,7 +4248,15 @@ impl RawBlockDevice {
         let mut views = Vec::with_capacity(n);
         let mut caps = Vec::with_capacity(n);
         for buffer in &buffers {
-            let view = get_pybuffer(py, buffer, true)?;
+            let view = match get_pybuffer(py, buffer, true) {
+                Ok(view) => view,
+                Err(error) => {
+                    for acquired in views {
+                        release_pybuffer(acquired);
+                    }
+                    return Err(error);
+                }
+            };
             if view.readonly != 0 {
                 for v in views {
                     release_pybuffer(v);
@@ -3216,6 +4275,19 @@ impl RawBlockDevice {
             views.push(view);
         }
 
+        let mut owners = Vec::with_capacity(n);
+        for buffer in &buffers {
+            match batch_buffer_owner(buffer, true) {
+                Ok(owner) => owners.push(owner),
+                Err(error) => {
+                    for view in views {
+                        release_pybuffer(view);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
         // Generate a unique batch ID for this batch
         let batch_id = self.next_batch_id.fetch_add(1, Ordering::Relaxed);
 
@@ -3231,10 +4303,7 @@ impl RawBlockDevice {
         // Store buffer objects to keep them alive until they complete
         {
             let mut stored_objs = self.batched_buffer_objs.lock().unwrap();
-            let batch_buffers = stored_objs.entry(batch_id).or_default();
-            for buffer in &buffers {
-                batch_buffers.push(buffer.clone().unbind());
-            }
+            stored_objs.insert(batch_id, owners);
         }
 
         // Extract pointers as usize before releasing GIL (raw pointers are not Send)
@@ -3345,6 +4414,8 @@ impl RawBlockDevice {
                     payload_len: payload_len_opt,
                     batch_id,
                     nvme_cmd_data: nvme_cmd_data.clone(),
+                    request_tag: request_tag.clone(),
+                    attempt: 0,
                 };
 
                 submissions.push((sub, comp));
@@ -3419,9 +4490,7 @@ impl RawBlockDevice {
         payload_len: Option<usize>,
         total_len: Option<usize>,
     ) -> PyResult<()> {
-        if self.closed.load(Ordering::Relaxed) {
-            return Err(PyRuntimeError::new_err("device is closed"));
-        }
+        self.ensure_io_available(false)?;
         let fd = self.fd;
 
         let view = get_pybuffer(py, data, false)?;
@@ -3556,9 +4625,7 @@ impl RawBlockDevice {
         payload_len: usize,
         total_len: Option<usize>,
     ) -> PyResult<()> {
-        if self.closed.load(Ordering::Relaxed) {
-            return Err(PyRuntimeError::new_err("device is closed"));
-        }
+        self.ensure_io_available(false)?;
         let fd = self.fd;
         let view = get_pybuffer(py, out, true)?;
         if view.readonly != 0 {
@@ -3670,23 +4737,74 @@ impl RawBlockDevice {
 
     /// Close the device after draining accepted I/O, without holding the GIL.
     ///
-    /// Repeated calls are harmless. This may wait indefinitely if an accepted
-    /// request cannot complete or be cancelled. Raises `OSError` if closing
-    /// the underlying file descriptor fails.
+    /// Repeated successful calls are harmless. A bounded drain that cannot
+    /// prove every operation has stopped raises RuntimeError and retains
+    /// the ring and its owners. Raises OSError if the descriptor close fails.
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
         if !self.closed.load(Ordering::Relaxed) {
             py.allow_threads(|| self.do_close())?;
         }
         Ok(())
     }
+
+    /// Report whether every admitted operation has a known terminal outcome.
+    fn is_idle(&self) -> bool {
+        self.in_flight_count.load(Ordering::SeqCst) == 0 && !self.outcome_is_unknown()
+    }
+
+    /// Stop and join the worker while retaining the device and its registrations.
+    fn drain_worker(&mut self, py: Python<'_>) {
+        py.allow_threads(|| self.do_drain_worker());
+    }
 }
 
 impl RawBlockDevice {
-    /// Internal function to perform the cleanup operation.
+    /// Release or quarantine a finished batch's Python buffer owners.
     ///
-    /// Accepted io_uring requests retain their buffers until terminal completion.
-    /// Shutdown may wait indefinitely if they cannot complete or be cancelled.
-    fn do_close(&mut self) -> Result<(), PyErr> {
+    /// A batch whose outcome the worker could not establish must keep them:
+    /// the device may still reach the memory they describe, and handing a
+    /// pool slice back to an allocator on the strength of a logical failure
+    /// is what this distinction exists to prevent. Logical completion is not
+    /// reusable capacity.
+    fn retire_batch_owners(&self, batch_id: u64) {
+        // The worker already moved this batch's owners if it marked the
+        // batch unknown, so that case is a no-op here rather than a second
+        // transfer. This is still the only release for a healthy batch, and
+        // for one the worker never saw.
+        if self.quarantined_batches.lock().unwrap().contains(&batch_id) {
+            drain_batch_owners(
+                &self.batched_buffer_objs,
+                &self.quarantined_owners,
+                Some(batch_id),
+            );
+            return;
+        }
+        let mut stored_objs = self.batched_buffer_objs.lock().unwrap();
+        stored_objs.remove(&batch_id);
+    }
+
+    /// Internal function to perform the cleanup operation.
+    /// Stop the worker and wait for it, without tearing anything down.
+    ///
+    /// The worker is joined before anything is examined. Quarantining a
+    /// submission is itself what decrements the in-flight count this waits
+    /// on, so reaching zero is not evidence the device is finished -- it is
+    /// reached *by* giving up. Only after the worker has stopped is the
+    /// quarantine complete enough to ask about.
+    ///
+    /// Separated from the teardown so a caller can learn whether the device
+    /// is quiet while it still has a device to write with. A writer's final
+    /// index is the case that needs this: deciding to publish it from a
+    /// question asked before the worker stopped publishes a manifest naming
+    /// extents whose writes were never observed.
+    fn do_drain_worker(&mut self) {
+        // Idempotent, and it has to be: close() drains for a caller that
+        // did not ask, and the wait below is on a counter only the worker
+        // decrements. Running it a second time with the worker already
+        // joined would wait for a decrement that can never come.
+        if self.worker.is_none() {
+            return;
+        }
         if self.use_iouring {
             if let (Some(queue), Some(shutdown)) = (&self.queue, &self.shutdown) {
                 stop_submissions(queue, shutdown);
@@ -3704,28 +4822,50 @@ impl RawBlockDevice {
                     .unwrap();
                 guard = g;
             }
+        }
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
+    }
+
+    fn do_close(&mut self) -> Result<(), PyErr> {
+        if self.use_iouring {
+            self.do_drain_worker();
+
+            if self.outcome_is_unknown() {
+                return Err(self.retain_everything(
+                    "io_uring engine could not establish what the device is \
+                     still doing; its buffer registration, exported buffers \
+                     and device descriptor are retained rather than torn \
+                     down, and this device is not reusable",
+                ));
+            }
 
             if self.fixed_buffers_registered.load(Ordering::Relaxed) {
-                if let Some(ring) = &self.ring {
-                    let _ = match ring {
-                        IoUringWrapper::Standard(ring) => {
-                            let ring = ring.lock().unwrap();
-                            ring.submitter().unregister_buffers()
-                        }
-                        IoUringWrapper::Big(ring) => {
-                            let ring = ring.lock().unwrap();
-                            ring.submitter().unregister_buffers()
-                        }
-                    };
+                let unregistered = match &self.ring {
+                    Some(ring) => ring.unregister_buffers(),
+                    None => Ok(()),
+                };
+                if let Err(e) = unregistered {
+                    // The kernel still holds a registration this process was
+                    // about to forget. Forgetting it is what would let the
+                    // memory behind it be reused, so this is the same
+                    // situation as an unknown completion and is treated as
+                    // one.
+                    self.poisoned.store(true, Ordering::SeqCst);
+                    return Err(self.retain_everything(&format!(
+                        "io_uring buffer unregister failed ({e}); the \
+                         registration the kernel still holds is retained \
+                         rather than forgotten, and this device is not \
+                         reusable"
+                    )));
                 }
                 self.fixed_buffers_registered
                     .store(false, Ordering::Relaxed);
                 self.fixed_buffer_map.lock().unwrap().clear();
             }
-        }
-
-        if let Some(handle) = self.worker.take() {
-            let _ = handle.join();
+        } else {
+            self.do_drain_worker();
         }
 
         let rc = unsafe { libc::close(self.fd) };
@@ -3734,6 +4874,47 @@ impl RawBlockDevice {
         }
         self.closed.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Whether this device has stopped being able to say what it is doing.
+    fn outcome_is_unknown(&self) -> bool {
+        self.poisoned.load(Ordering::SeqCst) || !self.quarantined_batches.lock().unwrap().is_empty()
+    }
+
+    /// Keep every resource an unproven outcome may still be reaching.
+    ///
+    /// The ring, its registration and the device descriptor stay open,
+    /// because closing them is what releases the kernel's attachments to
+    /// memory a command may still be landing in. The retained Python owners
+    /// are leaked deliberately, for the same reason the worker leaks its
+    /// quarantined submissions: their pool slices must not go back to an
+    /// allocator that would hand them to the next request.
+    ///
+    /// `closed` is deliberately left false. This device is finished, but
+    /// saying it is closed would invite a caller to conclude its resources
+    /// were released.
+    fn retain_everything(&mut self, reason: &str) -> PyErr {
+        // Everything still held by a batch, not only batches somebody
+        // marked. A registration that failed to unregister covers whatever
+        // memory it named, and a caller that never polled left its owners
+        // where only this sweep will find them. Over-retaining a
+        // proven-complete unpolled batch is the deliberate side to err on.
+        let swept = drain_batch_owners(&self.batched_buffer_objs, &self.quarantined_owners, None);
+        let owners = std::mem::take(&mut *self.quarantined_owners.lock().unwrap());
+        let owner_count = owners.len();
+        self.retained_owners
+            .fetch_add(owner_count, Ordering::SeqCst);
+        std::mem::forget(owners);
+        let registered = std::mem::take(&mut *self.fixed_buffer_map.lock().unwrap());
+        std::mem::forget(registered);
+        if let Some(ring) = self.ring.take() {
+            std::mem::forget(ring);
+        }
+        PyRuntimeError::new_err(format!(
+            "{reason} (retained {owner_count} buffer owner(s), {swept} of them \
+             from batches nobody polled, {batches} quarantined batch(es))",
+            batches = self.quarantined_batches.lock().unwrap().len(),
+        ))
     }
 }
 
@@ -3755,3 +4936,99 @@ fn lmcache_rust_raw_block_io(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod drain_batch_owners_tests {
+    use super::drain_batch_owners;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    #[test]
+    fn one_batch_moves_and_a_second_call_moves_nothing() {
+        let batched = Mutex::new(HashMap::from([(7u64, vec!["a", "b"])]));
+        let quarantined = Mutex::new(Vec::new());
+        assert_eq!(drain_batch_owners(&batched, &quarantined, Some(7)), 2);
+        assert_eq!(quarantined.lock().unwrap().len(), 2);
+        // Idempotent: the worker moves a batch when it learns the outcome,
+        // and a later poll must not try to move it again.
+        assert_eq!(drain_batch_owners(&batched, &quarantined, Some(7)), 0);
+        assert_eq!(quarantined.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn an_unknown_batch_id_moves_nothing() {
+        let batched = Mutex::new(HashMap::from([(7u64, vec!["a"])]));
+        let quarantined = Mutex::new(Vec::new());
+        assert_eq!(drain_batch_owners(&batched, &quarantined, Some(8)), 0);
+        assert!(quarantined.lock().unwrap().is_empty());
+        assert_eq!(batched.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sweeping_takes_every_batch_including_unpolled_ones() {
+        let batched = Mutex::new(HashMap::from([(1u64, vec!["a"]), (2u64, vec!["b", "c"])]));
+        let quarantined = Mutex::new(vec!["already"]);
+        assert_eq!(drain_batch_owners(&batched, &quarantined, None), 3);
+        assert!(batched.lock().unwrap().is_empty());
+        assert_eq!(quarantined.lock().unwrap().len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod io_journal_tests {
+    use super::{IoSubmission, NativeIoJournal, NvmeCmdData};
+
+    #[test]
+    fn nvme_success_counts_the_transfer_instead_of_the_status() {
+        let journal = NativeIoJournal::new(8);
+        let sub = IoSubmission {
+            len: 4096,
+            nvme_cmd_data: Some(NvmeCmdData {
+                nsid: 1,
+                lba_shift: 12,
+                dtype: 0,
+                dspec: 0,
+            }),
+            ..Default::default()
+        };
+        journal.record_completion(&sub, 7, 0);
+        journal.record_completion(&sub, 8, 1);
+        let (events, dropped) = journal.drain();
+        assert_eq!(dropped, 0);
+        assert_eq!(events[0].outcome, "completed");
+        assert_eq!(events[0].bytes, 4096);
+        assert_eq!(events[1].outcome, "failed");
+        assert_eq!(events[1].bytes, 0);
+    }
+
+    #[test]
+    fn short_and_zero_byte_completions_keep_their_actual_counts() {
+        let journal = NativeIoJournal::new(8);
+        let sub = IoSubmission {
+            len: 4096,
+            ..Default::default()
+        };
+        journal.record_completion(&sub, 7, 2048);
+        journal.record_completion(&sub, 8, 0);
+        let (events, dropped) = journal.drain();
+        assert_eq!(dropped, 0);
+        assert_eq!(events[0].outcome, "short");
+        assert_eq!(events[0].bytes, 2048);
+        assert_eq!(events[1].outcome, "short");
+        assert_eq!(events[1].bytes, 0);
+    }
+
+    #[test]
+    fn dropped_rows_are_returned_with_the_snapshot_that_lost_them() {
+        let journal = NativeIoJournal::new(1);
+        let sub = IoSubmission::default();
+        journal.record_submission(&sub, 7);
+        journal.record_completion(&sub, 7, 0);
+        let (events, dropped) = journal.drain();
+        assert_eq!(events.len(), 1);
+        assert_eq!(dropped, 1);
+        let (events, dropped) = journal.drain();
+        assert!(events.is_empty());
+        assert_eq!(dropped, 0);
+    }
+}

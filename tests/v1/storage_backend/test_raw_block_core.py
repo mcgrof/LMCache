@@ -142,6 +142,7 @@ def _buffer_address(buf: memoryview) -> int:
 
 def test_raw_block_core_uring_cmd_write_padding_uses_aligned_chunks(monkeypatch):
     core = RawBlockCore.__new__(RawBlockCore)
+    core._poisoned = False
     core.block_align = 4096
     core.max_data_transfer_size = 4096
     raw_dev = _RecordingUringCmdRawDevice()
@@ -165,6 +166,7 @@ def test_raw_block_core_uring_cmd_write_padding_uses_aligned_chunks(monkeypatch)
 
 def test_raw_block_core_uring_cmd_read_copyback_uses_aligned_chunks(monkeypatch):
     core = RawBlockCore.__new__(RawBlockCore)
+    core._poisoned = False
     core.block_align = 4096
     core.max_data_transfer_size = 4096
     raw_dev = _RecordingUringCmdRawDevice()
@@ -1820,6 +1822,7 @@ def _make_recovery_core(
 def _make_iouring_header_core() -> RawBlockCore:
     """Build a minimal RawBlockCore for batched slot-header reads."""
     core = object.__new__(RawBlockCore)
+    core._poisoned = False
     core._lock = threading.Lock()
     core._inflight_io_count = 0
     core._last_io_ts = 0.0

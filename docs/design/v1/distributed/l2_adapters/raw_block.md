@@ -1,5 +1,12 @@
 # Raw Block L2 Adapter Design
 
+Execution is restricted to synchronous POSIX I/O. Construction rejects
+`io_uring`, NVMe passthrough and FDP before opening a target: MP result and
+L1 shutdown contracts cannot retain backing resources after unknown I/O.
+Placement configuration and synchronous policy helpers remain available,
+but their unit tests do not establish asynchronous MP support.
+
+
 This document describes the built-in `raw_block` L2 adapter for LMCache MP
 mode. It covers the adapter shape, the shared raw-block core, and the recovery
 model.

@@ -6,6 +6,14 @@ device or pre-sized file using the Rust raw-device I/O bindings. It reuses the
 existing raw-block metadata checkpoint model and writes directly into the
 caller-provided load buffers during prefetch.
 
+Execution currently supports ``io_engine="posix"`` only. The adapter rejects
+``io_uring``, including NVMe passthrough and FDP, before native setup because
+MP load outcomes and whole-L1 teardown cannot retain an arena after unknown
+I/O completion. The in-process raw-block backend has a separate ownership
+contract and continues to support ``io_uring``. The asynchronous configuration
+fields below are retained for compatibility and placement-policy development;
+they do not enable MP execution.
+
 **Required fields:**
 
 - ``device_path``: Raw device path or pre-sized file path.

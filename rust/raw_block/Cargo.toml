@@ -13,6 +13,13 @@ crate-type = ["cdylib"]
 # Disable extension-module for cargo test so test binaries link to libpython.
 default = ["extension-module"]
 extension-module = ["pyo3/extension-module"]
+# A test-only seam for driving the worker's submit-failure transitions. Off by
+# default and never enabled for a serving build: it adds a settable plan that
+# replaces the outcome of a submit call, which is the only way to reach the
+# fatal and partial-submit paths without a device that fails on demand. It
+# intercepts before the ring, so no synthetic completion is ever reported for
+# a request the kernel owns.
+fault-injection = []
 
 [dependencies]
 pyo3 = "0.24"

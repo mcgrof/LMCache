@@ -184,7 +184,7 @@ def test_raw_block_l2_adapter_config_rejects_invalid_io_engine():
         RawBlockL2AdapterConfig.from_dict(_config_dict(io_engine="uring"))
 
 
-def test_raw_block_l2_adapter_buffered_iouring_accepts_unaligned_l1() -> None:
+def test_raw_block_l2_adapter_buffered_iouring_refuses_mp_setup() -> None:
     """Buffered io_uring does not require block-aligned L1 memory."""
     config = RawBlockL2AdapterConfig.from_dict(_config_dict(io_engine="io_uring"))
     descriptor = L1MemoryDesc(ptr=0x4000, size=8192, align_bytes=1024)
@@ -194,8 +194,9 @@ def test_raw_block_l2_adapter_buffered_iouring_accepts_unaligned_l1() -> None:
     ) as core_cls:
         core_cls.return_value.report_status.return_value = {}
         core_cls.return_value.snapshot_indexed_keys.return_value = []
-        adapter = RawBlockL2Adapter(config, descriptor)
-        adapter.close()
+        with pytest.raises(ValueError, match="MP raw_block io_uring is unsupported"):
+            RawBlockL2Adapter(config, descriptor)
+        core_cls.assert_not_called()
 
 
 @pytest.mark.parametrize("legacy_key", ["use_iouring", "use_uring"])
@@ -278,7 +279,7 @@ def test_raw_block_l2_adapter_uring_cmd_rejects_regular_file():
         with open(dev_path, "wb") as f:
             f.truncate(8 * 1024 * 1024)
 
-        with pytest.raises(ValueError, match="NVMe namespace character device"):
+        with pytest.raises(ValueError, match="MP raw_block io_uring is unsupported"):
             RawBlockL2Adapter(
                 _make_config(
                     dev_path,
