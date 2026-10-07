@@ -924,8 +924,8 @@ mismatch between producer and consumer surfaces as a loud
 ``CHECKSUM MISMATCH`` log line.
 
 
-Quick start
-~~~~~~~~~~~
+Server quick start
+~~~~~~~~~~~~~~~~~~
 
 Start the MP server in one terminal:
 
@@ -1194,8 +1194,8 @@ that recording a live process is never free.
    numbers as indicative, not a clean baseline.
 
 
-Output
-~~~~~~
+Server output
+~~~~~~~~~~~~~
 
 After the run completes (or is interrupted with ``Ctrl-C``), a structured
 metrics summary is printed. The summary includes:
@@ -1277,8 +1277,8 @@ Any ``CHECKSUM MISMATCH``, ``ERROR``, or Python traceback in the log
 indicates a real problem worth investigating.
 
 
-Exit codes
-~~~~~~~~~~
+Server exit codes
+~~~~~~~~~~~~~~~~~
 
 .. list-table::
    :header-rows: 1
@@ -1315,8 +1315,8 @@ only needs the adapter's own backing storage to be reachable (for the
 ``fs`` adapter, that simply means a writable directory).
 
 
-What it does
-~~~~~~~~~~~~
+L2 benchmark operations
+~~~~~~~~~~~~~~~~~~~~~~~
 
 For each measured operation the tool drives the adapter directly via
 its public submit/wait API:
@@ -1378,8 +1378,8 @@ support a clean store -> load round-trip.
    pages.
 
 
-Quick start
-~~~~~~~~~~~
+L2 quick start
+~~~~~~~~~~~~~~
 
 Benchmark the local filesystem adapter with default parameters:
 
@@ -1447,8 +1447,8 @@ If you prefer to keep the JSON spec out of the command line, set the
    lmcache bench l2 --num-keys 32 --in-flight 2
 
 
-Options
-~~~~~~~
+L2 options
+~~~~~~~~~~
 
 .. list-table::
    :header-rows: 1
@@ -1707,8 +1707,8 @@ The SVG is written to ``--flamegraph-output`` (default
 ``/tmp/lmcache_bench_flames/<adapter>.<mode>.svg``).
 
 
-Exit codes
-~~~~~~~~~~
+L2 exit codes
+~~~~~~~~~~~~~
 
 .. list-table::
    :header-rows: 1

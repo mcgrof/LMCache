@@ -43,7 +43,7 @@ CPU-Only Mode
        --world_size 1
 
 Remote P2P Mode
-~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~
 TO be added
 
 Configuration Section
