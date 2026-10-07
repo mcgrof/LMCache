@@ -1165,8 +1165,8 @@ def test_raw_block_core_uses_bounded_posix_recovery_read_tasks(monkeypatch):
     core._recovery_read_threads = 3
     core.key_namespace = "object"
     core._read_slot_header = lambda offset: (
-        specs[(offset // 4096) - 1].slot_identity,
-        7,
+        "decoded",
+        (specs[(offset // 4096) - 1].slot_identity, 7),
     )
 
     max_worker_calls: list[int] = []
@@ -1217,8 +1217,8 @@ def test_raw_block_core_iouring_recovery_does_not_use_posix_threads(monkeypatch)
     core._recovery_read_threads = 8
     core.key_namespace = "object"
     core._read_slot_header = lambda offset: (
-        specs[(offset // 4096) - 1].slot_identity,
-        7,
+        "decoded",
+        (specs[(offset // 4096) - 1].slot_identity, 7),
     )
     # io_uring dispatch reads headers via the batched path; stub it to the
     # single-read helper so this test exercises dispatch without real io_uring.
@@ -1819,15 +1819,17 @@ def _make_recovery_core(
     return core
 
 
-def _make_iouring_header_core() -> RawBlockCore:
-    """Build a minimal RawBlockCore for batched slot-header reads."""
-    core = object.__new__(RawBlockCore)
-    core._poisoned = False
-    core._lock = threading.Lock()
-    core._inflight_io_count = 0
-    core._last_io_ts = 0.0
-    core.block_align = 4096
-    core.header_bytes = 4096
+def _header_device() -> Mock:
+    device = Mock()
+    device.is_poisoned.return_value = False
+    device.worker_error.return_value = None
+    device.take_io_journal.return_value = ([], 0)
+    return device
+
+
+def _make_iouring_header_core(tmp_path, monkeypatch) -> RawBlockCore:
+    """Initialize the normal recovery and attribution paths without a device."""
+    core, _ = _make_fake_io_uring_core(tmp_path, monkeypatch)
     core.iouring_queue_depth = 256
     return core
 
@@ -1841,19 +1843,22 @@ def _slot_header(core: RawBlockCore, identity: int, payload_len: int) -> bytes:
 
 
 def test_read_slot_headers_batched_reads_and_decodes_one_batch(
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # White-box: single-batch decode and the batch_id -> wait_iouring wiring have
     # no public projection, so this asserts the io_uring read path directly.
-    core = _make_iouring_header_core()
+    core = _make_iouring_header_core(tmp_path, monkeypatch)
     offsets = [4096, 8192]
     expected = [(0xCAFE, 128), (0xBEEF, 256)]
-    raw_dev = Mock()
+    raw_dev = _header_device()
 
     def batched_read(
         batch_offsets: list[int],
         buffers: list[memoryview],
         total_lens: list[int],
+        *,
+        request_tag: str = "",
     ) -> int:
         assert batch_offsets == offsets
         assert total_lens == [core.header_bytes, core.header_bytes]
@@ -1869,25 +1874,30 @@ def test_read_slot_headers_batched_reads_and_decodes_one_batch(
     raw_dev.wait_iouring.return_value = ([True, True], [])
     monkeypatch.setattr(core, "_rawdev", lambda: raw_dev)
 
-    assert core._read_slot_headers_batched(offsets) == expected
+    assert core._read_slot_headers_batched(offsets) == [
+        ("decoded", header) for header in expected
+    ]
     raw_dev.wait_iouring.assert_called_once_with(77)
 
 
 def test_read_slot_headers_batched_splits_by_iouring_queue_depth(
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # White-box: queue_depth batching has no public projection; the only
     # observable is the batched_read call pattern, so assert it directly.
-    core = _make_iouring_header_core()
+    core = _make_iouring_header_core(tmp_path, monkeypatch)
     core.iouring_queue_depth = 2
     offsets = [4096, 8192, 12288, 16384, 20480]
     seen_batches: list[list[int]] = []
-    raw_dev = Mock()
+    raw_dev = _header_device()
 
     def batched_read(
         batch_offsets: list[int],
         buffers: list[memoryview],
         total_lens: list[int],
+        *,
+        request_tag: str = "",
     ) -> int:
         seen_batches.append(list(batch_offsets))
         for offset, buffer in zip(batch_offsets, buffers, strict=True):
@@ -1903,38 +1913,47 @@ def test_read_slot_headers_batched_splits_by_iouring_queue_depth(
     monkeypatch.setattr(core, "_rawdev", lambda: raw_dev)
 
     assert core._read_slot_headers_batched(offsets) == [
-        (4096, 64),
-        (8192, 64),
-        (12288, 64),
-        (16384, 64),
-        (20480, 64),
+        ("decoded", (4096, 64)),
+        ("decoded", (8192, 64)),
+        ("decoded", (12288, 64)),
+        ("decoded", (16384, 64)),
+        ("decoded", (20480, 64)),
     ]
     assert seen_batches == [[4096, 8192], [12288, 16384], [20480]]
     assert raw_dev.wait_iouring.call_count == 3
 
 
 @pytest.mark.parametrize("failure_kind", ["submission", "count"])
-def test_read_slot_headers_batched_falls_back_per_slot_on_batch_error(
+def test_read_slot_headers_batched_distinguishes_setup_and_completion_errors(
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
     failure_kind: str,
 ) -> None:
     # White-box: per-slot fallback isolation has no public projection; the only
     # observable is the per-slot re-read pattern, so assert it directly.
-    core = _make_iouring_header_core()
-    raw_dev = Mock()
+    core = _make_iouring_header_core(tmp_path, monkeypatch)
+    raw_dev = _header_device()
     raw_dev.batched_read.return_value = 77
     if failure_kind == "submission":
         raw_dev.batched_read.side_effect = RuntimeError("read failed")
     else:
         raw_dev.wait_iouring.return_value = ([True], [])
     monkeypatch.setattr(core, "_rawdev", lambda: raw_dev)
-    read_mock = Mock(side_effect=[(1, 64), None, (3, 64)])
+    read_mock = Mock(
+        side_effect=[("decoded", (1, 64)), ("invalid", None), ("decoded", (3, 64))]
+    )
     monkeypatch.setattr(core, "_read_slot_header", read_mock)
 
+    if failure_kind == "submission":
+        with pytest.raises(RuntimeError, match="read failed"):
+            core._read_slot_headers_batched([4096, 8192, 12288])
+        read_mock.assert_not_called()
+        return
+
     assert core._read_slot_headers_batched([4096, 8192, 12288]) == [
-        (1, 64),
-        None,
-        (3, 64),
+        ("decoded", (1, 64)),
+        ("invalid", None),
+        ("decoded", (3, 64)),
     ]
     assert read_mock.call_args_list == [
         call(4096),
@@ -1945,17 +1964,20 @@ def test_read_slot_headers_batched_falls_back_per_slot_on_batch_error(
 
 @pytest.mark.parametrize("retry_header", [(2, 64), None])
 def test_read_slot_headers_batched_retries_only_failed_completion(
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
     retry_header: tuple[int, int] | None,
 ) -> None:
     """Retry a failed slot without rereading a successfully completed header."""
-    core = _make_iouring_header_core()
-    raw_dev = Mock()
+    core = _make_iouring_header_core(tmp_path, monkeypatch)
+    raw_dev = _header_device()
 
     def batched_read(
         offsets: list[int],
         buffers: list[memoryview],
         total_lens: list[int],
+        *,
+        request_tag: str = "",
     ) -> int:
         assert offsets == [4096, 8192]
         assert total_lens == [core.header_bytes] * 2
@@ -1967,10 +1989,14 @@ def test_read_slot_headers_batched_retries_only_failed_completion(
     raw_dev.batched_read.side_effect = batched_read
     raw_dev.wait_iouring.return_value = ([True, False], [(1, "transient read error")])
     monkeypatch.setattr(core, "_rawdev", lambda: raw_dev)
-    read_mock = Mock(return_value=retry_header)
+    retry_result = ("invalid" if retry_header is None else "decoded", retry_header)
+    read_mock = Mock(return_value=retry_result)
     monkeypatch.setattr(core, "_read_slot_header", read_mock)
 
-    assert core._read_slot_headers_batched([4096, 8192]) == [(1, 64), retry_header]
+    assert core._read_slot_headers_batched([4096, 8192]) == [
+        ("decoded", (1, 64)),
+        retry_result,
+    ]
     read_mock.assert_called_once_with(8192)
     raw_dev.wait_iouring.assert_called_once_with(77)
 
@@ -1981,7 +2007,9 @@ def test_validate_loaded_entries_iouring_multi_entry_uses_batched_reader(
     specs = [encode_object_key(make_object_key(i)) for i in range(3)]
     core = _make_recovery_core(specs)
     expected_offsets = [4096, 8192, 12288]
-    batched_mock = Mock(return_value=[(spec.slot_identity, 64) for spec in specs])
+    batched_mock = Mock(
+        return_value=[("decoded", (spec.slot_identity, 64)) for spec in specs]
+    )
     monkeypatch.setattr(core, "_read_slot_headers_batched", batched_mock)
     read_mock = Mock()
     monkeypatch.setattr(core, "_read_slot_header", read_mock)
@@ -1999,7 +2027,9 @@ def test_validate_loaded_entries_uring_cmd_uses_batched_reader(
     specs = [encode_object_key(make_object_key(i)) for i in range(3)]
     core = _make_recovery_core(specs, use_uring_cmd=True)
     expected_offsets = [4096, 8192, 12288]
-    batched_mock = Mock(return_value=[(spec.slot_identity, 64) for spec in specs])
+    batched_mock = Mock(
+        return_value=[("decoded", (spec.slot_identity, 64)) for spec in specs]
+    )
     monkeypatch.setattr(core, "_read_slot_headers_batched", batched_mock)
     read_mock = Mock()
     monkeypatch.setattr(core, "_read_slot_header", read_mock)
