@@ -7,7 +7,9 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import Mock
+import asyncio
 import gc
+import threading
 import weakref
 
 # Third Party
@@ -223,3 +225,104 @@ def test_failed_sync_retains_owners_rejects_reuse_and_preserves_backends(
     assert source_ref() is not None
     assert destination_ref() is not None
     assert manager_ref() is not None
+
+
+@pytest.mark.parametrize("loop_started", [False, True])
+def test_constructor_failure_stops_and_closes_loop(
+    monkeypatch: pytest.MonkeyPatch, loop_started: bool
+) -> None:
+    loops: list[asyncio.AbstractEventLoop] = []
+    threads: list[threading.Thread] = []
+    release_start = threading.Event()
+    actual_loop_factory = asyncio.new_event_loop
+    actual_thread_class = threading.Thread
+
+    def make_loop() -> asyncio.AbstractEventLoop:
+        loop = actual_loop_factory()
+        loops.append(loop)
+        if not loop_started:
+            queue_callback = loop.call_soon_threadsafe
+
+            def queue_stop(callback: Any, *args: Any, **kwargs: Any) -> Any:
+                handle = queue_callback(callback, *args, **kwargs)
+                if callback == loop.stop:
+                    release_start.set()
+                return handle
+
+            monkeypatch.setattr(loop, "call_soon_threadsafe", queue_stop)
+        return loop
+
+    def make_thread(*args: Any, **kwargs: Any) -> threading.Thread:
+        target = kwargs["target"]
+        target_args = kwargs["args"]
+
+        def run() -> None:
+            if not loop_started:
+                assert release_start.wait(timeout=15)
+            target(*target_args)
+
+        thread = actual_thread_class(target=run, name=kwargs["name"])
+        threads.append(thread)
+        return thread
+
+    def fail_factory(*args: Any, **kwargs: Any) -> None:
+        if loop_started:
+            ready = threading.Event()
+            loops[0].call_soon_threadsafe(ready.set)
+            assert ready.wait(timeout=5)
+        raise OSError("backend construction failed")
+
+    monkeypatch.setattr(
+        "lmcache.v1.storage_backend.storage_manager.asyncio.new_event_loop", make_loop
+    )
+    monkeypatch.setattr(
+        "lmcache.v1.storage_backend.storage_manager.threading.Thread", make_thread
+    )
+    monkeypatch.setattr(
+        "lmcache.v1.storage_backend.storage_manager.CreateStorageBackends", fail_factory
+    )
+    config, metadata = manager_inputs()
+    try:
+        with pytest.raises(OSError, match="backend construction failed"):
+            StorageManager(config, metadata, EventManager())
+        assert len(threads) == 1
+        assert not threads[0].is_alive()
+        assert loops[0].is_closed()
+    finally:
+        release_start.set()
+        for loop, thread in zip(loops, threads, strict=True):
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5)
+            if not loop.is_closed() and not thread.is_alive():
+                loop.close()
+
+
+def test_later_constructor_failure_closes_created_backends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = Mock(spec=LocalCPUBackend)
+    loops: list[asyncio.AbstractEventLoop] = []
+
+    def create_backends(
+        config: LMCacheEngineConfig,
+        metadata: LMCacheMetadata,
+        loop: asyncio.AbstractEventLoop,
+        **kwargs: Any,
+    ) -> OrderedDict[str, Any]:
+        loops.append(loop)
+        return OrderedDict([("LocalCPUBackend", backend)])
+
+    monkeypatch.setattr(
+        "lmcache.v1.storage_backend.storage_manager.CreateStorageBackends",
+        create_backends,
+    )
+    monkeypatch.setattr(
+        "lmcache.v1.storage_backend.storage_manager.PrometheusLogger.GetOrCreate",
+        Mock(side_effect=OSError("metrics setup failed")),
+    )
+    config, metadata = manager_inputs()
+    with pytest.raises(OSError, match="metrics setup failed"):
+        StorageManager(config, metadata, EventManager())
+    backend.close.assert_called_once()
+    assert loops[0].is_closed()

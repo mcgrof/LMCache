@@ -266,9 +266,8 @@ class StorageManager:
         event_manager: EventManager,
         lmcache_worker: Optional["LMCacheWorker"] = None,
         async_lookup_server: Optional["LMCacheAsyncLookupServer"] = None,
-    ):
+    ) -> None:
         self.config = config
-        self._copy_owners_retained = False
         self.metadata = metadata
         self.loop = asyncio.new_event_loop()
 
@@ -277,56 +276,64 @@ class StorageManager:
             args=(self.loop,),
             name="storage-manager-event-loop",
         )
-        self.thread.start()
+        self.internal_copy_stream = None
+        self._copy_owners_retained = False
 
         self.storage_backends: OrderedDict[str, StorageBackendInterface] = OrderedDict()
         self.manager_lock = threading.Lock()
         self.lmcache_worker = lmcache_worker
 
-        # Use the unified create path so that init and
-        # dynamic creation share the same logic.
-        self.create_backends()
+        initialized = False
+        try:
+            self.thread.start()
+            # Use the unified create path so that init and
+            # dynamic creation share the same logic.
+            self.create_backends()
 
-        # the backend used for actual storage
-        self.non_allocator_backends = self.get_non_allocator_backends()
+            # the backend used for actual storage
+            self.non_allocator_backends = self.get_non_allocator_backends()
 
-        self.enable_pd = config.enable_pd
+            self.enable_pd = config.enable_pd
 
-        self.allocator_backend = None
-        if metadata.role != "scheduler":
-            self.allocator_backend = self._get_allocator_backend(config)
+            self.allocator_backend = None
+            if metadata.role != "scheduler":
+                self.allocator_backend = self._get_allocator_backend(config)
 
-        self.local_cpu_backend = self.storage_backends.get("LocalCPUBackend", None)
+            self.local_cpu_backend = self.storage_backends.get("LocalCPUBackend", None)
 
-        self.instance_id = config.lmcache_instance_id
-        self.worker_id = metadata.worker_id
+            self.instance_id = config.lmcache_instance_id
+            self.worker_id = metadata.worker_id
 
-        self.event_manager = event_manager
+            self.event_manager = event_manager
 
-        self.async_lookup_server: Optional["LMCacheAsyncLookupServer"] = (
-            async_lookup_server
-        )
-        self.async_serializer: Optional[AsyncSerializer] = None
+            self.async_lookup_server: Optional["LMCacheAsyncLookupServer"] = (
+                async_lookup_server
+            )
+            self.async_serializer: Optional[AsyncSerializer] = None
 
-        # The GPU stream for internal copies during put
-        if is_cuda_worker(metadata):
-            self.internal_copy_stream = torch_dev.Stream()
-        else:
-            self.internal_copy_stream = None
+            # The GPU stream for internal copies during put
+            if is_cuda_worker(metadata):
+                self.internal_copy_stream = torch_dev.Stream()
+            else:
+                self.internal_copy_stream = None
 
-        # freeze mode: only use local_cpu backend for retrieval
-        self._freeze = False
-        self._freeze_lock = threading.RLock()
+            # freeze mode: only use local_cpu backend for retrieval
+            self._freeze = False
+            self._freeze_lock = threading.RLock()
 
-        # Backend bypass mode: skip specific backends during health check failures
-        self._bypassed_backends: set[str] = set()
-        self._bypass_lock = threading.RLock()
+            # Backend bypass mode: skip specific backends during health check failures
+            self._bypassed_backends: set[str] = set()
+            self._bypass_lock = threading.RLock()
 
-        if not self.enable_pd and self.config.enable_async_loading:
-            assert self.allocator_backend is not None
-            self.async_serializer = AsyncSingleSerializer(self.loop)
+            if not self.enable_pd and self.config.enable_async_loading:
+                assert self.allocator_backend is not None
+                self.async_serializer = AsyncSingleSerializer(self.loop)
 
-        self._setup_metrics()
+            self._setup_metrics()
+            initialized = True
+        finally:
+            if not initialized:
+                self.close()
 
     def _setup_metrics(self) -> None:
         prometheus_logger = PrometheusLogger.GetOrCreate(
