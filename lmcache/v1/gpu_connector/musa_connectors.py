@@ -367,6 +367,37 @@ class VLLMPagedMemMUSAConnectorV2(VLLMPagedMemGPUConnectorV2):
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
+    def batched_from_gpu(
+        self,
+        memory_objs: Union[List[List[MemoryObj]], List[MemoryObj]],
+        starts: List[int],
+        ends: List[int],
+        **kwargs: object,
+    ) -> None:
+        """Gather each range using the MUSA transfer implementation.
+
+        Args:
+            memory_objs: Staging objects receiving the KV data, one per range.
+            starts: First token index of each range in the full slot mapping.
+            ends: Exclusive last token index of each range.
+            **kwargs: ``slot_mapping`` and optional ``kvcaches`` tensors,
+                as in :meth:`from_gpu`.
+
+        Returns:
+            None. Each transfer retains :meth:`from_gpu`'s existing MUSA
+            completion semantics; this does not use the CUDA batch path.
+
+        Raises:
+            ValueError: Batch lengths differ or transfer arguments are invalid.
+            AssertionError: Required tensors or compatible metadata are absent.
+            RuntimeError: A MUSA transfer fails.
+        """
+        typed_memory_objs = cast("List[MemoryObj]", memory_objs)
+        if not (len(typed_memory_objs) == len(starts) == len(ends)):
+            raise ValueError("memory_objs, starts and ends must have equal lengths")
+        for memory_obj, start, end in zip(typed_memory_objs, starts, ends, strict=True):
+            self.from_gpu(memory_obj, start, end, **kwargs)
+
     def batched_to_gpu(
         self,
         memory_objs: Union[
