@@ -339,7 +339,7 @@ def test_raw_block_core_load_many_into_batches_iouring_reads(monkeypatch):
         core.close()
 
 
-def test_raw_block_core_uring_cmd_reads_batch_split_chunks(monkeypatch):
+def test_raw_block_core_bounded_io_uring_reads_batch_split_chunks(monkeypatch):
     _install_fake_raw_block_device(monkeypatch)
     core = _make_raw_block_core(io_engine="io_uring")
     try:
@@ -358,7 +358,7 @@ def test_raw_block_core_uring_cmd_reads_batch_split_chunks(monkeypatch):
 
         out1 = bytearray(len(payload1))
         out2 = bytearray(len(payload2))
-        results = core._read_uring_cmd_buffers(
+        results = core._read_bounded_io_uring_buffers(
             [offset1, offset2],
             [out1, out2],
             [len(payload1), len(payload2)],
@@ -381,7 +381,7 @@ def test_raw_block_core_uring_cmd_reads_batch_split_chunks(monkeypatch):
 
 
 @pytest.mark.parametrize("completion_results", [[], [True]])
-def test_raw_block_core_uring_cmd_write_rejects_short_completion_bitmap(
+def test_raw_block_core_bounded_io_uring_write_rejects_short_completion_bitmap(
     monkeypatch, completion_results
 ):
     _install_fake_raw_block_device(monkeypatch)
@@ -392,8 +392,8 @@ def test_raw_block_core_uring_cmd_write_rejects_short_completion_bitmap(
         core.max_data_transfer_size = core.block_align
 
         payload = bytearray(b"x" * (core.block_align * 2))
-        with pytest.raises(RuntimeError, match="io_uring_cmd write failed"):
-            core._write_uring_cmd_buffers(
+        with pytest.raises(RuntimeError, match="bounded io_uring write failed"):
+            core._write_bounded_io_uring_buffers(
                 [core.block_align],
                 [payload],
                 [len(payload)],
@@ -404,7 +404,7 @@ def test_raw_block_core_uring_cmd_write_rejects_short_completion_bitmap(
 
 
 @pytest.mark.parametrize("completion_results", [[], [True]])
-def test_raw_block_core_uring_cmd_read_rejects_short_completion_bitmap(
+def test_raw_block_core_bounded_io_uring_read_rejects_short_completion_bitmap(
     monkeypatch, completion_results
 ):
     _install_fake_raw_block_device(monkeypatch)
@@ -415,7 +415,7 @@ def test_raw_block_core_uring_cmd_read_rejects_short_completion_bitmap(
         core.max_data_transfer_size = core.block_align
 
         out = bytearray(core.block_align * 2)
-        results = core._read_uring_cmd_buffers(
+        results = core._read_bounded_io_uring_buffers(
             [core.block_align],
             [out],
             [len(out)],
