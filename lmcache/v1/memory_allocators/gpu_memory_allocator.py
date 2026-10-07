@@ -3,6 +3,8 @@
 # Standard
 from contextlib import nullcontext
 from typing import List, Optional, Union
+import math
+import os
 import threading
 
 # Third Party
@@ -10,7 +12,9 @@ import torch
 
 # First Party
 from lmcache import torch_dev, torch_device_type
-from lmcache.utils import _lmcache_nvtx_annotate
+from lmcache.logging import init_logger
+from lmcache.utils import _lmcache_nvtx_annotate, get_size_bytes
+from lmcache.v1 import memory_management
 from lmcache.v1.memory_allocators.paged_tensor_memory_allocator import (
     PagedTensorMemoryAllocator,
 )
@@ -20,6 +24,8 @@ from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObj,
 )
+
+logger = init_logger(__name__)
 
 
 class GPUMemoryAllocator(MemoryAllocatorInterface):
@@ -33,24 +39,47 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
         use_paging: bool = False,
         **kwargs,
     ) -> None:
-        """
-        :param int size: The size of the GPU memory in bytes.
-        :param Optional[int] align_bytes: The byte alignment for allocations.
+        """Create a pool aligned for whole host-page DMA-BUF exports.
+
+        Args:
+            size: Minimum pool capacity in bytes. Capacity is rounded up to
+                whole host pages and, for paging, whole logical chunk slots.
+            device: Device on which the backing tensor is allocated.
+            align_bytes: Alignment for allocations when paging is disabled.
+            use_paging: Whether fixed-size chunk slots are used.
+            **kwargs: Paged pools require ``shapes``, ``dtypes``, and ``fmt``.
+
+        Raises:
+            ValueError: A required paged-pool argument is absent.
         """
         if not torch_dev.is_available():
             device = "cpu"
 
-        self.tensor = torch.empty(size, dtype=torch.uint8, device=device)
+        # The buffer starts and ends on a host page boundary so it can be
+        # exported as a dma-buf (the driver refuses a range that is not page
+        # aligned).  Over-allocate by one page and slice to the first page
+        # boundary; the extra page is the cost of the guarantee.
+        page = os.sysconf("SC_PAGE_SIZE")
+        allocation_alignment = page
+        if use_paging:
+            if not all(name in kwargs for name in ("shapes", "dtypes", "fmt")):
+                raise ValueError("paged allocation requires shapes, dtypes, and fmt")
+            allocation_alignment = math.lcm(
+                page, get_size_bytes(kwargs["shapes"], kwargs["dtypes"])
+            )
+        aligned_size = (
+            (size + allocation_alignment - 1)
+            // allocation_alignment
+            * allocation_alignment
+        )
+        self._backing = torch.empty(
+            aligned_size + page, dtype=torch.uint8, device=device
+        )
+        start = (-self._backing.data_ptr()) % page
+        self.tensor = self._backing[start : start + aligned_size]
 
         self.allocator: MemoryAllocatorInterface
         if use_paging:
-            assert "shapes" in kwargs, (
-                "shapes must be specified for paged memory allocator"
-            )
-            assert "dtypes" in kwargs, (
-                "dtypes must be specified for paged memory allocator"
-            )
-            assert "fmt" in kwargs, "fmt must be specified for paged memory allocator"
             self.allocator = PagedTensorMemoryAllocator(
                 tensor=self.tensor,
                 shapes=kwargs["shapes"],
@@ -64,6 +93,11 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
             self.allocator = TensorMemoryAllocator(self.tensor, **kwargs)
 
         self.device_mem_lock = threading.Lock() if not use_paging else nullcontext()
+        # dma-buf regions of the GPU buffer, exported on first request; they let
+        # a raw_block backend register the paged buffers with its NVMe device so
+        # loads and stores DMA straight to device memory.
+        self._dmabuf_regions: Optional[list[tuple[int, int, int]]] = None
+        self._closed = False
 
     @_lmcache_nvtx_annotate
     def allocate(
@@ -146,3 +180,57 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
 
     def __str__(self) -> str:
         return "GPUMemoryAllocator"
+
+    def get_paged_buffers(self) -> Optional[tuple[torch.Tensor, ...]]:
+        """Paged buffers for fixed-buffer registration, when paged."""
+        if isinstance(self.allocator, PagedTensorMemoryAllocator):
+            return self.allocator.get_paged_buffers()
+        return None
+
+    def get_paged_dmabuf_regions(self) -> Optional[list[tuple[int, int]]]:
+        """
+        For each paged buffer, the (dma-buf fd, mapped base) of the dma-buf
+        chunk of the GPU buffer that contains it, exporting the buffer on
+        first use.  None when not paged or when the device cannot export.
+        """
+        buffers = self.get_paged_buffers()
+        if not buffers:
+            return None
+        if self._dmabuf_regions is None:
+            try:
+                self._dmabuf_regions = memory_management.export_device_dmabufs(
+                    self.tensor
+                )
+            except Exception as exc:
+                logger.warning(
+                    "GPUMemoryAllocator: dma-buf export unavailable (%s); "
+                    "device-direct I/O disabled",
+                    exc,
+                )
+                self._dmabuf_regions = []
+        if not self._dmabuf_regions:
+            return None
+        regions = [
+            memory_management.get_dmabuf_region(buf.data_ptr()) for buf in buffers
+        ]
+        if any(r is None for r in regions):
+            return None
+        return regions  # type: ignore[return-value]
+
+    def close(self) -> None:
+        """Release dma-buf handles exported for the GPU arena."""
+        if self._closed:
+            return
+        try:
+            if self._dmabuf_regions:
+                memory_management.release_device_dmabufs(self.tensor)
+        finally:
+            self._dmabuf_regions = []
+            self.allocator.close()
+            self._closed = True
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
