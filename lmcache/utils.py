@@ -701,7 +701,9 @@ def _lmcache_nvtx_annotate(func, domain="lmcache"):
 
 
 ##### Observability Threading related #####
-_shared_observability_lock = threading.Lock()
+# Collector construction can trigger a memory finalizer that updates statistics
+# on the same thread. Keep cross-thread exclusion without blocking that cleanup.
+_shared_observability_lock = threading.RLock()
 
 
 def thread_safe(func):
