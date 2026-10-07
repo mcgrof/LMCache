@@ -5383,6 +5383,28 @@ impl RawBlockDevice {
         Ok(())
     }
 
+    /// Flush completed writes and device caches to persistent storage.
+    ///
+    /// Callers must await completion of every write this barrier must make
+    /// durable. Unrelated I/O may run concurrently; this does not substitute
+    /// for waiting on those operations. The kernel performs the file or block
+    /// device fsync without the GIL. Storage must honor flush commands for
+    /// the resulting durability guarantee to hold.
+    ///
+    /// Raises RuntimeError for closed or poisoned devices, and OSError
+    /// if the kernel cannot complete the flush.
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        self.ensure_io_available(false)?;
+        py.allow_threads(|| loop {
+            if unsafe { libc::fsync(self.fd) } == 0 {
+                return Ok(());
+            }
+            if errno() != libc::EINTR {
+                return Err(os_err("fsync failed"));
+            }
+        })
+    }
+
     /// Close the device after draining accepted I/O, without holding the GIL.
     ///
     /// Repeated successful calls are harmless. A bounded drain that cannot
