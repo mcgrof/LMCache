@@ -57,31 +57,59 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
 
         self.size = size
 
+        # A dma-buf backed buffer (config local_cpu_dmabuf) is ordinary
+        # page-backed memory to the CPU and the GPU; the dma-buf fd it also
+        # carries lets a raw_block backend register it with its device once.
+        self.dmabuf: Optional[str] = kwargs.get("dmabuf", None)
+        if self.dmabuf is None and config is not None:
+            self.dmabuf = getattr(config, "local_cpu_dmabuf", None)
+
         self.buffer = memory_management._allocate_cpu_memory(
-            size, self.numa_mapping, self.shm_name, use_hugepages=use_hugepages
+            size,
+            self.numa_mapping,
+            self.shm_name,
+            use_hugepages=use_hugepages,
+            dmabuf=self.dmabuf,
         )
 
         self._unregistered = False
+        # The exporter owns a page-rounded extent. Consumers allocate only
+        # the requested logical arena, which need not be a page multiple.
+        if self.dmabuf:
+            self.buffer = self.buffer[:size]
 
         self.pin_allocator: MemoryAllocatorInterface
-        if use_paging:
-            assert "shapes" in kwargs, (
-                "shapes must be specified for paged memory allocator"
+        try:
+            if use_paging:
+                assert "shapes" in kwargs, (
+                    "shapes must be specified for paged memory allocator"
+                )
+                assert "dtypes" in kwargs, (
+                    "dtypes must be specified for paged memory allocator"
+                )
+                assert "fmt" in kwargs, (
+                    "fmt must be specified for paged memory allocator"
+                )
+                self.pin_allocator = PagedTensorMemoryAllocator(
+                    tensor=self.buffer,
+                    shapes=kwargs["shapes"],
+                    dtypes=kwargs["dtypes"],
+                    fmt=kwargs["fmt"],
+                )
+            else:
+                self.pin_allocator = TensorMemoryAllocator(
+                    self.buffer, align_bytes=self.align_bytes
+                )
+        except BaseException:
+            memory_management._free_cpu_memory(
+                self.buffer,
+                self.size,
+                self.numa_mapping,
+                self.shm_name,
+                use_hugepages=self.use_hugepages,
             )
-            assert "dtypes" in kwargs, (
-                "dtypes must be specified for paged memory allocator"
-            )
-            assert "fmt" in kwargs, "fmt must be specified for paged memory allocator"
-            self.pin_allocator = PagedTensorMemoryAllocator(
-                tensor=self.buffer,
-                shapes=kwargs["shapes"],
-                dtypes=kwargs["dtypes"],
-                fmt=kwargs["fmt"],
-            )
-        else:
-            self.pin_allocator = TensorMemoryAllocator(
-                self.buffer, align_bytes=self.align_bytes
-            )
+            self._unregistered = True
+            raise
 
         self.host_mem_lock = threading.Lock() if not use_paging else nullcontext()
 
@@ -271,6 +299,27 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
         if isinstance(self.pin_allocator, PagedTensorMemoryAllocator):
             return self.pin_allocator.get_paged_buffers()
         return None
+
+    def get_paged_dmabuf_regions(self) -> Optional[list[tuple[int, int]]]:
+        """
+        For each paged buffer, the (dma-buf fd, mapped base address) of the
+        dma-buf that exports it, when the buffer is dma-buf backed.
+
+        Returns:
+            One (fd, base) per paged buffer, or None when the allocator is not
+            paged or its memory is not dma-buf backed.  A raw_block backend
+            passes these to RawBlockDevice.register_fixed_dmabufs() so its
+            device maps the memory once instead of per command.
+        """
+        buffers = self.get_paged_buffers()
+        if not buffers:
+            return None
+        regions = [
+            memory_management.get_dmabuf_region(buf.data_ptr()) for buf in buffers
+        ]
+        if any(r is None for r in regions):
+            return None
+        return regions  # type: ignore[return-value]
 
     def __str__(self) -> str:
         return "MixedMemoryAllocator"
