@@ -141,6 +141,7 @@ def test_storage_pd_miss_is_scheduled_for_receipt_adoption(
         "retrieve_raises",
         "partial",
         "coverage",
+        "overlapping_prefix",
         "ordinary_partial",
     ],
 )
@@ -167,7 +168,7 @@ def test_failed_restore_returns_its_acknowledgement_capacity(
         req_id="local-request",
         token_ids=list(range(8)),
         slot_mapping=torch.arange(8),
-        load_spec=LoadSpec(0, 8, True),
+        load_spec=LoadSpec(3 if failure == "overlapping_prefix" else 0, 8, True),
         request_configs=None,
         storage_pd_request_id=status.req_id,
         storage_pd_statuses=(
@@ -195,6 +196,10 @@ def test_failed_restore_returns_its_acknowledgement_capacity(
             mask = torch.ones(8, dtype=torch.bool)
             if failure in ("partial", "ordinary_partial"):
                 mask[-1] = False
+            if failure == "overlapping_prefix":
+                # Five restored tokens plus three resident tokens is eight,
+                # but positions 0..2 overlap and positions 5..7 are missing.
+                mask[5:] = False
             return mask
 
     metadata = LMCacheConnectorMetadata(requests=[request])  # type: ignore[list-item]
@@ -217,6 +222,7 @@ def test_failed_restore_returns_its_acknowledgement_capacity(
     connector._storage_pd_acks_sent = OrderedDict()
     connector._storage_pd_ack_client = client
     connector._storage_pd_session_id = "session"
+    connector._storage_pd_ack_deadline_s = 1.0
     connector.config = SimpleNamespace(extra_config={})
     fallback_requests: list[str] = []
 

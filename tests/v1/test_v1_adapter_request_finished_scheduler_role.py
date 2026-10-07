@@ -214,18 +214,19 @@ def test_request_finished_engine_initialized_runs_storage_manager_cancel() -> No
     assert engine.storage_manager.cancelled == ["req-engine-abort"]
 
 
-def test_aborted_prefill_before_first_token_does_not_crash() -> None:
-    """A timed-out producer can be cancelled before it generated anything."""
+@pytest.mark.parametrize("output_token_ids", [[], [42]])
+def test_aborted_prefill_uses_public_output_tokens(output_token_ids: list[int]) -> None:
+    """Cancellation can arrive before or after the first output token."""
     engine = _FakeEngine()
     connector = _make_connector(engine=engine, lookup_client=None, async_loading=False)
     request = _make_aborted_request("req-aborted-before-first-token")
     request.kv_transfer_params = {"ret_first_tok": True}
-    request._output_token_ids = []
+    request.output_token_ids = output_token_ids
 
     delay_free, return_params = connector.request_finished(request, [0, 1])
 
     assert delay_free is False
-    assert return_params is None
+    assert return_params == ({"first_tok": 42} if output_token_ids else None)
     assert engine.storage_manager.cancelled == ["req-aborted-before-first-token"]
 
 

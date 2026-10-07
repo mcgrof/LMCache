@@ -423,6 +423,11 @@ class LMCacheEngine:
             Should include KV cache specific information (e.g., paged KV buffer
             and the page tables).
 
+        :return: The storage manager's asynchronous completion when a batch is
+            submitted, or None when no store is performed. In storage P/D mode
+            the completion carries the durable publication receipt; finishing
+            the GPU gather alone does not imply durable storage.
+
         :raises: ValueError if the number of Falses in the mask is not a
             multiple of the chunk size.
         """

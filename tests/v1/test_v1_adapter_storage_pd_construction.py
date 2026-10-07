@@ -47,17 +47,24 @@ class _FakeKVTransferConfig:
 class _FakeManager:
     """Stand in for LMCacheManager without starting any service."""
 
+    instances: list["_FakeManager"] = []
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.started = False
+        self.stopped = False
         self.post_init_calls = 0
         self.lmcache_engine: Optional[Any] = None
         self.lmcache_engine_metadata = None
+        _FakeManager.instances.append(self)
 
     def start_services(self) -> None:
         self.started = True
 
     def post_init(self) -> None:
         self.post_init_calls += 1
+
+    def stop_services(self) -> None:
+        self.stopped = True
 
 
 class _RecordingSender:
@@ -107,6 +114,7 @@ class _FakeParent:
 def _stub_service_layer(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Let __init__ run for real without services, sockets or Prometheus."""
     _RecordingSender.instances = []
+    _FakeManager.instances = []
     monkeypatch.setattr(vllm_v1_adapter, "LMCacheManager", _FakeManager)
     monkeypatch.setattr(
         vllm_v1_adapter,
@@ -117,6 +125,7 @@ def _stub_service_layer(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setattr(vllm_v1_adapter, "print_banner_once", lambda _stream: None)
     yield
     _RecordingSender.instances = []
+    _FakeManager.instances = []
 
 
 def _build(
@@ -215,6 +224,35 @@ def test_a_worker_with_no_way_to_announce_refuses_to_start(
     with pytest.raises(ValueError, match="pd_proxy_host"):
         _build(KVConnectorRole.WORKER, proxy=False, monkeypatch=monkeypatch)
     assert _RecordingSender.instances == []
+    assert _FakeManager.instances[0].stopped
+
+
+@pytest.mark.parametrize("failure", ["queue", "ack", "metrics"])
+def test_failed_constructor_closes_started_services(
+    failure: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A constructor that raises must leave no owned background service."""
+    extra: dict[str, Any] = {}
+    if failure == "queue":
+        extra["rust_raw_block.status_queue_capacity"] = 0
+    elif failure == "ack":
+        extra["rust_raw_block.role"] = "reader"
+        extra["rust_raw_block.ack_max_owed"] = 0
+    else:
+
+        def fail_metrics(self: LMCacheConnectorV1Impl) -> None:
+            raise ValueError("metrics setup failed")
+
+        monkeypatch.setattr(LMCacheConnectorV1Impl, "_setup_metrics", fail_metrics)
+
+    with pytest.raises(ValueError):
+        _build(KVConnectorRole.WORKER, extra_config=extra, monkeypatch=monkeypatch)
+
+    assert len(_FakeManager.instances) == 1
+    assert _FakeManager.instances[0].started
+    assert _FakeManager.instances[0].stopped
+    assert len(_RecordingSender.instances) == 1
+    assert len(_RecordingSender.instances[0].closed_with) == 1
 
 
 def test_a_worker_told_to_run_without_a_consumer_builds_neither(

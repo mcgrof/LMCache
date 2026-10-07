@@ -30,7 +30,6 @@ import threading
 import time
 
 # Third Party
-from vllm.v1.request import RequestStatus
 import pytest
 import torch
 
@@ -40,6 +39,7 @@ pytest.importorskip("vllm")
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
 )
+from vllm.v1.request import RequestStatus
 
 # First Party
 from lmcache.integration.vllm.vllm_v1_adapter import (

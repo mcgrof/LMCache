@@ -549,15 +549,19 @@ class LMCacheConnectorV1Impl:
 
         service_factory = VllmServiceFactory(config, vllm_config, role.name.lower())
         self._manager = LMCacheManager(config, service_factory, connector=self)
+        # Construction can fail after services or a notification worker start.
+        # Establish their ownership before any such failure can occur.
+        self._storage_pd_status_sender: Optional[StoragePDStatusSender] = None
+        self._storage_pd_notify_queue: Optional[StoragePDNotificationQueue] = None
+        self._storage_pd_ack_client: Optional[StoragePDAckClient] = None
 
-        # Start services managed by LMCacheManager
-        self._manager.start_services()
-
-        # Initialize connector-specific state
-        self._init_connector_state(role, vllm_config, config)
-
-        # Setup metrics for monitoring data structures
-        self._setup_metrics()
+        try:
+            self._manager.start_services()
+            self._init_connector_state(role, vllm_config, config)
+            self._setup_metrics()
+        except BaseException:
+            self.shutdown()
+            raise
 
         logger.info(
             "LMCache initialized for role %s with version %s, "
@@ -639,11 +643,11 @@ class LMCacheConnectorV1Impl:
         # writer that was unreachable comes back, and tying retries to the
         # next restore makes a lost acknowledgement wait for traffic that
         # may never arrive.
-        self._storage_pd_ack_client: Optional[StoragePDAckClient] = None
+        self._storage_pd_ack_client = None
         self._storage_pd_lock = threading.Lock()
         self._storage_pd_tp_rank = 0
-        self._storage_pd_status_sender: Optional[StoragePDStatusSender] = None
-        self._storage_pd_notify_queue: Optional[StoragePDNotificationQueue] = None
+        self._storage_pd_status_sender = None
+        self._storage_pd_notify_queue = None
         # Whether a consumer is waiting to be told about this producer's
         # publications. It does not depend on which role this instance
         # plays, so an instance that completes requests without a sender
@@ -892,6 +896,9 @@ class LMCacheConnectorV1Impl:
 
         Non-layerwise synchronous loads release each request's lookup pins
         before loading the next request, allowing CPU cache space to be reused.
+        Shared-storage loads restore only the adopted manifest and acknowledge
+        it only when every token is resident or restored. A proxy continuation
+        token is computed by vLLM, not looked up as part of that manifest.
 
         Args:
             forward_context (ForwardContext): the forward context.
@@ -964,6 +971,19 @@ class LMCacheConnectorV1Impl:
                     request,
                     restore_attempt_id=restore_attempt_id,
                 )
+                status, published_tokens = adopted_publication
+                if lmcache_cached_tokens < published_tokens:
+                    self._release_storage_pd_ack_reservation(status)
+                    raise RuntimeError(
+                        "storage P/D restore did not cover the advertised "
+                        f"manifest for {request.req_id}: published_tokens="
+                        f"{published_tokens}, lmcache_cached_tokens="
+                        f"{lmcache_cached_tokens}"
+                    )
+                # The decoder prompt can include the producer's first output
+                # token. Its KV was never published; including it changes the
+                # final partial chunk's key and turns a valid READY into a miss.
+                lmcache_cached_tokens = published_tokens
             if self.use_layerwise:
                 if idx == last_idx:
                     sync = True
@@ -1067,9 +1087,13 @@ class LMCacheConnectorV1Impl:
                     restored_tokens = int(
                         ret_token_mask[:published_tokens].sum().item()
                     )
-                    if lmcache_cached_tokens < published_tokens or (
-                        resident_tokens + restored_tokens < published_tokens
-                    ):
+                    # A chunk-aligned load may re-read part of the resident
+                    # prefix. Counted overlap cannot stand in for missing tail
+                    # tokens when deciding whether the writer may reuse bytes.
+                    missing_tokens = not bool(
+                        ret_token_mask[resident_tokens:published_tokens].all().item()
+                    )
+                    if len(ret_token_mask) < published_tokens or missing_tokens:
                         self._release_storage_pd_ack_reservation(status)
                         raise RuntimeError(
                             "storage P/D restore did not cover the advertised "
@@ -1856,7 +1880,9 @@ class LMCacheConnectorV1Impl:
         )
 
     @_lmcache_nvtx_annotate
-    def _init_storage_pd_notification(self, config, extra_config: dict) -> None:
+    def _init_storage_pd_notification(
+        self, config: LMCacheEngineConfig, extra_config: dict[str, Any]
+    ) -> None:
         """Build this worker's status sender, or refuse the configuration.
 
         Only a worker reaches this. The scheduler builds no sender by design
@@ -1962,6 +1988,15 @@ class LMCacheConnectorV1Impl:
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
+        """Return producer requests whose durable status delivery has settled.
+
+        Args:
+            finished_req_ids: Requests whose model execution has ended.
+
+        Returns:
+            Finished sends and receives, respectively. Only writer workers
+            complete sends; extent reuse still requires the reader's ACK.
+        """
         if (
             not self._storage_pd_mode
             or self._storage_pd_raw_role != "writer"
@@ -2157,7 +2192,7 @@ class LMCacheConnectorV1Impl:
         return invalid_blocks
 
     @_lmcache_nvtx_annotate
-    def shutdown(self):
+    def shutdown(self) -> None:
         """Shutdown the connector by delegating to LMCacheManager."""
         logger.info("Starting LMCacheConnector shutdown...")
         try:
@@ -2451,8 +2486,16 @@ class LMCacheConnectorV1Impl:
             return
 
         if num_external_tokens == 0:
-            # No need to load anything
-            self.load_specs[request.request_id].can_load = False
+            # A local prefix hit removes the payload allocation requirement,
+            # but READY still owns an outstanding publication. Let the worker
+            # adopt it and settle its claim even when no new blocks are needed.
+            storage_pd_statuses, _ = _extract_storage_pd_request(
+                kv_transfer_params,
+                extract_request_configs(request.sampling_params),
+            )
+            self.load_specs[request.request_id].can_load = (
+                storage_pd_statuses is not None
+            )
             return
 
         recalc_last = (
@@ -2792,7 +2835,7 @@ class LMCacheConnectorV1Impl:
         # NOTE: Used to stream back the first token
         # for disagg prefill
         if params is not None and "ret_first_tok" in params:
-            output_token_ids = getattr(request, "_output_token_ids", ())
+            output_token_ids = request.output_token_ids
             if output_token_ids:
                 return_params = {
                     "first_tok": output_token_ids[0],
