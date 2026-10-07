@@ -6,9 +6,10 @@ from __future__ import annotations
 
 # Standard
 from collections import OrderedDict
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Iterator, Optional, Sequence
 import enum
 import threading
 import time
@@ -167,6 +168,9 @@ class RawBlockPDRequestTracker:
         self._core = core
         self._max_live_leases = max_live_leases
         self._lock = threading.Lock()
+        self._pending_failures: list[
+            tuple[Future[RawBlockPublicationReceipt], BaseException]
+        ] = []
         self._requests: dict[str, _RequestState] = {}
         self._finished: OrderedDict[str, Future[RawBlockPublicationReceipt]] = (
             OrderedDict()
@@ -230,7 +234,7 @@ class RawBlockPDRequestTracker:
         if not set(completed_keys).issubset(batch_key_set):
             raise ValueError("completed keys must belong to the registered batch")
         publish: tuple[str, list[str], Future[RawBlockPublicationReceipt]] | None
-        with self._lock:
+        with self._request_update():
             if self._closed:
                 raise RuntimeError("raw-block P/D request tracker is closed")
             if (
@@ -248,7 +252,7 @@ class RawBlockPDRequestTracker:
                     f"bound of {self._max_live_leases}; refusing to publish "
                     f"{req_id} rather than abandon one of them"
                 )
-            if req_id in self._finished:
+            if req_id in self._finished or req_id in self._leases:
                 raise RuntimeError(
                     f"request {req_id} has already finished and cannot be "
                     "registered again"
@@ -342,7 +346,7 @@ class RawBlockPDRequestTracker:
     ) -> Future[RawBlockPublicationReceipt]:
         """Mark an existing request complete when its final batch has no new keys."""
         publish: tuple[str, list[str], Future[RawBlockPublicationReceipt]] | None
-        with self._lock:
+        with self._request_update():
             remembered = self._finished.get(req_id)
             if remembered is not None:
                 return remembered
@@ -385,7 +389,7 @@ class RawBlockPDRequestTracker:
     ) -> None:
         """Record successful writes for one batch."""
         publish: tuple[str, list[str], Future[RawBlockPublicationReceipt]] | None
-        with self._lock:
+        with self._request_update():
             state = self._requests.get(req_id)
             if state is None or state.terminal.done():
                 return
@@ -407,14 +411,14 @@ class RawBlockPDRequestTracker:
 
     def fail_request(self, req_id: str, error: BaseException) -> None:
         """Fail a request once and prevent publication."""
-        with self._lock:
+        with self._request_update():
             state = self._requests.get(req_id)
             if state is not None:
                 self._fail_locked(req_id, state, error)
 
     def finish_request(self, req_id: str) -> None:
         """Fail a request that ended before its final batch was registered."""
-        with self._lock:
+        with self._request_update():
             state = self._requests.get(req_id)
             if (
                 state is not None
@@ -447,7 +451,7 @@ class RawBlockPDRequestTracker:
         a separate decision with a separate authority, and lives in
         :meth:`release_quiesced_leases`.
         """
-        with self._lock:
+        with self._request_update():
             if self._closed:
                 return not self._publishing
             self._closed = True
@@ -1108,8 +1112,19 @@ class RawBlockPDRequestTracker:
                         encoded_keys=list(encoded_keys),
                         receipt=receipt,
                     )
-                    terminal.set_result(receipt)
                     self._retire_locked(req_id, terminal)
+            if owned:
+                try:
+                    terminal.set_result(receipt)
+                except InvalidStateError:
+                    if not terminal.cancelled():
+                        raise
+                    self.release_unread(
+                        req_id,
+                        receipt,
+                        expected_writer_epoch=receipt.writer_epoch,
+                        reason="publication future cancelled before receipt delivery",
+                    )
             if not owned:
                 # The request ended while this was in flight, so nothing
                 # will ever release these extents by name. Let them go
@@ -1127,6 +1142,28 @@ class RawBlockPDRequestTracker:
 
         publication.add_done_callback(finish)
 
+    @contextmanager
+    def _request_update(self) -> Iterator[None]:
+        """Publish terminal failures only after request state is unlocked.
+
+        Future callbacks run synchronously and may query or change tracker
+        state. Retire requests first, then invoke callbacks outside the lock.
+        """
+        try:
+            with self._lock:
+                try:
+                    yield
+                finally:
+                    failures = self._pending_failures
+                    self._pending_failures = []
+        finally:
+            for terminal, error in failures:
+                try:
+                    terminal.set_exception(error)
+                except InvalidStateError:
+                    if not terminal.cancelled():
+                        raise
+
     def _fail_locked(
         self,
         req_id: str,
@@ -1137,7 +1174,7 @@ class RawBlockPDRequestTracker:
         if release_protection is not None:
             release_protection(req_id)
         if not state.terminal.done():
-            state.terminal.set_exception(error)
+            self._pending_failures.append((state.terminal, error))
         self._retire_locked(req_id, state.terminal)
 
     def _retire_locked(

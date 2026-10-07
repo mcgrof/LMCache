@@ -975,7 +975,7 @@ class RawBlockCloseOutcome:
         write with, and can only know at that point that everything it had
         handed over was answered for. If the close that follows then cannot
         prove quiescence -- because the worker quarantined something on its
-        way out -- the index is already durable and may name an extent whose
+        way out -- the index is already published and may name an extent whose
         write was never observed. It is written and it is not vouched for,
         and those are different things a caller has to be able to tell
         apart.
@@ -1089,22 +1089,9 @@ def _logical_payload_len(memory_obj: MemoryObj) -> int:
     their logical size comes from the metadata instead.
     """
     if _device_payload_tensor(memory_obj) is not None:
-        # TensorMemoryObj.get_size() returns a group prefix sum computed once
-        # at construction from the pool's grouped shapes.  A paged allocator
-        # rebinds a free block by updating the scalar meta.shape and slicing
-        # raw_data, and never refreshes that sum, so a reused block reports
-        # the pool's full chunk even when it now holds the final partial
-        # chunk of a request.  The engine writes from raw_data, so take the
-        # length from what this object actually describes.
-        #
-        # An explicit used-length override is already the logical length, and
-        # a grouped object's length is the sum over its groups: neither may be
-        # replaced by the scalar shape.  This lane supports only the
-        # single-group device representation, so refuse anything else rather
-        # than silently truncating it.
-        # Decide whether the representation is supported before trusting any
-        # length from it.  An override narrows a length; it does not make a
-        # grouped object single-group, so it cannot be returned first.
+        # Paged objects refresh their logical layout when reused; the public
+        # size accessor includes that layout and any explicit used-byte limit.
+        # Grouped device representations remain outside this lane's contract.
         meta = memory_obj.metadata
         shapes = getattr(meta, "shapes", None)
         if shapes is not None and len(shapes) > 1:
@@ -1113,10 +1100,6 @@ def _logical_payload_len(memory_obj: MemoryObj) -> int:
                 "is not supported by the raw-block lane; its logical length "
                 "is the sum over the groups, not the scalar shape"
             )
-        if getattr(memory_obj, "_used_size_override", None) is not None:
-            return int(memory_obj.get_size())
-        if meta.shape is not None and meta.dtype is not None:
-            return int(meta.shape.numel()) * int(meta.dtype.itemsize)
         return int(memory_obj.get_size())
     return len(memory_obj.byte_array)
 
@@ -2013,7 +1996,11 @@ class RawBlockCore:
 
         Args:
             keys: Ordered raw-block key specs corresponding to ``objs``.
-            objs: Memory objects whose byte buffers should be written.
+            objs: Memory objects whose byte buffers should be written. Device
+                callers must finish GPU writes and zero the physical alignment
+                tail before submission. The V2/V3 GPU connectors order
+                ``zero_padding()`` on their store stream and wait before handoff;
+                this storage layer does not own the producer stream.
             placement_ids: Optional per-key FDP placement identifiers for
                 raw-block writes. ``None`` omits the directive; explicit identifier
                 0 is rejected because default writes already use that mapping.
@@ -2493,6 +2480,12 @@ class RawBlockCore:
         Raises:
             RuntimeError: If called on a reader, a key is absent, or the
                 checkpoint cannot be written.
+            OSError: If either persistence barrier fails. No receipt is issued.
+
+        Notes:
+            Strict publications flush prior KV and checkpoint payload writes
+            before writing the commit header, then flush that header before
+            returning. The storage stack must honor flush completion.
         """
         if self.role != "writer":
             raise RuntimeError("only a writer core can publish a request")
@@ -3048,7 +3041,7 @@ class RawBlockCore:
                 logger.error(
                     "RawBlockCore %s published a final index and then could "
                     "not prove the device was finished (%s). That index is "
-                    "durable and may name an extent whose write was never "
+                    "visible and may name an extent whose write was never "
                     "observed; a later incarnation reading it will serve "
                     "those bytes as a hit.",
                     self.device_path,
@@ -3284,10 +3277,11 @@ class RawBlockCore:
         """Prepare a raw-block write straight out of a device memory object.
 
         The engine writes from the object's physical slot, so the O_DIRECT
-        tail past the logical payload must fit inside that slot.  The tail is
-        not zeroed: prior bytes in the slot are also persisted to storage.
-        A load consumes only the logical payload, but that does not prevent
-        disclosure through the aligned physical tail on the storage target.
+        tail past the logical payload must fit inside that slot. The caller
+        must initialize that tail and finish all GPU writes before submission.
+        V2/V3 connectors call ``zero_padding()`` on the store stream and fence
+        the handoff. This layer cannot safely clear bytes on an unrelated stream;
+        direct callers must provide the same initialized-buffer contract.
 
         Raises:
             RuntimeError: If the payload or its aligned length exceeds the
@@ -4781,6 +4775,11 @@ class RawBlockCore:
             [IO_KIND_CHECKPOINT],
             io_context=self._metadata_io_context,
         )
+        if self._derivation is not None:
+            # O_DIRECT completion establishes visibility, not persistence.
+            # Persist KV data and this checkpoint payload before its commit
+            # header can reach storage, then persist the header before READY.
+            self._rawdev().flush()
         self._write_buffers(
             [target],
             [header_block],
@@ -4790,6 +4789,10 @@ class RawBlockCore:
             [IO_KIND_CHECKPOINT],
             io_context=self._metadata_io_context,
         )
+
+        if self._derivation is not None:
+            self._rawdev().flush()
+            self.raise_if_failed()
 
         with self._lock:
             self._meta_seq = int(next_seq)

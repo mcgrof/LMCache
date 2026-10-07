@@ -6,7 +6,7 @@ from __future__ import annotations
 
 # Standard
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event
+from threading import Event, Thread
 from typing import Any
 
 # Third Party
@@ -69,6 +69,47 @@ class _FakeCore:
         self.linked_publications.append((req_id, receipt))
 
 
+@pytest.mark.parametrize("outcome", ["success", "failure", "invalid_batch", "close"])
+def test_terminal_callbacks_can_query_retired_tracker_state(outcome: str) -> None:
+    """Synchronous Future callbacks must not run inside the admission lock."""
+    core = _FakeCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    terminal = tracker.register_batch(
+        "callback-request", ["key"], expected_chunks=1, is_last_batch=True
+    )
+    callback_finished = Event()
+    statuses: list[dict[str, int]] = []
+
+    def callback(_future) -> None:
+        statuses.append(tracker.report_status())
+        callback_finished.set()
+
+    def settle() -> None:
+        if outcome == "success":
+            core.allow_publish.set()
+            tracker.complete_batch("callback-request", ["key"])
+        elif outcome == "failure":
+            tracker.fail_request("callback-request", OSError("write failed"))
+        elif outcome == "invalid_batch":
+            tracker.complete_batch("callback-request", ["unknown"])
+        else:
+            tracker.close()
+
+    terminal.add_done_callback(callback)
+    worker = Thread(target=settle, daemon=True)
+    worker.start()
+    try:
+        assert callback_finished.wait(2), "terminal callback deadlocked on tracker"
+        worker.join(2)
+        assert not worker.is_alive()
+        assert statuses[0]["inflight_request_count"] == 0
+        assert statuses[0]["live_lease_count"] == (1 if outcome == "success" else 0)
+    finally:
+        core.allow_publish.set()
+        if callback_finished.is_set():
+            tracker.close()
+
+
 def test_tracker_waits_for_every_write_before_publication() -> None:
     core = _FakeCore()
     tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
@@ -108,6 +149,36 @@ def test_tracker_waits_for_every_write_before_publication() -> None:
     # from the next writer, and nothing here says a reader is done with
     # them.
     assert core.leased == ["key-1", "key-2"]
+
+
+def test_cancellation_at_receipt_delivery_releases_an_unclaimed_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling the public future cannot consume admission capacity forever."""
+    core = _FakeCore()
+    tracker = RawBlockPDRequestTracker(core)  # type: ignore[arg-type]
+    terminal = tracker.register_batch(
+        "cancel-at-delivery", ["key"], expected_chunks=1, is_last_batch=True
+    )
+    set_result = terminal.set_result
+    delivery_attempted = Event()
+
+    def cancel_before_delivery(receipt: RawBlockPublicationReceipt) -> None:
+        assert terminal.cancel()
+        delivery_attempted.set()
+        set_result(receipt)
+
+    monkeypatch.setattr(terminal, "set_result", cancel_before_delivery)
+    try:
+        core.allow_publish.set()
+        tracker.complete_batch("cancel-at-delivery", ["key"])
+        assert delivery_attempted.wait(2)
+        assert tracker.close(timeout_s=2)
+        assert terminal.cancelled()
+        assert tracker.live_lease_count() == 0
+        assert core.leased == []
+    finally:
+        tracker.close()
 
 
 def test_tracker_failure_never_publishes() -> None:

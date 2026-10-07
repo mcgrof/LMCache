@@ -1122,3 +1122,106 @@ def test_control_connect_failure_closes_each_created_socket(
     assert transport.connect.call_count > 0
     assert transport.close.call_count == transport.connect.call_count
     transport.close.assert_called_with(linger=0)
+
+
+def test_ack_client_refuses_another_clients_reservation() -> None:
+    """Capacity ownership cannot move merely because endpoints are equal."""
+    owner = StoragePDAckClient(max_live_obligations=1, attempt_timeout_ms=10)
+    other = StoragePDAckClient(max_live_obligations=1, attempt_timeout_ms=10)
+    endpoint = "127.0.0.1:1"
+    try:
+        reservation = owner.reserve(endpoint=endpoint)
+        assert reservation is not None
+        other_reservation = other.reserve(endpoint=endpoint)
+        assert other_reservation is not None
+        with pytest.raises(RuntimeError, match="another client"):
+            other.owe(
+                _ack(),
+                endpoint=endpoint,
+                session_id="session",
+                deadline_s=1,
+                reservation=reservation,
+            )
+        assert owner.reserved_count() == 1
+        assert other.reserved_count() == 1
+        assert other.live_count() == 0
+        assert not reservation.spent
+        reservation.release()
+        reservation.release()
+        assert owner.reserved_count() == 0
+        assert other.reserved_count() == 1
+        other_reservation.release()
+    finally:
+        owner.close()
+        other.close()
+
+
+def test_released_ack_reservation_cannot_consume_another_tokens_capacity() -> None:
+    """A stale token cannot replace the live token that reused its capacity."""
+    client = StoragePDAckClient(max_live_obligations=1, attempt_timeout_ms=10)
+    endpoint = "127.0.0.1:1"
+    try:
+        returned = client.reserve(endpoint=endpoint)
+        assert returned is not None
+        returned.release()
+        current = client.reserve(endpoint=endpoint)
+        assert current is not None
+        returned.release()
+        with pytest.raises(RuntimeError, match="spent"):
+            client.owe(
+                _ack(),
+                endpoint=endpoint,
+                session_id="session",
+                deadline_s=1,
+                reservation=returned,
+            )
+        assert current.spent is False
+        assert client.reserved_count() == 1
+        assert client.reserve(endpoint=endpoint) is None
+        current.release()
+    finally:
+        client.close()
+
+
+def test_ack_obligation_keeps_the_first_settled_answer() -> None:
+    """Shutdown cannot overwrite a writer answer, or vice versa."""
+    obligation = StoragePDAckObligation(
+        _ack(),
+        endpoint="127.0.0.1:1",
+        session_id="session",
+        deadline=1,
+    )
+    assert obligation.settle(ACK_APPLIED, "writer answered")
+    assert not obligation.settle(ACK_UNRESOLVED, "shutdown")
+    assert obligation.wait(timeout=0) == ACK_APPLIED
+    assert obligation.reason == "writer answered"
+
+
+def test_competing_ack_settlements_keep_one_complete_answer() -> None:
+    """A shutdown result and worker result compete for one immutable answer."""
+    obligation = StoragePDAckObligation(
+        _ack(),
+        endpoint="127.0.0.1:1",
+        session_id="session",
+        deadline=1,
+    )
+    start = threading.Barrier(3)
+    accepted: list[tuple[str, str]] = []
+
+    def settle(outcome: str, reason: str) -> None:
+        start.wait(timeout=5)
+        if obligation.settle(outcome, reason):
+            accepted.append((outcome, reason))
+
+    workers = [
+        threading.Thread(target=settle, args=(ACK_APPLIED, "writer")),
+        threading.Thread(target=settle, args=(ACK_UNRESOLVED, "shutdown")),
+    ]
+    for worker in workers:
+        worker.start()
+    start.wait(timeout=5)
+    for worker in workers:
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+    assert len(accepted) == 1
+    assert (obligation.wait(timeout=0), obligation.reason) == accepted[0]

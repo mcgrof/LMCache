@@ -466,6 +466,7 @@ class StoragePDAckObligation:
         self.deadline = deadline
         self.attempts = 0
         self._settled = threading.Event()
+        self._settlement_lock = threading.Lock()
         self._outcome: Optional[str] = None
         self._reason = ""
 
@@ -486,12 +487,23 @@ class StoragePDAckObligation:
         self._settled.wait(timeout=timeout)
         return self._outcome
 
-    def _settle(self, outcome: str, reason: str) -> None:
-        if self._settled.is_set():
-            return
-        self._outcome = outcome
-        self._reason = reason
-        self._settled.set()
+    def settle(self, outcome: str, reason: str) -> bool:
+        """Record the first terminal answer, atomically across worker/shutdown.
+
+        Args:
+            outcome: The acknowledged result or an unresolved shutdown result.
+            reason: Human-readable explanation associated with that result.
+
+        Returns:
+            True if this call settled the obligation; False if already settled.
+        """
+        with self._settlement_lock:
+            if self._settled.is_set():
+                return False
+            self._outcome = outcome
+            self._reason = reason
+            self._settled.set()
+            return True
 
 
 class StoragePDAckReservation:
@@ -508,28 +520,20 @@ class StoragePDAckReservation:
     does not happen.
     """
 
-    __slots__ = ("endpoint", "_client", "_spent")
+    __slots__ = ("endpoint", "_client")
 
     def __init__(self, client: "StoragePDAckClient", endpoint: str) -> None:
         self._client = client
         self.endpoint = endpoint
-        self._spent = False
 
     @property
     def spent(self) -> bool:
-        return self._spent
+        """Return whether this reservation has been released or consumed."""
+        return not self._client.has_reservation(self)
 
     def release(self) -> None:
-        """Give the room back, for a read that did not happen."""
-        if self._spent:
-            return
-        self._spent = True
-        self._client._return_reservation()
-
-    def _spend(self) -> None:
-        if self._spent:
-            raise RuntimeError("this acknowledgement reservation is already spent")
-        self._spent = True
+        """Give room back exactly once, for a read that did not happen."""
+        self._client.release_reservation(self)
 
 
 class StoragePDAckClient:
@@ -576,7 +580,7 @@ class StoragePDAckClient:
         # their reads have not finished. Counted against the same bound as
         # the owed ones: the bound is on acknowledgements this consumer is
         # responsible for, and a read in progress is already one of those.
-        self._reserved = 0
+        self._reservations: set[StoragePDAckReservation] = set()
         # Sessions a writer has told this consumer it is not the reader of.
         # The answer cannot change while the session lasts -- the binding is
         # another incarnation's for its life -- so asking again would only
@@ -600,7 +604,7 @@ class StoragePDAckClient:
 
     def reserved_count(self) -> int:
         with self._lock:
-            return self._reserved
+            return len(self._reservations)
 
     def reserve(self, *, endpoint: str) -> Optional[StoragePDAckReservation]:
         """Take room for one acknowledgement, before the read that owes it.
@@ -621,24 +625,42 @@ class StoragePDAckClient:
             if self._stopping:
                 return None
             self._owed = [item for item in self._owed if not item.settled]
-            if len(self._owed) + self._reserved >= self._max_live:
+            if len(self._owed) + len(self._reservations) >= self._max_live:
                 logger.error(
                     "Storage P/D owes %d unanswered acknowledgement(s) and "
                     "has %d read(s) in progress, at its bound of %d; "
                     "refusing to read more rather than read something it "
                     "cannot acknowledge",
                     len(self._owed),
-                    self._reserved,
+                    len(self._reservations),
                     self._max_live,
                 )
                 return None
-            self._reserved += 1
-        return StoragePDAckReservation(self, endpoint)
+            reservation = StoragePDAckReservation(self, endpoint)
+            self._reservations.add(reservation)
+            return reservation
 
-    def _return_reservation(self) -> None:
+    def has_reservation(self, reservation: StoragePDAckReservation) -> bool:
+        """Return whether this client owns the live reservation supplied.
+
+        Args:
+            reservation: Capacity token returned by :meth:`reserve`.
+
+        Returns:
+            True only while this client holds that exact unused token.
+        """
         with self._lock:
-            if self._reserved > 0:
-                self._reserved -= 1
+            return reservation in self._reservations
+
+    def release_reservation(self, reservation: StoragePDAckReservation) -> None:
+        """Release an unused token atomically with acknowledgement admission.
+
+        Args:
+            reservation: Token to return. Already returned, consumed, or foreign
+                tokens do not change this client's capacity.
+        """
+        with self._lock:
+            self._reservations.discard(reservation)
 
     def claim(
         self,
@@ -735,6 +757,10 @@ class StoragePDAckClient:
         Optional restore identities correlate the causal receipt with the read.
         Record acceptance before the worker can send the acknowledgement, so a
         fast writer cannot apply it before its obligation appears in the trace.
+
+        Raises:
+            ValueError: The reservation names a different producer endpoint.
+            RuntimeError: The reservation is spent or belongs to another client.
         """
         if reservation.endpoint != endpoint:
             raise ValueError(
@@ -749,9 +775,11 @@ class StoragePDAckClient:
         with self._lock:
             if self._stopping:
                 return None
-            reservation._spend()
-            if self._reserved > 0:
-                self._reserved -= 1
+            if reservation not in self._reservations:
+                raise RuntimeError(
+                    "acknowledgement reservation is spent or belongs to another client"
+                )
+            self._reservations.remove(reservation)
             self._owed = [item for item in self._owed if not item.settled]
             self._owed.append(obligation)
             if restore_attempt_id:
@@ -792,7 +820,7 @@ class StoragePDAckClient:
         with self._lock:
             owed = list(self._owed)
         for obligation in owed:
-            obligation._settle(
+            obligation.settle(
                 ACK_UNRESOLVED, "the consumer stopped before a writer answered"
             )
         return quiesced
@@ -842,7 +870,7 @@ class StoragePDAckClient:
                 obligation.ack.req_id,
                 obligation.attempts,
             )
-            obligation._settle(ACK_UNRESOLVED, "the deadline passed unanswered")
+            obligation.settle(ACK_UNRESOLVED, "the deadline passed unanswered")
             return
         # One attempt may not outspend what the obligation has left. The
         # deadline is absolute and is never refreshed, so an attempt given
@@ -884,7 +912,7 @@ class StoragePDAckClient:
                 reply.outcome,
                 f" ({reply.reason})" if reply.reason else "",
             )
-            obligation._settle(reply.outcome, reply.reason)
+            obligation.settle(reply.outcome, reply.reason)
             return
         # Unresolved: the writer answered and could not say. Keep asking
         # until the obligation's own deadline.
@@ -1006,6 +1034,7 @@ class StoragePDUnreadObligation:
         self.deadline = deadline
         self.attempts = 0
         self._settled = threading.Event()
+        self._settlement_lock = threading.Lock()
         self._outcome: Optional[str] = None
         self._detail = ""
 
@@ -1026,12 +1055,23 @@ class StoragePDUnreadObligation:
         self._settled.wait(timeout=timeout)
         return self._outcome
 
-    def _settle(self, outcome: str, detail: str = "") -> None:
-        if self._settled.is_set():
-            return
-        self._outcome = outcome
-        self._detail = detail
-        self._settled.set()
+    def settle(self, outcome: str, detail: str = "") -> bool:
+        """Record the first terminal no-reader decision atomically.
+
+        Args:
+            outcome: Writer decision or unresolved shutdown result.
+            detail: Explanation associated with that result.
+
+        Returns:
+            True if this call settled the obligation; False if already settled.
+        """
+        with self._settlement_lock:
+            if self._settled.is_set():
+                return False
+            self._outcome = outcome
+            self._detail = detail
+            self._settled.set()
+            return True
 
 
 class StoragePDUnreadClient:
@@ -1163,7 +1203,7 @@ class StoragePDUnreadClient:
         with self._lock:
             owed = list(self._owed.values())
         for obligation in owed:
-            obligation._settle(
+            obligation.settle(
                 UNREAD_UNRESOLVED,
                 "the proxy stopped before the writer answered",
             )
@@ -1207,7 +1247,7 @@ class StoragePDUnreadClient:
     ) -> None:
         now = time.monotonic()
         if now >= obligation.deadline:
-            obligation._settle(
+            obligation.settle(
                 UNREAD_UNRESOLVED,
                 "the deadline passed without a writer decision",
             )
@@ -1227,9 +1267,9 @@ class StoragePDUnreadClient:
                 self._next_attempt[key] = now + self._retry_interval_s
             return
         if reply.released:
-            obligation._settle(UNREAD_RELEASED, reply.reason)
+            obligation.settle(UNREAD_RELEASED, reply.reason)
         else:
-            obligation._settle(UNREAD_REJECTED, reply.reason)
+            obligation.settle(UNREAD_REJECTED, reply.reason)
 
     def _exchange(
         self,
