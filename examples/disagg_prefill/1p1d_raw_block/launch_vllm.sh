@@ -8,6 +8,11 @@ role=${1:?"usage: launch_vllm.sh <writer|reader> [model]"}
 model=${2:-meta-llama/Llama-3.1-8B-Instruct}
 device=${LMCACHE_RAW_DEVICE:?"set LMCACHE_RAW_DEVICE to a dedicated by-id path"}
 gpu_buffer_bytes=${LMCACHE_GPU_BUFFER_BYTES:-4294967296}
+gpu_buffer_provider=${LMCACHE_GPU_BUFFER_PROVIDER:-native}
+case "$gpu_buffer_provider" in
+    native|vulkan_rm) ;;
+    *) echo "LMCACHE_GPU_BUFFER_PROVIDER must be native or vulkan_rm." >&2; exit 1 ;;
+esac
 # One slot must hold a full KV chunk plus its header; size it for the model.
 slot_bytes=${LMCACHE_RAW_SLOT_BYTES:-9437184}
 # Zero uses the entire raw namespace. A bounded value is useful for
@@ -80,6 +85,8 @@ printf -v extra_config \
     '{"storage_plugin.raw_block.module_path":"lmcache.v1.storage_backend.plugins.rust_raw_block_backend","storage_plugin.raw_block.class_name":"RustRawBlockBackend","storage_plugin.raw_block.required":true,%s"rust_raw_block.device_path":"%s","rust_raw_block.capacity_bytes":%s,"rust_raw_block.slot_bytes":%s,"rust_raw_block.io_engine":"io_uring","rust_raw_block.use_odirect":true,"rust_raw_block.use_uring_cmd":false,"rust_raw_block.gpu_buffer_bytes":%s,"rust_raw_block.require_dmabuf_registration":true,"rust_raw_block.publish_after_put":false,"rust_raw_block.publish_min_interval_ms":0,"rust_raw_block.meta_enable_periodic":false,"rust_raw_block.index_refresh_min_ms":1,"rust_raw_block.publication_adopt_timeout_ms":30000,"rust_raw_block.status_send_timeout_s":5,"rust_raw_block.ack_listen_port":%s,"rust_raw_block.ack_listen_host":"%s","rust_raw_block.ack_advertise_host":"%s","rust_raw_block.require_extent_reuse":true}' \
     "$role_settings" "$device" "$capacity_bytes" "$slot_bytes" "$gpu_buffer_bytes" \
     "$ack_port" "$ack_bind_host" "$ack_advertise_host"
+
+extra_config=$(python3 -c 'import json,sys; c=json.loads(sys.argv[1]); c["rust_raw_block.gpu_buffer_provider"]=sys.argv[2]; print(json.dumps(c))' "$extra_config" "$gpu_buffer_provider")
 
 # Both nodes must derive the same key for the same tokens, in separate
 # processes. Two things decide that, and both have to match.
