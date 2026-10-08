@@ -3,6 +3,7 @@
 # Standard
 from contextlib import nullcontext
 from typing import List, Optional, Union
+import importlib
 import math
 import os
 import threading
@@ -26,6 +27,7 @@ from lmcache.v1.memory_management import (
 )
 
 logger = init_logger(__name__)
+_RETAINED_PROVIDER_ALLOCATORS: list["GPUMemoryAllocator"] = []
 
 
 class GPUMemoryAllocator(MemoryAllocatorInterface):
@@ -37,6 +39,7 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
         device=torch_device_type,
         align_bytes: Optional[int] = None,
         use_paging: bool = False,
+        buffer_provider: str = "native",
         **kwargs,
     ) -> None:
         """Create a pool aligned for whole host-page DMA-BUF exports.
@@ -47,11 +50,27 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
             device: Device on which the backing tensor is allocated.
             align_bytes: Alignment for allocations when paging is disabled.
             use_paging: Whether fixed-size chunk slots are used.
+            buffer_provider: ``native`` (default) or explicit experimental
+                ``vulkan_rm`` allocation/export. Vulkan/RM requires CUDA,
+                its optional native extension and the supported NVIDIA ABI.
             **kwargs: Paged pools require ``shapes``, ``dtypes``, and ``fmt``.
 
         Raises:
-            ValueError: A required paged-pool argument is absent.
+            ValueError: Pool geometry or provider selection is invalid.
+            RuntimeError: The selected provider cannot initialize. Provider
+                failure never switches an allocation already handed to callers.
         """
+        self._provider_fd = -1
+        self._closed = False
+        self.buffer_provider = buffer_provider
+        if buffer_provider not in ("native", "vulkan_rm"):
+            raise ValueError("GPU buffer provider must be native or vulkan_rm")
+        if buffer_provider == "vulkan_rm" and (
+            torch.version.hip is not None or not torch_dev.is_available()
+        ):
+            raise RuntimeError(
+                "Vulkan/RM staging requires an available NVIDIA CUDA GPU"
+            )
         if not torch_dev.is_available():
             device = "cpu"
 
@@ -72,11 +91,48 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
             // allocation_alignment
             * allocation_alignment
         )
-        self._backing = torch.empty(
-            aligned_size + page, dtype=torch.uint8, device=device
-        )
-        start = (-self._backing.data_ptr()) % page
-        self.tensor = self._backing[start : start + aligned_size]
+        if buffer_provider == "native":
+            self._backing = torch.empty(
+                aligned_size + page, dtype=torch.uint8, device=device
+            )
+            start = (-self._backing.data_ptr()) % page
+            self.tensor = self._backing[start : start + aligned_size]
+        else:
+            if aligned_size <= 0 or aligned_size > 1 << 30:
+                raise ValueError(
+                    "Vulkan/RM staging pool must be between one page and 1 GiB"
+                )
+            selected = torch.device(device)
+            if selected.type != "cuda":
+                raise ValueError("Vulkan/RM staging requires a CUDA device")
+            try:
+                helper = importlib.import_module("lmcache._vulkan_rm")
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Vulkan/RM staging needs the optional "
+                    "BUILD_WITH_VULKAN_RM=1 extension"
+                ) from exc
+            ordinal = selected.index
+            if ordinal is None:
+                ordinal = torch_dev.current_device()
+            # The native storage deleter retains all allocation/export owners
+            # through every tensor alias; the FD returned here is borrowed.
+            tensor, borrowed_fd, identity = helper.allocate(aligned_size, ordinal)
+            if (
+                tensor.device != torch.device("cuda", ordinal)
+                or tensor.dtype != torch.uint8
+                or tensor.ndim != 1
+                or tensor.numel() != aligned_size
+                or not tensor.is_contiguous()
+                or tensor.data_ptr() % page
+            ):
+                raise RuntimeError(
+                    "Vulkan/RM helper returned an invalid staging tensor"
+                )
+            self._backing = tensor
+            self.tensor = tensor
+            self._provider_fd = os.dup(borrowed_fd)
+            logger.info("GPU staging provider=vulkan_rm %s", identity)
 
         self.allocator: MemoryAllocatorInterface
         if use_paging:
@@ -93,11 +149,10 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
             self.allocator = TensorMemoryAllocator(self.tensor, **kwargs)
 
         self.device_mem_lock = threading.Lock() if not use_paging else nullcontext()
-        # dma-buf regions of the GPU buffer, exported on first request; they let
+        # Native DMA-BUF regions, exported on first request; they let
         # a raw_block backend register the paged buffers with its NVMe device so
         # loads and stores DMA straight to device memory.
         self._dmabuf_regions: Optional[list[tuple[int, int, int]]] = None
-        self._closed = False
 
     @_lmcache_nvtx_annotate
     def allocate(
@@ -119,6 +174,8 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
             A memory object, or ``None`` if the inner allocator is full.
         """
         with self.device_mem_lock:
+            if self.buffer_provider == "vulkan_rm" and self._closed:
+                return None
             return self.allocator.allocate(shapes, dtypes, fmt, str(self))
 
     @_lmcache_nvtx_annotate
@@ -143,6 +200,8 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
             Memory objects, or ``None`` if the inner allocator is full.
         """
         with self.device_mem_lock:
+            if self.buffer_provider == "vulkan_rm" and self._closed:
+                return None
             return self.allocator.batched_allocate(
                 shapes, dtypes, batch_size, fmt, str(self)
             )
@@ -188,14 +247,32 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
         return None
 
     def get_paged_dmabuf_regions(self) -> Optional[list[tuple[int, int]]]:
-        """
-        For each paged buffer, the (dma-buf fd, mapped base) of the dma-buf
-        chunk of the GPU buffer that contains it, exporting the buffer on
-        first use.  None when not paged or when the device cannot export.
+        """Return each paged buffer's (DMA-BUF FD, mapped base).
+
+        Native export occurs on first use. Vulkan/RM exports during pool
+        initialization and resolves views against that owned logical extent.
+
+        Returns:
+            Regions, or ``None`` when not paged or native export is unavailable.
+
+        Raises:
+            RuntimeError: A Vulkan/RM pool is closed or a view exceeds its extent.
         """
         buffers = self.get_paged_buffers()
         if not buffers:
             return None
+        if self.buffer_provider == "vulkan_rm":
+            if self._closed:
+                raise RuntimeError("Vulkan/RM staging pool is closed")
+            base = self.tensor.data_ptr()
+            end = base + self.tensor.numel()
+            if any(
+                buf.data_ptr() < base
+                or buf.data_ptr() + buf.numel() * buf.element_size() > end
+                for buf in buffers
+            ):
+                raise RuntimeError("Paged buffer exceeds its Vulkan/RM logical extent")
+            return [(self._provider_fd, base) for _ in buffers]
         if self._dmabuf_regions is None:
             try:
                 self._dmabuf_regions = memory_management.export_device_dmabufs(
@@ -218,8 +295,25 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
         return regions  # type: ignore[return-value]
 
     def close(self) -> None:
-        """Release dma-buf handles exported for the GPU arena."""
+        """Release registration FDs after the caller proves storage quiescence.
+
+        Vulkan/RM tensor aliases continue to own the native allocation graph.
+        Its final storage deleter waits for CUDA quiescence, then destroys the
+        mapping, RM and Vulkan objects. Failed cleanup retains the graph and
+        seals provider admission. Closing an allocator does not prove I/O drain.
+        """
         if self._closed:
+            return
+        if self.buffer_provider == "vulkan_rm":
+            self._closed = True
+            fd, self._provider_fd = self._provider_fd, -1
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    _RETAINED_PROVIDER_ALLOCATORS.append(self)
+                    raise
+            self.allocator.close()
             return
         try:
             if self._dmabuf_regions:
