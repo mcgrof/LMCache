@@ -1457,15 +1457,10 @@ class RawBlockCore:
                 raise ValueError(
                     "require_dmabuf_registration is incompatible with use_uring_cmd"
                 )
-            try:
-                target_mode = os.stat(self.device_path).st_mode
-            except OSError as exc:
+            target_mode = os.stat(self.device_path).st_mode
+            if not (stat.S_ISBLK(target_mode) or stat.S_ISREG(target_mode)):
                 raise ValueError(
-                    "require_dmabuf_registration requires an existing block device"
-                ) from exc
-            if not stat.S_ISBLK(target_mode):
-                raise ValueError(
-                    "require_dmabuf_registration requires a block-device target"
+                    "strict DMA-BUF target must be a block device or regular file"
                 )
         if self.use_uring_cmd:
             try:

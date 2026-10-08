@@ -36,6 +36,37 @@ The logical payload size and physical I/O size remain separate.
 GPU staging does not fall back to host-pointer registration, POSIX I/O, or
 NVMe ``io_uring_cmd``. Unsupported export or registration fails setup.
 
+Strict filesystem targets
+-------------------------
+
+``rust_raw_block.require_dmabuf_registration: true`` accepts a block device
+or a regular file on qualified XFS/ext4 over NVMe. It requires ordinary
+``io_uring`` and ``O_DIRECT`` in both cases. File selection does not weaken
+registration, GPU ownership or publication durability. No test-only bypass
+is needed for the file configuration.
+
+The native preflight checks the opened descriptor, not only its pathname.
+The configured capacity must fit the target. For files, FIEMAP checks that
+initialized private extents cover the whole cache range. Sparse holes,
+unwritten preallocation, reflinks/shared extents, inline or encoded data and
+other filesystems are rejected. Allocate and initialize the complete range
+before starting either role; ``fallocate`` alone leaves unwritten extents.
+Keep the file exclusively assigned to the cache. External truncation, hole
+punching, reflinking or replacement while the group is running is unsupported.
+The kernel must preserve DMA-BUF direct I/O without a buffered fallback.
+
+This is admission support, not certification of every XFS/ext4 mount or GPU.
+The device/exporter pair still needs independent payload checks and serving
+qualification. The publication flush contract is the same for files and block
+devices. Unplanned process restart and physical reset recovery are not added.
+
+Run the native admission regressions only in assigned scratch space:
+
+.. code-block:: bash
+
+   LMCACHE_TEST_STRICT_FILESYSTEM_DIR=/qualified/filesystem \
+     pytest -xvs tests/v1/storage_backend/test_raw_block_filesystem.py
+
 The pool is bounded and has no evictor. Exhaustion returns no allocation;
 callers can skip a store or recompute a miss. Producer and gather readiness
 are fenced before external storage DMA reads the staging bytes. A failed

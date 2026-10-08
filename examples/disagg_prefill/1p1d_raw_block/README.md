@@ -1,7 +1,7 @@
 # Raw-block storage P/D proof of concept
 
 This example runs one vLLM prefiller and one decoder against one dedicated raw
-NVMe namespace. Payload I/O is ordinary block `io_uring` with O_DIRECT and
+NVMe namespace or one initialized XFS/ext4 file on NVMe. Payload I/O is ordinary `io_uring` with O_DIRECT and
 registered GPU dma-bufs. Nothing here uses NIXL.
 
 There are two ways to select this route. `pd_data_path=raw_block` says it
@@ -121,3 +121,69 @@ The launcher disables vLLM prefix caching, preserves the first-token
 continuation contract, saves the final partial chunk, and requires strict
 dma-buf registration. A valid correctness run still needs a fresh decoder or
 deliberately overwritten KV blocks and comparison with a no-LMCache oracle.
+
+## Strict filesystem configuration
+
+Select an existing, exclusively assigned regular file with `LMCACHE_RAW_FILE`
+instead of `LMCACHE_RAW_DEVICE`. Confirm that its cache area is expendable:
+
+```bash
+export LMCACHE_RAW_FILE=/absolute/path/to/disposable-cache.bin
+export LMCACHE_CONFIRM_FILE_OVERWRITE=$LMCACHE_RAW_FILE
+export LMCACHE_RAW_CAPACITY_BYTES=285212672
+export LMCACHE_RAW_SLOT_BYTES=9437184
+export LMCACHE_GPU_BUFFER_BYTES=268435456
+export LMCACHE_GPU_BUFFER_PROVIDER=vulkan_rm  # optional RTX provider; see build docs
+```
+
+The example capacity is 128 MiB of default metadata plus sixteen 9 MiB slots.
+Each slot includes its 4 KiB header; it fits the 8 MiB full BF16 KV chunk of
+Llama-3.2-1B-Instruct at 256 tokens and TP=1. Recompute these values for another
+model or tensor-parallel shard. The same file/inode must be visible to both
+roles. This local-NVMe profile is not a network-filesystem configuration.
+
+Create a **new** file and initialize every byte before launching. For example:
+
+```python
+import os
+
+path = "/absolute/path/to/disposable-cache.bin"
+capacity = 285212672
+fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+try:
+    os.posix_fallocate(fd, 0, capacity)
+    zeros = bytes(4 * 1024 * 1024)
+    for offset in range(0, capacity, len(zeros)):
+        data = zeros[:min(len(zeros), capacity - offset)]
+        if os.pwrite(fd, data, offset) != len(data):
+            raise RuntimeError("short file initialization")
+    os.fdatasync(fd)
+finally:
+    os.close(fd)
+```
+
+Strict startup validates the actual opened descriptor and rejects holes,
+unwritten space, reflinks, unsupported filesystems and capacity overflow.
+DMA-BUF registration remains mandatory. Do not enable
+`allow_unsafe_pd_io_for_testing` for this configuration. The file must remain
+private and unchanged by other applications while the group runs.
+
+For exact probability comparisons, qualify an explicit vLLM numerical profile.
+`VLLM_BATCH_INVARIANT=1` makes the tested BF16 eager text workload reproducible;
+without it, no-cache repeats can differ too. Report that selection and compare
+all outputs against the same no-cache profile without increasing tolerances.
+This does not qualify other models, kernels or serving configurations.
+
+## Causal evidence for reuse
+
+The optional timeline includes committed payload generations and their file
+offsets. Publication provenance binds those records to the manifest digest.
+The checker joins every range to completed writes from its original request,
+including when a later publication reuses it. A later overwrite makes the old
+generation invalid. Recovered data without its original trace remains unproved.
+
+A restore with no read CQE is accepted only when the adapter records that every
+published token is already resident and no token was restored. Exact publication
+adoption and the complete claim/ACK/decode chain are still required. This is
+zero storage work, not fabricated DMA-BUF traffic. Journal and request-ledger
+checks remain necessary to establish that the trace is complete.

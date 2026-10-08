@@ -42,7 +42,12 @@ CPU tests exercise receipt propagation, local-hit scheduling, exact token
 ranges, overlapping-prefix coverage, failure cleanup, and loopback control
 messages. They cannot validate CUDA/HIP stream completion, native DMA-BUF I/O,
 raw-device durability, or the real vLLM scheduler/worker lifecycle. Qualification
-requires the exact built tree on the target GPU, a separately provisioned raw
-device, and an unmodified supported vLLM installation. Include partial chunks,
+requires the exact built tree on the target GPU, an exclusively assigned
+storage target, and an unmodified supported vLLM installation. Initialized
+private filesystem targets need their own admission and payload checks;
+raw-device qualification needs a separately provisioned raw namespace.
+Include partial chunks,
 warm local prefixes, concurrent requests, cancellation, and stock serving in
-that run; a file-backed test or an import workaround is not a substitute.
+that run. File-backed results qualify only the tested filesystem profile;
+they do not establish raw-device correctness. Import workarounds do not
+qualify a stock vLLM installation.
