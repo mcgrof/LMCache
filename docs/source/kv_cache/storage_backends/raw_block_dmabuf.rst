@@ -15,7 +15,7 @@ Requirements and limits
 The Rust raw-block extension, a kernel implementing DMA-BUF fixed-buffer
 registration for ordinary ``io_uring``, a working GPU exporter, and a qualified
 device/filesystem/topology are required. Stock Linux does not provide this
-registration ABI. NVIDIA export needs open kernel modules and
+registration ABI. Native NVIDIA export needs open kernel modules and
 ``cuMemGetHandleForAddressRange``; ROCm export uses
 ``hsa_amd_portable_export_dmabuf`` and preserves driver-exported byte offsets
 without widening the pool's logical slice bounds.
@@ -112,3 +112,69 @@ This native connector/file test is not an ordinary engine-level store/retrieve
 or raw-device P/D validation. Those workloads require separate runtime gates.
 MP's server-owned raw-block adapter and its evolving L1 interfaces are not
 qualified as a GPU-staging route by this in-process integration.
+
+Optional Vulkan/RM NVIDIA staging
+----------------------------------
+
+``rust_raw_block.gpu_buffer_provider: native`` is the default. An experimental
+``vulkan_rm`` option allocates the staging pool through Vulkan, maps the same
+owned device-local allocation into CUDA using OPAQUE_FD, and exports a separate
+RM core DMA-BUF for storage. This can be useful when native CUDA DMA-BUF export
+returns error 801 (``CUDA_ERROR_NOT_SUPPORTED``). It does not re-export arbitrary
+Torch allocations, run inference in Vulkan, or add a host payload bounce.
+CUDA still runs the existing gather/scatter kernels. No vLLM option or patch
+is needed: this selects LMCache's staging allocator, not vLLM's KV allocator.
+The helper initializes the selected CUDA primary context before importing the
+external allocation, including in a process that has not allocated a Torch
+CUDA tensor yet.
+
+The CUDA import contract is described in `NVIDIA's external-memory guide
+<https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/graphics-interop.html#importing-memory-objects>`_.
+The final DMA-BUF export uses a version-coupled RM interface, not a stable CUDA
+API. This implementation supports only the NVIDIA 615.71.09 ABI, a single
+unlinked GPU identity, and a pool/backing extent of at most 1 GiB. Device,
+filesystem and topology qualification remains necessary; this is not a promise
+of support for every RTX GPU or NVIDIA driver.
+
+Build the optional helper with CUDA Torch, a matching CUDA toolkit, Vulkan
+development headers/loader, and a clean checkout of NVIDIA's public SDK source:
+
+.. code-block:: bash
+
+   git clone --depth 1 --branch 615.71.09 \
+     https://github.com/NVIDIA/open-gpu-kernel-modules.git /path/to/nvidia-sdk
+   BUILD_WITH_VULKAN_RM=1 LMCACHE_NVIDIA_RM_HEADERS=/path/to/nvidia-sdk \
+     pip install --no-build-isolation .
+
+The build verifies SDK commit ``61dcc93722ecb418bb5f2e00923f05b4b8051dd1``.
+Default builds do not require Vulkan. The native runtime does not load the
+helper or enumerate Vulkan devices. Add the following to the preceding YAML:
+
+.. code-block:: yaml
+
+   extra_config:
+     rust_raw_block.gpu_buffer_provider: vulkan_rm
+     rust_raw_block.gpu_buffer_bytes: 268435456
+     rust_raw_block.gpu_buffer_device: cuda:0
+
+Keep the other raw-block settings; the three lines above are additions, not a
+complete backend configuration. This is explicit selection, not automatic
+fallback: allocation/export/registration errors fail setup, with no provider
+switch after views or I/O have been published. Missing optional dependencies
+and unsupported RM versions produce errors. The allocation owner survives all
+tensor aliases and storage completion; uncertain I/O or failed cleanup retains
+owners rather than recycling potentially active memory.
+
+To exercise the actual provider and V2/V3 kernels on a qualified scratch
+filesystem, use exclusive new files with the existing test:
+
+.. code-block:: bash
+
+   LMCACHE_RUN_VULKAN_RM=1 LMCACHE_DMABUF_TEST_DIR=/qualified/filesystem \
+     pytest -xvs tests/v1/test_vulkan_rm_staging.py
+   LMCACHE_RUN_DMABUF_ORDERING=1 LMCACHE_DMABUF_TEST_PROVIDER=vulkan_rm \
+     LMCACHE_DMABUF_TEST_DIR=/qualified/filesystem \
+     pytest -xvs tests/v1/gpu_connector/test_vllm_staging_ordering_dmabuf.py
+
+These tests do not establish model-serving, raw-device P/D, reset/recovery or
+performance qualification, nor repair an unrelated numerical/ordering failure.

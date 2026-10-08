@@ -184,6 +184,15 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
             raise ValueError("RustRawBlockBackend requires config")
 
         extra = self.config.extra_config or {}
+        gpu_buffer_bytes = int(extra.get("rust_raw_block.gpu_buffer_bytes", 0) or 0)
+        provider = str(extra.get("rust_raw_block.gpu_buffer_provider", "native"))
+        if provider not in ("native", "vulkan_rm") or (
+            provider != "native" and gpu_buffer_bytes <= 0
+        ):
+            raise ValueError(
+                "rust_raw_block.gpu_buffer_provider must be native or vulkan_rm; "
+                "vulkan_rm requires positive gpu_buffer_bytes"
+            )
 
         # Every chunk this backend reads or writes has to live somewhere the
         # device can reach: the local CPU pool, or the GPU staging pool when
@@ -318,7 +327,6 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         # bounce.  Without it the local CPU allocator's pinned pages are the
         # endpoints and the GPU connector copies through the host.
         self._gpu_allocator: Optional[Any] = None
-        gpu_buffer_bytes = int(extra.get("rust_raw_block.gpu_buffer_bytes", 0) or 0)
         if gpu_buffer_bytes > 0:
             if self._core.io_engine != "io_uring" or self._core.use_uring_cmd:
                 self._core.close()
@@ -327,6 +335,7 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                 self._gpu_allocator = self._build_gpu_allocator(
                     gpu_buffer_bytes,
                     extra.get("rust_raw_block.gpu_buffer_device"),
+                    **({"buffer_provider": provider} if provider != "native" else {}),
                 )
             except BaseException:
                 try:
@@ -510,13 +519,17 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         """Validate and apply a raw-block metadata checkpoint payload."""
         return self._core.apply_loaded_state(data)
 
-    def _build_gpu_allocator(self, size_bytes: int, device: Optional[str]) -> Any:
+    def _build_gpu_allocator(
+        self, size_bytes: int, device: Optional[str], buffer_provider: str = "native"
+    ) -> Any:
         """Create the paged GPU staging pool used as the raw-block endpoint.
 
         The pool is paged with the engine's KV shapes so every slot is one
         chunk, exactly like the local CPU allocator, and the slot layout is
         what the engine registers with io_uring.  The metadata supplies the
         shapes and dtypes; without it there is no chunk geometry to page by.
+        ``buffer_provider`` selects allocation before any views or registrations
+        exist. It is independent of vLLM's model/KV allocator and connector.
         """
         # First Party
         from lmcache.v1.memory_allocators.gpu_memory_allocator import (
@@ -530,6 +543,8 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
                 "the KV chunk shapes"
             )
         kwargs: dict[str, Any] = {}
+        if buffer_provider != "native":
+            kwargs["buffer_provider"] = buffer_provider
         if device:
             kwargs["device"] = device
         allocator = GPUMemoryAllocator(

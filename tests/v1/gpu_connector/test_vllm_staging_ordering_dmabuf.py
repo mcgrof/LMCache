@@ -179,6 +179,7 @@ def test_native_staging_dmabuf_ordering(version: int, tokens: int) -> None:
         2 * 1024 * 1024,
         device=device,
         use_paging=True,
+        buffer_provider=os.environ.get("LMCACHE_DMABUF_TEST_PROVIDER", "native"),
         shapes=[STAGING_SHAPE],
         dtypes=[torch.float16],
         fmt=MemoryFormat.KV_2LTD,
