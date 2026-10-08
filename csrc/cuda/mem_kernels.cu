@@ -643,6 +643,8 @@ void multi_layer_kv_transfer_templated(
 
   int num_layers = key_value.size(1);
   int num_tokens = key_value.size(2);
+  TORCH_CHECK(skip_prefix_n_tokens >= 0 && skip_prefix_n_tokens <= num_tokens,
+              "skip_prefix_n_tokens must be between zero and num_tokens");
   int num_transfer_tokens = num_tokens - skip_prefix_n_tokens;
   int num_origin_elements = key_value.size(3);
   int elements_per_xword = sizeof(T) / key_value.element_size();
@@ -660,6 +662,9 @@ void multi_layer_kv_transfer_templated(
       engine_kv_format != EngineKVFormat::NL_X_NB_BSV_BSS || sizeof(T) == 4,
       "NL_X_NB_BSV_BSS requires 4-byte transfer units (row bytes "
       "must be divisible by 4 and not by 8)");
+  if (num_transfer_tokens == 0) {
+    return;
+  }
 
   // Fused packs K+V in the trailing dim (kv_size == 1, like MLA): single pass.
   int k_or_v_size =
