@@ -52,6 +52,23 @@ lease prevents request-ID reuse even after the bounded result history evicts
 that request. Cancellation before receipt delivery releases only an unclaimed
 publication; it cannot release bytes a reader claimed.
 
+## Filesystem admission and causal provenance
+
+Strict DMA-BUF setup accepts an initialized, private XFS/ext4 file as well
+as a block device. Native validation checks the opened descriptor, capacity,
+filesystem type and FIEMAP coverage before recovery reads or registration.
+Sparse, unwritten, shared or encoded extents are refused. Admission does not
+protect against an external owner modifying the file; exclusive assignment
+and qualified kernel/device behavior remain deployment requirements.
+
+A successful payload commit records its physical generation and original
+request. Local publication trace provenance includes the exact compatibility
+records covered by the manifest digest. The checker requires complete native
+write-CQE coverage of each range and refuses references superseded by a later
+commit at that extent. Deduplication reuses this proof, not a made-up new write.
+These diagnostic generations are not durable leases or a restart protocol;
+recovered entries without the original trace cannot establish provenance.
+
 ## Qualification
 
 CPU and native fault-seam tests check ownership, failure propagation, flush

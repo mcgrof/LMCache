@@ -7,7 +7,7 @@
 //! Design notes (for reviewers unfamiliar with Rust / Linux I/O):
 //! - This module exposes a very small surface to Python via PyO3.
 //! - We wrap Linux `pread` / `pwrite` on a file descriptor opened from a
-//!   block device (e.g., /dev/nvmeXnY) or a regular file (for tests).
+//!   block device (e.g., /dev/nvmeXnY) or a regular file.
 //! - When O_DIRECT is enabled, Linux requires aligned offsets and I/O sizes.
 //!   If Python buffers are aligned, we use them directly; otherwise we fallback
 //!   to a bounce buffer (aligned via `posix_memalign`) for safety.
@@ -1113,6 +1113,86 @@ fn fd_size_bytes(fd: RawFd) -> Result<u64, PyErr> {
         return Err(os_err("fstat failed"));
     }
     Ok(st.st_size as u64)
+}
+
+// Linux FIEMAP UAPI; the bounded array follows the fixed 32-byte header.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FileExtent {
+    logical: u64,
+    physical: u64,
+    length: u64,
+    reserved64: [u64; 2],
+    flags: u32,
+    reserved: [u32; 3],
+}
+
+#[repr(C)]
+struct FileExtentMap {
+    start: u64,
+    length: u64,
+    flags: u32,
+    mapped_extents: u32,
+    extent_count: u32,
+    reserved: u32,
+    extents: [FileExtent; 128],
+}
+
+fn validate_initialized_file(fd: RawFd, capacity: u64) -> PyResult<()> {
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: fs points to a writable statfs with the platform ABI.
+    if unsafe { libc::fstatfs(fd, &mut fs) } != 0 {
+        return Err(os_err("fstatfs failed"));
+    }
+    if fs.f_type != 0x58465342 && fs.f_type != 0xef53 {
+        return Err(PyValueError::new_err(
+            "strict DMA-BUF files require XFS or ext4",
+        ));
+    }
+    let mut covered = 0;
+    while covered < capacity {
+        let mut map = FileExtentMap {
+            start: covered,
+            length: capacity - covered,
+            flags: 1, // FIEMAP_FLAG_SYNC: resolve pending allocation first.
+            mapped_extents: 0,
+            extent_count: 128,
+            reserved: 0,
+            extents: [FileExtent::default(); 128],
+        };
+        // SAFETY: FS_IOC_FIEMAP receives the UAPI header and 128 extent slots.
+        if unsafe { libc::ioctl(fd, 0xc020660b as libc::c_ulong, &mut map) } != 0 {
+            return Err(os_err("FIEMAP failed"));
+        }
+        if map.mapped_extents == 0 {
+            return Err(PyValueError::new_err(
+                "strict DMA-BUF file contains a hole in the cache range",
+            ));
+        }
+        for extent in &map.extents[..map.mapped_extents as usize] {
+            // LAST is descriptive. Other flags identify uninitialized,
+            // shared, encoded or otherwise unsupported representations.
+            if extent.flags & !1 != 0 {
+                return Err(PyValueError::new_err(format!(
+                    "strict DMA-BUF file requires initialized private extents; flags={:#x}",
+                    extent.flags
+                )));
+            }
+            let end = extent.logical.checked_add(extent.length).ok_or_else(|| {
+                PyValueError::new_err("FIEMAP extent exceeds the file offset range")
+            })?;
+            if extent.logical > covered || end <= covered {
+                return Err(PyValueError::new_err(
+                    "strict DMA-BUF file contains a hole in the cache range",
+                ));
+            }
+            covered = end.min(capacity);
+            if covered == capacity {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 // NVMe helper functions for io_uring command support
@@ -3623,6 +3703,39 @@ impl RawBlockDevice {
     // Expose cached size to Python.
     fn size_bytes(&self) -> PyResult<u64> {
         Ok(self.size)
+    }
+
+    /// Validate the actual opened target before strict DMA-BUF setup.
+    ///
+    /// Accept block devices and initialized, private XFS/ext4 files. This
+    /// preflight does not register a buffer or prevent external file mutation.
+    fn validate_dmabuf_target(&self, capacity_bytes: u64) -> PyResult<&'static str> {
+        self.ensure_io_available(false)?;
+        if !self.use_odirect || self.use_uring_cmd {
+            return Err(PyValueError::new_err(
+                "strict DMA-BUF targets require ordinary O_DIRECT I/O",
+            ));
+        }
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: st points to a writable stat with the platform ABI.
+        if unsafe { libc::fstat(self.fd, &mut st) } != 0 {
+            return Err(os_err("fstat failed"));
+        }
+        if capacity_bytes == 0 || capacity_bytes > fd_size_bytes(self.fd)? {
+            return Err(PyValueError::new_err(
+                "strict DMA-BUF capacity must be positive and fit the opened target",
+            ));
+        }
+        match st.st_mode & libc::S_IFMT {
+            libc::S_IFBLK => Ok("block"),
+            libc::S_IFREG => {
+                validate_initialized_file(self.fd, capacity_bytes)?;
+                Ok("file")
+            }
+            _ => Err(PyValueError::new_err(
+                "strict DMA-BUF target must be a block device or regular file",
+            )),
+        }
     }
 
     /// Return the terminal io_uring submission error, or None if none occurred.
