@@ -623,6 +623,7 @@ def _read_hugepage_info() -> Optional[Tuple[int, int, int]]:
 # not accept for host registration. A udmabuf mapping uses the underlying
 # memfd VMA and can be registered through the platform abstraction.
 _DMABUF_REGIONS: dict[int, tuple[int, Any, int, int, bool]] = {}
+_CPU_DMABUF_GROUPS: dict[int, tuple[int, ...]] = {}
 
 _UDMABUF_CREATE = 0x40187542  # _IOW('u', 0x42, struct udmabuf_create)
 _UDMABUF_FLAGS_CLOEXEC = 0x01
@@ -635,7 +636,7 @@ _F_ADD_SEALS = 1033
 
 
 def _allocate_dmabuf_cpu_memory(
-    size: int, kind: str, use_hugepages: bool
+    size: int, kind: str, use_hugepages: bool, chunk_bytes: int | None = None
 ) -> torch.Tensor:
     """Export a host arena and keep its mapping and descriptors until release.
 
@@ -649,9 +650,13 @@ def _allocate_dmabuf_cpu_memory(
     import struct
 
     page = 2 * 1024 * 1024 if use_hugepages else 4096
+    if chunk_bytes is not None and (
+        kind != "udmabuf" or chunk_bytes <= 0 or chunk_bytes % page
+    ):
+        raise ValueError("chunked host exports require page-aligned udmabuf regions")
     size = (size + page - 1) // page * page
     backing_fd = -1
-    dmabuf_fd = -1
+    exports: list[tuple[int, int, int]] = []
     mm = None
     try:
         if kind == "udmabuf":
@@ -664,10 +669,15 @@ def _allocate_dmabuf_cpu_memory(
             dev = os.open("/dev/udmabuf", os.O_RDWR | os.O_CLOEXEC)
             try:
                 # This ioctl returns the export fd, not a populated fd field.
-                request = bytearray(
-                    struct.pack("IIQQ", backing_fd, _UDMABUF_FLAGS_CLOEXEC, 0, size)
-                )
-                dmabuf_fd = cast(int, fcntl.ioctl(dev, _UDMABUF_CREATE, request))
+                for offset in range(0, size, chunk_bytes or size):
+                    length = min(chunk_bytes or size, size - offset)
+                    request = bytearray(
+                        struct.pack(
+                            "IIQQ", backing_fd, _UDMABUF_FLAGS_CLOEXEC, offset, length
+                        )
+                    )
+                    fd = cast(int, fcntl.ioctl(dev, _UDMABUF_CREATE, request))
+                    exports.append((offset, length, fd))
             finally:
                 os.close(dev)
             mm = mmap.mmap(backing_fd, size, flags=mmap.MAP_SHARED)
@@ -683,6 +693,7 @@ def _allocate_dmabuf_cpu_memory(
                 )
                 fcntl.ioctl(heap, _DMA_HEAP_IOCTL_ALLOC, request)
                 dmabuf_fd = struct.unpack("QIIQ", bytes(request))[1]
+                exports.append((0, size, dmabuf_fd))
             finally:
                 os.close(heap)
             mm = mmap.mmap(dmabuf_fd, size, flags=mmap.MAP_SHARED)
@@ -708,18 +719,26 @@ def _allocate_dmabuf_cpu_memory(
     except BaseException:
         if mm is not None:
             mm.close()
-        if dmabuf_fd >= 0:
-            os.close(dmabuf_fd)
+        for _offset, _length, fd in exports:
+            os.close(fd)
         if backing_fd >= 0:
             os.close(backing_fd)
         raise
 
-    _DMABUF_REGIONS[ptr] = (dmabuf_fd, mm, backing_fd, size, host_registered)
+    for offset, length, fd in exports:
+        _DMABUF_REGIONS[ptr + offset] = (
+            fd,
+            mm if offset == 0 else None,
+            backing_fd if offset == 0 else -1,
+            length,
+            host_registered if offset == 0 else False,
+        )
+    _CPU_DMABUF_GROUPS[ptr] = tuple(ptr + offset for offset, _length, _fd in exports)
     logger.info(
-        "Allocated %d MiB of dma-buf backed host memory from %s (fd %d)",
+        "Allocated %d MiB of dma-buf backed host memory from %s (%d exports)",
         size >> 20,
         kind,
-        dmabuf_fd,
+        len(exports),
     )
     return buffer
 
@@ -880,6 +899,7 @@ def _allocate_cpu_memory(
     shm_name: Optional[str] = None,
     use_hugepages: bool = False,
     dmabuf: Optional[str] = None,
+    dmabuf_chunk_bytes: int | None = None,
 ) -> torch.Tensor:
     if size == 0:
         return torch.empty(0, dtype=torch.uint8)
@@ -889,7 +909,9 @@ def _allocate_cpu_memory(
             raise ValueError(
                 "dma-buf backed host memory is not supported with shm or NUMA mapping"
             )
-        return _allocate_dmabuf_cpu_memory(size, dmabuf, use_hugepages)
+        return _allocate_dmabuf_cpu_memory(
+            size, dmabuf, use_hugepages, dmabuf_chunk_bytes
+        )
 
     resolved = _resolve_pinned_alloc_free(
         numa_mapping,
@@ -951,10 +973,12 @@ def _free_cpu_memory(
         fd, mm, backing_fd, region_size, host_registered = _DMABUF_REGIONS[ptr]
         if host_registered and not current_device_spec.unpin_memory(ptr):
             raise RuntimeError("Cannot release DMA-BUF memory: host unregister failed")
-        _DMABUF_REGIONS.pop(ptr)
+        _DMABUF_REGIONS[ptr] = (fd, mm, backing_fd, region_size, False)
         del buffer
         mm.close()
-        os.close(fd)
+        for base in _CPU_DMABUF_GROUPS.pop(ptr):
+            export_fd, _mm, _bfd, _size, _registered = _DMABUF_REGIONS.pop(base)
+            os.close(export_fd)
         if backing_fd >= 0:
             os.close(backing_fd)
         return
@@ -1725,20 +1749,38 @@ class AddressManager:
 
     ALIGN_BYTES = 4096
 
-    def __init__(self, size: int, align_bytes: int = ALIGN_BYTES):
+    def __init__(
+        self,
+        size: int,
+        align_bytes: int = ALIGN_BYTES,
+        allocation_boundary_bytes: int | None = None,
+    ) -> None:
         """
         Initializes the AddressManager with a given size.
 
         Args:
             size: The initial size of the virtual address space.
             align_bytes: The alignment requirement for allocations.
+            allocation_boundary_bytes: Optional aligned power-of-two window.
+                Allocations cannot cross a window, even after coalescing.
+
+        Raises:
+            ValueError: The boundary is not a positive aligned power of two.
         """
         self._size = size
         self._align = align_bytes
+        if allocation_boundary_bytes is not None and (
+            align_bytes <= 0
+            or allocation_boundary_bytes <= 0
+            or allocation_boundary_bytes & (allocation_boundary_bytes - 1)
+            or allocation_boundary_bytes % align_bytes
+        ):
+            raise ValueError("allocation boundary must be an aligned power of two")
+        self._allocation_boundary = allocation_boundary_bytes
 
         # Current implementation: explicit list
         self._explicit_list: SortedList[FreeBlock] = SortedList(key=lambda x: x.start)
-        self._explicit_list.add(FreeBlock(start=0, size=size))
+        self._add_free_range(0, size)
 
         # thread safe lock
         self._lock = threading.Lock()
@@ -1762,13 +1804,17 @@ class AddressManager:
         self, curr_block: FreeBlock, prev_block: FreeBlock
     ) -> bool:
         """Hook: Check if curr_block can merge with prev_block."""
-        return prev_block.can_be_coalesced(curr_block)
+        return prev_block.can_be_coalesced(curr_block) and self._within_boundary(
+            prev_block.start, curr_block.start + curr_block.size
+        )
 
     def _can_merge_with_succ(
         self, curr_block: FreeBlock, succ_block: FreeBlock
     ) -> bool:
         """Hook: Check if curr_block can merge with succ_block."""
-        return curr_block.can_be_coalesced(succ_block)
+        return curr_block.can_be_coalesced(succ_block) and self._within_boundary(
+            curr_block.start, succ_block.start + succ_block.size
+        )
 
     @_lmcache_nvtx_annotate
     def _coalesce(
@@ -1983,13 +2029,9 @@ class AddressManager:
                 with the ALIGN_BYTES
         """
         size = self.compute_aligned_size(size)
-        new_block = FreeBlock(start=self._size, size=size)
-        prev_block = self._explicit_list[-1] if len(self._explicit_list) > 0 else None
-        succ_block = None
-        coalesced = self._coalesce(new_block, prev_block, succ_block)
-        if not coalesced:
-            self._explicit_list.add(new_block)
-
+        if size == 0:
+            return
+        self._add_free_range(self._size, size)
         self._size += size
 
     def get_heap_size(self) -> int:
@@ -2021,7 +2063,7 @@ class AddressManager:
         for prev, succ in zip(
             self._explicit_list[:-1], self._explicit_list[1:], strict=False
         ):
-            if prev.can_be_coalesced(succ):
+            if self._can_merge_with_succ(prev, succ):
                 return False
 
         # Check if total size matches
@@ -2030,6 +2072,21 @@ class AddressManager:
             return False
 
         return True
+
+    def _within_boundary(self, start: int, end: int) -> bool:
+        boundary = self._allocation_boundary
+        return boundary is None or start // boundary == (end - 1) // boundary
+
+    def _add_free_range(self, start: int, size: int) -> None:
+        end = start + size
+        while start < end:
+            boundary = self._allocation_boundary
+            stop = min(end, (start // boundary + 1) * boundary) if boundary else end
+            block = FreeBlock(start, stop - start)
+            prev = self._explicit_list[-1] if self._explicit_list else None
+            if not self._coalesce(block, prev, None):
+                self._explicit_list.add(block)
+            start = stop
 
 
 _CORE_EXPORTS = [

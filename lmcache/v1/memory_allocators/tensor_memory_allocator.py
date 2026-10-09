@@ -31,6 +31,7 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         tensor: torch.Tensor,
         align_bytes: int = AddressManager.ALIGN_BYTES,
         init_address_space: int | None = None,
+        allocation_boundary_bytes: int | None = None,
     ) -> None:
         """
         Args:
@@ -38,6 +39,8 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             align_bytes: The alignment requirement for allocations.
             init_address_space: Initial size of the address space. If None,
                 use the size of the provided tensor.
+            allocation_boundary_bytes: Optional window that allocations and
+                their physical padding must not cross.
 
         Note:
             The `init_address_space` is used for lazy memory allocation.
@@ -50,6 +53,7 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         self.address_manager = AddressManager(
             self.buffer.numel() if init_address_space is None else init_address_space,
             align_bytes,
+            allocation_boundary_bytes,
         )
 
         # For debugging purposes
@@ -106,6 +110,7 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         raw_data = self._get_buffer_slice(block_start, raw_size)
         return TensorMemoryObj(
             raw_data=raw_data,
+            physical_data=self._get_buffer_slice(block_start, aligned_size),
             metadata=MemoryObjMetadata(
                 shapes[0],
                 dtypes[0],

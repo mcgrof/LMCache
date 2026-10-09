@@ -11,16 +11,69 @@ import enum
 # First Party
 from lmcache.v1.distributed.api import L1BackendType, ObjectKey
 
+# Use 1 GiB windows to fit the supported fixed-buffer registration ABI.
+L1_REGISTRATION_WINDOW_BYTES = 1 << 30
+
+
+@dataclass(frozen=True)
+class L1MemoryRegion:
+    """Stable registration view whose mapping and FD are owned by its L1.
+
+    ``dmabuf_base`` is the mapping origin of the exported FD, not necessarily
+    the beginning of the full arena. Ordinary fixed buffers omit both fields.
+    """
+
+    ptr: int
+    size: int
+    dmabuf_fd: int | None = None
+    dmabuf_base: int | None = None
+
 
 @dataclass(frozen=True)
 class L1MemoryDesc:
-    """
-    Describes the L1 memory buffer registered with an external backend (e.g. Nixl).
+    """Describe an L1 arena and borrowed views for external registration.
+
+    The L1 manager owns every mapping and export FD. Consumers must prove
+    native shutdown before releasing that manager. Optional fixed regions
+    cover the full arena in order; existing consumers can use ptr and size.
     """
 
     ptr: int
     size: int
     align_bytes: int
+    buffer_registration: str = "none"
+    regions: tuple[L1MemoryRegion, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.buffer_registration == "none":
+            return
+        if self.buffer_registration not in ("fixed", "dmabuf"):
+            raise ValueError("unsupported L1 buffer registration mode")
+        cursor = self.ptr
+        end = self.ptr + self.size
+        if self.ptr <= 0 or self.size <= 0 or not self.regions:
+            raise ValueError("L1 registration requires a positive arena and regions")
+        if self.align_bytes <= 0 or self.ptr % self.align_bytes:
+            raise ValueError("L1 registration arena does not satisfy its alignment")
+        for region in self.regions:
+            if (
+                region.ptr != cursor
+                or region.size <= 0
+                or region.size > L1_REGISTRATION_WINDOW_BYTES
+            ):
+                raise ValueError(
+                    "L1 registration regions must cover the arena in order"
+                )
+            if self.buffer_registration == "dmabuf" and (
+                region.dmabuf_fd is None
+                or region.dmabuf_fd < 0
+                or region.dmabuf_base is None
+                or region.dmabuf_base > region.ptr
+            ):
+                raise ValueError("L1 registration requires complete DMA-BUF exports")
+            cursor += region.size
+        if cursor != end:
+            raise ValueError("L1 registration regions must cover the entire arena")
 
 
 @dataclass(frozen=True)

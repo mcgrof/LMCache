@@ -15,6 +15,7 @@ import os
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import L1BackendType
+from lmcache.v1.distributed.internal_api import L1_REGISTRATION_WINDOW_BYTES
 from lmcache.v1.distributed.l2_adapters.config import (
     L2AdapterConfigBase,
     L2AdaptersConfig,
@@ -311,8 +312,33 @@ class L1MemoryManagerConfig:
     devdax_size_in_bytes: int = 0
     """ Optional Device-DAX overflow size for hybrid DRAM + DAX L1. """
 
+    buffer_registration: Literal["none", "fixed", "dmabuf"] = "none"
+    """ Stable eager host regions for raw-block io_uring registration. """
+
     def __post_init__(self):
         self.init_size_in_bytes = min(self.init_size_in_bytes, self.size_in_bytes)
+
+        if self.buffer_registration not in ("none", "fixed", "dmabuf"):
+            raise ValueError("buffer_registration must be none, fixed or dmabuf")
+        if self.buffer_registration != "none":
+            if self.use_lazy or self.devdax_path:
+                raise ValueError("buffer registration requires eager host DRAM")
+            if (
+                self.align_bytes <= 0
+                or self.align_bytes & (self.align_bytes - 1)
+                or self.align_bytes > L1_REGISTRATION_WINDOW_BYTES
+                or self.size_in_bytes < self.align_bytes
+                or self.size_in_bytes > L1_REGISTRATION_WINDOW_BYTES * (1 << 14)
+            ):
+                raise ValueError("buffer registration exceeds io_uring region limits")
+            if self.buffer_registration == "dmabuf" and self.shm_name:
+                raise ValueError('DMA-BUF registration requires --shm-name ""')
+            if self.shm_name and self.align_bytes > 4096:
+                raise ValueError("fixed SHM registration requires alignment <= 4096")
+            if self.buffer_registration == "dmabuf" and self.align_bytes > (
+                2 << 20 if self.use_hugepages else 4096
+            ):
+                raise ValueError("DMA-BUF alignment exceeds the backing page size")
 
         if self.devdax_path is not None:
             self.devdax_path = self.devdax_path.strip()

@@ -566,6 +566,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     align_cpu_size_bytes,
                     use_paging=True,
                     use_hugepages=bool(config.local_cpu_dmabuf) and use_hugepages,
+                    allocation_boundary_bytes=None,
                     **kwargs,
                 )
 
