@@ -33,14 +33,23 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
     """
 
     def __init__(
-        self, size: int, use_paging: bool = False, use_hugepages: bool = False, **kwargs
+        self,
+        size: int,
+        use_paging: bool = False,
+        use_hugepages: bool = False,
+        allocation_boundary_bytes: int | None = None,
+        **kwargs,
     ) -> None:
         """
         :param int size: The size of the pinned memory in bytes.
         :param bool use_hugepages: Whether to use hugepages.
+        :param allocation_boundary_bytes: Optional registration window for
+            non-paged allocations and udmabuf exports.
         """
 
         self.numa_mapping = kwargs.get("numa_mapping", None)
+        if use_paging and allocation_boundary_bytes is not None:
+            raise ValueError("registration boundaries require non-paged allocations")
         self.use_hugepages = use_hugepages
         self.align_bytes = kwargs.get("align_bytes", AddressManager.ALIGN_BYTES)
         if self.align_bytes <= 0 or self.align_bytes & (self.align_bytes - 1) != 0:
@@ -64,13 +73,23 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
         if self.dmabuf is None and config is not None:
             self.dmabuf = getattr(config, "local_cpu_dmabuf", None)
 
-        self.buffer = memory_management._allocate_cpu_memory(
-            size,
+        self._backing_size = size + (
+            self.align_bytes - 1
+            if allocation_boundary_bytes is not None and not self.dmabuf
+            else 0
+        )
+        self._allocation_buffer = memory_management._allocate_cpu_memory(
+            self._backing_size,
             self.numa_mapping,
             self.shm_name,
             use_hugepages=use_hugepages,
             dmabuf=self.dmabuf,
+            dmabuf_chunk_bytes=allocation_boundary_bytes,
         )
+        self.buffer = self._allocation_buffer
+        if allocation_boundary_bytes is not None and not self.dmabuf:
+            offset = -self.buffer.data_ptr() % self.align_bytes
+            self.buffer = self.buffer[offset : offset + size]
 
         self._unregistered = False
         # The exporter owns a page-rounded extent. Consumers allocate only
@@ -98,12 +117,14 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
                 )
             else:
                 self.pin_allocator = TensorMemoryAllocator(
-                    self.buffer, align_bytes=self.align_bytes
+                    self.buffer,
+                    align_bytes=self.align_bytes,
+                    allocation_boundary_bytes=allocation_boundary_bytes,
                 )
         except BaseException:
             memory_management._free_cpu_memory(
-                self.buffer,
-                self.size,
+                self._allocation_buffer,
+                self._backing_size,
                 self.numa_mapping,
                 self.shm_name,
                 use_hugepages=self.use_hugepages,
@@ -280,8 +301,8 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
             if self.buffer.numel() == 0:
                 return
             memory_management._free_cpu_memory(
-                self.buffer,
-                self.size,
+                self._allocation_buffer,
+                self._backing_size,
                 self.numa_mapping,
                 self.shm_name,
                 use_hugepages=self.use_hugepages,

@@ -9,12 +9,17 @@ from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import L1BackendType, MemoryLayoutDesc
 from lmcache.v1.distributed.config import L1MemoryManagerConfig
 from lmcache.v1.distributed.error import L1Error
-from lmcache.v1.distributed.internal_api import L1MemoryDesc
+from lmcache.v1.distributed.internal_api import (
+    L1_REGISTRATION_WINDOW_BYTES,
+    L1MemoryDesc,
+    L1MemoryRegion,
+)
 from lmcache.v1.memory_allocators.lazy_memory_allocator import LazyMemoryAllocator
 from lmcache.v1.memory_allocators.mixed_memory_allocator import MixedMemoryAllocator
 from lmcache.v1.memory_management import (
     MemoryAllocatorInterface,
     MemoryObj,
+    get_dmabuf_region,
 )
 
 logger = init_logger(__name__)
@@ -70,6 +75,11 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
             config.align_bytes,
         )
         shm_name = config.shm_name
+        boundary = (
+            L1_REGISTRATION_WINDOW_BYTES
+            if config.buffer_registration != "none"
+            else None
+        )
         if shm_name:
             # Keep the lmcache_l1_pool_ prefix in normalized SHM names so
             # stale-segment cleanup can recognize and unlink user-provided names.
@@ -82,11 +92,14 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
                 align_bytes=config.align_bytes,
                 shm_name=shm_name,
                 use_hugepages=config.use_hugepages,
+                allocation_boundary_bytes=boundary,
             )
         return MixedMemoryAllocator(
             config.size_in_bytes,
             align_bytes=config.align_bytes,
             use_hugepages=config.use_hugepages,
+            allocation_boundary_bytes=boundary,
+            dmabuf="udmabuf" if config.buffer_registration == "dmabuf" else None,
         )
 
 
@@ -104,6 +117,7 @@ class L1MemoryManager:
         self._allocator = create_memory_allocator(config)
         self._size_in_bytes = config.size_in_bytes
         self._align_bytes = config.align_bytes
+        self._buffer_registration = config.buffer_registration
 
     def allocate(
         self, layout_desc: MemoryLayoutDesc, count: int
@@ -197,10 +211,12 @@ class L1MemoryManager:
         Return an L1MemoryDesc describing the underlying memory buffer.
 
         Returns:
-            L1MemoryDesc: Pointer, size, and alignment of the L1 buffer.
+            L1MemoryDesc: Pointer, size, alignment and optional stable regions.
+                Mapping and FD ownership remains with this manager.
 
         Raises:
             NotImplementedError: If the allocator type does not support this operation.
+            RuntimeError: A requested registration region lacks its DMA-BUF export.
         """
         if isinstance(self._allocator, MixedMemoryAllocator):
             buffer = self._allocator.buffer
@@ -212,10 +228,27 @@ class L1MemoryManager:
             raise NotImplementedError(
                 "get_l1_memory_desc is not implemented for this allocator type."
             )
+        ptr = buffer.data_ptr()
+        regions: list[L1MemoryRegion] = []
+        if self._buffer_registration != "none":
+            for offset in range(0, self._size_in_bytes, L1_REGISTRATION_WINDOW_BYTES):
+                region_ptr = ptr + offset
+                size = min(L1_REGISTRATION_WINDOW_BYTES, self._size_in_bytes - offset)
+                fd = base = None
+                if self._buffer_registration == "dmabuf":
+                    export = get_dmabuf_region(region_ptr)
+                    if export is None:
+                        raise RuntimeError(
+                            "L1 registration region lacks a DMA-BUF export"
+                        )
+                    fd, base = export
+                regions.append(L1MemoryRegion(region_ptr, size, fd, base))
         return L1MemoryDesc(
-            ptr=buffer.data_ptr(),
+            ptr=ptr,
             size=self._size_in_bytes,
             align_bytes=self._align_bytes,
+            buffer_registration=self._buffer_registration,
+            regions=tuple(regions),
         )
 
     def close(self) -> None:

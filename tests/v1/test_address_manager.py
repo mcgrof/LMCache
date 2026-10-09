@@ -13,6 +13,36 @@ import pytest
 from lmcache.v1.memory_management import AddressManager
 
 
+def test_registration_windows_survive_free_and_growth() -> None:
+    """Coalescing and growth preserve the registered allocation boundaries."""
+    manager = AddressManager(3 * 4096, allocation_boundary_bytes=8192)
+    first = manager.allocate(8192)
+    manager.free(*first)
+    with pytest.raises(RuntimeError):
+        manager.allocate(12288)
+    manager.sbrk(5 * 4096)
+    assert manager.batched_allocate(8192, 4) == [
+        (0, 8192),
+        (8192, 8192),
+        (16384, 8192),
+        (24576, 8192),
+    ]
+    for start in range(0, 32768, 8192):
+        manager.free(start, 8192)
+    assert manager.get_free_size() == 32768
+    assert manager.check_consistency()
+    with pytest.raises(RuntimeError):
+        manager.batched_allocate(8192, 5)
+    assert manager.get_free_size() == 32768
+    assert manager.allocate(8192) == (0, 8192)
+
+
+@pytest.mark.parametrize("boundary", [0, -4096, 6144, 2048])
+def test_registration_window_requires_aligned_power_of_two(boundary: int) -> None:
+    with pytest.raises(ValueError, match="boundary"):
+        AddressManager(8192, allocation_boundary_bytes=boundary)
+
+
 class TestAddressManagerBasic:
     """Test basic functionality of AddressManager."""
 
