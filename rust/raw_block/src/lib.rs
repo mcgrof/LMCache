@@ -2431,14 +2431,14 @@ fn fixed_buffer_for_range(
     };
 
     for (base, (index, size, dmabuf_offset)) in registrations {
-        let Some(base_offset) = *dmabuf_offset else {
-            continue;
-        };
         let Some(buffer_end) = base.checked_add(*size) else {
             continue;
         };
         if ptr_addr >= *base && range_end <= buffer_end {
-            return (Some(*index), Some(base_offset + (ptr_addr - *base)));
+            return (
+                Some(*index),
+                dmabuf_offset.map(|base_offset| base_offset + (ptr_addr - *base)),
+            );
         }
     }
 
@@ -2461,25 +2461,30 @@ mod fixed_buffer_range_tests {
     }
 
     #[test]
-    fn ordinary_fixed_buffer_does_not_match_an_interior_slice() {
+    fn ordinary_fixed_buffer_slice_keeps_slot_and_host_address() {
         let mut registrations = HashMap::new();
         registrations.insert(0x1000, (3, 0x4000, None));
 
         assert_eq!(
             fixed_buffer_for_range(&registrations, 0x2000, 0x1000),
-            (None, None)
+            (Some(3), None)
         );
     }
 
     #[test]
     fn range_cannot_extend_beyond_registered_buffer() {
-        let mut registrations = HashMap::new();
-        registrations.insert(0x1000, (3, 0x4000, Some(0x8000)));
-
-        assert_eq!(
-            fixed_buffer_for_range(&registrations, 0x4000, 0x2000),
-            (None, None)
-        );
+        for offset in [None, Some(0x8000)] {
+            let mut registrations = HashMap::new();
+            registrations.insert(0x1000, (3, 0x4000, offset));
+            assert_eq!(
+                fixed_buffer_for_range(&registrations, 0x4000, 0x2000),
+                (None, None)
+            );
+            assert_eq!(
+                fixed_buffer_for_range(&registrations, usize::MAX - 1, 0x2000),
+                (None, None)
+            );
+        }
     }
 }
 
