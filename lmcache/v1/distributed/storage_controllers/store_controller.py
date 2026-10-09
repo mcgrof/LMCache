@@ -23,7 +23,11 @@ from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L1ManagerListener
 from lmcache.v1.distributed.l1_manager import L1Manager
-from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
+from lmcache.v1.distributed.l2_adapters.base import (
+    L2AdapterInterface,
+    L2CloseOutcome,
+    L2TaskId,
+)
 from lmcache.v1.distributed.storage_controller import StorageControllerInterface
 from lmcache.v1.distributed.storage_controllers.adapter_lifecycle import (
     AddAdapterOp,
@@ -80,6 +84,7 @@ class StoreListener(L1ManagerListener):
 
     def __init__(self) -> None:
         self._pending_keys: list[ObjectKey] = []
+        self._closed = False
         self._lock = threading.Lock()
         self._event_fd = create_event_notifier()
 
@@ -94,8 +99,10 @@ class StoreListener(L1ManagerListener):
         return self._event_fd.fileno()
 
     def notify(self) -> None:
-        """Signal the notifier to wake any blocked poll() waiter."""
-        self._event_fd.notify()
+        """Wake a poll waiter while the listener is open."""
+        with self._lock:
+            if not self._closed:
+                self._event_fd.notify()
 
     def pop_pending_keys(self) -> list[ObjectKey]:
         """
@@ -130,8 +137,10 @@ class StoreListener(L1ManagerListener):
             keys (list[ObjectKey]): Keys that finished writing.
         """
         with self._lock:
+            if self._closed:
+                return
             self._pending_keys.extend(keys)
-        self._event_fd.notify()
+            self._event_fd.notify()
 
     def on_l1_keys_reserved_read(self, keys: list[ObjectKey]) -> None:
         pass
@@ -154,8 +163,11 @@ class StoreListener(L1ManagerListener):
         pass
 
     def close(self) -> None:
-        """Close the notifier."""
-        self._event_fd.close()
+        """Stop accepting callbacks and close the notifier once."""
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                self._event_fd.close()
 
 
 class StorePhase(enum.Enum):
@@ -183,6 +195,11 @@ class InFlightStoreTask:
     read_locked_keys: list[ObjectKey]
     """The subset of keys for which reserve_read succeeded
     (i.e., keys holding an L1 read lock that must be released)."""
+
+    io_lease_id: int | None = None
+    """L1 lease protecting submitted source buffers until ownership settles."""
+
+    buffers_reusable: bool = True
 
     l2_store_result: bool | None = None
     """L2 outcome (True=success, False=failure, None=still in flight)."""
@@ -311,21 +328,34 @@ class StoreController(StorageControllerInterface):
         self._thread.start()
 
     def stop(self) -> None:
-        """
-        Signal the loop to stop, wait for the thread to join.
+        """Stop submissions and conservatively retain unresolved I/O buffers."""
+        self.stop_submission()
+        self.finish_shutdown({})
 
-        Releases all in-flight read locks on shutdown so that
-        L1 objects are not permanently locked.
-        """
+    def stop_submission(self) -> None:
+        """Join the controller before adapter shutdown without releasing leases."""
         self._stop_flag.set()
-        # Wake up the poll loop so it can exit promptly
         self._listener.notify()
         self._thread.join()
-        self._cleanup_in_flight_tasks()
         self._listener.close()
         self._adapter_ctrl_efd.close()
         if StoreController._gauge_targets.get(self._l1_manager.config.tag) is self:
             del StoreController._gauge_targets[self._l1_manager.config.tag]
+
+    def finish_shutdown(self, outcomes: dict[int, L2CloseOutcome | None]) -> None:
+        """Settle pending sources after adapters close, using ownership proofs.
+
+        Args:
+            outcomes: Adapter IDs mapped to shutdown proofs, or None when an
+                adapter supplies only individual task completion proofs.
+        """
+        try:
+            self._drain_l2_store_completions(set(self._l2_adapters))
+            self._cleanup_in_flight_tasks(outcomes)
+        except Exception:
+            # A broken completion query cannot authorize releasing the arena.
+            self._l1_manager.retain_backing_resources()
+            raise
 
     def report_status(self) -> dict:
         """Return a status dict for the store controller."""
@@ -660,7 +690,9 @@ class StoreController(StorageControllerInterface):
                 continue
 
             adapter = self._l2_adapters[adapter_index]
+            lease_id = None
             try:
+                lease_id = l1_mgr.acquire_io_lease(successful_keys, successful_objs)
                 task_id = adapter.submit_store_task(successful_keys, successful_objs)
             except Exception:
                 logger.exception(
@@ -669,12 +701,15 @@ class StoreController(StorageControllerInterface):
                     len(successful_keys),
                 )
                 l1_mgr.finish_read(successful_keys)
+                if lease_id is not None:
+                    l1_mgr.release_io_lease(lease_id, buffers_reusable=True)
                 continue
 
             self._in_flight_tasks[(adapter_index, task_id)] = InFlightStoreTask(
                 adapter_index=adapter_index,
                 keys=successful_keys,
                 read_locked_keys=list(successful_keys),
+                io_lease_id=lease_id,
             )
             self._status_in_flight_count += 1
 
@@ -710,8 +745,8 @@ class StoreController(StorageControllerInterface):
         tasks, to be consumed by ``_advance_request``."""
         for adapter_index in signaled_adapters:
             adapter = self._l2_adapters[adapter_index]
-            completed = adapter.pop_completed_store_tasks()
-            for task_id, result in completed.items():
+            completed = adapter.pop_completed_store_outcomes()
+            for task_id, outcome in completed.items():
                 task = self._in_flight_tasks.get((adapter_index, task_id))
                 if task is None:
                     logger.warning(
@@ -720,8 +755,11 @@ class StoreController(StorageControllerInterface):
                         adapter_index,
                     )
                     continue
-                task.l2_store_result = result.is_successful()
-                task.l2_bytes_transferred = result.bytes_transferred()
+                task.buffers_reusable = outcome.buffers_reusable
+                task.l2_store_result = (
+                    outcome.buffers_reusable and outcome.result.is_successful()
+                )
+                task.l2_bytes_transferred = outcome.result.bytes_transferred()
 
     def _advance_request(
         self,
@@ -746,7 +784,13 @@ class StoreController(StorageControllerInterface):
         l1_mgr = self._l1_manager
         success = task.l2_store_result
 
+        if not task.buffers_reusable:
+            l1_mgr.retain_backing_resources()
         l1_mgr.finish_read(task.read_locked_keys)
+        if task.io_lease_id is not None:
+            l1_mgr.release_io_lease(
+                task.io_lease_id, buffers_reusable=task.buffers_reusable
+            )
         del self._in_flight_tasks[task_key]
         self._status_in_flight_count -= 1
 
@@ -796,11 +840,10 @@ class StoreController(StorageControllerInterface):
                 task.keys,
             )
 
-    def _cleanup_in_flight_tasks(self) -> None:
-        """
-        Release all held read locks for any in-flight tasks that
-        haven't completed. Called during stop().
-        """
+    def _cleanup_in_flight_tasks(
+        self, outcomes: dict[int, L2CloseOutcome | None]
+    ) -> None:
+        """Release known-quiescent tasks and retain every unresolved source."""
         l1_mgr = self._l1_manager
         for (adapter_index, task_id), task in self._in_flight_tasks.items():
             logger.warning(
@@ -809,5 +852,16 @@ class StoreController(StorageControllerInterface):
                 adapter_index,
                 len(task.read_locked_keys),
             )
+            proof = outcomes.get(adapter_index)
+            reusable = (
+                task.buffers_reusable
+                if task.l2_store_result is not None
+                else proof is not None and proof.buffers_reusable
+            )
+            if task.io_lease_id is not None and not reusable:
+                l1_mgr.retain_backing_resources()
             l1_mgr.finish_read(task.read_locked_keys)
+            if task.io_lease_id is not None:
+                l1_mgr.release_io_lease(task.io_lease_id, buffers_reusable=reusable)
         self._in_flight_tasks.clear()
+        self._status_in_flight_count = 0
