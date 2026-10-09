@@ -1,7 +1,8 @@
 Raw Block (Rust)
 ================
 
-A built-in L2 adapter that stores KV objects in fixed-size slots on a raw block
+A built-in L2 adapter for multiprocess (MP) LMCache that stores KV objects in
+fixed-size slots on a raw block
 device or pre-sized file using the Rust raw-device I/O bindings. It reuses the
 existing raw-block metadata checkpoint model and writes directly into the
 caller-provided load buffers during prefetch.
@@ -13,14 +14,61 @@ completion is unresolved, the server retains and seals the affected L1 arena
 instead of letting another request reuse it. Restart the owning process group
 only after establishing device quiescence.
 
-MP does not register its L1 descriptor as fixed buffers or DMA-BUFs. The
-in-process :doc:`/kv_cache/storage_backends/raw_block_dmabuf` backend has a
-separate exporter and registration path. Enabling MP ``io_uring`` therefore
-provides asynchronous storage I/O without claiming that DMA-BUF data path.
+MP can register eager host L1 regions as classic fixed buffers or DMA-BUFs.
+Classic registration pins host pages for the ring. DMA-BUF registration
+imports exported host memory through the kernel's DMA-BUF direct-I/O path.
+DMA-BUF is Linux's file-descriptor interface for sharing memory with drivers.
+The in-process :doc:`/kv_cache/storage_backends/raw_block_dmabuf` backend
+provides separate GPU staging; MP registration described here uses host DRAM.
 The adapter rejects ``io_uring`` combined with serde because the serialization
 wrapper cannot preserve intermediate-buffer ownership after unresolved I/O.
 NVMe passthrough and Flexible Data Placement require separate device
 qualification; placement-policy unit tests do not qualify hardware execution.
+
+Register the host L1 pool
+-------------------------
+
+Set ``--l1-buffer-registration fixed`` or ``dmabuf`` together with
+``--no-l1-use-lazy``. The default ``none`` keeps unregistered I/O. Registration
+requires ordinary ``io_uring``, ``use_odirect=true`` and
+``enable_zero_copy=true`` on each attached raw-block adapter. NVMe
+``io_uring_cmd`` is rejected for these MP modes.
+
+For example, register a 1 GiB host pool exported by ``/dev/udmabuf``::
+
+    lmcache server --l1-size-gb 1 --eviction-policy LRU \
+      --no-l1-use-lazy --shm-name "" --l1-buffer-registration dmabuf \
+      --l2-adapter '{"type":"raw_block","device_path":"/mnt/cache/kv.bin","slot_bytes":1048576,"io_engine":"io_uring","use_odirect":true}'
+
+The file must already contain initialized extents across the selected capacity.
+Use a dedicated NVMe-backed XFS or ext4 file, or a dedicated NVMe block device,
+on a kernel implementing this DMA-BUF registration ABI. Sparse files, holes,
+unsupported filesystems and failed registration reject setup. DMA-BUF mode
+does not fall back to classic registration or ordinary I/O during setup.
+It requires access to ``/dev/udmabuf`` and disables POSIX shared memory;
+the MP server owns a sealable memfd and its exports. Hugepages remain optional
+and require a preallocated pool. DMA-BUF alignment cannot exceed the backing
+page size: 4 KiB normally or 2 MiB with hugepages.
+
+Classic ``fixed`` mode can use POSIX shared memory with alignment up to 4 KiB.
+The process needs enough locked-memory allowance for every ring's registration.
+Lazy allocation, Device-DAX and storage-backed L1 tiers cannot use these modes.
+For tagged pools, put ``"buffer_registration":"dmabuf"`` and
+``"use_lazy":false`` inside that DRAM ``--l1-manager`` JSON object.
+
+The allocator divides the arena into regions of at most 1 GiB to fit the
+supported registration ABI. Objects and their physical alignment padding
+stay within one region. Each attached ring registers the regions independently;
+the L1 manager owns the mapping and all export FDs until every adapter proves
+shutdown. A failed constructor also retains the affinity arena if cleanup
+cannot prove that it removed a partial registration.
+
+``report_status()["core"]["buffer_registration_mode"]`` reports setup mode.
+The ``io_by_request`` native journal distinguishes ``host_fixed`` and
+``dmabuf_fixed`` payload operations from ordinary or bounce I/O, using the MP
+task ID and a distinct adapter incarnation. Slot headers and checkpoints use
+separate buffers and can still bounce. Registration alone is not a bandwidth
+result or proof of GPU-direct storage.
 
 **Required fields:**
 

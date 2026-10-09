@@ -2,8 +2,8 @@
 
 The adapter implements POSIX and ordinary Rust io_uring storage I/O. MP
 controllers hold exact-buffer L1 leases until completion returns ownership.
-Unknown completion seals and retains the affinity arena. MP fixed-buffer and
-DMA-BUF registration remain unimplemented, and io_uring with serde is rejected
+Unknown completion seals and retains the affinity arena. Eager host L1 pools
+can provide fixed-buffer or DMA-BUF regions, and io_uring with serde is rejected
 because the wrapper cannot retain its intermediate buffers. NVMe passthrough
 and FDP require their own hardware qualification.
 
@@ -162,9 +162,24 @@ retains any buffers whose completion is still pending. Partial initialization
 and runtime adapter removal also retain an affinity arena when close fails or
 explicitly withholds ownership.
 
-MP uses host-backed L1 buffers and does not register the L1 descriptor with
-io_uring. It does not provide the in-process GPU staging or fixed DMA-BUF data
-path. The serde wrapper rejects adapters that can report unresolved I/O before
+MP uses host-backed L1 buffers. Its optional `buffer_registration` mode describes
+stable regions in `L1MemoryDesc`: classic `fixed` regions use host pointers;
+`dmabuf` regions also carry borrowed export FDs and their mapping origins.
+The allocator keeps every object's physical extent within one 1 GiB window,
+including after free-space coalescing. UDMABUF exports split at those windows
+while retaining one contiguous backing memfd mapping. The L1 owner closes all
+exports together after adapter shutdown proves reuse.
+
+`RawBlockL2Adapter` registers the descriptor with its ring before accepting
+tasks. DMA-BUF mode enables strict filesystem validation and requires all
+exports; no registration fallback is allowed. Partial setup returns an
+`L2AdapterInitializationError` when native cleanup cannot prove release.
+The factory retains the affinity L1 and the failed adapter retains its native
+handle for the process lifetime. Immutable task contexts join native operations
+to their MP task IDs so diagnostics can distinguish fixed I/O from fallback.
+
+This is host registration, not the in-process GPU staging path. The
+serde wrapper rejects adapters that can report unresolved I/O before
 allocating intermediate buffers. The fault wrapper propagates ownership along
 with its modified load bitmap.
 
