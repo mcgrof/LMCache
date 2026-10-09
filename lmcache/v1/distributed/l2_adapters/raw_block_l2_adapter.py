@@ -27,6 +27,9 @@ from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.internal_api import L2StoreResult
 from lmcache.v1.distributed.l2_adapters.base import (
     L2AdapterInterface,
+    L2CloseOutcome,
+    L2LoadOutcome,
+    L2StoreOutcome,
     L2TaskId,
 )
 from lmcache.v1.distributed.l2_adapters.config import (
@@ -207,12 +210,11 @@ def _local_rank_from_kv_rank(kv_rank: int) -> int:
 
 
 def _validate_mp_io_mode(config: "RawBlockL2AdapterConfig") -> None:
-    """Refuse asynchronous MP I/O until all L1 owners can retain its arena."""
-    if config.io_engine == "io_uring":
+    """Reject serde before creating resources for an unresolved-I/O backend."""
+    if config.io_engine == "io_uring" and config.serde_config is not None:
         raise ValueError(
-            "MP raw_block io_uring is unsupported: load results and L1 teardown "
-            "cannot retain backing resources after unknown I/O completion; "
-            "use the in-process raw_block backend or io_engine='posix'"
+            "MP raw_block io_uring with serde is unsupported: intermediate "
+            "buffers cannot retain their backing arena after unresolved I/O"
         )
 
 
@@ -599,6 +601,9 @@ class RawBlockL2Adapter(L2AdapterInterface):
             )
 
         self._closed = False
+        self._close_lock = threading.Lock()
+        self._close_outcome: L2CloseOutcome | None = None
+        self._uses_iouring = config.io_engine == "io_uring"
         self._core: RawBlockCore
         self._store_efd: EventNotifier | None = None
         self._lookup_efd: EventNotifier | None = None
@@ -628,7 +633,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 logger.warning(
                     "RawBlockL2Adapter: MP raw_block uses io_uring without "
                     "fixed-buffer registration; zero-copy fixed buffers are "
-                    "disabled unless registered by a future MP allocator path"
+                    "disabled for the MP L1 descriptor path"
                 )
             self._max_capacity_bytes = int(
                 self._core.report_status().get("usable_capacity_bytes", 0)
@@ -658,9 +663,9 @@ class RawBlockL2Adapter(L2AdapterInterface):
         self._lock = threading.Lock()
         self._next_task_id: L2TaskId = 0
 
-        self._completed_store_tasks: dict[L2TaskId, L2StoreResult] = {}
+        self._completed_store_tasks: dict[L2TaskId, L2StoreOutcome] = {}
         self._completed_lookup_tasks: dict[L2TaskId, Bitmap] = {}
-        self._completed_load_tasks: dict[L2TaskId, Bitmap] = {}
+        self._completed_load_tasks: dict[L2TaskId, L2LoadOutcome] = {}
 
         self._store_inflight_tasks: int = 0
         self._lookup_inflight_tasks: int = 0
@@ -713,19 +718,34 @@ class RawBlockL2Adapter(L2AdapterInterface):
             self._raise_if_closed_locked()
             task_id = self._get_next_task_id_locked()
             self._store_inflight_tasks += 1
-        try:
-            future = self._submit_task(
-                self._store_pool, self._run_store_task, list(keys), list(objects)
-            )
-        except Exception:
-            with self._lock:
+            try:
+                future = self._submit_task(
+                    self._store_pool, self._run_store_task, list(keys), list(objects)
+                )
+            except Exception:
                 self._store_inflight_tasks -= 1
-            raise
+                raise
         future.add_done_callback(partial(self._finish_store_task, task_id))
         return task_id
 
     def pop_completed_store_tasks(self) -> dict[L2TaskId, L2StoreResult]:
-        """Drain and return completed store task results."""
+        """Drain reusable store results; unresolved outcomes require the new API.
+
+        Raises:
+            RuntimeError: An unresolved result remains queued. The caller must
+                consume ownership outcomes and retain its arena.
+        """
+        with self._lock:
+            if any(
+                not o.buffers_reusable for o in self._completed_store_tasks.values()
+            ):
+                raise RuntimeError("Unresolved store I/O requires ownership outcomes")
+            completed = self._completed_store_tasks
+            self._completed_store_tasks = {}
+        return {task_id: outcome.result for task_id, outcome in completed.items()}
+
+    def pop_completed_store_outcomes(self) -> dict[L2TaskId, L2StoreOutcome]:
+        """Consume store status and source-buffer ownership exactly once."""
         with self._lock:
             completed = self._completed_store_tasks
             self._completed_store_tasks = {}
@@ -754,14 +774,13 @@ class RawBlockL2Adapter(L2AdapterInterface):
             self._raise_if_closed_locked()
             task_id = self._get_next_task_id_locked()
             self._lookup_inflight_tasks += 1
-        try:
-            future = self._submit_task(
-                self._lookup_pool, self._run_lookup_task, list(keys)
-            )
-        except Exception:
-            with self._lock:
+            try:
+                future = self._submit_task(
+                    self._lookup_pool, self._run_lookup_task, list(keys)
+                )
+            except Exception:
                 self._lookup_inflight_tasks -= 1
-            raise
+                raise
         future.add_done_callback(partial(self._finish_lookup_task, task_id, len(keys)))
         return task_id
 
@@ -804,21 +823,48 @@ class RawBlockL2Adapter(L2AdapterInterface):
             self._raise_if_closed_locked()
             task_id = self._get_next_task_id_locked()
             self._load_inflight_tasks += 1
-        try:
-            future = self._submit_task(
-                self._load_pool, self._run_load_task, list(keys), list(objects)
-            )
-        except Exception:
-            with self._lock:
+            try:
+                future = self._submit_task(
+                    self._load_pool, self._run_load_task, list(keys), list(objects)
+                )
+            except Exception:
                 self._load_inflight_tasks -= 1
-            raise
+                raise
         future.add_done_callback(partial(self._finish_load_task, task_id, len(keys)))
         return task_id
 
     def query_load_result(self, task_id: L2TaskId) -> Bitmap | None:
-        """Return and remove a completed load bitmap if available."""
+        """Consume a reusable bitmap or refuse an unresolved destination.
+
+        Raises:
+            RuntimeError: The queued outcome requires arena retention. Consume
+                query_load_outcome instead; a zero bitmap cannot return ownership.
+        """
+        with self._lock:
+            outcome = self._completed_load_tasks.get(task_id)
+            if outcome is None:
+                return None
+            if not outcome.buffers_reusable:
+                raise RuntimeError("Unresolved load I/O requires ownership outcomes")
+            del self._completed_load_tasks[task_id]
+            return outcome.bitmap
+
+    def query_load_outcome(self, task_id: L2TaskId) -> L2LoadOutcome | None:
+        """Consume a completed load and its destination-buffer ownership once."""
         with self._lock:
             return self._completed_load_tasks.pop(task_id, None)
+
+    @property
+    def may_report_unresolved_io(self) -> bool:
+        """Whether native asynchronous I/O can require permanent arena retention."""
+        return self._uses_iouring
+
+    def close_with_outcome(self) -> L2CloseOutcome:
+        """Close and return the cached proof of native buffer quiescence."""
+        self.close()
+        if self._close_outcome is None:
+            raise RuntimeError("Raw-block adapter did not return a shutdown outcome")
+        return self._close_outcome
 
     def delete(self, keys: list[ObjectKey]) -> None:
         """Delete keys from raw-block L2 and notify listeners for removals."""
@@ -853,32 +899,32 @@ class RawBlockL2Adapter(L2AdapterInterface):
             )
 
     def close(self) -> None:
-        """Wait for worker pools, close the core, and close eventfds."""
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
+        """Stop admission, join pools, and preserve the native close outcome."""
+        with self._close_lock:
+            with self._lock:
+                if self._closed:
+                    return
+                self._closed = True
 
-        self._store_pool.shutdown(wait=True)
-        self._lookup_pool.shutdown(wait=True)
-        self._load_pool.shutdown(wait=True)
-
-        self._core.close()
-
-        with self._lock:
-            store_efd = self._store_efd
-            lookup_efd = self._lookup_efd
-            load_efd = self._load_efd
-            self._store_efd = None
-            self._lookup_efd = None
-            self._load_efd = None
-
-        if store_efd is not None:
-            store_efd.close()
-        if lookup_efd is not None:
-            lookup_efd.close()
-        if load_efd is not None:
-            load_efd.close()
+            self._store_pool.shutdown(wait=True)
+            self._lookup_pool.shutdown(wait=True)
+            self._load_pool.shutdown(wait=True)
+            # A close exception supplies no proof that L1 can be freed.
+            self._close_outcome = L2CloseOutcome(False)
+            try:
+                outcome = self._core.close()
+                self._close_outcome = L2CloseOutcome(
+                    outcome.may_release_backing_resources
+                )
+            finally:
+                with self._lock:
+                    notifiers = (self._store_efd, self._lookup_efd, self._load_efd)
+                    self._store_efd = None
+                    self._lookup_efd = None
+                    self._load_efd = None
+                for notifier in notifiers:
+                    if notifier is not None:
+                        notifier.close()
 
     def report_status(self) -> dict:
         """Return adapter health, task counters, and core status."""
@@ -1287,10 +1333,12 @@ class RawBlockL2Adapter(L2AdapterInterface):
             bytes_transferred = sum(stored_sizes)
         except Exception as e:
             logger.error("RawBlockL2Adapter store task %d failed: %s", task_id, e)
+        buffers_reusable = not self._core.is_poisoned()
         with self._lock:
             self._store_inflight_tasks -= 1
-            self._completed_store_tasks[task_id] = L2StoreResult(
-                success, bytes_transferred
+            self._completed_store_tasks[task_id] = L2StoreOutcome(
+                L2StoreResult(success and buffers_reusable, bytes_transferred),
+                buffers_reusable,
             )
             event_fd = self._store_efd
         if stored_keys:
@@ -1347,9 +1395,12 @@ class RawBlockL2Adapter(L2AdapterInterface):
             bitmap, accessed_keys = future.result()
         except Exception as e:
             logger.error("RawBlockL2Adapter load task %d failed: %s", task_id, e)
+        buffers_reusable = not self._core.is_poisoned()
         with self._lock:
             self._load_inflight_tasks -= 1
-            self._completed_load_tasks[task_id] = bitmap
+            self._completed_load_tasks[task_id] = L2LoadOutcome(
+                bitmap, buffers_reusable
+            )
             event_fd = self._load_efd
         if accessed_keys:
             try:

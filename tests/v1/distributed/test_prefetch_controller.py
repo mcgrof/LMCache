@@ -523,6 +523,7 @@ class TestRawBlockWorkerFailure:
             core.report_status.return_value = {"usable_capacity_bytes": 1024 * 1024}
             core.snapshot_indexed_keys.return_value = []
             core.raise_if_failed.side_effect = reject_failed_worker
+            core.is_poisoned.return_value = False
             core.exists_many.side_effect = lookup_keys
             core.unlock_many.side_effect = locked_keys.difference_update
             raw_adapter = RawBlockL2Adapter(raw_config)
