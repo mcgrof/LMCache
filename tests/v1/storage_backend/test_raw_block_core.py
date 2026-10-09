@@ -14,6 +14,7 @@ import ctypes
 import dataclasses
 import importlib.util
 import json
+import mmap
 import os
 import stat
 import sys
@@ -63,6 +64,41 @@ requires_rust_raw_block_io = pytest.mark.skipif(
     importlib.util.find_spec("lmcache_rust_raw_block_io") is None,
     reason="lmcache_rust_raw_block_io is not installed",
 )
+
+
+@requires_rust_raw_block_io
+def test_register_stable_host_regions(tmp_path: Path) -> None:
+    """Register a caller-owned mapping and release it only after proven close."""
+    path = make_raw_block_file(tmp_path)
+    core = RawBlockCore(
+        replace(make_raw_block_core_config(path), io_engine="io_uring"),
+        key_namespace="object",
+    )
+    with mmap.mmap(-1, 8192) as arena:
+        ptr = ctypes.addressof(ctypes.c_char.from_buffer(arena))
+        core.register_fixed_buffer_regions([ptr, ptr + 4096], [4096, 4096])
+        assert core.report_status()["buffer_registration_mode"] == "classic"
+        assert core.close().may_release_backing_resources
+
+
+@pytest.mark.parametrize(
+    "ptrs,sizes", [([], []), ([1], []), ([0], [4096]), ([1], [0]), ([1, 2], [2, 2])]
+)
+@requires_rust_raw_block_io
+def test_fixed_regions_reject_invalid_spans(
+    tmp_path: Path, ptrs: list[int], sizes: list[int]
+) -> None:
+    """Reject malformed external regions before native registration."""
+    core = RawBlockCore(
+        replace(
+            make_raw_block_core_config(make_raw_block_file(tmp_path)),
+            io_engine="io_uring",
+        ),
+        key_namespace="object",
+    )
+    with pytest.raises(ValueError, match="regions"):
+        core.register_fixed_buffer_regions(ptrs, sizes)
+    core.close()
 
 
 def test_normalize_raw_block_placement_ids_rejects_out_of_range() -> None:

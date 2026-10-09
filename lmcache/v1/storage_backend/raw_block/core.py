@@ -1356,6 +1356,7 @@ class RawBlockCore:
         )
         self._last_publish_ts: float = 0.0
         self._buffer_registration_mode = "none"
+        self._use_registered_physical_padding = False
         # Set when the native engine could not establish what the device was
         # doing. Separate from ``_closed``: marking the core closed would make
         # ``close()`` return without draining or unregistering, and the point
@@ -1813,11 +1814,8 @@ class RawBlockCore:
         regions = regions() if callable(regions) else None
         if regions and not self.use_uring_cmd:
             try:
-                self._rawdev().register_fixed_dmabufs(
-                    buffer_ptrs,
-                    buffer_sizes,
-                    [fd for fd, _base in regions],
-                    [base for _fd, base in regions],
+                self.register_fixed_buffer_regions(
+                    buffer_ptrs, buffer_sizes, dmabuf_regions=regions
                 )
                 logger.info(
                     "RawBlockCore: registered %d paged buffers as dma-buf "
@@ -1825,7 +1823,6 @@ class RawBlockCore:
                     len(buffers),
                     len({fd for fd, _base in regions}),
                 )
-                self._buffer_registration_mode = "dmabuf"
                 return
             except Exception as exc:
                 if device_buffers:
@@ -1847,12 +1844,70 @@ class RawBlockCore:
             raise RuntimeError(
                 "strict dma-buf mode requires dma-buf regions for every paged buffer"
             )
-        self._rawdev().register_fixed_buffers(buffer_ptrs, buffer_sizes)
-        self._buffer_registration_mode = "classic"
+        self.register_fixed_buffer_regions(buffer_ptrs, buffer_sizes)
         logger.info(
             "RawBlockCore: registered %d paged buffers for io_uring fixed I/O",
             len(buffers),
         )
+
+    def register_fixed_buffer_regions(
+        self,
+        buffer_ptrs: Sequence[int],
+        buffer_sizes: Sequence[int],
+        *,
+        dmabuf_regions: Sequence[tuple[int, int]] | None = None,
+        use_physical_padding: bool = False,
+    ) -> None:
+        """Register stable, disjoint host regions for fixed io_uring I/O.
+
+        The caller owns the mappings and export FDs until ``close()`` proves
+        native quiescence. Objects, including their alignment padding, must
+        fit inside a single region. DMA-BUF registration never falls back.
+
+        Args:
+            buffer_ptrs: Starting host addresses of the regions.
+            buffer_sizes: Accessible byte lengths, in the same order.
+            dmabuf_regions: Optional export FD and mapping origin per region.
+            use_physical_padding: Allow I/O to use the object's owned physical
+                extent. Writes zero its padding and reads can replace it.
+                Leave false to preserve the logical-buffer padding contract.
+
+        Raises:
+            ValueError: Regions are empty, overlapping or malformed, or the
+                configured engine cannot use the requested registration.
+            RuntimeError: Strict DMA-BUF mode lacks exports, or native
+                registration fails. A failure still requires ``close()``.
+        """
+        if self.io_engine != "io_uring":
+            raise ValueError("fixed registration requires io_uring")
+        if not buffer_ptrs or len(buffer_ptrs) != len(buffer_sizes):
+            raise ValueError("fixed registration requires matching non-empty regions")
+        spans = sorted(zip(buffer_ptrs, buffer_sizes, strict=True))
+        end = 0
+        for ptr, size in spans:
+            if ptr <= 0 or size <= 0 or ptr < end:
+                raise ValueError(
+                    "fixed registration requires positive disjoint regions"
+                )
+            end = ptr + size
+        if dmabuf_regions is not None:
+            if self.use_uring_cmd or len(dmabuf_regions) != len(buffer_ptrs):
+                raise ValueError(
+                    "DMA-BUF requires ordinary io_uring and complete exports"
+                )
+            self._rawdev().register_fixed_dmabufs(
+                list(buffer_ptrs),
+                list(buffer_sizes),
+                [fd for fd, _base in dmabuf_regions],
+                [base for _fd, base in dmabuf_regions],
+            )
+            self._buffer_registration_mode = "dmabuf"
+        else:
+            if self.require_dmabuf_registration:
+                raise RuntimeError("strict dma-buf mode requires complete exports")
+            self._rawdev().register_fixed_buffers(list(buffer_ptrs), list(buffer_sizes))
+            self._buffer_registration_mode = "classic"
+        self._use_registered_physical_padding = use_physical_padding
 
     def contains_key(self, encoded_key: str, *, lock: bool = False) -> bool:
         """Return whether one encoded key is present in the raw-block index.
@@ -3242,6 +3297,15 @@ class RawBlockCore:
         ptr = int(ptr_val)
         if ptr <= 0 or ptr % self.block_align != 0:
             return None
+        physical = memory_obj.physical_tensor
+        if (
+            self._use_registered_physical_padding
+            and isinstance(physical, torch.Tensor)
+            and physical.device.type == "cpu"
+            and physical.is_contiguous()
+            and physical.data_ptr() == ptr
+        ):
+            buffer_len = min(physical.nbytes, memory_obj.get_physical_size())
         if buffer_len < payload_len:
             return None
 
@@ -3301,9 +3365,8 @@ class RawBlockCore:
                     f"Aligned payload {total_len} exceeds slot capacity "
                     f"{payload_capacity}"
                 )
-            # byte_array exposes only payload_len bytes, so a padded payload
-            # reaches the Rust write path shorter than total_len and is bounced
-            # there, which also zeroes [payload_len, total_len).
+            # Use padding only when the memory object owns the full extent;
+            # extending a logical view could otherwise overwrite a neighbor.
             direct_view = self._build_direct_odirect_view(
                 memory_obj=memory_obj,
                 payload_len=payload_len,
