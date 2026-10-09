@@ -543,7 +543,13 @@ class DRAML1ManagerConfig(L1ManagerConfig):
             defaults,
             read_ttl,
             write_ttl,
-            {"use_lazy", "init_size_gb", "shm_name", "use_hugepages"},
+            {
+                "use_lazy",
+                "init_size_gb",
+                "shm_name",
+                "use_hugepages",
+                "buffer_registration",
+            },
         )
         use_lazy = _l1_bool(values, "use_lazy", True)
         hugepages = _l1_bool(values, "use_hugepages", False)
@@ -558,6 +564,10 @@ class DRAML1ManagerConfig(L1ManagerConfig):
             init_size_in_bytes=int(_l1_number(values, "init_size_gb", 20) * (1 << 30)),
             shm_name=shm_name,
             use_hugepages=hugepages,
+            buffer_registration=cast(
+                Literal["none", "fixed", "dmabuf"],
+                values.get("buffer_registration", "none"),
+            ),
         )
         if hugepages:
             _check_hugepage_availability(config.memory_config.size_in_bytes)
@@ -735,6 +745,11 @@ def validate_storage_manager_config(config: StorageManagerConfig) -> None:
         ValueError: If mutually exclusive L1 tiers are both configured, or
             hybrid L1 is paired with incompatible L2 adapters.
     """
+    # First Party
+    from lmcache.v1.distributed.l2_adapters.raw_block_l2_adapter import (
+        RawBlockL2AdapterConfig,
+    )
+
     by_tag = {c.tag: c for c in config.l1_manager_configs}
     shm_names = [
         c.memory_config.shm_name
@@ -746,6 +761,11 @@ def validate_storage_manager_config(config: StorageManagerConfig) -> None:
     if len(set(shm_names)) != len(shm_names):
         raise ValueError("DRAM L1 managers require distinct shm_name values")
     for l1 in by_tag.values():
+        if (
+            l1.gds_l1_config is not None
+            and l1.memory_config.buffer_registration != "none"
+        ):
+            raise ValueError("fixed buffer registration requires host DRAM L1")
         if l1.gds_l1_config is not None and l1.memory_config.devdax_path:
             raise ValueError("gds-l1-path cannot be used with l1-devdax-path")
     for adapter_config in config.l2_adapter_config.adapters:
@@ -757,6 +777,9 @@ def validate_storage_manager_config(config: StorageManagerConfig) -> None:
         if l1.gds_l1_config is not None:
             raise ValueError("L2 affinity requires a host-backed DRAM or DEVDAX L1")
         memory = l1.memory_config
+        inner = unwrap_l2_adapter_config(adapter_config)
+        if isinstance(inner, RawBlockL2AdapterConfig):
+            inner.validate_l1_registration(memory.buffer_registration)
         adapter_name = requires_single_l1_memory_region(adapter_config)
         if memory.devdax_path and memory.devdax_size_in_bytes and adapter_name:
             raise ValueError(
@@ -862,6 +885,14 @@ def add_storage_manager_args(
             "shared memory (--shm-name) and lazy allocation (--l1-use-lazy). "
             "Default is False."
         ),
+    )
+    memory_group.add_argument(
+        "--l1-buffer-registration",
+        choices=("none", "fixed", "dmabuf"),
+        default="none",
+        help="Register eager host L1 with raw-block ordinary O_DIRECT io_uring. "
+        'Requires --no-l1-use-lazy; dmabuf also requires --shm-name "" '
+        "and /dev/udmabuf. Default is none.",
     )
     memory_group.add_argument(
         "--l1-devdax-path",
@@ -1052,6 +1083,7 @@ def parse_args_to_config(
             args.l1_size_gb is not None
             or args.gds_l1_path is not None
             or args.l1_devdax_path is not None
+            or getattr(args, "l1_buffer_registration", "none") != "none"
         ):
             raise ValueError("Use either --l1-manager or legacy L1 flags")
         classes: dict[
@@ -1124,6 +1156,7 @@ def parse_args_to_config(
             align_bytes=args.l1_align_bytes,
             use_hugepages=use_hugepages,
             devdax_path=args.l1_devdax_path,
+            buffer_registration=getattr(args, "l1_buffer_registration", "none"),
         )
     else:
         memory_config = L1MemoryManagerConfig(
@@ -1134,6 +1167,7 @@ def parse_args_to_config(
             shm_name=shm_name,
             use_hugepages=use_hugepages,
             devdax_path=args.l1_devdax_path,
+            buffer_registration=getattr(args, "l1_buffer_registration", "none"),
         )
 
     gds_l1_config: GdsL1Config | None = None

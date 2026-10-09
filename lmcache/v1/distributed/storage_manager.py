@@ -37,6 +37,7 @@ from lmcache.v1.distributed.l1_manager import L1Manager, L1OperationResult
 from lmcache.v1.distributed.l2_adapters import create_l2_adapter
 from lmcache.v1.distributed.l2_adapters.base import (
     AdapterUsage,
+    L2AdapterInitializationError,
     L2AdapterInterface,
     L2CloseOutcome,
 )
@@ -1517,9 +1518,13 @@ class StorageManager:
         manager = self._l1_by_tag[config.affinity_tag]
         adapter_id = self._next_adapter_id
         self._next_adapter_id += 1
-        adapter: L2AdapterInterface = create_l2_adapter(
-            config, manager.get_l1_memory_desc()
-        )
+        try:
+            adapter: L2AdapterInterface = create_l2_adapter(
+                config, manager.get_l1_memory_desc()
+            )
+        except L2AdapterInitializationError:
+            manager.retain_backing_resources()
+            raise
         if config.serde_config is not None:
             try:
                 serde = create_serde_processor(config.serde_config)

@@ -104,6 +104,14 @@ class L2CloseOutcome:
     buffers_reusable: bool
 
 
+class L2AdapterInitializationError(RuntimeError):
+    """Adapter setup failed without proof that its L1 arena can be released.
+
+    The factory's caller must retain the affinity L1 backing resources for
+    the process lifetime, including any borrowed DMA-BUF export FDs.
+    """
+
+
 class L2AdapterInterface(ABC):
     """
     The abstracted interface for L2 I/O adapters.

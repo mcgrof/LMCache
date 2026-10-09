@@ -12,9 +12,11 @@ from __future__ import annotations
 
 # Standard
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Optional, ParamSpec, TypeVar, cast
 import threading
+import uuid
 
 if TYPE_CHECKING:
     from lmcache.lmcache_native import Bitmap
@@ -26,6 +28,7 @@ from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.internal_api import L2StoreResult
 from lmcache.v1.distributed.l2_adapters.base import (
+    L2AdapterInitializationError,
     L2AdapterInterface,
     L2CloseOutcome,
     L2LoadOutcome,
@@ -45,6 +48,7 @@ from lmcache.v1.storage_backend.raw_block import (
     DEFAULT_IOURING_QUEUE_DEPTH,
     RawBlockCore,
     RawBlockCoreConfig,
+    RawBlockIoContext,
     decode_object_key,
     encode_object_key,
     normalize_raw_block_io_engine,
@@ -62,6 +66,10 @@ RawBlockStoreTaskResult = tuple[
 
 _TaskArgs = ParamSpec("_TaskArgs")
 _TaskResult = TypeVar("_TaskResult")
+
+# Failed constructors have no returned adapter owner. Retain their native
+# handles when cleanup cannot establish that registrations were released.
+_RETAINED_INITIALIZATIONS: list[RawBlockL2Adapter] = []
 
 _FDP_DATA_PLACEMENT_POLICY_NONE = "none"
 _FDP_DATA_PLACEMENT_POLICY_CACHE_SALT_PREFIX = "cache_salt_prefix"
@@ -562,6 +570,28 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             ),
         )
 
+    def validate_l1_registration(self, registration: str) -> None:
+        """Validate a requested host registration mode before allocating L1.
+
+        Args:
+            registration: L1 mode: ``none``, ``fixed`` or ``dmabuf``.
+
+        Raises:
+            ValueError: The mode or I/O configuration cannot use fixed regions.
+        """
+        if registration not in ("none", "fixed", "dmabuf"):
+            raise ValueError("unsupported L1 buffer registration mode")
+        if registration != "none" and (
+            self.io_engine != "io_uring"
+            or self.use_uring_cmd
+            or not self.enable_zero_copy
+            or not self.use_odirect
+        ):
+            raise ValueError(
+                "MP registration requires ordinary O_DIRECT io_uring "
+                "with enable_zero_copy=true"
+            )
+
 
 class RawBlockL2Adapter(L2AdapterInterface):
     """MP L2 adapter that persists KV objects into raw-block slots."""
@@ -575,21 +605,33 @@ class RawBlockL2Adapter(L2AdapterInterface):
 
         Args:
             config: Validated raw-block adapter configuration.
-            l1_memory_desc: Optional L1 allocation descriptor used to validate
-                O_DIRECT or NVMe io_uring_cmd alignment compatibility.
+            l1_memory_desc: Borrowed L1 allocation and optional registration
+                regions. The caller owns its mapping and export FDs.
 
         Raises:
             ValueError: If O_DIRECT or io_uring_cmd is enabled and L1 alignment
                 is insufficient.
             RuntimeError: If the shared core cannot open or recover the raw
                 device.
+            L2AdapterInitializationError: Setup failed without proof that its
+                L1 mapping and export FDs can be released.
 
         Notes:
-            Resources created before an initialization failure are closed before
-            the exception is re-raised.
+            Cleanup closes proven resources. Unresolved registration retains
+            the native handle and requires the caller to retain the L1 arena.
         """
         super().__init__()
         _validate_mp_io_mode(config)
+        registration = (
+            l1_memory_desc.buffer_registration if l1_memory_desc is not None else "none"
+        )
+        config.validate_l1_registration(registration)
+        self._registered_regions = (
+            l1_memory_desc.regions
+            if l1_memory_desc is not None and registration != "none"
+            else ()
+        )
+        self._block_align = config.block_align
         if (
             (config.use_odirect or config.use_uring_cmd)
             and l1_memory_desc is not None
@@ -603,6 +645,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
         self._closed = False
         self._close_lock = threading.Lock()
         self._close_outcome: L2CloseOutcome | None = None
+        self._io_incarnation = uuid.uuid4().hex
         self._uses_iouring = config.io_engine == "io_uring"
         self._core: RawBlockCore
         self._store_efd: EventNotifier | None = None
@@ -623,13 +666,33 @@ class RawBlockL2Adapter(L2AdapterInterface):
         self._fdp_fallback_warning_emitted = False
 
         try:
-            self._core = RawBlockCore(config.to_core_config(), key_namespace="object")
+            core_config = replace(
+                config.to_core_config(),
+                require_dmabuf_registration=registration == "dmabuf",
+            )
+            self._core = RawBlockCore(core_config, key_namespace="object")
+            if registration != "none":
+                assert l1_memory_desc is not None
+                regions = l1_memory_desc.regions
+                exports = None
+                if registration == "dmabuf":
+                    exports = []
+                    for region in regions:
+                        if region.dmabuf_fd is None or region.dmabuf_base is None:
+                            raise ValueError("L1 region lacks a DMA-BUF export")
+                        exports.append((region.dmabuf_fd, region.dmabuf_base))
+                self._core.register_fixed_buffer_regions(
+                    [region.ptr for region in regions],
+                    [region.size for region in regions],
+                    dmabuf_regions=exports,
+                    use_physical_padding=True,
+                )
             self._fdp_enabled = bool(config.fdp_enabled)
             self._fdp_discovered_status: list[tuple[int, int]] = []
             self._fdp_placement_ids: list[int] = []
             if self._fdp_enabled:
                 self._configure_fdp(config.fdp_placement_ids)
-            if config.io_engine == "io_uring":
+            if config.io_engine == "io_uring" and registration == "none":
                 logger.warning(
                     "RawBlockL2Adapter: MP raw_block uses io_uring without "
                     "fixed-buffer registration; zero-copy fixed buffers are "
@@ -656,8 +719,19 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 max_workers=config.num_load_workers,
                 thread_name_prefix="rawblk-load",
             )
-        except Exception:
-            self._cleanup_after_init_failure()
+        except Exception as exc:
+            try:
+                reusable = self._cleanup_after_init_failure()
+            except Exception as cleanup_exc:
+                _RETAINED_INITIALIZATIONS.append(self)
+                raise L2AdapterInitializationError(
+                    "raw_block setup cleanup could not release its L1 registration"
+                ) from cleanup_exc
+            if not reusable:
+                _RETAINED_INITIALIZATIONS.append(self)
+                raise L2AdapterInitializationError(
+                    "raw_block setup failed with an unresolved L1 registration"
+                ) from exc
             raise
 
         self._lock = threading.Lock()
@@ -713,6 +787,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
             raise ValueError("keys and objects must be non-empty")
         if len(keys) != len(objects):
             raise ValueError("keys and objects must have the same length")
+        self._validate_registered_objects(objects)
 
         with self._lock:
             self._raise_if_closed_locked()
@@ -720,7 +795,11 @@ class RawBlockL2Adapter(L2AdapterInterface):
             self._store_inflight_tasks += 1
             try:
                 future = self._submit_task(
-                    self._store_pool, self._run_store_task, list(keys), list(objects)
+                    self._store_pool,
+                    self._run_store_task,
+                    list(keys),
+                    list(objects),
+                    self._task_io_context(task_id, "store"),
                 )
             except Exception:
                 self._store_inflight_tasks -= 1
@@ -818,6 +897,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
             raise ValueError("keys and objects must be non-empty")
         if len(keys) != len(objects):
             raise ValueError("keys and objects must have the same length")
+        self._validate_registered_objects(objects)
 
         with self._lock:
             self._raise_if_closed_locked()
@@ -825,7 +905,11 @@ class RawBlockL2Adapter(L2AdapterInterface):
             self._load_inflight_tasks += 1
             try:
                 future = self._submit_task(
-                    self._load_pool, self._run_load_task, list(keys), list(objects)
+                    self._load_pool,
+                    self._run_load_task,
+                    list(keys),
+                    list(objects),
+                    self._task_io_context(task_id, "load"),
                 )
             except Exception:
                 self._load_inflight_tasks -= 1
@@ -1291,12 +1375,14 @@ class RawBlockL2Adapter(L2AdapterInterface):
         self,
         keys: list[ObjectKey],
         objects: list[MemoryObj],
+        io_context: RawBlockIoContext,
     ) -> RawBlockStoreTaskResult:
         """Persist one submitted store batch in the worker pool.
 
         Args:
             keys: Object keys submitted for storage.
             objects: Payload buffers aligned with ``keys``.
+            io_context: Immutable identity of the submitted MP task.
 
         Returns:
             A 3-tuple containing:
@@ -1307,7 +1393,9 @@ class RawBlockL2Adapter(L2AdapterInterface):
         """
         specs = [encode_object_key(key) for key in keys]
         placement_ids = self._assign_fdp_placement_ids(keys)
-        put_result = self._core.put_many(specs, objects, placement_ids=placement_ids)
+        put_result = self._core.put_many(
+            specs, objects, placement_ids=placement_ids, io_context=io_context
+        )
         stored_encoded = set(put_result.stored_keys)
         slot_bytes = int(self._core.slot_bytes)
         stored_keys: list[ObjectKey] = []
@@ -1375,9 +1463,12 @@ class RawBlockL2Adapter(L2AdapterInterface):
         self,
         keys: list[ObjectKey],
         objects: list[MemoryObj],
+        io_context: RawBlockIoContext,
     ) -> tuple[Bitmap, list[ObjectKey]]:
         specs = [encode_object_key(key) for key in keys]
-        results = self._core.load_many_into([spec.encoded for spec in specs], objects)
+        results = self._core.load_many_into(
+            [spec.encoded for spec in specs], objects, io_context=io_context
+        )
         bitmap = _make_bitmap(len(keys))
         accessed_keys: list[ObjectKey] = []
         for i, ok in enumerate(results):
@@ -1416,7 +1507,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
         except OSError:
             logger.debug("event notifier was closed before signaling")
 
-    def _cleanup_after_init_failure(self) -> None:
+    def _cleanup_after_init_failure(self) -> bool:
         for pool_name in ("_store_pool", "_lookup_pool", "_load_pool"):
             pool = getattr(self, pool_name, None)
             if pool is not None:
@@ -1424,8 +1515,9 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 setattr(self, pool_name, None)
 
         core = getattr(self, "_core", None)
+        reusable = True
         if core is not None:
-            core.close()
+            reusable = core.close().may_release_backing_resources
 
         for fd_name in ("_store_efd", "_lookup_efd", "_load_efd"):
             fd = getattr(self, fd_name, None)
@@ -1434,6 +1526,46 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 setattr(self, fd_name, None)
 
         self._closed = True
+        return reusable
+
+    def _task_io_context(self, task_id: L2TaskId, operation: str) -> RawBlockIoContext:
+        return RawBlockIoContext(
+            run_id="mp-raw-block",
+            request_id=f"{operation}-{task_id}",
+            incarnation=self._io_incarnation,
+            work_kind="mp_task",
+        )
+
+    def _validate_registered_objects(self, objects: list[MemoryObj]) -> None:
+        if not self._registered_regions:
+            return
+        for obj in objects:
+            physical = obj.physical_tensor
+            if (
+                physical is None
+                or physical.device.type != "cpu"
+                or not physical.is_contiguous()
+            ):
+                raise ValueError(
+                    "MP registered I/O requires contiguous host L1 objects"
+                )
+            ptr = physical.data_ptr()
+            length = (
+                (obj.get_size() + self._block_align - 1)
+                // self._block_align
+                * self._block_align
+            )
+            if (
+                obj.data_ptr != ptr
+                or ptr % self._block_align
+                or length <= 0
+                or length > min(physical.nbytes, obj.get_physical_size())
+                or not any(
+                    r.ptr <= ptr and ptr + length <= r.ptr + r.size
+                    for r in self._registered_regions
+                )
+            ):
+                raise ValueError("MP payload must fit in one registered L1 region")
 
 
 register_l2_adapter_type("raw_block", RawBlockL2AdapterConfig)
