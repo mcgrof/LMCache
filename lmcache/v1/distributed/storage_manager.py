@@ -35,7 +35,11 @@ from lmcache.v1.distributed.error import L1Error, L1ReconfigureError, strerror
 from lmcache.v1.distributed.internal_api import L1MemoryDesc, L2AdapterListener
 from lmcache.v1.distributed.l1_manager import L1Manager, L1OperationResult
 from lmcache.v1.distributed.l2_adapters import create_l2_adapter
-from lmcache.v1.distributed.l2_adapters.base import AdapterUsage, L2AdapterInterface
+from lmcache.v1.distributed.l2_adapters.base import (
+    AdapterUsage,
+    L2AdapterInterface,
+    L2CloseOutcome,
+)
 from lmcache.v1.distributed.l2_adapters.config import (
     L2AdapterConfigBase,
     get_type_name_for_config,
@@ -176,6 +180,7 @@ class StorageManager:
             # Serializes L1/L2 additions and L2 adapter registration/deletion.
             # Held from ownership check through add, before allocator/device locks.
             self._lifecycle_lock = threading.Lock()
+            self._closed = False
             # Keeps capacity snapshots ordered by the point at which they are
             # built. Registration can publish concurrently with runtime changes.
             self._capacity_publish_lock = threading.Lock()
@@ -186,7 +191,11 @@ class StorageManager:
             self._adapter_descriptors: dict[int, L2AdapterDescriptor] = {}
             for ac in config.l2_adapter_config.adapters:
                 adapter_id, adapter, descriptor = self._build_l2_adapter(ac)
-                cleanup.callback(adapter.close)
+                cleanup.callback(
+                    self._close_adapter_for_owner,
+                    adapter,
+                    self._l1_by_tag[ac.affinity_tag],
+                )
                 self._l2_adapters[adapter_id] = adapter
                 self._adapter_descriptors[adapter_id] = descriptor
 
@@ -305,6 +314,8 @@ class StorageManager:
         Raises:
             Exception: Allocation exceptions propagate; they are not overflow.
         """
+        if self._closed:
+            raise RuntimeError("Storage manager is closed")
         reserve_result: dict[ObjectKey, L1OperationResult] = {
             key: (L1Error.OUT_OF_MEMORY, None) for key in keys
         }
@@ -1121,6 +1132,8 @@ class StorageManager:
                 mapped by L1 or another L2 adapter.
         """
         with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("Storage manager is closed")
             # Mirror of the check in add_l1_devdax_device: a single-region
             # adapter may only be added while L1 is exactly one memory region.
             adapter_name = requires_single_l1_memory_region(config)
@@ -1187,6 +1200,8 @@ class StorageManager:
                 retry.
         """
         with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("Storage manager is closed")
             if adapter_id not in self._l2_adapters:
                 raise ValueError(f"No L2 adapter with id {adapter_id}")
 
@@ -1210,7 +1225,7 @@ class StorageManager:
             with self._adapters_lock:
                 adapter = self._l2_adapters.pop(adapter_id)
                 self._adapter_descriptors.pop(adapter_id, None)
-            adapter.close()
+            self._close_adapter_for_owner(adapter, self._l1_by_tag[affinity])
             logger.info("Deleted L2 adapter %d", adapter_id)
             self._publish_capacity_changed()
 
@@ -1234,32 +1249,26 @@ class StorageManager:
         Clear data in the storage manager.
 
         Args:
-            force: If True, clear ALL objects including locked ones.
-                This may corrupt in-flight store/prefetch operations.
+            force: If True, clear objects including reservation-locked ones.
+                Active external I/O leases prevent clearing in either mode.
                 If False (default), only clear unlocked objects, keeping
                 write-locked and read-locked objects intact.
         """
         for manager in self._l1_managers_by_id.values():
             manager.clear(force=force)
 
-    def close(self):
+    def close(self) -> None:
         """
-        Close the storage manager and release all resources.
+        Close adapters before releasing L1 arenas, retaining unresolved I/O.
+
+        Repeated calls have no effect. Shutdown serializes with L2 lifecycle
+        changes and stops controller submissions before collecting ownership.
         """
-        self._prefetch_controller.stop()
-        for controller in self._store_controllers.values():
-            controller.stop()
-        for controller in self._eviction_controllers:
-            controller.stop()
-        self._l2_eviction_controller.stop()
-
-        PeriodicEventNotifier.shutdown()
-
-        for adapter in self._l2_adapters.values():
-            adapter.close()
-
-        for manager in self._l1_managers_by_id.values():
-            manager.close()
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._close_owned_resources()
 
     @property
     def is_multi_l1(self) -> bool:
@@ -1378,6 +1387,56 @@ class StorageManager:
         for owner, keys in completion:
             self.finish_read_prefetched(keys, l1_owners=dict.fromkeys(keys, owner))
 
+    def _close_adapter_for_owner(
+        self, adapter: L2AdapterInterface, manager: L1Manager
+    ) -> L2CloseOutcome | None:
+        """Retain the affinity arena on failed or explicitly unresolved shutdown."""
+        try:
+            outcome = adapter.close_with_outcome()
+        except Exception:
+            manager.retain_backing_resources()
+            raise
+        if outcome is not None and not outcome.buffers_reusable:
+            manager.retain_backing_resources()
+        return outcome
+
+    def _close_owned_resources(self) -> None:
+        """Settle adapter ownership before freeing L1; caller holds lifecycle lock."""
+        self._prefetch_controller.stop_submission()
+        for controller in self._store_controllers.values():
+            controller.stop_submission()
+        for eviction_controller in self._eviction_controllers:
+            eviction_controller.stop()
+        self._l2_eviction_controller.stop()
+
+        PeriodicEventNotifier.shutdown()
+
+        outcomes = {}
+        for adapter_id, adapter in self._l2_adapters.items():
+            try:
+                affinity = self._adapter_descriptors[adapter_id].config.affinity_tag
+                outcome = self._close_adapter_for_owner(
+                    adapter, self._l1_by_tag[affinity]
+                )
+            except Exception:
+                # Shutdown is an ownership boundary: continue closing other
+                # adapters, but retain this arena when no proof was returned.
+                logger.exception("L2 adapter %d failed to close", adapter_id)
+                outcome = L2CloseOutcome(False)
+            outcomes[adapter_id] = outcome
+        try:
+            self._prefetch_controller.finish_shutdown(outcomes)
+        except Exception:
+            logger.exception("Prefetch shutdown cleanup failed")
+        for controller in self._store_controllers.values():
+            try:
+                controller.finish_shutdown(outcomes)
+            except Exception:
+                logger.exception("Store shutdown cleanup failed")
+
+        for manager in self._l1_managers_by_id.values():
+            manager.close()
+
     def _read_groups(
         self, keys: list[ObjectKey], owners: dict[ObjectKey, int] | None
     ) -> dict[int, list[ObjectKey]]:
@@ -1462,11 +1521,21 @@ class StorageManager:
             config, manager.get_l1_memory_desc()
         )
         if config.serde_config is not None:
-            adapter = SerdeL2AdapterWrapper(
-                inner=adapter,
-                serde=create_serde_processor(config.serde_config),
-                l1_manager=manager,
-            )
+            try:
+                serde = create_serde_processor(config.serde_config)
+            except Exception:
+                self._close_adapter_for_owner(adapter, manager)
+                raise
+            try:
+                adapter = SerdeL2AdapterWrapper(
+                    inner=adapter, serde=serde, l1_manager=manager
+                )
+            except Exception:
+                try:
+                    serde.close()
+                finally:
+                    self._close_adapter_for_owner(adapter, manager)
+                raise
         descriptor = L2AdapterDescriptor(index=adapter_id, config=config)
         # Stamp the registered type name so the adapter's cache events on
         # the observability bus carry their backend identity.

@@ -41,7 +41,11 @@ from lmcache.v1.distributed.bitmap_ops.fold import (
 )
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.l1_manager import L1Manager
-from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
+from lmcache.v1.distributed.l2_adapters.base import (
+    L2AdapterInterface,
+    L2CloseOutcome,
+    L2TaskId,
+)
 from lmcache.v1.distributed.storage_controller import StorageControllerInterface
 from lmcache.v1.distributed.storage_controllers.adapter_lifecycle import (
     AddAdapterOp,
@@ -359,6 +363,8 @@ class InFlightPrefetchRequest:
     # In flight L2 operations: L2 adapter idx -> L2 task ID
     inflight_lookup_tasks: dict[int, L2TaskId] = field(default_factory=dict)
     inflight_load_tasks: dict[int, L2TaskId] = field(default_factory=dict)
+    io_leases: dict[int, int] = field(default_factory=dict)
+    """Adapter ID -> lease on the affinity L1 destination buffers."""
 
     # L2 adapter idx -> L1 bytes reserved for that adapter's in-flight load.
     # Entries are removed as load results arrive.
@@ -582,6 +588,8 @@ class PrefetchController(StorageControllerInterface):
             is queryable via query_prefetch_result once this returns.
         """
         with self._submission_lock:
+            if self._stop_flag.is_set():
+                raise RuntimeError("Prefetch controller is stopped")
             request_id = self._next_request_id
             self._next_request_id += 1
 
@@ -593,6 +601,8 @@ class PrefetchController(StorageControllerInterface):
             return request_id
 
         with self._submission_lock:
+            if self._stop_flag.is_set():
+                raise RuntimeError("Prefetch controller is stopped")
             self._submission_queue.append((request_id, spec))
             self._submission_efd.notify()
         return request_id
@@ -740,18 +750,34 @@ class PrefetchController(StorageControllerInterface):
         self._thread.start()
 
     def stop(self) -> None:
-        """
-        Signal the loop to stop and wait for the thread to join.
+        """Stop submissions and conservatively retain unresolved destinations."""
+        self.stop_submission()
+        self.finish_shutdown({})
 
-        Cleans up any in-flight requests (releases L1 write locks,
-        L2 locks) before returning.
-        """
-        self._stop_flag.set()
-        self._submission_efd.notify()
+    def stop_submission(self) -> None:
+        """Join the controller before adapter shutdown without releasing leases."""
+        with self._submission_lock:
+            self._stop_flag.set()
+            self._submission_efd.notify()
         self._thread.join()
-        self._cleanup_in_flight_requests()
         self._submission_efd.close()
         self._adapter_ctrl_efd.close()
+
+    def finish_shutdown(self, outcomes: dict[int, L2CloseOutcome | None]) -> None:
+        """Settle pending loads after adapters close, using ownership proofs.
+
+        Args:
+            outcomes: Adapter IDs mapped to shutdown proofs, or None when only
+                individual task completion proves that buffers are reusable.
+        """
+        try:
+            self._cleanup_in_flight_requests(outcomes)
+        except Exception:
+            # No query failure may discard a pending destination owner.
+            for manager in self._l1_managers.values():
+                if manager.report_status()["external_io_lease_count"]:
+                    manager.retain_backing_resources()
+            raise
 
     def add_adapter(
         self,
@@ -1302,7 +1328,17 @@ class PrefetchController(StorageControllerInterface):
             if not keys:
                 continue
             objects = [reserved_objs[key] for key in keys]
-            task_id = self._l2_adapters[l2_idx].submit_load_task(keys, objects)
+            l1_manager = self._l1_managers[self._get_l2_affinity_manager(l2_idx)]
+            lease_id = l1_manager.acquire_io_lease(
+                keys, objects, tag=_get_prefetch_write_tag(request.request_id)
+            )
+            try:
+                task_id = self._l2_adapters[l2_idx].submit_load_task(keys, objects)
+            except Exception:
+                # The adapter submission contract forbids admitting I/O on error.
+                l1_manager.release_io_lease(lease_id, buffers_reusable=True)
+                raise
+            request.io_leases[l2_idx] = lease_id
             request.inflight_load_tasks[l2_idx] = task_id
             plan_keys.extend(keys)
 
@@ -1416,20 +1452,27 @@ class PrefetchController(StorageControllerInterface):
             if adapter_idx not in signaled_adapters:
                 continue
             task_id = request.inflight_load_tasks[adapter_idx]
-            result = self._l2_adapters[adapter_idx].query_load_result(task_id)
-            if result is None:
+            outcome = self._l2_adapters[adapter_idx].query_load_outcome(task_id)
+            if outcome is None:
                 continue
 
             # The load task was submitted with the keys of ``planned`` in
             # row-major order, so ``result`` is a flat bitmap over them.
             planned = states.l2_locked_keys[adapter_idx]
-            loaded = _scatter_bitmaps(planned, result)
+            loaded = (
+                _scatter_bitmaps(planned, outcome.bitmap)
+                if outcome.buffers_reusable
+                else planned.zeros_like()
+            )
             failed = planned - loaded
             l1_idx = self._get_l2_affinity_manager(adapter_idx)
             l1_manager = self._l1_managers[l1_idx]
 
             loaded_keys = _gather_keys(request.key_groups, loaded)
             failed_keys = _gather_keys(request.key_groups, failed)
+
+            if not outcome.buffers_reusable:
+                l1_manager.retain_backing_resources()
 
             # Update L1 key status
             if loaded_keys:
@@ -1440,8 +1483,13 @@ class PrefetchController(StorageControllerInterface):
                 l1_manager.finish_write_and_delete(failed_keys, tag=tag)
 
             # Unlock L2
-            self._l2_adapters[adapter_idx].submit_unlock(
-                _gather_keys(request.key_groups, planned)
+            if outcome.buffers_reusable:
+                self._l2_adapters[adapter_idx].submit_unlock(
+                    _gather_keys(request.key_groups, planned)
+                )
+            l1_manager.release_io_lease(
+                request.io_leases.pop(adapter_idx),
+                buffers_reusable=outcome.buffers_reusable,
             )
 
             # Update the key states and the inflight load tasks
@@ -1609,18 +1657,41 @@ class PrefetchController(StorageControllerInterface):
         """Remove a finished request from the in-flight table."""
         self._in_flight_requests.pop(request.request_id, None)
 
-    def _release_all_locks(self, request: InFlightPrefetchRequest) -> None:
+    def _release_all_locks(
+        self,
+        request: InFlightPrefetchRequest,
+        outcomes: dict[int, L2CloseOutcome | None] | None = None,
+    ) -> None:
         """Return every lock and buffer the request's key states record.
 
-        L2 read locks are returned, reserved L1 staging buffers are deleted,
-        and L1 read locks are released. Outstanding adapter tasks are left
-        to complete on their own.
+        Return L2 locks only after destination access conclusively stops.
+        Unresolved tasks seal and retain their L1 arenas before any bookkeeping.
+        Shutdown may provide adapter-wide proof; an ordinary abort may not.
         """
         states = request.key_states
         tag = _get_prefetch_write_tag(request.request_id)
+        reusable_by_adapter: dict[int, bool] = {}
+        for l2_idx, task_id in request.inflight_load_tasks.items():
+            outcome = self._l2_adapters[l2_idx].query_load_outcome(task_id)
+            proof = None if outcomes is None else outcomes.get(l2_idx)
+            reusable = (
+                outcome.buffers_reusable
+                if outcome is not None
+                else proof is not None and proof.buffers_reusable
+            )
+            reusable_by_adapter[l2_idx] = reusable
+            if not reusable:
+                self._l1_managers[
+                    self._get_l2_affinity_manager(l2_idx)
+                ].retain_backing_resources()
         for l2_idx, cells in states.l2_locked_keys.items():
             keys = _gather_keys(request.key_groups, cells)
-            if keys and l2_idx in self._l2_adapters:
+            if (
+                keys
+                and l2_idx in self._l2_adapters
+                and l2_idx not in (outcomes or {})
+                and reusable_by_adapter.get(l2_idx, True)
+            ):
                 self._l2_adapters[l2_idx].submit_unlock(keys)
         for l1_idx, cells in states.l1_reserved_keys.items():
             keys = _gather_keys(request.key_groups, cells)
@@ -1633,9 +1704,18 @@ class PrefetchController(StorageControllerInterface):
                     keys, read_locks=request.num_kv_readers
                 )
 
+        for l2_idx, lease_id in request.io_leases.items():
+            self._l1_managers[self._get_l2_affinity_manager(l2_idx)].release_io_lease(
+                lease_id, buffers_reusable=reusable_by_adapter[l2_idx]
+            )
+        request.io_leases.clear()
+        request.inflight_load_tasks.clear()
+        request.load_bytes_by_adapter.clear()
         request.key_states = PrefetchKeyState()
 
-    def _cleanup_in_flight_requests(self) -> None:
+    def _cleanup_in_flight_requests(
+        self, outcomes: dict[int, L2CloseOutcome | None]
+    ) -> None:
         """Release resources for any in-flight requests during shutdown."""
         for request in list(self._in_flight_requests.values()):
             logger.warning(
@@ -1643,5 +1723,5 @@ class PrefetchController(StorageControllerInterface):
                 request.request_id,
                 len(request.get_flattened_keys()),
             )
-            self._release_all_locks(request)
+            self._release_all_locks(request, outcomes)
             self._retire_request(request)

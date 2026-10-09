@@ -510,7 +510,7 @@ class TestRawBlockWorkerFailure:
             device_path="/unused/raw-block",
             slot_bytes=1024 * 1024,
             use_odirect=False,
-            io_engine="io_uring",
+            io_engine="posix",
             num_store_workers=1,
             num_lookup_workers=1,
             num_load_workers=1,
@@ -1556,8 +1556,9 @@ class TestRuntimeAdapters:
 
 
 class TestShutdown:
-    def test_stop_releases_in_flight_locks(self, l1_manager):
-        """Stopping mid-load returns L2 locks and L1 buffers."""
+    @pytest.mark.no_shared_allocator
+    def test_stop_retains_unresolved_in_flight_buffers(self, l1_manager):
+        """A controller-only stop has no proof that a pending load quiesced."""
         adapter = make_adapter(bandwidth_gb=0.001)
         layout = make_layout()
         keys = [make_object_key(i) for i in range(3)]
@@ -1572,7 +1573,9 @@ class TestShutdown:
         )
         ctrl.stop()
 
-        assert_l2_unlocked(adapter)
+        assert adapter.debug_get_locked_key_count() == len(keys)
+        assert l1_manager.report_status()["backing_resources_retained"]
+        assert l1_manager.report_status()["external_io_lease_count"] == 0
         assert l1_manager.get_staging_memory_usage() == 0
         assert ctrl.report_status()["in_flight_request_count"] == 0
         adapter.close()
