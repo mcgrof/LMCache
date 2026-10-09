@@ -1,11 +1,11 @@
 # Raw Block L2 Adapter Design
 
-Execution is restricted to synchronous POSIX I/O. Construction rejects
-`io_uring`, NVMe passthrough and FDP before opening a target: MP result and
-L1 shutdown contracts cannot retain backing resources after unknown I/O.
-Placement configuration and synchronous policy helpers remain available,
-but their unit tests do not establish asynchronous MP support.
-
+The adapter implements POSIX and ordinary Rust io_uring storage I/O. MP
+controllers hold exact-buffer L1 leases until completion returns ownership.
+Unknown completion seals and retains the affinity arena. MP fixed-buffer and
+DMA-BUF registration remain unimplemented, and io_uring with serde is rejected
+because the wrapper cannot retain its intermediate buffers. NVMe passthrough
+and FDP require their own hardware qualification.
 
 This document describes the built-in `raw_block` L2 adapter for LMCache MP
 mode. It covers the adapter shape, the shared raw-block core, and the recovery
@@ -30,7 +30,7 @@ StoreController / PrefetchController
                 |
                 v
          lmcache_rust_raw_block_io
-      (pwrite_from_buffer / pread_into)
+      (POSIX / ordinary io_uring / NVMe passthrough)
                 |
                 v
          raw block device / file
@@ -140,18 +140,33 @@ queuing work in the thread pool:
 - each completion decrements its in-flight counter, publishes the result, and
   signals the corresponding eventfd. Results are consumed once.
 
-This lets the controllers release failed-load buffers and lookup/store locks
-through their normal completion paths. Existing L1 and healthy-adapter hits
-remain usable; missing data can be recomputed by the serving engine. Unlocks
-remain available after worker failure. Invalid arguments and submissions after
-adapter close still raise. The legacy non-MP backend skips new stores after a
-known worker failure without retaining objects or raising to its caller.
+A known worker failure that admits no I/O returns reusable buffers. Native
+poison instead means that completion is unknown. The adapter returns that
+verdict separately from the store status or load bitmap through
+`pop_completed_store_outcomes` and `query_load_outcome`. Legacy result APIs
+refuse unknown outcomes without consuming them. A zero bitmap is not a buffer
+ownership proof.
 
-I/O already accepted by the kernel keeps its buffers until terminal completion
-or cancellation completion; a worker error alone must not complete those
-tasks. Close and destructor cleanup release the GIL while draining and joining
-the worker. Cleanup can still wait indefinitely for uncancellable I/O: the
-submission retry budget is not a shutdown timeout.
+Store and prefetch acquire an L1 lease before submitting each batch. The lease
+pins exact objects independently of reservation timeouts, eviction or forced
+delete. L1 bookkeeping runs before the lease is settled. Known completion
+returns deferred frees to the allocator; unknown completion retains the arena,
+objects and any external-memory context for the process lifetime. Loads with
+unknown completion publish no hits and keep their L2 source locks.
+
+Shutdown stops and joins controller threads before closing adapters. A cached
+`L2CloseOutcome` carries the core's native quiescence verdict; repeated close
+does not invent new proof. Controllers then settle pending leases and L1 closes
+only reusable arenas. A controller-only stop has no adapter-wide proof, so it
+retains any buffers whose completion is still pending. Partial initialization
+and runtime adapter removal also retain an affinity arena when close fails or
+explicitly withholds ownership.
+
+MP uses host-backed L1 buffers and does not register the L1 descriptor with
+io_uring. It does not provide the in-process GPU staging or fixed DMA-BUF data
+path. The serde wrapper rejects adapters that can report unresolved I/O before
+allocating intermediate buffers. The fault wrapper propagates ownership along
+with its modified load bitmap.
 
 ## Locking Model
 

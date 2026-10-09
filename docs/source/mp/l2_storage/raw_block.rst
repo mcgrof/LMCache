@@ -6,13 +6,21 @@ device or pre-sized file using the Rust raw-device I/O bindings. It reuses the
 existing raw-block metadata checkpoint model and writes directly into the
 caller-provided load buffers during prefetch.
 
-Execution currently supports ``io_engine="posix"`` only. The adapter rejects
-``io_uring``, including NVMe passthrough and FDP, before native setup because
-MP load outcomes and whole-L1 teardown cannot retain an arena after unknown
-I/O completion. The in-process raw-block backend has a separate ownership
-contract and continues to support ``io_uring``. The asynchronous configuration
-fields below are retained for compatibility and placement-policy development;
-they do not enable MP execution.
+Execution supports ``io_engine="posix"`` and the ordinary Rust
+``io_engine="io_uring"`` path. Controllers lease each submitted L1 buffer
+until the adapter returns ownership, independently of task success. If native
+completion is unresolved, the server retains and seals the affected L1 arena
+instead of letting another request reuse it. Restart the owning process group
+only after establishing device quiescence.
+
+MP does not register its L1 descriptor as fixed buffers or DMA-BUFs. The
+in-process :doc:`/kv_cache/storage_backends/raw_block_dmabuf` backend has a
+separate exporter and registration path. Enabling MP ``io_uring`` therefore
+provides asynchronous storage I/O without claiming that DMA-BUF data path.
+The adapter rejects ``io_uring`` combined with serde because the serialization
+wrapper cannot preserve intermediate-buffer ownership after unresolved I/O.
+NVMe passthrough and Flexible Data Placement require separate device
+qualification; placement-policy unit tests do not qualify hardware execution.
 
 **Required fields:**
 
@@ -72,6 +80,30 @@ they do not enable MP execution.
   on default NVMe placement.
 - ``num_store_workers`` / ``num_lookup_workers`` / ``num_load_workers``:
   Worker-thread counts for each operation type.
+
+Buffer ownership and shutdown
+-----------------------------
+
+A successful or failed task may return reusable buffers. An unresolved task
+returns ``buffers_reusable=False`` through ``pop_completed_store_outcomes`` or
+``query_load_outcome``. Prefetch publishes no hits from that task and keeps its
+L2 source locks. Store and prefetch stop returning arena memory to the allocator
+and reject new reads and allocations in the affected L1 manager. Other L1
+managers keep their own ownership state.
+
+An external I/O lease protects buffers even after a reservation expires. Forced
+L1 deletion cannot reclaim a leased buffer, and ``clear`` refuses while any
+lease is active. A controller-only stop has no proof that pending I/O stopped
+and retains unresolved buffers. StorageManager shutdown first joins the
+controllers, then closes the adapters and settles leases from their completion
+or shutdown proofs before closing L1. An adapter close exception also retains
+its affinity arena. Repeated StorageManager shutdown has no effect.
+
+The legacy status-only APIs remain available for known completion. They raise
+on an unresolved raw-block result without consuming it; callers must use the
+ownership API and retain their arena. ``report_status()`` on L1 reports
+``backing_resources_retained`` and ``external_io_lease_count``. A retained arena
+is unhealthy and remains allocated for the process lifetime.
 
 **Notes:**
 

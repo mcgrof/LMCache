@@ -214,3 +214,11 @@ Notes:
 - Raw-block slot reclamation is driven by the shared/global L2 eviction
   controller or explicit `delete()` calls.
 - `raw_block` remains the adapter type for all supported engines.
+- MP does not register its L1 descriptor as fixed buffers or DMA-BUFs.
+  Ordinary io_uring execution does not qualify the in-process DMA-BUF path.
+- MP io_uring with serde is rejected because intermediate buffers cannot honor
+  unknown completion. Controllers retain an affected L1 arena until the
+  owning process group restarts after device quiescence is established.
+- Use the ownership outcome APIs for MP store, load and shutdown. Status-only
+  methods reject unresolved results without consuming them; a failed task is
+  not proof that its buffers are reusable.
