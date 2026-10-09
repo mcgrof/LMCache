@@ -41,6 +41,7 @@ from lmcache.v1.memory_management import MemoryObj  # noqa: E402
 from lmcache.v1.storage_backend.raw_block import (  # noqa: E402
     NativeQuiescence,
     RawBlockCloseOutcome,
+    RawBlockIoContext,
     RawBlockKeySpec,
     RawBlockPutManyResult,
 )
@@ -159,6 +160,8 @@ class _FakeFdpCore:
         specs: list[Any],
         objects: list[Any],
         placement_ids: list[int | None] | None = None,
+        *,
+        io_context: RawBlockIoContext | None = None,
     ) -> RawBlockPutManyResult:
         self.put_many_calls.append(
             None if placement_ids is None else list(placement_ids)
@@ -309,11 +312,13 @@ def test_raw_block_l2_adapter_failed_store_bypasses_busy_pool() -> None:
         specs: list[RawBlockKeySpec],
         objects: list[MemoryObj],
         placement_ids: list[int | None] | None = None,
+        *,
+        io_context: RawBlockIoContext | None = None,
     ) -> RawBlockPutManyResult:
         started.set()
         if not release.wait(timeout=5):
             raise TimeoutError("test store was not released")
-        return put_many(specs, objects, placement_ids)
+        return put_many(specs, objects, placement_ids, io_context=io_context)
 
     try:
         with patch.object(fake_core, "put_many", side_effect=blocked_put):
