@@ -38,6 +38,9 @@ from lmcache.logging import init_logger
 from lmcache.v1.distributed.l2_adapters.base import (
     AdapterUsage,
     L2AdapterInterface,
+    L2CloseOutcome,
+    L2LoadOutcome,
+    L2StoreOutcome,
     L2TaskId,
 )
 from lmcache.v1.distributed.l2_adapters.config import (
@@ -377,6 +380,34 @@ class FaultInjectL2Adapter(L2AdapterInterface):
                     len(keys),
                 )
         return bitmap
+
+    def pop_completed_store_outcomes(self) -> dict[L2TaskId, L2StoreOutcome]:
+        """Preserve the inner adapter's source-buffer ownership outcome."""
+        return self._inner.pop_completed_store_outcomes()
+
+    def query_load_outcome(self, task_id: L2TaskId) -> L2LoadOutcome | None:
+        """Apply load faults while preserving destination-buffer ownership."""
+        outcome = self._inner.query_load_outcome(task_id)
+        if outcome is None:
+            return None
+        with self._keys_lock:
+            keys = self._load_keys.pop(task_id, None)
+        if keys is not None:
+            for position in self._drop_positions(keys):
+                outcome.bitmap.clear(position)
+        return outcome
+
+    @property
+    def may_report_unresolved_io(self) -> bool:
+        """Preserve the inner adapter's ownership requirement."""
+        return self._inner.may_report_unresolved_io
+
+    def close_with_outcome(self) -> L2CloseOutcome | None:
+        """Close the inner adapter and preserve its shutdown proof."""
+        outcome = self._inner.close_with_outcome()
+        with self._keys_lock:
+            self._load_keys.clear()
+        return outcome
 
     # -- listener / eviction / usage (delegate) -------------------------------
 

@@ -112,6 +112,10 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
         serde: SerdeProcessor,
         l1_manager: L1Manager,
     ) -> None:
+        if inner.may_report_unresolved_io:
+            raise ValueError(
+                "Serde wrapper cannot retain intermediate buffers after unresolved I/O"
+            )
         super().__init__()
         self._inner = inner
         self._serde = serde

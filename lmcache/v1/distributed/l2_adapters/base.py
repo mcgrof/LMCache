@@ -77,6 +77,33 @@ class AdapterUsage:
         return self.total_bytes_used / self.total_capacity_bytes
 
 
+@dataclass(frozen=True)
+class L2StoreOutcome:
+    """Store status and whether every submitted source buffer is reusable."""
+
+    result: L2StoreResult
+    buffers_reusable: bool
+
+
+@dataclass(frozen=True)
+class L2LoadOutcome:
+    """Load bitmap and whether every destination buffer is reusable.
+
+    A false ownership result invalidates the entire bitmap. The caller must
+    retain its arena and the adapter's source locks rather than publish data.
+    """
+
+    bitmap: Bitmap
+    buffers_reusable: bool
+
+
+@dataclass(frozen=True)
+class L2CloseOutcome:
+    """Proof that adapter shutdown permits releasing its registered L1 arena."""
+
+    buffers_reusable: bool
+
+
 class L2AdapterInterface(ABC):
     """
     The abstracted interface for L2 I/O adapters.
@@ -220,6 +247,9 @@ class L2AdapterInterface(ABC):
 
         Returns:
             L2TaskId: the task id of the submitted store task.
+
+        Raises:
+            Exception: Submission failed without admitting any buffer access.
         """
         pass
 
@@ -235,6 +265,18 @@ class L2AdapterInterface(ABC):
             to inspect the outcome.
         """
         pass
+
+    def pop_completed_store_outcomes(self) -> dict[L2TaskId, L2StoreOutcome]:
+        """Consume completed stores together with their buffer ownership result.
+
+        Legacy adapters must report completion only after they stop accessing
+        every source buffer, including failure. Adapters that can lose proof
+        of completion must override this method and the legacy result method.
+        """
+        return {
+            task_id: L2StoreOutcome(result, True)
+            for task_id, result in self.pop_completed_store_tasks().items()
+        }
 
     #####################
     # Lookup and Lock Interface
@@ -329,6 +371,9 @@ class L2AdapterInterface(ABC):
 
         Returns:
             L2TaskId: the task id of the submitted load task.
+
+        Raises:
+            Exception: Submission failed without admitting any buffer access.
         """
         pass
 
@@ -351,6 +396,36 @@ class L2AdapterInterface(ABC):
             None is returned when the load task is not completed.
         """
         pass
+
+    def query_load_outcome(self, task_id: L2TaskId) -> L2LoadOutcome | None:
+        """Consume a load outcome once, or return None while it is pending.
+
+        Legacy adapters must stop accessing all destination buffers before
+        reporting any bitmap. Override this method if completion can be unknown.
+        """
+        bitmap = self.query_load_result(task_id)
+        return None if bitmap is None else L2LoadOutcome(bitmap, True)
+
+    @property
+    def may_report_unresolved_io(self) -> bool:
+        """Whether an adapter can complete a task without returning its buffers.
+
+        Wrappers that allocate intermediate buffers must propagate the ownership
+        contract or reject such an adapter before submitting work.
+        """
+        return False
+
+    def close_with_outcome(self) -> L2CloseOutcome | None:
+        """Close and optionally prove that the registered L1 arena is reusable.
+
+        None gives no shutdown proof: pending leases require individual completed
+        task outcomes, otherwise the caller must retain their arenas. Returning
+        a false buffers_reusable field requires retaining the affinity arena even
+        without pending tasks. A true field proves that all queued and submitted
+        buffer access stopped.
+        """
+        self.close()
+        return None
 
     #####################
     # Listener Interface
