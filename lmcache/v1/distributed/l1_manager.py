@@ -41,6 +41,8 @@ from lmcache.v1.mp_observability.otel_init import register_gauge
 
 logger = init_logger(__name__)
 _l1_manager_ids = count()
+# Retained arenas must outlive every ordinary owner and allocator finalizer.
+_RETAINED_L1_MANAGERS: list["L1Manager"] = []
 
 
 # Internal classes and helper functions
@@ -189,6 +191,13 @@ class L1Manager:
         self._config = config
         self._l1_manager_id = next(_l1_manager_ids)
         self._lock = threading.Lock()
+        self._backing_resources_retained = False
+        self._retained_memory_objects: dict[int, MemoryObj] = {}
+        self._closed = False
+        self._io_leases: dict[int, list[MemoryObj]] = {}
+        self._io_buffer_refs: dict[int, int] = {}
+        self._deferred_io_frees: dict[int, MemoryObj] = {}
+        self._io_lease_ids = count()
 
         # Resident objects: readable, never write-locked.
         self._objects: dict[ObjectKey, L1ObjectState] = {}
@@ -296,7 +305,11 @@ class L1Manager:
             A dictionary mapping each object key to a tuple
             of (L1Error, Optional[MemoryObj]).
 
+        Raises:
+            RuntimeError: If the arena was already released by close.
+
         Errors:
+            BACKING_RESOURCES_RETAINED: External I/O quiescence is unknown.
             KEY_NOT_EXIST: The key does not exist.
 
         Note:
@@ -304,6 +317,10 @@ class L1Manager:
             being written is reported as ``KEY_NOT_EXIST``.
         """
         total = _validate_read_locks(read_locks)
+        if self._closed and not self._backing_resources_retained:
+            raise RuntimeError("L1 manager is closed")
+        if self._backing_resources_retained:
+            return {key: (L1Error.BACKING_RESOURCES_RETAINED, None) for key in keys}
         ret: dict[ObjectKey, L1OperationResult] = {}
         successful_keys: list[ObjectKey] = []
         for key in keys:
@@ -341,10 +358,18 @@ class L1Manager:
             A dictionary mapping each object key to a tuple of
             (L1Error, Optional[MemoryObj]).
 
+        Raises:
+            RuntimeError: If the arena was already released by close.
+
         Errors:
+            BACKING_RESOURCES_RETAINED: External I/O quiescence is unknown.
             KEY_NOT_EXIST: The key does not exist.
             KEY_NOT_READABLE: The key is not readable (in this case, not read-locked).
         """
+        if self._closed and not self._backing_resources_retained:
+            raise RuntimeError("L1 manager is closed")
+        if self._backing_resources_retained:
+            return {key: (L1Error.BACKING_RESOURCES_RETAINED, None) for key in keys}
         ret: dict[ObjectKey, L1OperationResult] = {}
 
         for key in keys:
@@ -430,7 +455,7 @@ class L1Manager:
             successful_keys.append(key)
 
         freed_meta = [self._object_meta(obj) for obj in need_to_free]
-        self._memory_manager.free(need_to_free)
+        self._free_memory_objects(need_to_free)
 
         for listener in self._registered_listeners:
             listener.on_l1_keys_read_finished(successful_keys)
@@ -478,9 +503,11 @@ class L1Manager:
             (L1Error, Optional[MemoryObj]).
 
         Raises:
+            RuntimeError: If the arena was already released by close.
             ValueError: If ``keys`` and ``is_temporary`` differ in length.
 
         Errors:
+            BACKING_RESOURCES_RETAINED: External I/O quiescence is unknown.
             KEY_NOT_WRITABLE: The key already has a resident object, or
                 ``tag`` already stages the key.
             OUT_OF_MEMORY: Not enough memory to allocate for the object.
@@ -496,6 +523,10 @@ class L1Manager:
                 f"{len(is_temporary)} is_temporary flags"
             )
 
+        if self._closed and not self._backing_resources_retained:
+            raise RuntimeError("L1 manager is closed")
+        if self._backing_resources_retained:
+            return {key: (L1Error.BACKING_RESOURCES_RETAINED, None) for key in keys}
         need_to_allocate: list[tuple[ObjectKey, bool]] = []
         ret: dict[ObjectKey, L1OperationResult] = {}
         successful_keys: list[ObjectKey] = []
@@ -507,7 +538,10 @@ class L1Manager:
 
             staged = self._get_staging(key, tag)
             if staged is not None:
-                if staged.write_lock.is_locked():
+                if (
+                    id(staged.memory_obj) in self._io_buffer_refs
+                    or staged.write_lock.is_locked()
+                ):
                     ret[key] = (L1Error.KEY_NOT_WRITABLE, None)
                     continue
                 # The previous reservation expired: hand the buffer over.
@@ -539,7 +573,7 @@ class L1Manager:
 
             # Free the memory if partial allocation succeeded
             if allocated_objs:
-                self._memory_manager.free(allocated_objs)
+                self._free_memory_objects(allocated_objs)
 
         else:
             for (key, is_temp), mem_obj in zip(
@@ -628,7 +662,7 @@ class L1Manager:
                 notification_keys.append(key)
                 notification_keys_meta.append(self._object_meta(entry.memory_obj))
 
-        self._memory_manager.free(discarded)
+        self._free_memory_objects(discarded)
 
         if notification_keys:
             for listener in self._registered_listeners:
@@ -713,7 +747,7 @@ class L1Manager:
                 entry.read_lock.lock()
             ret[key] = (L1Error.SUCCESS, entry.memory_obj)
 
-        self._memory_manager.free(discarded)
+        self._free_memory_objects(discarded)
         if resident_keys:
             self._report_read_reserved(resident_keys)
 
@@ -778,6 +812,9 @@ class L1Manager:
                 gone_keys.append(key)
                 continue
 
+            if id(entry.memory_obj) in self._io_buffer_refs:
+                ret[key] = L1Error.KEY_IS_LOCKED
+                continue
             locked = entry.read_lock.is_locked()
             if locked and not force:
                 ret[key] = L1Error.KEY_IS_LOCKED
@@ -837,7 +874,7 @@ class L1Manager:
             if key not in self._objects and key not in self._staging:
                 gone_keys.append(key)
 
-        self._memory_manager.free(discarded)
+        self._free_memory_objects(discarded)
         self._report_staging_gone(gone_keys)
         return ret
 
@@ -863,25 +900,29 @@ class L1Manager:
 
         Args:
             force: If True, clear ALL objects including read-locked ones and
-                every staging object. This may corrupt in-flight
-                store/prefetch operations. If False (default), only clear
+                every staging object. Active external I/O leases prevent
+                clearing even when force is True. If False (default), only clear
                 unlocked resident objects and staging objects whose write
                 lock expired, keeping read-locked objects and live staging
                 objects intact.
+
+        Raises:
+            RuntimeError: If external I/O still owns any buffers.
         """
+        if self._io_leases:
+            raise RuntimeError("Cannot clear L1 while external I/O owns buffers")
         if force:
             staging_count = sum(len(per_tag) for per_tag in self._staging.values())
             logger.warning(
                 "L1Manager: force-clearing all %d objects and %d staging objects "
-                "(including locked ones). This may corrupt in-flight "
-                "store/prefetch operations — use with caution.",
+                "(including reservation-locked ones).",
                 len(self._objects),
                 staging_count,
             )
             all_keys = list(self._objects.keys())
             all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
             all_meta = [self._object_meta(obj) for obj in all_memory_objs]
-            self._memory_manager.free(all_memory_objs)
+            self._free_memory_objects(all_memory_objs)
             self._objects.clear()
             for listener in self._registered_listeners:
                 listener.on_l1_keys_deleted_by_manager(all_keys)
@@ -958,14 +999,20 @@ class L1Manager:
             or a staging object whose write lock expired; False otherwise.
         """
         entry = self._objects.get(key, None)
-        if entry is not None and not entry.read_lock.is_locked():
+        if (
+            entry is not None
+            and id(entry.memory_obj) not in self._io_buffer_refs
+            and not entry.read_lock.is_locked()
+        ):
             return True
         per_tag = self._staging.get(key, None)
         if per_tag is None:
             return False
         # Snapshot: this runs without the manager lock.
         return any(
-            not staged.write_lock.is_locked() for staged in list(per_tag.values())
+            id(staged.memory_obj) not in self._io_buffer_refs
+            and not staged.write_lock.is_locked()
+            for staged in list(per_tag.values())
         )
 
     def get_memory_usage(self) -> tuple[int, int]:
@@ -1098,9 +1145,14 @@ class L1Manager:
             L1ReconfigureError: If L1 is not Device-DAX backed or the request
                 cannot be applied.
         """
-        return self._require_devdax_memory_manager().add_device(
-            device_path, size_in_bytes
-        )
+        with self._lock:
+            if self._backing_resources_retained or self._io_leases:
+                raise L1ReconfigureError(
+                    409, "L1 backing resources are retained or leased"
+                )
+            return self._require_devdax_memory_manager().add_device(
+                device_path, size_in_bytes
+            )
 
     def remove_devdax_device(
         self,
@@ -1120,26 +1172,125 @@ class L1Manager:
             L1ReconfigureError: If L1 is not Device-DAX backed or the request
                 cannot be applied.
         """
-        return self._require_devdax_memory_manager().remove_device(device_path, mode)
+        with self._lock:
+            if self._backing_resources_retained or self._io_leases:
+                raise L1ReconfigureError(
+                    409, "L1 backing resources are retained or leased"
+                )
+            return self._require_devdax_memory_manager().remove_device(
+                device_path, mode
+            )
 
     @property
     def config(self) -> L1ManagerConfig:
         """Return this manager's backend and lifetime configuration."""
         return self._config
 
-    def close(self) -> None:
-        """Close the L1Manager and free all resources."""
-        close_l1_gds_context(self._l1_manager_id)
-        with self._lock:
-            all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
-            for per_tag in self._staging.values():
-                all_memory_objs.extend(staged.memory_obj for staged in per_tag.values())
-            self._memory_manager.free(all_memory_objs)
-            self._objects.clear()
-            self._staging.clear()
-            self._staging_bytes = 0
+    @l1_mgr_synchronized
+    def acquire_io_lease(
+        self, keys: list[ObjectKey], objects: list[MemoryObj], *, tag: str | None = None
+    ) -> int:
+        """Pin the exact L1 buffers before submitting external I/O.
 
-        self._memory_manager.close()
+        Args:
+            keys: Keys corresponding to the buffers, in submission order.
+            objects: The objects returned by this manager for those keys.
+            tag: Write-reservation tag for a load; None for resident store sources.
+
+        Returns:
+            Lease ID to pass to release_io_lease after the ownership outcome.
+
+        Raises:
+            ValueError: If lists differ in length or an object is no longer owned.
+            RuntimeError: If this arena is closed or permanently retained.
+        """
+        if self._closed or self._backing_resources_retained:
+            raise RuntimeError("L1 arena cannot admit external I/O")
+        if not keys or len(keys) != len(objects):
+            raise ValueError("I/O lease requires matching non-empty keys and objects")
+        for key, obj in zip(keys, objects, strict=True):
+            entry = (
+                self._objects.get(key) if tag is None else self._get_staging(key, tag)
+            )
+            if entry is None or entry.memory_obj is not obj:
+                raise ValueError(
+                    "I/O lease buffer no longer belongs to this reservation"
+                )
+        lease_id = next(self._io_lease_ids)
+        self._io_leases[lease_id] = list(objects)
+        for obj in objects:
+            identity = id(obj)
+            self._io_buffer_refs[identity] = self._io_buffer_refs.get(identity, 0) + 1
+        return lease_id
+
+    @l1_mgr_synchronized
+    def release_io_lease(self, lease_id: int, *, buffers_reusable: bool) -> None:
+        """Settle a lease after completing its L1 bookkeeping.
+
+        Args:
+            lease_id: ID returned by acquire_io_lease, consumed exactly once.
+            buffers_reusable: Whether external I/O has conclusively stopped.
+                False seals and retains the entire backing arena.
+
+        Raises:
+            KeyError: If the lease is unknown or already consumed.
+        """
+        objects = self._io_leases.pop(lease_id)
+        if not buffers_reusable:
+            self._retain_backing_resources()
+        free = []
+        for obj in objects:
+            identity = id(obj)
+            refs = self._io_buffer_refs[identity] - 1
+            if refs:
+                self._io_buffer_refs[identity] = refs
+            else:
+                del self._io_buffer_refs[identity]
+                deferred = self._deferred_io_frees.pop(identity, None)
+                if deferred is not None:
+                    free.append(deferred)
+        self._free_memory_objects(free)
+
+    @l1_mgr_synchronized
+    def retain_backing_resources(self) -> None:
+        """Seal and retain this arena after an unresolved external I/O outcome.
+
+        Reject new reads and allocations and withhold frees, unmaps and exporter
+        cleanup for the process lifetime. The decision is irreversible.
+
+        Raises:
+            RuntimeError: If resources were already released by close.
+
+        Note:
+            Recover by restarting the owning process group after establishing
+            device quiescence.
+        """
+        self._retain_backing_resources()
+
+    def close(self) -> None:
+        """Release a quiescent arena or keep a retained arena alive.
+
+        Repeated calls have no effect. Retained arenas keep their allocator,
+        objects and external-memory context for the process lifetime.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            if self._io_leases:
+                self._retain_backing_resources()
+            if not self._backing_resources_retained:
+                close_l1_gds_context(self._l1_manager_id)
+                all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
+                for per_tag in self._staging.values():
+                    all_memory_objs.extend(
+                        staged.memory_obj for staged in per_tag.values()
+                    )
+                self._free_memory_objects(all_memory_objs)
+                self._objects.clear()
+                self._staging.clear()
+                self._staging_bytes = 0
+                self._memory_manager.close()
+            self._closed = True
         with L1Manager._gauge_lock:
             L1Manager._gauge_targets.pop(self._l1_manager_id, None)
 
@@ -1174,7 +1325,10 @@ class L1Manager:
         # grown heap on the lazy tier). ``memory_configured_bytes`` is the
         # current declared capacity, summed to fit this dict's flat shape.
         return {
-            "is_healthy": self._memory_manager.memcheck(),
+            "is_healthy": not self._backing_resources_retained
+            and self._memory_manager.memcheck(),
+            "backing_resources_retained": self._backing_resources_retained,
+            "external_io_lease_count": len(self._io_leases),
             "total_object_count": len(self._objects) + staging,
             "write_locked_count": write_locked,
             "read_locked_count": read_locked,
@@ -1230,6 +1384,29 @@ class L1Manager:
 
     # Private helpers
 
+    def _retain_backing_resources(self) -> None:
+        """Keep the arena and deferred objects alive; caller holds the lock."""
+        if self._backing_resources_retained:
+            return
+        if self._closed:
+            raise RuntimeError("Cannot retain an already closed L1 arena")
+        self._backing_resources_retained = True
+        self._retained_memory_objects.update(self._deferred_io_frees)
+        _RETAINED_L1_MANAGERS.append(self)
+
+    def _free_memory_objects(self, objects: list[MemoryObj]) -> None:
+        """Withhold externally owned buffers; caller holds the lock."""
+        if self._backing_resources_retained:
+            self._retained_memory_objects.update((id(obj), obj) for obj in objects)
+            return
+        free = []
+        for obj in objects:
+            if id(obj) in self._io_buffer_refs:
+                self._deferred_io_frees[id(obj)] = obj
+            else:
+                free.append(obj)
+        self._memory_manager.free(free)
+
     def _get_staging(self, key: ObjectKey, tag: str) -> L1ObjectState | None:
         """Return ``tag``'s staging object for ``key``, or None."""
         per_tag = self._staging.get(key, None)
@@ -1277,7 +1454,10 @@ class L1Manager:
         if staged is None:
             return L1Error.KEY_NOT_EXIST, None
 
-        if not staged.write_lock.is_locked():
+        if (
+            not staged.write_lock.is_locked()
+            and id(staged.memory_obj) not in self._io_buffer_refs
+        ):
             logger.warning(
                 "L1Manager: %s on key %s (tag %r) whose write reservation "
                 "expired, potential inconsistent data might be written",
@@ -1306,6 +1486,8 @@ class L1Manager:
             return 0
         freed: list[MemoryObj] = []
         for tag, staged in list(per_tag.items()):
+            if id(staged.memory_obj) in self._io_buffer_refs:
+                continue
             if staged.write_lock.is_locked():
                 if not force:
                     continue
@@ -1321,7 +1503,7 @@ class L1Manager:
                     tag,
                 )
             freed.append(self._pop_staging(key, tag).memory_obj)
-        self._memory_manager.free(freed)
+        self._free_memory_objects(freed)
         return len(freed)
 
     def _report_read_reserved(self, keys: list[ObjectKey]) -> None:
@@ -1354,7 +1536,7 @@ class L1Manager:
         """Free ``objs`` and report ``keys`` as deleted to listeners and
         the event bus."""
         freed_meta = [self._object_meta(obj) for obj in objs]
-        self._memory_manager.free(objs)
+        self._free_memory_objects(objs)
 
         for listener in self._registered_listeners:
             listener.on_l1_keys_deleted_by_manager(keys)

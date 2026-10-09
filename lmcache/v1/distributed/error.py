@@ -47,6 +47,9 @@ class L1Error(enum.Enum):
     OUT_OF_MEMORY = enum.auto()
     """ Not enough memory to complete the operation. """
 
+    BACKING_RESOURCES_RETAINED = enum.auto()
+    """ External I/O quiescence is unknown; the arena cannot be reused. """
+
 
 ErrorType = L1Error
 
@@ -73,6 +76,8 @@ def strerror(error: ErrorType) -> str:
             return "The specified key is in the wrong state for the operation."
         elif error == L1Error.KEY_IS_LOCKED:
             return "The specified key is locked and cannot perform the operation."
+        elif error == L1Error.BACKING_RESOURCES_RETAINED:
+            return "L1 backing resources are retained after unresolved I/O."
         elif error == L1Error.OUT_OF_MEMORY:
             return "Not enough memory to complete the operation."
 
