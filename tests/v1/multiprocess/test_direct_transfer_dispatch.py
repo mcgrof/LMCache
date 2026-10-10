@@ -51,8 +51,14 @@ def native(monkeypatch):
 # ------------------------------------------------------------------ #
 
 
+def _memory_obj(device: str = "cpu"):
+    obj = MagicMock()
+    obj.raw_tensor = SimpleNamespace(device=SimpleNamespace(type=device))
+    return obj
+
+
 def _supported(cc, block_ids_host=((1, 2),), memory_objs=()):
-    objs = list(memory_objs) if memory_objs else [MagicMock()]
+    objs = list(memory_objs) if memory_objs else [_memory_obj()]
     return direct_transfer_supported(cc, 0, objs, list(block_ids_host))
 
 
@@ -98,7 +104,13 @@ def test_missing_host_block_ids_is_unsupported(native):
 def test_gds_objects_are_unsupported(native):
     gds = MagicMock(spec=GDSMemoryObject)
     cc = _cache_context([_FMT_ELIGIBLE])
-    assert _supported(cc, memory_objs=[MagicMock(), gds]) is False
+    assert _supported(cc, memory_objs=[_memory_obj(), gds]) is False
+
+
+def test_gpu_objects_use_staged_transfer(native):
+    cc = _cache_context([_FMT_ELIGIBLE])
+    assert _supported(cc, memory_objs=[_memory_obj("cuda")]) is False
+    native.direct_copy_format_supported.assert_not_called()
 
 
 # ------------------------------------------------------------------ #
@@ -116,7 +128,7 @@ def _dispatch(monkeypatch, block_ids_host):
     mod.transfer_kv_per_object_group(
         cc,
         block_ids_gpu=[MagicMock()],
-        memory_objs=[MagicMock()],
+        memory_objs=[_memory_obj()],
         object_group_id=0,
         batch_size=1,
         skip_first_n_tokens=0,

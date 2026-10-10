@@ -14,11 +14,16 @@ import weakref
 from lmcache.lmcache_native import TTLLock
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import L1BackendType, MemoryLayoutDesc, ObjectKey
-from lmcache.v1.distributed.config import L1ManagerConfig, get_configured_capacity_bytes
+from lmcache.v1.distributed.config import (
+    GPUL1ManagerConfig,
+    L1ManagerConfig,
+    get_configured_capacity_bytes,
+)
 from lmcache.v1.distributed.error import L1Error, L1ReconfigureError
 from lmcache.v1.distributed.internal_api import L1ManagerListener, L1ObjectMeta
 from lmcache.v1.distributed.memory_manager import (
     GDSL1MemoryManager,
+    GPUL1MemoryManager,
     L1ManagerProtocol,
     L1MemoryManager,
 )
@@ -210,7 +215,9 @@ class L1Manager:
         # GDS, Device-DAX, and CPU L1 are mutually exclusive tiers. Each tier
         # owns its backing allocator instead of branching inside the CPU path.
         self._memory_manager: L1ManagerProtocol
-        if config.gds_l1_config is not None:
+        if isinstance(config, GPUL1ManagerConfig):
+            self._memory_manager = GPUL1MemoryManager(config)
+        elif config.gds_l1_config is not None:
             if config.memory_config.devdax_path:
                 raise ValueError("GDS and Device-DAX require separate L1 managers")
             self._memory_manager = GDSL1MemoryManager(config.gds_l1_config)
@@ -1574,7 +1581,9 @@ class L1Manager:
                 value(m),
                 {
                     "l1_tag": m.config.tag,
-                    "backend": "gds"
+                    "backend": "gpu"
+                    if isinstance(m.config, GPUL1ManagerConfig)
+                    else "gds"
                     if m.config.gds_l1_config
                     else "dram+devdax"
                     if m.config.memory_config.devdax_path

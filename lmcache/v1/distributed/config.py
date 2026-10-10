@@ -11,6 +11,7 @@ import argparse
 import json
 import math
 import os
+import re
 
 # First Party
 from lmcache.logging import init_logger
@@ -465,6 +466,8 @@ def get_configured_capacity_bytes(
     Returns:
         Configured bytes per medium, omitting any sized zero.
     """
+    if isinstance(config, GPUL1ManagerConfig):
+        return {L1BackendType.GPU: config.memory_config.size_in_bytes}
     if config.gds_l1_config is not None:
         size = config.gds_l1_config.size_in_bytes
         return {L1BackendType.GDS: size} if size > 0 else {}
@@ -572,6 +575,70 @@ class DRAML1ManagerConfig(L1ManagerConfig):
         if hugepages:
             _check_hugepage_availability(config.memory_config.size_in_bytes)
         return config
+
+
+@dataclass
+class GPUL1ManagerConfig(L1ManagerConfig):
+    """A server-owned GPU arena for registered raw-block io_uring I/O."""
+
+    device: str = "cuda:0"
+    """CUDA/HIP device in the server process; engine copies must use this GPU."""
+    buffer_provider: str = "native"
+    """Native device export or the explicit experimental vulkan_rm provider."""
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"cuda(?::[0-9]+)?", self.device):
+            raise ValueError("GPU L1 device must be cuda or cuda:<ordinal>")
+        if self.buffer_provider not in ("native", "vulkan_rm"):
+            raise ValueError("GPU L1 provider must be native or vulkan_rm")
+        memory = self.memory_config
+        if (
+            memory.use_lazy
+            or memory.shm_name
+            or memory.use_hugepages
+            or memory.devdax_path
+            or self.gds_l1_config is not None
+            or memory.size_in_bytes % 4096
+            or memory.align_bytes != 4096
+            or memory.buffer_registration == "fixed"
+        ):
+            raise ValueError(
+                "GPU L1 requires eager device memory and 4096-byte alignment"
+            )
+        if self.buffer_provider == "vulkan_rm" and memory.size_in_bytes > 1 << 30:
+            raise ValueError("Vulkan/RM GPU L1 capacity must not exceed 1 GiB")
+        self.memory_config = replace(memory, buffer_registration="dmabuf")
+
+    @classmethod
+    def from_dict(
+        cls,
+        values: dict[str, object],
+        defaults: EvictionConfig | None,
+        read_ttl: int = 300,
+        write_ttl: int = 600,
+    ) -> "GPUL1ManagerConfig":
+        """Parse a tagged GPU arena without allocating device memory.
+
+        Args:
+            values: GPU JSON fields including tag, size_gb, device and provider.
+            defaults: Global eviction defaults or a required local policy.
+            read_ttl: Default read-lock lifetime in seconds.
+            write_ttl: Default write-lock lifetime in seconds.
+
+        Returns:
+            Configuration for an eager DMA-BUF arena in the server process.
+
+        Raises:
+            ValueError: A field is malformed or incompatible with GPU storage.
+        """
+        config = _parse_l1_common(
+            cls, values, defaults, read_ttl, write_ttl, {"device", "buffer_provider"}
+        )
+        device = values.get("device", "cuda:0")
+        provider = values.get("buffer_provider", "native")
+        if not isinstance(device, str) or not isinstance(provider, str):
+            raise ValueError("GPU device and buffer_provider must be strings")
+        return replace(config, device=device, buffer_provider=provider)
 
 
 @dataclass
@@ -778,6 +845,16 @@ def validate_storage_manager_config(config: StorageManagerConfig) -> None:
             raise ValueError("L2 affinity requires a host-backed DRAM or DEVDAX L1")
         memory = l1.memory_config
         inner = unwrap_l2_adapter_config(adapter_config)
+        if isinstance(l1, GPUL1ManagerConfig) and not isinstance(
+            inner, RawBlockL2AdapterConfig
+        ):
+            raise ValueError("GPU L1 affinity requires the raw_block io_uring adapter")
+        if (
+            isinstance(l1, GPUL1ManagerConfig)
+            and adapter_config.serde_config is not None
+            and adapter_config.serde_config.type != "fp8"
+        ):
+            raise ValueError("GPU L1 currently supports fp8 serde only")
         if isinstance(inner, RawBlockL2AdapterConfig):
             inner.validate_l1_registration(memory.buffer_registration)
         adapter_name = requires_single_l1_memory_region(adapter_config)
@@ -796,12 +873,12 @@ def l1_exposes_single_memory_region(config: StorageManagerConfig) -> bool:
 
     Returns:
         ``True`` if L1 is a single registerable memory region, ``False`` for
-        GDS L1 or Device-DAX L1.
+        GPU L1, GDS L1 or Device-DAX L1.
     """
     if len(config.l1_manager_configs) != 1:
         return False
     l1_config = config.l1_manager_config
-    if l1_config.gds_l1_config is not None:
+    if isinstance(l1_config, GPUL1ManagerConfig) or l1_config.gds_l1_config is not None:
         return False
     if l1_config.memory_config.devdax_path:
         return False
@@ -842,7 +919,7 @@ def add_storage_manager_args(
         default=[],
         metavar="JSON",
         help=(
-            "Tagged L1 JSON: type (DRAM, DEVDAX, GDS), tag, size_gb "
+            "Tagged L1 JSON: type (DRAM, GPU, DEVDAX, GDS), tag, size_gb "
             "and backend fields. Repeat for multiple L1s."
         ),
     )
@@ -1090,9 +1167,11 @@ def parse_args_to_config(
             str,
             type[DRAML1ManagerConfig]
             | type[DevDaxL1ManagerConfig]
-            | type[GDSL1ManagerConfig],
+            | type[GDSL1ManagerConfig]
+            | type[GPUL1ManagerConfig],
         ] = {
             "DRAM": DRAML1ManagerConfig,
+            "GPU": GPUL1ManagerConfig,
             "DEVDAX": DevDaxL1ManagerConfig,
             "GDS": GDSL1ManagerConfig,
         }
@@ -1104,7 +1183,7 @@ def parse_args_to_config(
                 or not isinstance(values.get("type"), str)
                 or values["type"] not in classes
             ):
-                raise ValueError("--l1-manager requires type DRAM, DEVDAX or GDS")
+                raise ValueError("--l1-manager requires type DRAM, GPU, DEVDAX or GDS")
             l1_configs.append(
                 classes[values["type"]].from_dict(
                     values,
