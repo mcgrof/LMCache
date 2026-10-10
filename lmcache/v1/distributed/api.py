@@ -90,6 +90,7 @@ class L1BackendType(str, enum.Enum):
     wire value (``L1BackendType.DRAM == "dram"``).
     """
 
+    GPU = "gpu"
     DRAM = "dram"
     DEVDAX = "devdax"
     GDS = "gds"

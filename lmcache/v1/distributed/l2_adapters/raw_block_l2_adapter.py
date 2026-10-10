@@ -621,6 +621,12 @@ class RawBlockL2Adapter(L2AdapterInterface):
             if l1_memory_desc is not None and registration != "none"
             else ()
         )
+        self._registered_device = (
+            l1_memory_desc.device if l1_memory_desc is not None else "cpu"
+        )
+        if self._registered_device != "cpu" and registration != "dmabuf":
+            raise ValueError("GPU L1 requires DMA-BUF registration")
+        self._device_access_unresolved = False
         self._block_align = config.block_align
         if (
             (config.use_odirect or config.use_uring_cmd)
@@ -989,6 +995,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 outcome = self._core.close()
                 self._close_outcome = L2CloseOutcome(
                     outcome.may_release_backing_resources
+                    and not self._device_access_unresolved
                 )
             finally:
                 with self._lock:
@@ -1019,7 +1026,10 @@ class RawBlockL2Adapter(L2AdapterInterface):
             )
         with self._lock:
             return {
-                "is_healthy": core_status.get("is_healthy", True) and not self._closed,
+                "is_healthy": core_status.get("is_healthy", True)
+                and not self._closed
+                and not self._device_access_unresolved,
+                "device_access_unresolved": self._device_access_unresolved,
                 "type": "RawBlockL2Adapter",
                 "store_inflight_task_count": self._store_inflight_tasks,
                 "lookup_inflight_task_count": self._lookup_inflight_tasks,
@@ -1106,8 +1116,10 @@ class RawBlockL2Adapter(L2AdapterInterface):
 
     def _raise_if_closed_locked(self) -> None:
         """Reject submissions after the adapter has been closed."""
-        if self._closed:
-            raise RuntimeError("RawBlockL2Adapter is closed")
+        if self._closed or self._device_access_unresolved:
+            raise RuntimeError(
+                "RawBlockL2Adapter is closed or has unresolved GPU access"
+            )
 
     def _submit_task(
         self,
@@ -1381,6 +1393,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
             - newly stored object keys
             - raw-block slot byte charges aligned with the newly stored keys
         """
+        self._prepare_gpu_payloads(objects, zero_padding=True)
         specs = [encode_object_key(key) for key in keys]
         placement_ids = self._assign_fdp_placement_ids(keys)
         put_result = self._core.put_many(
@@ -1411,7 +1424,9 @@ class RawBlockL2Adapter(L2AdapterInterface):
             bytes_transferred = sum(stored_sizes)
         except Exception as e:
             logger.error("RawBlockL2Adapter store task %d failed: %s", task_id, e)
-        buffers_reusable = not self._core.is_poisoned()
+        buffers_reusable = not (
+            self._core.is_poisoned() or self._device_access_unresolved
+        )
         with self._lock:
             self._store_inflight_tasks -= 1
             self._completed_store_tasks[task_id] = L2StoreOutcome(
@@ -1455,6 +1470,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
         objects: list[MemoryObj],
         io_context: RawBlockIoContext,
     ) -> tuple[Bitmap, list[ObjectKey]]:
+        self._prepare_gpu_payloads(objects, zero_padding=False)
         specs = [encode_object_key(key) for key in keys]
         results = self._core.load_many_into(
             [spec.encoded for spec in specs], objects, io_context=io_context
@@ -1476,7 +1492,9 @@ class RawBlockL2Adapter(L2AdapterInterface):
             bitmap, accessed_keys = future.result()
         except Exception as e:
             logger.error("RawBlockL2Adapter load task %d failed: %s", task_id, e)
-        buffers_reusable = not self._core.is_poisoned()
+        buffers_reusable = not (
+            self._core.is_poisoned() or self._device_access_unresolved
+        )
         with self._lock:
             self._load_inflight_tasks -= 1
             self._completed_load_tasks[task_id] = L2LoadOutcome(
@@ -1526,6 +1544,27 @@ class RawBlockL2Adapter(L2AdapterInterface):
             work_kind="mp_task",
         )
 
+    def _prepare_gpu_payloads(
+        self, objects: list[MemoryObj], *, zero_padding: bool
+    ) -> None:
+        """Fence worker-side GPU padding before giving its slot to storage.
+
+        Producers must complete their own streams before handing objects to
+        the adapter. This stream owns only padding writes; a failed fence
+        retains the affinity arena even if the storage engine can close.
+        """
+        if self._registered_device == "cpu":
+            return
+        try:
+            with torch_dev.device(self._registered_device):
+                if zero_padding:
+                    for obj in objects:
+                        obj.zero_padding()
+                torch_dev.current_stream().synchronize()
+        except RuntimeError:
+            self._device_access_unresolved = True
+            raise
+
     def _validate_registered_objects(self, objects: list[MemoryObj]) -> None:
         if not self._registered_regions:
             return
@@ -1533,11 +1572,12 @@ class RawBlockL2Adapter(L2AdapterInterface):
             physical = obj.physical_tensor
             if (
                 physical is None
-                or physical.device.type != "cpu"
+                or str(physical.device) != self._registered_device
                 or not physical.is_contiguous()
             ):
                 raise ValueError(
-                    "MP registered I/O requires contiguous host L1 objects"
+                    "MP registered I/O requires contiguous objects "
+                    "on the registered L1 device"
                 )
             ptr = physical.data_ptr()
             length = (

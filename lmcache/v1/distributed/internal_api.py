@@ -43,6 +43,8 @@ class L1MemoryDesc:
     align_bytes: int
     buffer_registration: str = "none"
     regions: tuple[L1MemoryRegion, ...] = ()
+    device: str = "cpu"
+    """Device owning the registered arena; CPU is the legacy default."""
 
     def __post_init__(self) -> None:
         if self.buffer_registration == "none":

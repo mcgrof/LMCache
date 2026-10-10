@@ -72,7 +72,7 @@ def direct_transfer_supported(
     """Whether one object group can be moved by the copy engine.
 
     The direct path (see :func:`run_direct_transfer`) needs host block ids, a
-    non-GDS object set, and a token-major layout whose paged block is one
+    host-backed object set, and a token-major layout whose paged block is one
     contiguous run in every kernel group of the object group. Callers must
     also have checked :data:`_HAS_BATCH_MEMCPY_ASYNC`; this function assumes
     the native entry point exists and only inspects the request.
@@ -92,9 +92,17 @@ def direct_transfer_supported(
     """
     if not block_ids_host:
         return False
-    if any(isinstance(mo, GDSMemoryObject) for mo in memory_objs):
+    if any(
+        isinstance(mo, GDSMemoryObject)
+        or (
+            mo is not None
+            and mo.raw_tensor is not None
+            and mo.raw_tensor.device.type != "cpu"
+        )
+        for mo in memory_objs
+    ):
         logger.debug(
-            "Object group %d has GDS-backed objects; using the kernel path",
+            "Object group %d has device-backed objects; using the kernel path",
             object_group_id,
         )
         return False

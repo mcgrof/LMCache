@@ -19,6 +19,7 @@ from lmcache.usage_telemetry.l2_usage import InitializeL2ConnectorUsage
 from lmcache.usage_telemetry.mp import InitializeMPUsageContext
 from lmcache.usage_telemetry.mp_continuous import InitializeMPContinuousUsage
 from lmcache.v1.distributed.config import (
+    GPUL1ManagerConfig,
     StorageManagerConfig,
     add_storage_manager_args,
     parse_args_to_config,
@@ -319,6 +320,20 @@ def run_cache_server(
         If return_engine is True: tuple of (request server, MPCacheServer).
         If return_engine is False: None (blocks until interrupted).
     """
+    if (
+        any(
+            isinstance(c, GPUL1ManagerConfig)
+            for c in storage_manager_config.l1_manager_configs
+        )
+        and mp_config.supported_transfer_mode != "lmcache_driven"
+    ):
+        raise ValueError("GPU L1 requires --supported-transfer-mode lmcache_driven")
+    if mp_config.p2p_config.enabled and any(
+        isinstance(c, GPUL1ManagerConfig)
+        for c in storage_manager_config.l1_manager_configs
+    ):
+        raise ValueError("GPU L1 does not support peer transfer channels")
+
     # Before any event IPC backend is resolved (KV-cache registration), so
     # the setting is observed by every resolver in this process.
     set_isolated_ipc(mp_config.isolated_ipc)

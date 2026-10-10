@@ -37,6 +37,8 @@ def lmcache_memcpy_async_h2d(
         raise ValueError(
             "memory_obj.raw_tensor is None; ensure the MemoryObj has been allocated."
         )
+    if src_tensor.device.type != "cpu" and src_tensor.device != gpu_buffer.device:
+        raise ValueError("GPU L1 and engine KV staging must use the same device")
     mem_obj_size = memory_obj.get_size()
     if mem_obj_size != gpu_buffer.nbytes:
         raise ValueError(
@@ -80,6 +82,8 @@ def lmcache_memcpy_async_d2h(
         raise ValueError(
             "memory_obj.raw_tensor is None; ensure the MemoryObj has been allocated."
         )
+    if dst_tensor.device.type != "cpu" and dst_tensor.device != gpu_buffer.device:
+        raise ValueError("GPU L1 and engine KV staging must use the same device")
     mem_obj_size = memory_obj.get_size()
     if mem_obj_size != gpu_buffer.nbytes:
         raise ValueError(
@@ -99,6 +103,7 @@ def lmcache_memcpy_async_d2h(
         dst_tensor.view(torch.uint8)[:mem_obj_size].copy_(
             gpu_buffer.view(torch.uint8), non_blocking=True
         )
+        memory_obj.zero_padding()
 
 
 def build_staging_copies(
