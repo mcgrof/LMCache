@@ -915,20 +915,3 @@ def test_raw_block_fdp_requires_nonzero_device_ids() -> None:
 
     with pytest.raises(RuntimeError, match="no non-zero identifiers"):
         _make_fdp_adapter(fake_core, _make_fdp_config())
-
-
-def test_mp_uring_serde_refuses_before_native_or_arena_setup(tmp_path: Path) -> None:
-    """Reject intermediate-buffer ownership before native registration."""
-    config = RawBlockL2AdapterConfig(
-        device_path=str(tmp_path / "unopened"), slot_bytes=4096, io_engine="io_uring"
-    )
-    # First Party
-    from lmcache.v1.distributed.serde import SerdeConfig
-
-    config.serde_config = SerdeConfig("fp8")
-    with patch(
-        "lmcache.v1.distributed.l2_adapters.raw_block_l2_adapter.RawBlockCore"
-    ) as core:
-        with pytest.raises(ValueError, match="io_uring with serde is unsupported"):
-            RawBlockL2Adapter(config)
-        core.assert_not_called()

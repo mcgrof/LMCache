@@ -31,7 +31,6 @@ from __future__ import annotations
 
 # Standard
 from dataclasses import dataclass, field
-import enum
 import select
 import threading
 
@@ -45,6 +44,9 @@ from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.l2_adapters.base import (
     AdapterUsage,
     L2AdapterInterface,
+    L2CloseOutcome,
+    L2LoadOutcome,
+    L2StoreOutcome,
     L2TaskId,
 )
 from lmcache.v1.distributed.serde import (
@@ -65,21 +67,14 @@ _POLL_TIMEOUT_MS = 500
 _L1_WRITE_TAG = "serde_wrapper"
 
 
-class _StorePhase(enum.Enum):
-    SERIALIZE = enum.auto()
-    INNER_STORE = enum.auto()
-
-
 @dataclass
 class _StoreTaskState:
     wrapped_id: L2TaskId
     keys: list[ObjectKey]
     temp_keys: list[ObjectKey]
     temp_objs: list[MemoryObj]
-    phase: _StorePhase
-    """SERIALIZE while temps are write-locked; INNER_STORE after the
-    serialize→store transition. Only read on shutdown to pick the right
-    lock-release path; assignment is done under ``self._lock``."""
+    lease_id: int
+    read_temp_keys: list[ObjectKey] = field(default_factory=list)
 
 
 @dataclass
@@ -89,6 +84,7 @@ class _LoadTaskState:
     dst_objs: list[MemoryObj]
     temp_keys: list[ObjectKey]
     temp_objs: list[MemoryObj]
+    lease_id: int
     load_bitmap: Bitmap = field(default_factory=lambda: Bitmap(0))
     """Inner adapter's per-key load bitmap; populated in
     ``_drain_inner_load`` before the task transitions to the deserialize
@@ -112,10 +108,6 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
         serde: SerdeProcessor,
         l1_manager: L1Manager,
     ) -> None:
-        if inner.may_report_unresolved_io:
-            raise ValueError(
-                "Serde wrapper cannot retain intermediate buffers after unresolved I/O"
-            )
         super().__init__()
         self._inner = inner
         self._serde = serde
@@ -129,6 +121,10 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
         # Task-id space separate from inner's. Reverse maps let the
         # internal thread pair inner / serde completions back to our
         # wrapped task id.
+        self._admission_lock = threading.RLock()
+        self._closed = False
+        self._unresolved = False
+        self._close_outcome: L2CloseOutcome | None = None
         self._lock = threading.Lock()
         self._next_task_id: L2TaskId = 0
         self._store_tasks: dict[L2TaskId, _StoreTaskState] = {}
@@ -139,8 +135,8 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
         self._serde_to_load: dict[SerdeTaskId, L2TaskId] = {}
 
         # User-visible completion queues (drained by controller polls).
-        self._completed_store: dict[L2TaskId, L2StoreResult] = {}
-        self._completed_load: dict[L2TaskId, Bitmap] = {}
+        self._completed_store: dict[L2TaskId, L2StoreOutcome] = {}
+        self._completed_load: dict[L2TaskId, L2LoadOutcome] = {}
 
         self._stop_flag = threading.Event()
         self._thread = threading.Thread(
@@ -178,52 +174,72 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
 
         All-or-nothing: if temp alloc fails for any key or serialize
         submission raises, the whole task is marked failed and the
-        caller's next ``pop_completed_store_tasks`` call sees it.
+        caller consumes the failure through ``pop_completed_store_outcomes``.
         """
-        with self._lock:
-            wrapped_id = self._next_task_id
-            self._next_task_id += 1
-
-        temp_keys, temp_objs = self._alloc_temp_buffers(keys, objects)
-        if temp_objs is None:
-            logger.warning(
-                "Serde wrapper: temp alloc failed for store task %d",
-                wrapped_id,
-            )
-            self._finalize_store(wrapped_id, success=False)
-            return wrapped_id
-
-        # Hold the wrapper lock across submit + reverse-map registration
-        # so the internal drain thread cannot observe a half-state where
-        # the serde already signaled completion but ``_serde_to_store``
-        # has no entry — which would leave the wrapped task hanging.
-        state = _StoreTaskState(
-            wrapped_id=wrapped_id,
-            keys=list(keys),
-            temp_keys=temp_keys,
-            temp_objs=temp_objs,
-            phase=_StorePhase.SERIALIZE,
-        )
-        try:
+        with self._admission_lock:
+            if self._closed:
+                raise RuntimeError("Serde wrapper is closed")
             with self._lock:
-                self._store_tasks[wrapped_id] = state
-                serde_task_id = self._serde.submit_serialize(
-                    objects, temp_objs, state.keys
+                wrapped_id = self._next_task_id
+                self._next_task_id += 1
+
+            temp_keys, temp_objs = self._alloc_temp_buffers(keys, objects)
+            if temp_objs is None:
+                logger.warning(
+                    "Serde wrapper: temp alloc failed for store task %d",
+                    wrapped_id,
                 )
-                self._serde_to_store[serde_task_id] = wrapped_id
-        except Exception:
-            logger.exception(
-                "Serde wrapper: submit_serialize raised for store task %d",
-                wrapped_id,
+                self._finalize_store(wrapped_id, success=False)
+                return wrapped_id
+
+            # Hold the wrapper lock across submit + reverse-map registration
+            # so the internal drain thread cannot observe a half-state where
+            # the serde already signaled completion but ``_serde_to_store``
+            # has no entry — which would leave the wrapped task hanging.
+            try:
+                lease = self._l1_manager.acquire_io_lease(
+                    temp_keys, temp_objs, tag=_L1_WRITE_TAG
+                )
+            except (ValueError, RuntimeError):
+                self._release_write_temps(temp_keys)
+                raise
+            state = _StoreTaskState(
+                wrapped_id=wrapped_id,
+                keys=list(keys),
+                temp_keys=temp_keys,
+                temp_objs=temp_objs,
+                lease_id=lease,
             )
-            with self._lock:
-                self._store_tasks.pop(wrapped_id, None)
-            self._release_write_temps(temp_keys)
-            self._finalize_store(wrapped_id, success=False)
+            try:
+                with self._lock:
+                    self._store_tasks[wrapped_id] = state
+                    serde_task_id = self._serde.submit_serialize(
+                        objects, temp_objs, state.keys
+                    )
+                    self._serde_to_store[serde_task_id] = wrapped_id
+            except (RuntimeError, ValueError, TypeError, OSError):
+                logger.exception(
+                    "Serde wrapper: submit_serialize raised for store task %d",
+                    wrapped_id,
+                )
+                self._finalize_store(wrapped_id, success=False, buffers_reusable=False)
+                return wrapped_id
             return wrapped_id
-        return wrapped_id
 
     def pop_completed_store_tasks(self) -> dict[L2TaskId, L2StoreResult]:
+        """Consume store results; unresolved ownership is exposed by outcomes."""
+        with self._lock:
+            if any(
+                not outcome.buffers_reusable
+                for outcome in self._completed_store.values()
+            ):
+                raise RuntimeError("Unresolved serde store requires ownership outcomes")
+            completed = self._completed_store
+            self._completed_store = {}
+        return {task: outcome.result for task, outcome in completed.items()}
+
+    def pop_completed_store_outcomes(self) -> dict[L2TaskId, L2StoreOutcome]:
+        """Consume results with the ownership proof for the entire affinity arena."""
         with self._lock:
             result = self._completed_store
             self._completed_store = {}
@@ -256,52 +272,81 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
         """Submit a wrapped load (inner.load → deserialize).
 
         All-or-nothing: if temp alloc or inner submission fails, the
-        caller gets an all-zeros bitmap on next ``query_load_result``.
+        caller consumes an all-zeros bitmap through ``query_load_outcome``.
         """
-        with self._lock:
-            wrapped_id = self._next_task_id
-            self._next_task_id += 1
-
-        temp_keys, temp_objs = self._alloc_temp_buffers(keys, objects)
-        if temp_objs is None:
-            logger.warning(
-                "Serde wrapper: temp alloc failed for load task %d",
-                wrapped_id,
-            )
-            self._finalize_load(wrapped_id, Bitmap(len(keys)))
-            return wrapped_id
-
-        # Hold the wrapper lock across submit + reverse-map registration
-        # so the internal drain thread cannot observe a half-state where
-        # the inner already signaled completion but ``_inner_to_load``
-        # has no entry.
-        state = _LoadTaskState(
-            wrapped_id=wrapped_id,
-            keys=list(keys),
-            dst_objs=list(objects),
-            temp_keys=temp_keys,
-            temp_objs=temp_objs,
-        )
-        try:
+        with self._admission_lock:
+            if self._closed:
+                raise RuntimeError("Serde wrapper is closed")
             with self._lock:
-                self._load_tasks[wrapped_id] = state
-                inner_task_id = self._inner.submit_load_task(keys, temp_objs)
-                self._inner_to_load[inner_task_id] = wrapped_id
-        except Exception:
-            logger.exception(
-                "Serde wrapper: inner.submit_load_task raised for task %d",
-                wrapped_id,
+                wrapped_id = self._next_task_id
+                self._next_task_id += 1
+
+            temp_keys, temp_objs = self._alloc_temp_buffers(keys, objects)
+            if temp_objs is None:
+                logger.warning(
+                    "Serde wrapper: temp alloc failed for load task %d",
+                    wrapped_id,
+                )
+                self._finalize_load(wrapped_id, Bitmap(len(keys)))
+                return wrapped_id
+
+            # Hold the wrapper lock across submit + reverse-map registration
+            # so the internal drain thread cannot observe a half-state where
+            # the inner already signaled completion but ``_inner_to_load``
+            # has no entry.
+            try:
+                lease = self._l1_manager.acquire_io_lease(
+                    temp_keys, temp_objs, tag=_L1_WRITE_TAG
+                )
+            except (ValueError, RuntimeError):
+                self._release_write_temps(temp_keys)
+                raise
+            state = _LoadTaskState(
+                wrapped_id=wrapped_id,
+                keys=list(keys),
+                dst_objs=list(objects),
+                temp_keys=temp_keys,
+                temp_objs=temp_objs,
+                lease_id=lease,
             )
-            with self._lock:
-                self._load_tasks.pop(wrapped_id, None)
-            self._release_write_temps(temp_keys)
-            self._finalize_load(wrapped_id, Bitmap(len(keys)))
+            try:
+                with self._lock:
+                    self._load_tasks[wrapped_id] = state
+                    inner_task_id = self._inner.submit_load_task(keys, temp_objs)
+                    self._inner_to_load[inner_task_id] = wrapped_id
+            except (RuntimeError, ValueError, TypeError, OSError):
+                logger.exception(
+                    "Serde wrapper: inner.submit_load_task raised for task %d",
+                    wrapped_id,
+                )
+                self._finalize_load(
+                    wrapped_id,
+                    Bitmap(len(keys)),
+                    buffers_reusable=not self._inner.may_report_unresolved_io,
+                )
+                return wrapped_id
             return wrapped_id
-        return wrapped_id
 
     def query_load_result(self, task_id: L2TaskId) -> Bitmap | None:
+        """Consume a load bitmap, withholding hits after unresolved I/O."""
+        with self._lock:
+            outcome = self._completed_load.get(task_id)
+            if outcome is None:
+                return None
+            if not outcome.buffers_reusable:
+                raise RuntimeError("Unresolved serde load requires ownership outcomes")
+            del self._completed_load[task_id]
+        return outcome.bitmap
+
+    def query_load_outcome(self, task_id: L2TaskId) -> L2LoadOutcome | None:
+        """Consume a load result and its backing-arena ownership proof."""
         with self._lock:
             return self._completed_load.pop(task_id, None)
+
+    @property
+    def may_report_unresolved_io(self) -> bool:
+        """Expose ownership results from storage and codec completion fences."""
+        return True
 
     # ------------------------------------------------------------------
     # Eviction / metadata / listeners (delegate to inner)
@@ -352,58 +397,55 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        self._stop_flag.set()
-        self._thread.join()
+        """Stop submissions and retain intermediates unless shutdown proves drain."""
+        self.close_with_outcome()
 
-        # Shut down the inner adapter and serde processor BEFORE
-        # releasing temp buffers. Both ``close()`` calls block until
-        # their in-flight reads / writes against the temp MemoryObjs
-        # finish; releasing the temps first would let L1 reclaim memory
-        # that the inner adapter or serde thread pool is still touching
-        # (use-after-free).
-        self._inner.close()
-        self._serde.close()
+    def close_with_outcome(self) -> L2CloseOutcome:
+        """Join codec work and close storage before settling intermediate leases.
 
-        # Now safe to release leftover temp buffers. Store tasks in
-        # SERIALIZE phase hold write locks on their temps; tasks in
-        # INNER_STORE phase hold read locks (transitioned after
-        # serialize). Load tasks always hold write locks.
-        with self._lock:
-            write_locked: list[ObjectKey] = []
-            read_locked: list[ObjectKey] = []
-            for s in self._store_tasks.values():
-                if s.phase is _StorePhase.SERIALIZE:
-                    write_locked.extend(s.temp_keys)
-                else:
-                    read_locked.extend(s.temp_keys)
-            for load in self._load_tasks.values():
-                write_locked.extend(load.temp_keys)
-            self._store_tasks.clear()
-            self._load_tasks.clear()
+        Unknown inner shutdown retains the L1 arena. A prior unknown task
+        outcome remains irreversible even if a later close proves quiescence.
+        Repeated calls return the same outcome.
+        """
+        with self._admission_lock:
+            if self._close_outcome is not None:
+                return self._close_outcome
+            self._closed = True
+            self._stop_flag.set()
+            self._thread.join()
+            reusable = True
+            try:
+                reusable = self._serde.close_with_outcome()
+            except (RuntimeError, OSError):
+                logger.exception("Serde wrapper: codec shutdown did not prove drain")
+                reusable = False
+            try:
+                inner_outcome = self._inner.close_with_outcome()
+                reusable = reusable and (
+                    inner_outcome.buffers_reusable
+                    if inner_outcome is not None
+                    else not self._inner.may_report_unresolved_io
+                )
+            except (RuntimeError, OSError):
+                logger.exception("Serde wrapper: storage shutdown did not prove drain")
+                reusable = False
+            reusable = reusable and not self._unresolved
+            if not reusable:
+                self._l1_manager.retain_backing_resources()
+            for task in list(self._store_tasks):
+                self._finalize_store(task, False, buffers_reusable=reusable)
+            for task, state in list(self._load_tasks.items()):
+                self._finalize_load(
+                    task, Bitmap(len(state.keys)), buffers_reusable=reusable
+                )
             self._serde_to_store.clear()
             self._inner_to_store.clear()
             self._inner_to_load.clear()
             self._serde_to_load.clear()
-
-        if write_locked:
-            try:
-                self._l1_manager.finish_write_and_delete(
-                    write_locked, tag=_L1_WRITE_TAG
-                )
-            except Exception:
-                logger.exception(
-                    "Serde wrapper: error releasing write-locked leftover temps"
-                )
-        if read_locked:
-            try:
-                self._l1_manager.finish_read(read_locked)
-            except Exception:
-                logger.exception(
-                    "Serde wrapper: error releasing read-locked leftover temps"
-                )
-
-        self._store_efd.close()
-        self._load_efd.close()
+            self._store_efd.close()
+            self._load_efd.close()
+            self._close_outcome = L2CloseOutcome(reusable)
+            return self._close_outcome
 
     # ------------------------------------------------------------------
     # Internal loop
@@ -441,14 +483,16 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
                         self._drain_deserialize()
                 except Exception:
                     logger.exception("Serde wrapper: internal loop error on fd %d", fd)
+                    self._fail_pending_io(fd == inner_store_efd, fd == inner_load_efd)
+                    self._fail_pending_codec(fd == serialize_efd, fd == deserialize_efd)
 
     def _drain_serialize(self) -> None:
         """Poll pending serialize tasks; on success submit inner store."""
         with self._lock:
             pending = list(self._serde_to_store.keys())
         for serde_id in pending:
-            result = self._serde.query_serialize_result(serde_id)
-            if result is None:
+            outcome = self._serde.query_serialize_outcome(serde_id)
+            if outcome is None:
                 continue
             with self._lock:
                 wrapped_id = self._serde_to_store.pop(serde_id, None)
@@ -460,58 +504,66 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
             if wrapped_id is None or state is None:
                 continue
 
-            if not result:
-                self._release_write_temps(state.temp_keys)
-                self._finalize_store(wrapped_id, success=False)
+            if not outcome.success or not outcome.buffers_reusable:
+                self._finalize_store(
+                    wrapped_id, success=False, buffers_reusable=outcome.buffers_reusable
+                )
                 continue
 
             # Serialize succeeded — transition temps write → read so inner
             # can safely read them during the store.
-            self._l1_manager.finish_write_and_reserve_read(
+            transition = self._l1_manager.finish_write_and_reserve_read(
                 state.temp_keys, tag=_L1_WRITE_TAG
             )
+            state.read_temp_keys = [
+                key
+                for key, (error, _) in transition.items()
+                if error == L1Error.SUCCESS
+            ]
+            if any(
+                transition[key][0] != L1Error.SUCCESS or transition[key][1] is not obj
+                for key, obj in zip(state.temp_keys, state.temp_objs, strict=True)
+            ):
+                self._finalize_store(wrapped_id, success=False)
+                continue
             try:
                 inner_id = self._inner.submit_store_task(state.keys, state.temp_objs)
-            except Exception:
+            except (RuntimeError, ValueError, TypeError, OSError):
                 logger.exception(
                     "Serde wrapper: inner.submit_store_task raised for task %d",
                     wrapped_id,
                 )
                 # Temps are now read-locked and temporary — finish_read
                 # is enough; the entries auto-delete.
-                self._l1_manager.finish_read(state.temp_keys)
-                self._finalize_store(wrapped_id, success=False)
+                self._finalize_store(
+                    wrapped_id,
+                    success=False,
+                    buffers_reusable=not self._inner.may_report_unresolved_io,
+                )
                 continue
 
-            # Phase flip and reverse-map insert happen under the same
-            # lock so ``close()``'s cleanup can't observe a half-way
-            # transition.
             with self._lock:
-                state.phase = _StorePhase.INNER_STORE
                 self._inner_to_store[inner_id] = wrapped_id
 
     def _drain_inner_store(self) -> None:
         """Drain inner store completions; release temp read locks (auto-
         delete) and finalize the wrapped tasks."""
-        completed = self._inner.pop_completed_store_tasks()
-        for inner_id, result in completed.items():
+        completed = self._inner.pop_completed_store_outcomes()
+        for inner_id, outcome in completed.items():
             with self._lock:
                 wrapped_id = self._inner_to_store.pop(inner_id, None)
-                state = (
-                    self._store_tasks.get(wrapped_id)
-                    if wrapped_id is not None
-                    else None
-                )
+
             if wrapped_id is None:
                 logger.warning(
                     "Serde wrapper: inner store task %d has no wrapped id",
                     inner_id,
                 )
                 continue
-            if state is not None:
-                self._l1_manager.finish_read(state.temp_keys)
             self._finalize_store(
-                wrapped_id, result.is_successful(), result.bytes_transferred()
+                wrapped_id,
+                outcome.result.is_successful() and outcome.buffers_reusable,
+                outcome.result.bytes_transferred(),
+                buffers_reusable=outcome.buffers_reusable,
             )
 
     def _drain_inner_load(self) -> None:
@@ -520,8 +572,8 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
         with self._lock:
             pending = list(self._inner_to_load.keys())
         for inner_id in pending:
-            bitmap = self._inner.query_load_result(inner_id)
-            if bitmap is None:
+            outcome = self._inner.query_load_outcome(inner_id)
+            if outcome is None:
                 continue
             with self._lock:
                 wrapped_id = self._inner_to_load.pop(inner_id, None)
@@ -531,6 +583,12 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
             if wrapped_id is None or state is None:
                 continue
 
+            if not outcome.buffers_reusable:
+                self._finalize_load(
+                    wrapped_id, Bitmap(len(state.keys)), buffers_reusable=False
+                )
+                continue
+            bitmap = outcome.bitmap
             src_objs: list[MemoryObj] = []
             dst_objs: list[MemoryObj] = []
             sel_keys: list[ObjectKey] = []
@@ -542,20 +600,20 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
 
             if not src_objs:
                 # Inner loaded nothing — skip deserialize, finalize.
-                self._release_write_temps(state.temp_keys)
                 self._finalize_load(wrapped_id, bitmap)
                 continue
 
             state.load_bitmap = bitmap
             try:
                 serde_id = self._serde.submit_deserialize(src_objs, dst_objs, sel_keys)
-            except Exception:
+            except (RuntimeError, ValueError, TypeError, OSError):
                 logger.exception(
                     "Serde wrapper: submit_deserialize raised for task %d",
                     wrapped_id,
                 )
-                self._release_write_temps(state.temp_keys)
-                self._finalize_load(wrapped_id, Bitmap(len(state.keys)))
+                self._finalize_load(
+                    wrapped_id, Bitmap(len(state.keys)), buffers_reusable=False
+                )
                 continue
             with self._lock:
                 self._serde_to_load[serde_id] = wrapped_id
@@ -566,8 +624,8 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
         with self._lock:
             pending = list(self._serde_to_load.keys())
         for serde_id in pending:
-            result = self._serde.query_deserialize_result(serde_id)
-            if result is None:
+            outcome = self._serde.query_deserialize_outcome(serde_id)
+            if outcome is None:
                 continue
             with self._lock:
                 wrapped_id = self._serde_to_load.pop(serde_id, None)
@@ -577,7 +635,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
             if wrapped_id is None or state is None:
                 continue
 
-            if result:
+            if outcome.success and outcome.buffers_reusable:
                 # ``load_bitmap`` was populated by _drain_inner_load before
                 # the task was registered in ``_serde_to_load``.
                 final_bitmap = state.load_bitmap
@@ -589,12 +647,43 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
                 )
                 final_bitmap = Bitmap(len(state.keys))
 
-            self._release_write_temps(state.temp_keys)
-            self._finalize_load(wrapped_id, final_bitmap)
+            self._finalize_load(
+                wrapped_id, final_bitmap, buffers_reusable=outcome.buffers_reusable
+            )
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _fail_pending_io(self, stores: bool, loads: bool) -> None:
+        """Retain buffers if an inner completion query loses its ownership proof."""
+        with self._lock:
+            store_ids = list(self._inner_to_store.values()) if stores else []
+            load_ids = list(self._inner_to_load.values()) if loads else []
+            if stores:
+                self._inner_to_store.clear()
+            if loads:
+                self._inner_to_load.clear()
+        for task in store_ids:
+            self._finalize_store(task, False, buffers_reusable=False)
+        for task in load_ids:
+            state = self._load_tasks[task]
+            self._finalize_load(task, Bitmap(len(state.keys)), buffers_reusable=False)
+
+    def _fail_pending_codec(self, stores: bool, loads: bool) -> None:
+        """Retain codec buffers if querying completion loses its drain proof."""
+        with self._lock:
+            store_ids = list(self._serde_to_store.values()) if stores else []
+            load_ids = list(self._serde_to_load.values()) if loads else []
+            if stores:
+                self._serde_to_store.clear()
+            if loads:
+                self._serde_to_load.clear()
+        for task in store_ids:
+            self._finalize_store(task, False, buffers_reusable=False)
+        for task in load_ids:
+            state = self._load_tasks[task]
+            self._finalize_load(task, Bitmap(len(state.keys)), buffers_reusable=False)
 
     def _alloc_temp_buffers(
         self,
@@ -644,7 +733,7 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
             return
         try:
             self._l1_manager.finish_write_and_delete(temp_keys, tag=_L1_WRITE_TAG)
-        except Exception:
+        except (RuntimeError, ValueError, TypeError, OSError):
             logger.exception("Serde wrapper: failed releasing write-locked temps")
 
     def _finalize_store(
@@ -652,21 +741,44 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
         wrapped_id: L2TaskId,
         success: bool,
         bytes_transferred: int = 0,
+        *,
+        buffers_reusable: bool = True,
     ) -> None:
         with self._lock:
-            self._store_tasks.pop(wrapped_id, None)
-            self._completed_store[wrapped_id] = L2StoreResult(
-                success, bytes_transferred
+            state = self._store_tasks.pop(wrapped_id, None)
+        if state is not None:
+            self._release_write_temps(
+                [key for key in state.temp_keys if key not in state.read_temp_keys]
+            )
+            if state.read_temp_keys:
+                self._l1_manager.finish_read(state.read_temp_keys)
+            self._l1_manager.release_io_lease(
+                state.lease_id, buffers_reusable=buffers_reusable
+            )
+        with self._lock:
+            self._unresolved |= not buffers_reusable
+            self._completed_store[wrapped_id] = L2StoreOutcome(
+                L2StoreResult(success and buffers_reusable, bytes_transferred),
+                buffers_reusable,
             )
         try:
             self._store_efd.notify()
         except OSError:
             logger.exception("Serde wrapper: failed to signal store notifier")
 
-    def _finalize_load(self, wrapped_id: L2TaskId, bitmap: Bitmap) -> None:
+    def _finalize_load(
+        self, wrapped_id: L2TaskId, bitmap: Bitmap, *, buffers_reusable: bool = True
+    ) -> None:
         with self._lock:
-            self._load_tasks.pop(wrapped_id, None)
-            self._completed_load[wrapped_id] = bitmap
+            state = self._load_tasks.pop(wrapped_id, None)
+        if state is not None:
+            self._release_write_temps(state.temp_keys)
+            self._l1_manager.release_io_lease(
+                state.lease_id, buffers_reusable=buffers_reusable
+            )
+        with self._lock:
+            self._unresolved |= not buffers_reusable
+            self._completed_load[wrapped_id] = L2LoadOutcome(bitmap, buffers_reusable)
         try:
             self._load_efd.notify()
         except OSError:

@@ -11,7 +11,6 @@ import pytest
 from lmcache.lmcache_native import Bitmap
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.internal_api import L2StoreResult
-from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.l2_adapters.base import (
     L2AdapterInterface,
     L2CloseOutcome,
@@ -21,8 +20,6 @@ from lmcache.v1.distributed.l2_adapters.base import (
 from lmcache.v1.distributed.l2_adapters.fault_inject_l2_adapter import (
     FaultInjectL2Adapter,
 )
-from lmcache.v1.distributed.l2_adapters.serde_wrapper import SerdeL2AdapterWrapper
-from lmcache.v1.distributed.serde import SerdeProcessor
 
 
 @pytest.mark.parametrize("reusable", [False, True])
@@ -48,15 +45,3 @@ def test_fault_wrapper_preserves_all_ownership_outcomes(reusable: bool) -> None:
     assert wrapper.may_report_unresolved_io
     assert wrapper.close_with_outcome() is close
     inner.close_with_outcome.assert_called_once()
-
-
-def test_serde_rejects_unresolved_io_before_allocating_buffers() -> None:
-    inner = create_autospec(L2AdapterInterface, instance=True)
-    inner.may_report_unresolved_io = True
-    serde = create_autospec(SerdeProcessor, instance=True)
-    manager = create_autospec(L1Manager, instance=True)
-    with pytest.raises(ValueError, match="intermediate buffers"):
-        SerdeL2AdapterWrapper(inner, serde, manager)
-    manager.reserve_write.assert_not_called()
-    inner.submit_store_task.assert_not_called()
-    inner.submit_load_task.assert_not_called()
