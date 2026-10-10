@@ -40,6 +40,7 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
         align_bytes: Optional[int] = None,
         use_paging: bool = False,
         buffer_provider: str = "native",
+        allocation_boundary_bytes: int | None = None,
         **kwargs,
     ) -> None:
         """Create a pool aligned for whole host-page DMA-BUF exports.
@@ -53,6 +54,8 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
             buffer_provider: ``native`` (default) or explicit experimental
                 ``vulkan_rm`` allocation/export. Vulkan/RM requires CUDA,
                 its optional native extension and the supported NVIDIA ABI.
+            allocation_boundary_bytes: Optional boundary that an unpaged object
+                and its physical padding must not cross.
             **kwargs: Paged pools require ``shapes``, ``dtypes``, and ``fmt``.
 
         Raises:
@@ -80,6 +83,8 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
         # boundary; the extra page is the cost of the guarantee.
         page = os.sysconf("SC_PAGE_SIZE")
         allocation_alignment = page
+        if use_paging and allocation_boundary_bytes is not None:
+            raise ValueError("registration boundaries require unpaged GPU allocations")
         if use_paging:
             if not all(name in kwargs for name in ("shapes", "dtypes", "fmt")):
                 raise ValueError("paged allocation requires shapes, dtypes, and fmt")
@@ -146,7 +151,11 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
             kwargs = {}
             if align_bytes is not None:
                 kwargs["align_bytes"] = align_bytes
-            self.allocator = TensorMemoryAllocator(self.tensor, **kwargs)
+            self.allocator = TensorMemoryAllocator(
+                self.tensor,
+                allocation_boundary_bytes=allocation_boundary_bytes,
+                **kwargs,
+            )
 
         self.device_mem_lock = threading.Lock() if not use_paging else nullcontext()
         # Native DMA-BUF regions, exported on first request; they let
@@ -293,6 +302,48 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
         if any(r is None for r in regions):
             return None
         return regions  # type: ignore[return-value]
+
+    def get_registration_regions(self) -> list[tuple[torch.Tensor, int, int]]:
+        """Export stable GPU windows for ordinary io_uring DMA-BUF registration.
+
+        Returns:
+            Tuples of contiguous window tensor, borrowed DMA-BUF FD and its
+            mapped origin. Windows cover the full pool and are at most 1 GiB.
+            The allocator owns exports until close; callers must prove I/O
+            quiescence before closing it.
+
+        Raises:
+            RuntimeError: The allocator is closed or native export fails.
+        """
+        if self._closed:
+            raise RuntimeError("GPU staging pool is closed")
+        if self.buffer_provider == "native" and self._dmabuf_regions is None:
+            self._dmabuf_regions = memory_management.export_device_dmabufs(self.tensor)
+        regions = []
+        for offset in range(0, self.tensor.nbytes, 1 << 30):
+            window = self.tensor[offset : offset + (1 << 30)]
+            if self.buffer_provider == "vulkan_rm":
+                fd, base = self._provider_fd, self.tensor.data_ptr()
+            else:
+                export = memory_management.get_dmabuf_region(window.data_ptr())
+                if export is None:
+                    raise RuntimeError("GPU registration window lacks a DMA-BUF export")
+                fd, base = export
+            regions.append((window, fd, base))
+        return regions
+
+    def get_memory_usage(self) -> tuple[int, int]:
+        """Return allocated bytes and capacity for an unpaged GPU arena.
+
+        Raises:
+            NotImplementedError: The pool uses fixed-size paging.
+        """
+        if not isinstance(self.allocator, TensorMemoryAllocator):
+            raise NotImplementedError(
+                "GPU arena accounting requires unpaged allocation"
+            )
+        with self.device_mem_lock:
+            return self.allocator.total_allocated_size, self.tensor.nbytes
 
     def close(self) -> None:
         """Release registration FDs after the caller proves storage quiescence.
