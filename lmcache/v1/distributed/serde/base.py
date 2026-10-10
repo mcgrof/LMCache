@@ -109,6 +109,14 @@ class Deserializer(abc.ABC):
 # ============================================================================
 
 
+@dataclass(frozen=True)
+class SerdeTaskOutcome:
+    """Codec success and proof that its source and destination accesses stopped."""
+
+    success: bool
+    buffers_reusable: bool
+
+
 class SerdeProcessor(abc.ABC):
     """Async serde processor with eventfd-based completion notification.
 
@@ -205,6 +213,31 @@ class SerdeProcessor(abc.ABC):
         Non-idempotent: only returns a non-None value once per task.
         """
         raise NotImplementedError
+
+    def query_serialize_outcome(self, task_id: SerdeTaskId) -> SerdeTaskOutcome | None:
+        """Consume serialization status with its buffer ownership proof.
+
+        Legacy processors must stop accessing all buffers before reporting a
+        result. GPU processors must fence their streams or report false ownership.
+        """
+        result = self.query_serialize_result(task_id)
+        return None if result is None else SerdeTaskOutcome(result, True)
+
+    def query_deserialize_outcome(
+        self, task_id: SerdeTaskId
+    ) -> SerdeTaskOutcome | None:
+        """Consume deserialization status with its buffer ownership proof."""
+        result = self.query_deserialize_result(task_id)
+        return None if result is None else SerdeTaskOutcome(result, True)
+
+    def close_with_outcome(self) -> bool:
+        """Close and prove all codec accesses stopped, or return false.
+
+        Legacy synchronous codecs complete all buffer access before close
+        returns. Override when a device fence can fail without establishing drain.
+        """
+        self.close()
+        return True
 
     # ----- Size estimation -----
 

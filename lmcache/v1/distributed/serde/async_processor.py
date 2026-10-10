@@ -15,12 +15,14 @@ import enum
 import threading
 
 # First Party
+from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.serde.base import (
     Deserializer,
     SerdeProcessor,
     SerdeTaskId,
+    SerdeTaskOutcome,
     Serializer,
 )
 from lmcache.v1.memory_management import MemoryObj
@@ -63,10 +65,11 @@ class AsyncSerdeProcessor(SerdeProcessor):
 
         self._lock = threading.Lock()
         self._next_task_id: SerdeTaskId = 0
-        # task_id -> (success: bool) for completed tasks, partitioned by type
-        self._completed_serialize: dict[SerdeTaskId, bool] = {}
-        self._completed_deserialize: dict[SerdeTaskId, bool] = {}
+        # Completed outcomes are partitioned by codec operation.
+        self._completed_serialize: dict[SerdeTaskId, SerdeTaskOutcome] = {}
+        self._completed_deserialize: dict[SerdeTaskId, SerdeTaskOutcome] = {}
 
+        self._unresolved_gpu = False
         self._pool = ThreadPoolExecutor(max_workers=max_workers)
 
     # ----- Event fds -----
@@ -107,7 +110,13 @@ class AsyncSerdeProcessor(SerdeProcessor):
     def query_serialize_result(self, task_id: SerdeTaskId) -> bool | None:
         """Pop and return the serialize task result, or None if pending."""
         with self._lock:
-            return self._completed_serialize.pop(task_id, None)
+            outcome = self._completed_serialize.get(task_id)
+            if outcome is not None and not outcome.buffers_reusable:
+                raise RuntimeError(
+                    "Use query_serialize_outcome for unresolved GPU access"
+                )
+            outcome = self._completed_serialize.pop(task_id, None)
+        return None if outcome is None else outcome.success
 
     # ----- Deserialize -----
 
@@ -137,6 +146,24 @@ class AsyncSerdeProcessor(SerdeProcessor):
     def query_deserialize_result(self, task_id: SerdeTaskId) -> bool | None:
         """Pop and return the deserialize task result, or None if pending."""
         with self._lock:
+            outcome = self._completed_deserialize.get(task_id)
+            if outcome is not None and not outcome.buffers_reusable:
+                raise RuntimeError(
+                    "Use query_deserialize_outcome for unresolved GPU access"
+                )
+            outcome = self._completed_deserialize.pop(task_id, None)
+        return None if outcome is None else outcome.success
+
+    def query_serialize_outcome(self, task_id: SerdeTaskId) -> SerdeTaskOutcome | None:
+        """Consume a serialization result after its worker stream was fenced."""
+        with self._lock:
+            return self._completed_serialize.pop(task_id, None)
+
+    def query_deserialize_outcome(
+        self, task_id: SerdeTaskId
+    ) -> SerdeTaskOutcome | None:
+        """Consume a deserialization result after its worker stream was fenced."""
+        with self._lock:
             return self._completed_deserialize.pop(task_id, None)
 
     # ----- Size estimation (delegates to sync serializer) -----
@@ -152,6 +179,11 @@ class AsyncSerdeProcessor(SerdeProcessor):
         self._pool.shutdown(wait=True)
         self._serialize_efd.close()
         self._deserialize_efd.close()
+
+    def close_with_outcome(self) -> bool:
+        """Join workers and withhold ownership after any failed GPU fence."""
+        self.close()
+        return not self._unresolved_gpu
 
     # ----- Internal -----
 
@@ -205,6 +237,24 @@ class AsyncSerdeProcessor(SerdeProcessor):
             )
             success = False
 
+        reusable = True
+        devices = {
+            tensor.device
+            for obj in (*src_objs, *dst_objs)
+            if isinstance(obj, MemoryObj)
+            and (tensor := obj.physical_tensor) is not None
+            and tensor.device.type != "cpu"
+        }
+        for device in devices:
+            try:
+                torch_dev.current_stream(device).synchronize()
+            except RuntimeError:
+                logger.exception("Serde task %d lost GPU completion proof", task_id)
+                reusable = False
+                success = False
+        with self._lock:
+            self._unresolved_gpu |= not reusable
+
         if success:
             logger.debug(
                 "Serde: %s task %d completed successfully (%d objects)",
@@ -222,9 +272,11 @@ class AsyncSerdeProcessor(SerdeProcessor):
 
         with self._lock:
             if task_type == _TaskType.SERIALIZE:
-                self._completed_serialize[task_id] = success
+                self._completed_serialize[task_id] = SerdeTaskOutcome(success, reusable)
             else:
-                self._completed_deserialize[task_id] = success
+                self._completed_deserialize[task_id] = SerdeTaskOutcome(
+                    success, reusable
+                )
 
         # Signal the appropriate notifier to wake the controller's poll loop
         notifier = (
