@@ -18,7 +18,7 @@ from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
     ObjectKey,
 )
-from lmcache.v1.distributed.storage_manager import L1WriteCompletion
+from lmcache.v1.distributed.storage_manager import L1TransferLeases, L1WriteCompletion
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.kv_layer_groups import ObjectGroupInfo
 from lmcache.v1.memory_management import MemoryObj
@@ -49,6 +49,7 @@ from lmcache.v1.platform.cache_context import create_cache_context
 import lmcache.lmcache_native as lmcache_native
 
 logger = init_logger(__name__)
+_RETAINED_TRANSFER_CONTEXTS: list["ContextEntry"] = []
 
 
 def get_layout_desc(
@@ -207,6 +208,16 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             "release_imported_event",
             self._release_imported_event,
             payload_type=tuple[int, int],
+        )
+        self._device_host_func_dispatcher.register(
+            "release_transfer_leases",
+            self._ctx.storage_manager.release_transfer_leases,
+            payload_type=L1TransferLeases,
+        )
+        self._device_host_func_dispatcher.register(
+            "discard_write_by_owner",
+            self._ctx.storage_manager.discard_write_by_owner,
+            payload_type=L1WriteCompletion,
         )
         self._device_host_func_dispatcher.start()
 
@@ -388,7 +399,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         if not entries:
             return
         for entry in entries:
-            entry.cache_context.close()
+            try:
+                entry.cache_context.close()
+            except RuntimeError:
+                logger.exception("GPU context shutdown did not prove stream completion")
+                _RETAINED_TRANSFER_CONTEXTS.append(entry)
+                continue
             self._ctx.layout_desc_registry.unregister(
                 entry.model_name, entry.world_size
             )
@@ -424,18 +440,18 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         return {
             "registered_gpu_ids": registered_gpu_ids,
             "cache_context_meta": cache_context_meta,
+            "retained_gpu_context_count": len(_RETAINED_TRANSFER_CONTEXTS),
+            "is_healthy": not _RETAINED_TRANSFER_CONTEXTS,
         }
 
     def close(self) -> None:
         """Release GPU resources owned by this module."""
-        # Stop the drain thread before storage_manager.close() so any
-        # in-flight completions reach a live storage manager.
-        self._device_host_func_dispatcher.stop()
-
         with self._lock:
             entries = list(self._cache_contexts.values())
             self._cache_contexts.clear()
         self._release_entries(entries)
+        # Stream synchronization queues terminal callbacks before the last drain.
+        self._device_host_func_dispatcher.stop()
 
     @request_handler()
     def register_kv_cache(
@@ -748,6 +764,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             all_dict: dict[ObjectKey, MemoryObj] = {}
             total_bytes: int = 0
             store_succeeded = False
+            transfer_leases: L1TransferLeases = []
             try:
                 for obj_group_id in range(num_object_groups):
                     obj_keys = obj_keys_per_obj_group[obj_group_id]
@@ -764,6 +781,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         keys_to_reserve, layout_desc
                     )
                     all_dict.update(reserved_dict)
+                    transfer_leases.extend(
+                        self._ctx.storage_manager.acquire_write_transfer_leases(
+                            reserved_dict
+                        )
+                    )
                     if reserved_dict:
                         total_bytes += next(
                             iter(reserved_dict.values())
@@ -789,26 +811,34 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         block_ids_host=gpu_block_ids,
                     )
 
-                completion = (
-                    self._ctx.storage_manager.prepare_write_completion(all_dict)
-                    if all_dict
-                    else []
-                )
                 store_succeeded = True
             except Exception:
                 logger.exception("Cannot store keys due to exception")
             finally:
-                event_backend.record_event(event, cache_context.stream)
-                # Fail closed: commit the reserved objects only when every chunk
-                # copied successfully; otherwise the whole store is skipped.
                 stored_count = len(all_dict) if store_succeeded else 0
-                if stored_count:
-                    submit_callback_to_stream(
-                        cache_context.cupy_stream,
-                        "finish_write_by_owner",
-                        completion,
-                    )
-                else:
+                try:
+                    event_backend.record_event(event, cache_context.stream)
+                    if all_dict and (store_succeeded or transfer_leases):
+                        completion = self._ctx.storage_manager.prepare_write_completion(
+                            all_dict
+                        )
+                        submit_callback_to_stream(
+                            cache_context.cupy_stream,
+                            "finish_write_by_owner"
+                            if store_succeeded
+                            else "discard_write_by_owner",
+                            completion,
+                        )
+                    if transfer_leases:
+                        submit_callback_to_stream(
+                            cache_context.cupy_stream,
+                            "release_transfer_leases",
+                            transfer_leases,
+                        )
+                except (RuntimeError, ValueError, OSError):
+                    self._ctx.storage_manager.retain_transfer_leases(transfer_leases)
+                    raise
+                if not stored_count:
                     total_bytes = 0
                 num_tokens = num_chunks * self._ctx.chunk_size if stored_count else 0
                 self._ctx.event_bus.publish_on_stream(
@@ -1031,6 +1061,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             )
             total_bytes = 0
             retrieve_succeeded = True
+            transfer_leases: L1TransferLeases = []
             try:
                 for obj_group_id in range(num_object_groups):
                     if obj_group_id in skipped_groups:
@@ -1045,6 +1076,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         retrieve_succeeded = False
                         break
 
+                    transfer_leases.extend(
+                        self._ctx.storage_manager.acquire_read_transfer_leases(
+                            dict(zip(found_keys, window_objs, strict=True))
+                        )
+                    )
                     total_bytes += sum(mo.get_size() for mo in window_objs)
                     # None-pad the skipped prefix so block-id slicing is unchanged.
                     memory_objs: list[MemoryObj | None] = [None] * skip + window_objs
@@ -1064,13 +1100,23 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 logger.exception("Cannot retrieve keys due to exception")
                 retrieve_succeeded = False
             finally:
-                event_backend.record_event(event, cache_context.stream)
-                if retained_keys:
-                    submit_callback_to_stream(
-                        cache_context.cupy_stream,
-                        "finish_read_by_owner",
-                        read_completion,
-                    )
+                try:
+                    event_backend.record_event(event, cache_context.stream)
+                    if retained_keys:
+                        submit_callback_to_stream(
+                            cache_context.cupy_stream,
+                            "finish_read_by_owner",
+                            read_completion,
+                        )
+                    if transfer_leases:
+                        submit_callback_to_stream(
+                            cache_context.cupy_stream,
+                            "release_transfer_leases",
+                            transfer_leases,
+                        )
+                except (RuntimeError, ValueError, OSError):
+                    self._ctx.storage_manager.retain_transfer_leases(transfer_leases)
+                    raise
                 num_tokens = (
                     num_chunks * self._ctx.chunk_size
                     if len(prefetched_keys) == expected_retained
