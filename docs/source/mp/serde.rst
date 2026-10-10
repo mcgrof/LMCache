@@ -72,6 +72,26 @@ serde factory.
        ``max_workers`` (thread pool size, default 1)
 
 
+Registered io_uring buffers
+---------------------------
+
+The :doc:`l2_storage/raw_block` adapter supports serde with eager host fixed
+buffers, host DMA-BUF buffers and GPU DMA-BUF L1. The wrapper allocates encoded
+intermediates in the adapter's affinity arena and leases those exact objects
+before handing them to a codec or storage adapter. It decodes only after a
+load returns buffer ownership, then releases intermediates after codec
+completion. An unresolved storage operation or GPU fence retains the arena
+and reports no cache hit. GPU L1 currently permits the ``fp8`` codec only.
+
+Custom GPU serializers and deserializers must enqueue work on the worker's
+current stream. If they use a private stream, they must drain it before
+returning, including on exceptions. ``AsyncSerdeProcessor`` fences the
+worker's current stream on each participating GPU before publishing its
+``SerdeTaskOutcome``. Controllers consume ownership outcomes separately from
+success. Legacy result methods reject unknown ownership without consuming
+the result. Shutdown also returns an ownership proof.
+
+
 TurboQuant serde
 ----------------
 
