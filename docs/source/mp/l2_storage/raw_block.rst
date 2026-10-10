@@ -18,10 +18,13 @@ MP can register eager host L1 regions as classic fixed buffers or DMA-BUFs.
 Classic registration pins host pages for the ring. DMA-BUF registration
 imports exported host memory through the kernel's DMA-BUF direct-I/O path.
 DMA-BUF is Linux's file-descriptor interface for sharing memory with drivers.
-The in-process :doc:`/kv_cache/storage_backends/raw_block_dmabuf` backend
-provides separate GPU staging; MP registration described here uses host DRAM.
-The adapter rejects ``io_uring`` combined with serde because the serialization
-wrapper cannot preserve intermediate-buffer ownership after unresolved I/O.
+MP also supports an eager GPU L1 arena through DMA-BUF. The server gathers
+engine KV tensors into its own GPU arena through CUDA interprocess sharing,
+then submits the exported arena directly to ordinary io_uring. It scatters
+reloaded objects back into the engine's GPU tensors. This path uses the
+existing :doc:`/kv_cache/storage_backends/raw_block_dmabuf` exporter support.
+Both host registration modes and GPU L1 can use serde; the wrapper leases its
+intermediate buffers until codec and storage completion return ownership.
 NVMe passthrough and Flexible Data Placement require separate device
 qualification; placement-policy unit tests do not qualify hardware execution.
 
@@ -69,6 +72,39 @@ The ``io_by_request`` native journal distinguishes ``host_fixed`` and
 task ID and a distinct adapter incarnation. Slot headers and checkpoints use
 separate buffers and can still bounce. Registration alone is not a bandwidth
 result or proof of GPU-direct storage.
+
+Use a GPU L1 arena
+------------------
+
+Choose a tagged ``GPU`` manager and ``--supported-transfer-mode lmcache_driven``::
+
+    lmcache server --supported-transfer-mode lmcache_driven \
+      --l1-manager '{"type":"GPU","tag":"gpu","size_gb":1,"device":"cuda:0","eviction":{"eviction_policy":"LRU"}}' \
+      --l2-adapter '{"type":"raw_block","affinity_tag":"gpu","device_path":"/mnt/cache/kv.bin","slot_bytes":1048576,"io_engine":"io_uring","use_odirect":true,"serde":{"type":"fp8"}}'
+
+The default ``buffer_provider="native"`` requires a working CUDA DMA-BUF
+exporter and the kernel's DMA-BUF direct-I/O ABI. Export or registration
+failure aborts startup. There is no host-memory fallback. The explicit
+experimental ``buffer_provider="vulkan_rm"`` supports a single arena of at
+most 1 GiB and requires the exporter dependencies described in the in-process
+backend documentation. GPU L1 uses 4096-byte alignment and process-local
+memory; it cannot use lazy allocation, host shared memory, hugepages or
+Device-DAX. Peer transfer channels are unsupported with GPU L1.
+
+GPU L1 currently supports plain payloads and ``fp8`` serde. CPU byte-view
+codecs, including AES-GCM, are rejected for this arena. Codec intermediates
+also consume GPU L1 capacity, so budget room for both KV objects and their
+encoded buffers. Codec workers fence their GPU stream before reporting a
+result, and the adapter fences padding work before storage submission.
+The GPU gather/scatter stream holds a separate lease until its completion
+callback runs. A failed GPU fence seals and retains the arena and export FDs,
+even if native storage shutdown succeeds.
+
+This provides MP GPU staging and encoded-buffer ownership for the ordinary
+io_uring path. It does not establish model accuracy for lossy FP8, native
+exporter compatibility on every GPU, serving throughput, or networked
+prefill/decode deployment performance. Validate the selected GPU, kernel,
+filesystem and engine/model configuration together.
 
 **Required fields:**
 

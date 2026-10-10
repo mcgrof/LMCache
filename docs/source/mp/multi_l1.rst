@@ -1,7 +1,7 @@
 Multiple L1 Managers
 ====================
 
-The MP server can serve KV objects from independently configured DRAM,
+The MP server can serve KV objects from independently configured DRAM, GPU,
 Device-DAX, and GDS L1 managers. Each manager has its own capacity, eviction
 controller, and store controller. L2 adapters use a fixed L1 affinity tag.
 
@@ -10,7 +10,7 @@ Configuration
 
 Repeat ``--l1-manager`` in write-placement order. Each JSON object requires
 ``type``, a unique non-empty ``tag``, and ``size_gb`` (GiB). The types are
-``DRAM``, ``DEVDAX``, and ``GDS``. The ``_default`` tag is reserved for DRAM
+``DRAM``, ``GPU``, ``DEVDAX``, and ``GDS``. The ``_default`` tag is reserved for DRAM
 in this interface and is the default affinity target for L2 adapters.
 
 For example, use a dedicated Device-DAX device and a GDS-capable directory:
@@ -66,6 +66,9 @@ TTLs must be positive integers. Unknown fields are rejected.
      - ``use_lazy`` (true), ``init_size_gb`` (20, capped at capacity),
        ``shm_name`` (empty), ``use_hugepages`` (false). Shared memory and
        hugepages require eager allocation. Shared-memory names must be unique.
+   * - ``GPU``
+     - ``device`` (``cuda:0``), ``buffer_provider`` (``native``). Eager DMA-BUF
+       arena with 4096-byte alignment. See :doc:`l2_storage/raw_block`.
    * - ``DEVDAX``
      - Required ``path``; the allocator checks mapping size and device alignment.
    * - ``GDS``
@@ -80,7 +83,7 @@ manager may free space before a later write needs to overflow.
 
 Legacy single-L1 flags, including ``--l1-size-gb``, remain supported. Do not
 combine ``--l1-manager`` with legacy capacity or backend-selection flags.
-Python callers can use ``DRAML1ManagerConfig``, ``DevDaxL1ManagerConfig``, and
+Python callers can use ``DRAML1ManagerConfig``, ``GPUL1ManagerConfig``, ``DevDaxL1ManagerConfig``, and
 ``GDSL1ManagerConfig``; their ``from_dict`` methods implement the JSON schema.
 
 Placement, affinity, and reads
@@ -91,8 +94,9 @@ the next manager; conflicts and exceptions do not. Allocation remains atomic
 within each batch, so a batch can fail even when combined free space across
 managers would suffice. This does not add cross-L1 deduplication or migration.
 
-An L2 adapter's ``affinity_tag`` selects the host-backed L1 used for both
-stores and reloads. It defaults to ``_default`` and must name a configured
+An L2 adapter's ``affinity_tag`` selects the L1 used for both
+stores and reloads. GPU affinity requires ordinary raw-block io_uring with
+DMA-BUF registration and supports plain payloads or FP8 serde. It defaults to ``_default`` and must name a configured
 manager. An adapter sees completed stores from that manager only. Set the tag
 explicitly for a Device-DAX-only configuration. GDS cannot be an affinity
 target for the existing host-buffer L2 adapters. Affinity is fixed; runtime
@@ -115,7 +119,7 @@ Status and Prometheus
 - ``l1_usage``: aggregate ``[used_bytes, allocated_bytes]``. For lazy DRAM,
   allocated bytes can be below configured capacity.
 - ``l1_capacity_bytes_by_backend``: configured/live capacity summed by
-  ``dram``, ``devdax``, and ``gds``. Draining Device-DAX arenas are excluded.
+  ``dram``, ``gpu``, ``devdax``, and ``gds``. Draining Device-DAX arenas are excluded.
 
 The legacy singular status fields remain available when there is one manager.
 ``GET /config`` includes every L1 configuration and each adapter's affinity.

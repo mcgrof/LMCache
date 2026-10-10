@@ -3,8 +3,10 @@
 The adapter implements POSIX and ordinary Rust io_uring storage I/O. MP
 controllers hold exact-buffer L1 leases until completion returns ownership.
 Unknown completion seals and retains the affinity arena. Eager host L1 pools
-can provide fixed-buffer or DMA-BUF regions, and io_uring with serde is rejected
-because the wrapper cannot retain its intermediate buffers. NVMe passthrough
+provide fixed-buffer or DMA-BUF regions; eager GPU L1 pools provide DMA-BUF
+regions. The serde wrapper holds separate leases on encoded intermediate
+buffers and propagates codec and storage ownership outcomes. GPU affinity
+supports plain payloads or FP8 serde on ordinary io_uring. NVMe passthrough
 and FDP require their own hardware qualification.
 
 This document describes the built-in `raw_block` L2 adapter for LMCache MP
