@@ -96,6 +96,7 @@ _L1_WRITE_TAG = "storage_manager"
 
 # Internal stream-callback payload. No MemoryObj or device pointer crosses msgpack.
 L1WriteCompletion = list[tuple[int, list[ObjectKey]]]
+L1TransferLeases = list[tuple[int, int]]
 
 
 class StorageManager:
@@ -444,6 +445,83 @@ class StorageManager:
         )
 
         # TODO: global key states update
+
+    def acquire_write_transfer_leases(
+        self, objects: dict[ObjectKey, MemoryObj]
+    ) -> L1TransferLeases:
+        """Pin exact GPU write reservations before enqueueing gather copies.
+
+        Args:
+            objects: Objects returned by reserve_write, keyed by their keys.
+
+        Returns:
+            Owner/lease IDs for stream-ordered release. Host objects need no
+            additional transfer lease. No device pointers cross the callback.
+
+        Raises:
+            ValueError: An object no longer belongs to its captured reservation.
+            RuntimeError: Its arena is closed or retained.
+        """
+        return self._acquire_transfer_leases(objects, _L1_WRITE_TAG)
+
+    def acquire_read_transfer_leases(
+        self, objects: dict[ObjectKey, MemoryObj]
+    ) -> L1TransferLeases:
+        """Pin exact GPU resident objects before enqueueing scatter copies.
+
+        Args:
+            objects: Already read-locked objects returned by unsafe_read.
+
+        Returns:
+            Owner/lease IDs for stream-ordered release; host objects are omitted.
+
+        Raises:
+            ValueError: An object no longer belongs to its captured resident key.
+            RuntimeError: Its arena is closed or retained.
+        """
+        return self._acquire_transfer_leases(objects, None)
+
+    def release_transfer_leases(self, leases: L1TransferLeases) -> None:
+        """Release transfer leases after their GPU stream callback executes.
+
+        Args:
+            leases: Owner/lease IDs from an acquire_*_transfer_leases call.
+
+        Raises:
+            KeyError: An owner or lease is unknown or already settled.
+        """
+        for owner, lease in leases:
+            self._l1_managers_by_id[owner].release_io_lease(
+                lease, buffers_reusable=True
+            )
+
+    def retain_transfer_leases(self, leases: L1TransferLeases) -> None:
+        """Seal GPU arenas when a transfer completion callback cannot be queued.
+
+        Args:
+            leases: Owner/lease IDs whose stream completion is unresolved.
+
+        Raises:
+            KeyError: An owner or lease is unknown or already settled.
+        """
+        for owner, lease in leases:
+            self._l1_managers_by_id[owner].release_io_lease(
+                lease, buffers_reusable=False
+            )
+
+    def discard_write_by_owner(self, completion: L1WriteCompletion) -> None:
+        """Discard a failed GPU store's reservations after its stream drains.
+
+        Args:
+            completion: Owner/key groups captured from the reserved objects.
+
+        Raises:
+            KeyError: An owner is no longer registered.
+        """
+        for owner, keys in completion:
+            self._l1_managers_by_id[owner].finish_write_and_delete(
+                keys, tag=_L1_WRITE_TAG
+            )
 
     @contextmanager
     def read_prefetched_results(
@@ -1470,6 +1548,31 @@ class StorageManager:
                 self._l1_managers_by_id[owner].finish_read(group, read_locks=count)
             )
         return results
+
+    def _acquire_transfer_leases(
+        self, objects: dict[ObjectKey, MemoryObj], tag: str | None
+    ) -> L1TransferLeases:
+        groups: dict[int, dict[ObjectKey, MemoryObj]] = {}
+        for key, obj in objects.items():
+            tensor = obj.physical_tensor
+            if tensor is None or tensor.device.type == "cpu":
+                continue
+            owner = obj.get_l1_manager()
+            if owner is None or owner not in self._l1_managers_by_id:
+                raise ValueError("GPU transfer requires a registered L1 owner")
+            groups.setdefault(owner, {})[key] = obj
+        leases: L1TransferLeases = []
+        try:
+            for owner, buffers in groups.items():
+                manager = self._l1_managers_by_id[owner]
+                lease = manager.acquire_io_lease(
+                    list(buffers), list(buffers.values()), tag=tag
+                )
+                leases.append((owner, lease))
+        except (RuntimeError, ValueError):
+            self.release_transfer_leases(leases)
+            raise
+        return leases
 
     def _require_single_l1(self) -> None:
         """Guard legacy operations that cannot identify an individual L1."""
