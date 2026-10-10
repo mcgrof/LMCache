@@ -293,7 +293,11 @@ def test_partial_initialization_retains_an_unresolved_adapter_owner() -> None:
             "lmcache.v1.distributed.storage_manager.create_l2_adapter",
             return_value=inner,
         ),
-        pytest.raises(ValueError, match="intermediate buffers"),
+        patch(
+            "lmcache.v1.distributed.storage_manager.create_serde_processor",
+            side_effect=RuntimeError("codec setup failed"),
+        ),
+        pytest.raises(RuntimeError, match="codec setup failed"),
     ):
         StorageManager(config)
     inner.close_with_outcome.assert_called_once()

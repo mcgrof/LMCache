@@ -217,15 +217,6 @@ def _local_rank_from_kv_rank(kv_rank: int) -> int:
     return int(kv_rank) & 0xFF
 
 
-def _validate_mp_io_mode(config: "RawBlockL2AdapterConfig") -> None:
-    """Reject serde before creating resources for an unresolved-I/O backend."""
-    if config.io_engine == "io_uring" and config.serde_config is not None:
-        raise ValueError(
-            "MP raw_block io_uring with serde is unsupported: intermediate "
-            "buffers cannot retain their backing arena after unresolved I/O"
-        )
-
-
 def _make_bitmap(size: int) -> "Bitmap":
     # First Party
     from lmcache.lmcache_native import Bitmap
@@ -621,7 +612,6 @@ class RawBlockL2Adapter(L2AdapterInterface):
             the native handle and requires the caller to retain the L1 arena.
         """
         super().__init__()
-        _validate_mp_io_mode(config)
         registration = (
             l1_memory_desc.buffer_registration if l1_memory_desc is not None else "none"
         )
