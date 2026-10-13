@@ -45,7 +45,7 @@ from lmcache.v1.distributed.storage_controllers.utils import L2AdapterDescriptor
 from lmcache.v1.memory_management import MemoryObj
 from tests.v1.distributed.utils import should_use_lazy_alloc
 
-if not torch_dev.is_available():
+if torch_device_type != "cpu" and not torch_dev.is_available():
     pytest.skip(
         f"Requires available {torch_device_type} runtime",
         allow_module_level=True,
