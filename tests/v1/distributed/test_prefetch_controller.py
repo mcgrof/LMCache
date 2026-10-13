@@ -63,7 +63,7 @@ from lmcache.v1.memory_management import MemoryObjMetadata, TensorMemoryObj
 from lmcache.v1.storage_backend.raw_block import RawBlockCore, encode_object_key
 from tests.v1.distributed.utils import should_use_lazy_alloc
 
-if not torch_dev.is_available():
+if torch_device_type != "cpu" and not torch_dev.is_available():
     pytest.skip(
         f"Requires available {torch_device_type} runtime",
         allow_module_level=True,
