@@ -45,7 +45,9 @@ For example, register a 1 GiB host pool exported by ``/dev/udmabuf``::
 
 The file must already contain initialized extents across the selected capacity.
 Use a dedicated NVMe-backed XFS or ext4 file, or a dedicated NVMe block device,
-on a kernel implementing this DMA-BUF registration ABI. Sparse files, holes,
+on a booted kernel implementing this DMA-BUF registration ABI. The underlying
+block device must also support DMA-BUF import; an ext4 or XFS mount alone does
+not establish that capability. Sparse files, holes,
 unsupported filesystems and failed registration reject setup. DMA-BUF mode
 does not fall back to classic registration or ordinary I/O during setup.
 It requires access to ``/dev/udmabuf`` and disables POSIX shared memory;
