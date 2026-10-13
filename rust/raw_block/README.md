@@ -214,11 +214,16 @@ Notes:
 - Raw-block slot reclamation is driven by the shared/global L2 eviction
   controller or explicit `delete()` calls.
 - `raw_block` remains the adapter type for all supported engines.
-- MP does not register its L1 descriptor as fixed buffers or DMA-BUFs.
-  Ordinary io_uring execution does not qualify the in-process DMA-BUF path.
-- MP io_uring with serde is rejected because intermediate buffers cannot honor
-  unknown completion. Controllers retain an affected L1 arena until the
-  owning process group restarts after device quiescence is established.
+- MP can register eager host L1 regions as classic fixed buffers or DMA-BUFs,
+  and eager GPU L1 regions as DMA-BUFs, for ordinary O_DIRECT io_uring.
+  DMA-BUF requires a booted kernel implementing the registration ABI and a
+  supported underlying block device. Files must have initialized extents on
+  XFS or ext4. Failed registration aborts setup without an I/O fallback.
+- MP serde leases encoded intermediates from the affinity L1 pool until codec
+  and storage completion return ownership. GPU affinity supports plain and FP8
+  payloads; host affinity also supports CPU codecs such as AES-GCM.
+  Controllers retain an affected L1 arena until the owning process group
+  restarts after device quiescence is established.
 - Use the ownership outcome APIs for MP store, load and shutdown. Status-only
   methods reject unresolved results without consuming them; a failed task is
   not proof that its buffers are reusable.

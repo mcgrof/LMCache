@@ -164,7 +164,7 @@ retains any buffers whose completion is still pending. Partial initialization
 and runtime adapter removal also retain an affinity arena when close fails or
 explicitly withholds ownership.
 
-MP uses host-backed L1 buffers. Its optional `buffer_registration` mode describes
+MP supports eager host and GPU L1 buffers. Its `buffer_registration` mode describes
 stable regions in `L1MemoryDesc`: classic `fixed` regions use host pointers;
 `dmabuf` regions also carry borrowed export FDs and their mapping origins.
 The allocator keeps every object's physical extent within one 1 GiB window,
@@ -180,10 +180,12 @@ The factory retains the affinity L1 and the failed adapter retains its native
 handle for the process lifetime. Immutable task contexts join native operations
 to their MP task IDs so diagnostics can distinguish fixed I/O from fallback.
 
-This is host registration, not the in-process GPU staging path. The
-serde wrapper rejects adapters that can report unresolved I/O before
-allocating intermediate buffers. The fault wrapper propagates ownership along
-with its modified load bitmap.
+Host DMA-BUF registration uses UDMABUF exports; GPU registration uses the
+configured GPU exporter. GPU affinity supports plain payloads and FP8 serde.
+The serde wrapper allocates encoded intermediates from the affinity L1 pool
+and leases them through codec and storage completion. Unknown completion
+retains these buffers with their arena. The fault wrapper propagates ownership
+along with its modified load bitmap.
 
 ## Locking Model
 
