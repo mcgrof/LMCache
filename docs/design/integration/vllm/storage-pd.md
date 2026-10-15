@@ -51,3 +51,16 @@ warm local prefixes, concurrent requests, cancellation, and stock serving in
 that run. File-backed results qualify only the tested filesystem profile;
 they do not establish raw-device correctness. Import workarounds do not
 qualify a stock vLLM installation.
+
+## Strict MP consumer prefix
+
+The MP connector's opt-in `lmcache.mp.strict_prefix=true` requires a consumer
+role and vLLM's `kv_load_failure_policy=fail`. Ordinary MP lookup prefetches into
+L1 before advertising a prefix. If that prefetch fails, returning zero would
+bypass vLLM's failed-load policy and recompute. Strict mode instead advertises
+the required complete prefix range so worker retrieval must succeed or report
+invalid blocks through vLLM's existing failure path. It does not implement a
+second abort protocol. The expected range excludes the last prompt token and
+is rounded down to the MP chunk boundary. Non-strict requests keep ordinary
+cache-miss behavior. Storage receipt adoption and claims happen through the MP
+control API before dispatch; ACK follows completion, never a failed restore.

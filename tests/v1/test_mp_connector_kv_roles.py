@@ -560,3 +560,44 @@ def test_multi_connector_child_role_and_completion(
     mock_io.scheduler.end_session.assert_called_once_with("request")
     worker.shutdown()
     scheduler.shutdown()
+
+
+@pytest.mark.parametrize("hits", [0, 4, 8])
+def test_strict_consumer_routes_missing_prefix_through_worker_failure(
+    mock_io: SimpleNamespace, hits: int
+) -> None:
+    """A miss cannot bypass worker retrieval and vLLM's configured fail policy."""
+    config = _config(
+        KVTransferConfig(
+            kv_connector="LMCacheMPConnector",
+            kv_role="kv_consumer",
+            kv_load_failure_policy="fail",
+            kv_connector_extra_config={"lmcache.mp.strict_prefix": True},
+        )
+    )
+    mock_io.scheduler.check_lookup_result.return_value = hits
+    scheduler = LMCacheMPConnector(config, KVConnectorRole.SCHEDULER)
+    try:
+        assert scheduler.get_num_new_matched_tokens(_request(), 0) == (8, True)
+    finally:
+        scheduler.shutdown()
+
+
+@pytest.mark.parametrize(
+    "role,policy",
+    [("kv_producer", "fail"), ("kv_both", "fail"), ("kv_consumer", "recompute")],
+)
+def test_strict_prefix_rejects_configuration_that_can_recompute(
+    mock_io: SimpleNamespace, role: str, policy: str
+) -> None:
+    """Strict handoff is explicit and requires a read-only fail-policy engine."""
+    config = _config(
+        KVTransferConfig(
+            kv_connector="LMCacheMPConnector",
+            kv_role=role,
+            kv_load_failure_policy=policy,
+            kv_connector_extra_config={"lmcache.mp.strict_prefix": True},
+        )
+    )
+    with pytest.raises(ValueError, match="strict_prefix requires"):
+        LMCacheMPConnector(config, KVConnectorRole.SCHEDULER)
