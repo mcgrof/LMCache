@@ -348,3 +348,18 @@ phase with the same model, key derivation and storage layout. Readers
 load the checkpoint at startup. This option does not supply request
 publication, acknowledgement or live checkpoint refresh; the caller must
 coordinate those operations and preserve the published extents.
+
+Live shared-storage MP requests
+-------------------------------
+
+Independent MP writer and reader servers can share one physical namespace.
+Set ``pd_derivation`` on both raw-block adapters to opt in. Compute it with
+``TokenHasher(chunk_size, "blake3").raw_block_derivation().as_payload()``;
+use the actual MP chunk size. For a server configured with 256 tokens per
+chunk, compute the JSON field with:
+
+.. code-block:: python
+
+    from lmcache.v1.multiprocess.token_hasher import TokenHasher
+
+    pd_derivation = TokenHasher(256, "blake3").raw_block_derivation().as_payload()

@@ -106,3 +106,10 @@ class TestSafeAsdict:
     def test_primitive_inputs_rejected(self, bad: Any):
         with pytest.raises(TypeError, match="Expected a dataclass"):
             safe_asdict(bad)
+
+
+def test_nested_dataclass_config_retains_structured_fields() -> None:
+    """An adapter's typed derivation remains a JSON object in config output."""
+    result = make_json_safe({"descriptor": _FakeCfg()})
+    assert result == {"descriptor": safe_asdict(_FakeCfg())}
+    assert make_json_safe(_FakeCfg) == str(_FakeCfg)

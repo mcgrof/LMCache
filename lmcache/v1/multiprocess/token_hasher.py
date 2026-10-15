@@ -21,6 +21,7 @@ import numpy as np
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.storage_backend.raw_block import RawBlockDerivationDescriptor
 
 logger = init_logger(__name__)
 
@@ -68,6 +69,25 @@ class TokenHasher:
             "TokenHasher initialized: chunk_size=%d, hash_algorithm=%s",
             chunk_size,
             hash_algorithm,
+        )
+
+    def raw_block_derivation(self) -> RawBlockDerivationDescriptor:
+        """Describe the supported stable MP hash chain for shared raw storage.
+
+        Returns:
+            Object-key derivation including chunk size, algorithm and chain root.
+
+        Raises:
+            ValueError: A hasher other than the built-in MP BLAKE3 chain is used.
+        """
+        if self.hash_algorithm_name != "blake3":
+            raise ValueError("MP raw-block P/D currently requires blake3 hashing")
+        return RawBlockDerivationDescriptor(
+            hash_algorithm="blake3",
+            hash_implementation=f"lmcache.mp.blake3.chunk{self.chunk_size}.v1",
+            hash_seed="",
+            chain_root=self.none_hash.hex(),
+            key_namespace="object",
         )
 
     def _get_hash_func(self, hash_algorithm: str) -> Callable:

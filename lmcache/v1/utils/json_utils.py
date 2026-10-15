@@ -16,7 +16,7 @@ from typing import Any
 def make_json_safe(obj: Any) -> Any:
     """Recursively convert ``obj`` into a JSON-serializable value.
 
-    Dicts, lists and tuples are traversed; primitive JSON types are
+    Dicts, lists, tuples and dataclass instances are traversed; primitive types are
     returned unchanged; any other value falls back to ``str(obj)``.
 
     Args:
@@ -29,6 +29,8 @@ def make_json_safe(obj: Any) -> Any:
     Exceptions:
         None.
     """
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return safe_asdict(obj)
     if isinstance(obj, dict):
         return {k: make_json_safe(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):

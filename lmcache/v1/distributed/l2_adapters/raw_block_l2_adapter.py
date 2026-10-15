@@ -42,12 +42,14 @@ from lmcache.v1.distributed.l2_adapters.config import (
 from lmcache.v1.distributed.l2_adapters.factory import (
     register_l2_adapter_factory,
 )
+from lmcache.v1.distributed.l2_adapters.raw_block_handoff import RawBlockMPHandoff
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.platform import EventNotifier, create_event_notifier
 from lmcache.v1.storage_backend.raw_block import (
     DEFAULT_IOURING_QUEUE_DEPTH,
     RawBlockCore,
     RawBlockCoreConfig,
+    RawBlockDerivationDescriptor,
     RawBlockIoContext,
     decode_object_key,
     encode_object_key,
@@ -234,6 +236,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         slot_bytes: int,
         capacity_bytes: int = 0,
         role: str = "writer",
+        pd_derivation: RawBlockDerivationDescriptor | None = None,
         use_odirect: bool = True,
         block_align: int = 4096,
         header_bytes: int = 4096,
@@ -265,6 +268,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             device_path: Raw device path or pre-sized file path used for L2.
             slot_bytes: Fixed data-slot size in bytes.
             capacity_bytes: Optional cap on usable bytes; zero uses device size.
+            pd_derivation: Opt-in shared-storage key derivation. Enables request
+                publication, extent leases and reclamation after ACK.
             role: ``writer`` owns storage; ``reader`` opens a checkpoint read-only
                 and rejects stores and deletes. Reader close does not checkpoint.
             use_odirect: Whether to open the raw path with O_DIRECT.
@@ -308,6 +313,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         if role not in ("writer", "reader"):
             raise ValueError("raw_block role must be writer or reader")
         self.role = role
+        self.pd_derivation = pd_derivation
         self.device_path = device_path
         self.slot_bytes = int(slot_bytes)
         self.capacity_bytes = int(capacity_bytes)
@@ -456,6 +462,11 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         return cls(
             device_path=device_path,
             role=d.get("role", "writer"),
+            pd_derivation=(
+                RawBlockDerivationDescriptor(**d["pd_derivation"])
+                if d.get("pd_derivation") is not None
+                else None
+            ),
             slot_bytes=slot_bytes,
             capacity_bytes=capacity_bytes,
             use_odirect=bool(d.get("use_odirect", True)),
@@ -499,6 +510,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             "bytes (default 4096)\n"
             "- header_bytes (int): per-slot header reservation (default 4096)\n"
             "- role (str): writer (default) or read-only reader\n"
+            "- pd_derivation (dict): opt-in MP shared-storage key derivation\n"
             "- meta_total_bytes (int): reserved metadata checkpoint region "
             "(default 256MiB)\n"
             "- meta_magic (str): 8-byte metadata magic (default LMCIDX01)\n"
@@ -547,6 +559,9 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             device_path=self.device_path,
             role=self.role,
             verify_slot_header_on_load=self.role == "reader",
+            derivation=self.pd_derivation,
+            evict_unlocked_on_full=self.pd_derivation is not None,
+            close_writes_final_checkpoint=self.pd_derivation is None,
             capacity_bytes=self.capacity_bytes,
             block_align=self.block_align,
             header_bytes=self.header_bytes,
@@ -653,6 +668,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
         self._close_outcome: L2CloseOutcome | None = None
         self._io_incarnation = uuid.uuid4().hex
         self._uses_iouring = config.io_engine == "io_uring"
+        self._handoff: RawBlockMPHandoff | None = None
         self._core: RawBlockCore
         self._store_efd: EventNotifier | None = None
         self._lookup_efd: EventNotifier | None = None
@@ -750,6 +766,19 @@ class RawBlockL2Adapter(L2AdapterInterface):
         self._store_inflight_tasks: int = 0
         self._lookup_inflight_tasks: int = 0
         self._load_inflight_tasks: int = 0
+        if config.pd_derivation is not None:
+            self._handoff = RawBlockMPHandoff(self._core, config.pd_derivation)
+
+    @property
+    def handoff(self) -> RawBlockMPHandoff:
+        """Return opt-in shared-storage request control.
+
+        Raises:
+            RuntimeError: ``pd_derivation`` was not configured.
+        """
+        if self._handoff is None:
+            raise RuntimeError("raw_block handoff requires pd_derivation")
+        return self._handoff
 
     def get_store_event_fd(self) -> int:
         """Return the eventfd signaled when store tasks complete."""
@@ -1001,6 +1030,8 @@ class RawBlockL2Adapter(L2AdapterInterface):
                     return
                 self._closed = True
 
+            if self._handoff is not None:
+                self._handoff.close()
             self._store_pool.shutdown(wait=True)
             self._lookup_pool.shutdown(wait=True)
             self._load_pool.shutdown(wait=True)
@@ -1065,6 +1096,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 "completed_store_task_count": len(self._completed_store_tasks),
                 "completed_lookup_task_count": len(self._completed_lookup_tasks),
                 "completed_load_task_count": len(self._completed_load_tasks),
+                "handoff": self._handoff.report_status() if self._handoff else {},
                 "core": core_status,
             }
 
