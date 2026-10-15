@@ -290,7 +290,9 @@ extents and pair the checkpoint with compatible key and model metadata.
 ## Independent MP storage owners
 
 `pd_derivation` opts the adapter into `RawBlockMPHandoff`. The descriptor comes
-from the MP BLAKE3 hasher and records chunk size and chain root. Core checkpoint adoption checks this descriptor against storage. An ordinary reader role still loads only its startup
+from the MP BLAKE3 hasher and records chunk size and chain root. The HTTP control
+surface checks it against the running server, and core checkpoint adoption
+checks it against storage. An ordinary reader role still loads only its startup
 checkpoint unless the caller uses the opt-in adoption control.
 
 The controller reuses `RawBlockPDRequestTracker`, not a second lease algorithm:
@@ -304,6 +306,14 @@ own registered arena and verify slot headers. Adoption also checks every
 committed chunk's tensor shape, dtype and logical bytes against the reader's
 registered canonical layout before lookup. Equal byte counts alone do not
 make fused/split K/V or different dtypes interchangeable.
+
+The `/storage-pd/*` handlers expose these operations through public adapter and
+storage-manager APIs. Model/token addressing is initially restricted to TP=PP=1
+and one full-attention group. The caller supplies dispatch and ACK ordering.
+Prepared/unacknowledged requests are bounded; failed reads deliberately retain
+leases. Shutdown drains the publication executor before closing core resources.
+One writer is required; writer restart with live old readers, automatic dead
+reader fencing, a router, and crash-safe lease recovery are not implemented.
 
 Prepared cancellation uses the tracker's terminal future, preventing READY
 while an in-flight publisher retains its pins until settlement. A completed
