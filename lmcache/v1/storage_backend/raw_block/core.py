@@ -2632,9 +2632,10 @@ class RawBlockCore:
                 raise ValueError(
                     "raw-block storage P/D requires a persistent block "
                     "namespace identity; this device exposes none, so "
-                    "configure rust_raw_block.namespace_identity with an "
-                    "identity that names the same namespace on every node "
-                    "that shares it"
+                    "configure rust_raw_block.namespace_identity, or "
+                    "namespace_identity in the MP raw-block adapter, with "
+                    "an identity that names the same namespace on every "
+                    "node that shares it"
                 )
             self._last_publish_ts = time.monotonic()
             manifest_records = [

@@ -286,3 +286,27 @@ eviction. The adapter loads its reader checkpoint at startup; it does not
 add a request publication/acknowledgement protocol or refresh an index
 while requests run. External handoff coordination must preserve source
 extents and pair the checkpoint with compatible key and model metadata.
+
+## Independent MP storage owners
+
+`pd_derivation` opts the adapter into `RawBlockMPHandoff`. The descriptor comes
+from the MP BLAKE3 hasher and records chunk size and chain root. Core checkpoint adoption checks this descriptor against storage. An ordinary reader role still loads only its startup
+checkpoint unless the caller uses the opt-in adoption control.
+
+The controller reuses `RawBlockPDRequestTracker`, not a second lease algorithm:
+prepare protects all keys before model stores; publish observes all committed
+metadata, then the tracker pins extents before the forced checkpoint. READY
+therefore follows payload completion and both persistence barriers. Repeated
+publish calls share the original future and receipt. Exact claimed ACK releases
+the hold; wrong epoch, manifest, session or consumer cannot do so. Deletion and
+capacity eviction use the existing core lock references. Reads use the reader's
+own registered arena and verify slot headers. Adoption also checks every
+committed chunk's tensor shape, dtype and logical bytes against the reader's
+registered canonical layout before lookup. Equal byte counts alone do not
+make fused/split K/V or different dtypes interchangeable.
+
+Prepared cancellation uses the tracker's terminal future, preventing READY
+while an in-flight publisher retains its pins until settlement. A completed
+publication cannot use this shortcut. Exact unread release reuses the core
+tracker's no-claim check; it cannot release a reader's claimed extents. These
+paths retire request admission without treating timeouts as proof of safety.
