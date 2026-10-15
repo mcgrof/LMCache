@@ -596,6 +596,18 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         assert vllm_config.kv_transfer_config is not None
         self._can_store = vllm_config.kv_transfer_config.is_kv_producer
+        self._strict_prefix = vllm_config.kv_transfer_config.get_from_extra_config(
+            "lmcache.mp.strict_prefix", False
+        )
+        if not isinstance(self._strict_prefix, bool):
+            raise ValueError("lmcache.mp.strict_prefix must be a boolean")
+        if self._strict_prefix and (
+            self._can_store
+            or vllm_config.kv_transfer_config.kv_load_failure_policy != "fail"
+        ):
+            raise ValueError(
+                "strict_prefix requires kv_consumer and kv_load_failure_policy=fail"
+            )
         self._save_decode_cache = vllm_config.kv_transfer_config.get_from_extra_config(
             "lmcache.mp.save_decode_cache", False
         )
@@ -1299,6 +1311,17 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             // self._hit_alignment_tokens
             * self._hit_alignment_tokens
         )
+
+        if self._strict_prefix:
+            # A strict handoff promised every complete prefix chunk. If the
+            # prefetch failed before vLLM advertised an external prefix, a
+            # normal miss would bypass its fail policy and recompute. Route
+            # the promised range through worker retrieve instead: missing
+            # objects report invalid blocks via vLLM's existing request error
+            # path, before local prefill can replace a broken handoff.
+            chunk_size = self.scheduler_adapter.lmcache_tokens_per_chunk
+            required = (tracker.num_prompt_tokens - 1) // chunk_size * chunk_size
+            ret = max(ret, required)
 
         if ret == 0:
             return 0, False

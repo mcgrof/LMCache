@@ -415,3 +415,16 @@ assigned, ``POST /storage-pd/unread`` takes ``request_id``, the exact
 ``receipt`` and ``session_id``. It releases only an unclaimed publication;
 an exact duplicate is safe, and a claimed read still requires its ACK.
 A publication timeout alone does not cancel the request.
+
+Strict decode prefixes
+~~~~~~~~~~~~~~~~~~~~~~
+
+A normal MP cache miss permits local recomputation. A strict decoder sets
+``"lmcache.mp.strict_prefix": true`` in ``kv_connector_extra_config``, uses
+``kv_role="kv_consumer"`` and ``kv_load_failure_policy="fail"``. Every complete
+prompt chunk before the last prompt token is then required. If prefetch
+fails before advertising an external prefix, the connector routes the
+promised range through worker retrieval so vLLM's existing failed-load path
+rejects the request. It cannot silently treat the failed handoff as a cold
+cache. Producer/both roles and recompute policy are refused for this option.
+Disable automatic prefix caching when validating the storage restore itself.
