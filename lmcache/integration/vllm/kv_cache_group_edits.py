@@ -41,11 +41,10 @@ from collections.abc import Mapping
 from typing import TypeAlias
 
 # Third Party
+from vllm.v1 import kv_cache_interface
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
-    KVCacheSpecKind,
-    get_kv_cache_spec_kind,
 )
 import torch
 
@@ -71,12 +70,39 @@ _SYNTHETIC_NUM_HEADS = 1
 # Standard-paged (non-MLA) attention kinds eligible for the sub-paged edit.
 _SUBPAGEABLE_ATTENTION_KINDS = frozenset(
     {
-        KVCacheSpecKind.FULL_ATTENTION,
-        KVCacheSpecKind.SLIDING_WINDOW,
-        KVCacheSpecKind.CHUNKED_LOCAL_ATTENTION,
-        KVCacheSpecKind.SINK_FULL_ATTENTION,
+        "FULL_ATTENTION",
+        "SLIDING_WINDOW",
+        "CHUNKED_LOCAL_ATTENTION",
+        "SINK_FULL_ATTENTION",
     }
 )
+
+
+def _cache_spec_kind(spec: KVCacheSpec) -> str:
+    """Classify a vLLM cache spec across enum and class-based interfaces.
+
+    Current engines provide a classifier; older engines identify the same
+    layouts through their public spec classes. Walk the class hierarchy so
+    specialized attention specs take precedence over FullAttentionSpec.
+    Unknown layouts are rejected instead of treated as ordinary attention.
+    """
+    classifier = getattr(kv_cache_interface, "get_kv_cache_spec_kind", None)
+    if classifier is not None:
+        return classifier(spec).name
+    legacy_kinds = {
+        "FullAttentionSpec": "FULL_ATTENTION",
+        "SlidingWindowSpec": "SLIDING_WINDOW",
+        "ChunkedLocalAttentionSpec": "CHUNKED_LOCAL_ATTENTION",
+        "SinkFullAttentionSpec": "SINK_FULL_ATTENTION",
+        "CrossAttentionSpec": "CROSS_ATTENTION",
+        "MambaSpec": "MAMBA",
+        "MLAAttentionSpec": "MLA_ATTENTION",
+        "EncoderOnlyAttentionSpec": "ENCODER_ONLY_ATTENTION",
+    }
+    for cls in type(spec).__mro__:
+        if cls.__name__ in legacy_kinds:
+            return legacy_kinds[cls.__name__]
+    raise ValueError(f"Unsupported vLLM KV cache spec: {type(spec).__name__}")
 
 
 def _declares_slot_compression(spec: KVCacheSpec) -> bool:
@@ -153,12 +179,13 @@ def validate_kv_cache_groups(kv_cache_config: KVCacheConfig | None) -> None:
     unsupported: list[str] = []
     for group_idx, group in enumerate(kv_cache_config.kv_cache_groups):
         for spec in _leaf_specs(group.kv_cache_spec):
-            kind = get_kv_cache_spec_kind(spec)
-            if kind == KVCacheSpecKind.CROSS_ATTENTION:
+            kind = _cache_spec_kind(spec)
+            if kind == "CROSS_ATTENTION":
                 unsupported.append(f"group {group_idx}: CrossAttentionSpec")
-            elif kind == KVCacheSpecKind.MAMBA and getattr(
-                spec, "mamba_cache_mode", "none"
-            ) not in ("align", "all"):
+            elif kind == "MAMBA" and getattr(spec, "mamba_cache_mode", "none") not in (
+                "align",
+                "all",
+            ):
                 unsupported.append(
                     f"group {group_idx}: MambaSpec with mamba_cache_mode="
                     f"'{getattr(spec, 'mamba_cache_mode', 'none')}' "
@@ -254,9 +281,7 @@ class _MambaPageViewEdit(KVCacheGroupEdit):
     name = "mamba-page-view"
 
     def matches(self, spec: KVCacheSpec, kv_cache: RegisteredKVCache) -> bool:
-        return get_kv_cache_spec_kind(spec) == KVCacheSpecKind.MAMBA and isinstance(
-            kv_cache, list
-        )
+        return _cache_spec_kind(spec) == "MAMBA" and isinstance(kv_cache, list)
 
     def apply(
         self,
@@ -338,7 +363,7 @@ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
         return (
             # Standard-paged attention only; MLA layouts and declared slot
             # compression (DeepSeek) belong to other transfer paths.
-            get_kv_cache_spec_kind(spec) in _SUBPAGEABLE_ATTENTION_KINDS
+            _cache_spec_kind(spec) in _SUBPAGEABLE_ATTENTION_KINDS
             and not _declares_slot_compression(spec)
             # A rank-5 or rank-4 layout whose block dim disagrees with the
             # scheduler block-id unit, i.e. the backend re-paged the tensor at
@@ -470,7 +495,7 @@ class _MambaUnifiedViewEdit(KVCacheGroupEdit):
         Matches the mamba kv cache with unified layout.
         """
         return (
-            get_kv_cache_spec_kind(spec) == KVCacheSpecKind.MAMBA
+            _cache_spec_kind(spec) == "MAMBA"
             and isinstance(kv_cache, torch.Tensor)
             and kv_cache.ndim == 4
         )
@@ -563,7 +588,7 @@ class _SubpagedMLAAttentionViewEdit(KVCacheGroupEdit):
 
     def matches(self, spec: KVCacheSpec, kv_cache: RegisteredKVCache) -> bool:
         return (
-            get_kv_cache_spec_kind(spec) == KVCacheSpecKind.MLA_ATTENTION
+            _cache_spec_kind(spec) == "MLA_ATTENTION"
             and isinstance(kv_cache, torch.Tensor)
             and kv_cache.ndim in (3, 4)
             and kv_cache.shape[_mla_states_dim(kv_cache)] != _num_states(spec)

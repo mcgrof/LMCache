@@ -27,7 +27,7 @@ so they behave the same whether or not vLLM is installed.
 from dataclasses import dataclass
 from enum import Enum
 from types import ModuleType
-from typing import TypeAlias
+from typing import TypeAlias, cast
 from unittest.mock import patch
 import importlib
 import sys
@@ -119,7 +119,7 @@ def edits():
         ):
             sys.modules.pop(_MODULE, None)
             module = importlib.import_module(_MODULE)
-            assert module.KVCacheSpecKind is _SpecKind
+            assert module.kv_cache_interface is stub
             yield module
     finally:
         sys.modules.pop(_MODULE, None)
@@ -492,3 +492,87 @@ def test_flash_attention_hybrid_needs_no_attention_edit(edits):
     # Passed through untouched, and already at block-id granularity.
     assert edited["attn.0"] is kv_caches["attn.0"]
     assert edited["attn.0"].shape[2] == LOGICAL_BLOCK_SIZE
+
+
+def test_legacy_full_attention_without_kind_registry(
+    edits: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Serve legacy attention specs when vLLM has no enum classifier."""
+    monkeypatch.delattr(edits.kv_cache_interface, "get_kv_cache_spec_kind")
+    legacy_type = type("FullAttentionSpec", (_Spec,), {})
+    spec = legacy_type(
+        kind=_SpecKind.FULL_ATTENTION,
+        block_size=LOGICAL_BLOCK_SIZE,
+        page_size_bytes=_attention_page_bytes(),
+    )
+    config = _Config(kv_cache_groups=[_Group(layer_names=["attn"], kv_cache_spec=spec)])
+    edits.validate_kv_cache_groups(config)
+    result = edits.apply_kv_cache_group_edits(
+        config, {"attn": _split_kv_cache()}, layout_hints={}
+    )
+    assert result["attn"].shape[2] == LOGICAL_BLOCK_SIZE
+
+
+def test_legacy_unknown_layout_is_rejected(
+    edits: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delattr(edits.kv_cache_interface, "get_kv_cache_spec_kind")
+    config = _Config(
+        kv_cache_groups=[
+            _Group(layer_names=["unknown"], kv_cache_spec=_attention_spec())
+        ]
+    )
+    with pytest.raises(ValueError, match="Unsupported vLLM KV cache spec"):
+        edits.validate_kv_cache_groups(config)
+
+
+def test_import_with_class_only_vllm_specs() -> None:
+    """Import and serve a legacy attention spec without the newer enum API."""
+
+    @dataclass
+    class FullAttentionSpec:
+        block_size: int
+        page_size_bytes: int
+
+    stub = ModuleType("vllm.v1.kv_cache_interface")
+    stub.__dict__.update(KVCacheConfig=_Config, KVCacheSpec=FullAttentionSpec)
+    parent = importlib.import_module("lmcache.integration.vllm")
+    previous = sys.modules.get(_MODULE)
+    previous_attribute = parent.__dict__.get("kv_cache_group_edits")
+    try:
+        with patch.dict(
+            sys.modules,
+            {
+                "vllm": ModuleType("vllm"),
+                "vllm.v1": ModuleType("vllm.v1"),
+                "vllm.v1.kv_cache_interface": stub,
+            },
+        ):
+            sys.modules.pop(_MODULE, None)
+            module = importlib.import_module(_MODULE)
+            config = _Config(
+                kv_cache_groups=[
+                    _Group(
+                        layer_names=["attn"],
+                        kv_cache_spec=cast(
+                            _Spec,
+                            FullAttentionSpec(
+                                LOGICAL_BLOCK_SIZE, _attention_page_bytes()
+                            ),
+                        ),
+                    )
+                ]
+            )
+            module.validate_kv_cache_groups(config)
+            result = module.apply_kv_cache_group_edits(
+                config, {"attn": _split_kv_cache()}, layout_hints={}
+            )
+            assert result["attn"].shape[2] == LOGICAL_BLOCK_SIZE
+    finally:
+        sys.modules.pop(_MODULE, None)
+        if previous is not None:
+            sys.modules[_MODULE] = previous
+        if previous_attribute is None:
+            parent.__dict__.pop("kv_cache_group_edits", None)
+        else:
+            parent.__dict__["kv_cache_group_edits"] = previous_attribute
