@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+from pathlib import Path
 from unittest.mock import patch
 import os
 import select
@@ -656,3 +657,58 @@ def test_raw_block_l2_adapter_error_bitmaps_keep_submitted_size():
             assert str(load_bitmap) == "00"
         finally:
             adapter.close()
+
+
+@pytest.mark.parametrize("role", ["writer", "reader"])
+def test_raw_block_l2_adapter_role_reaches_core(role: str) -> None:
+    config = RawBlockL2AdapterConfig.from_dict(_config_dict(role=role))
+    core_config = config.to_core_config()
+    assert core_config.role == role
+    assert core_config.verify_slot_header_on_load is (role == "reader")
+
+
+@pytest.mark.parametrize("role", ["", "Reader", "both", None, False])
+def test_raw_block_l2_adapter_rejects_invalid_role(role: object) -> None:
+    with pytest.raises(ValueError, match="role must be writer or reader"):
+        RawBlockL2AdapterConfig.from_dict(_config_dict(role=role))
+
+
+@requires_raw_block_ext
+def test_raw_block_l2_reader_does_not_mutate_checkpoint(tmp_path: Path) -> None:
+    """Read a writer checkpoint without stores, eviction or close-time writes."""
+    path = tmp_path / "media.bin"
+    path.write_bytes(bytes(8 << 20))
+    key = _create_object_key(71)
+    source = _create_memory_obj(fill_value=7.0)
+    writer = RawBlockL2Adapter(_make_config(str(path)))
+    try:
+        assert _run_store(writer, [key], [source])
+    finally:
+        writer.close()
+    original = path.read_bytes()
+    config = RawBlockL2AdapterConfig.from_dict(
+        _config_dict(
+            device_path=str(path),
+            role="reader",
+            meta_total_bytes=1 << 20,
+            meta_enable_periodic=True,
+        )
+    )
+    reader = RawBlockL2Adapter(config)
+    try:
+        assert not reader.supports_global_eviction
+        _, hits = _run_lookup(reader, [key])
+        assert hits is not None and hits.get_indices_list() == [0]
+        destination = _create_memory_obj(fill_value=-1.0)
+        task = reader.submit_load_task([key], [destination])
+        assert _wait_event_fd(reader.get_load_event_fd())
+        loaded = reader.query_load_result(task)
+        assert loaded is not None and loaded.get_indices_list() == [0]
+        torch.testing.assert_close(destination.tensor, source.tensor)
+        reader.submit_unlock([key])
+        assert not _run_store(reader, [_create_object_key(72)], [source])
+        with pytest.raises(RuntimeError, match="refusing to delete on a reader"):
+            reader.delete([key])
+    finally:
+        reader.close()
+    assert path.read_bytes() == original

@@ -233,6 +233,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         device_path: str,
         slot_bytes: int,
         capacity_bytes: int = 0,
+        role: str = "writer",
         use_odirect: bool = True,
         block_align: int = 4096,
         header_bytes: int = 4096,
@@ -264,6 +265,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             device_path: Raw device path or pre-sized file path used for L2.
             slot_bytes: Fixed data-slot size in bytes.
             capacity_bytes: Optional cap on usable bytes; zero uses device size.
+            role: ``writer`` owns storage; ``reader`` opens a checkpoint read-only
+                and rejects stores and deletes. Reader close does not checkpoint.
             use_odirect: Whether to open the raw path with O_DIRECT.
             block_align: Required power-of-two block alignment in bytes.
             header_bytes: Per-slot header reservation in bytes.
@@ -302,6 +305,9 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             num_load_workers: Number of load worker threads.
         """
         super().__init__()
+        if role not in ("writer", "reader"):
+            raise ValueError("raw_block role must be writer or reader")
+        self.role = role
         self.device_path = device_path
         self.slot_bytes = int(slot_bytes)
         self.capacity_bytes = int(capacity_bytes)
@@ -449,6 +455,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
 
         return cls(
             device_path=device_path,
+            role=d.get("role", "writer"),
             slot_bytes=slot_bytes,
             capacity_bytes=capacity_bytes,
             use_odirect=bool(d.get("use_odirect", True)),
@@ -491,6 +498,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             "- block_align (int): required power-of-two block alignment in "
             "bytes (default 4096)\n"
             "- header_bytes (int): per-slot header reservation (default 4096)\n"
+            "- role (str): writer (default) or read-only reader\n"
             "- meta_total_bytes (int): reserved metadata checkpoint region "
             "(default 256MiB)\n"
             "- meta_magic (str): 8-byte metadata magic (default LMCIDX01)\n"
@@ -537,6 +545,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         """Convert this adapter config to the shared RawBlockCore config."""
         return RawBlockCoreConfig(
             device_path=self.device_path,
+            role=self.role,
+            verify_slot_header_on_load=self.role == "reader",
             capacity_bytes=self.capacity_bytes,
             block_align=self.block_align,
             header_bytes=self.header_bytes,
@@ -963,6 +973,11 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 self._notify_keys_deleted(deleted_keys, deleted_sizes)
             except Exception as e:
                 logger.warning("RawBlockL2Adapter delete notification failed: %s", e)
+
+    @property
+    def supports_global_eviction(self) -> bool:
+        """Allow slot reclamation only on the storage writer."""
+        return self._core.role == "writer"
 
     def register_listener(self, listener: "L2AdapterListener") -> None:
         """Register a listener and seed it with currently indexed keys."""
