@@ -363,3 +363,55 @@ chunk, compute the JSON field with:
     from lmcache.v1.multiprocess.token_hasher import TokenHasher
 
     pd_derivation = TokenHasher(256, "blake3").raw_block_derivation().as_payload()
+
+The HTTP API compares this descriptor with
+its own hasher before accepting a handoff. Different chunk sizes, roots or
+implementations are rejected. The initial token-addressed API supports one
+full-attention object group with TP=PP=1.
+
+Both servers use the same device/file and geometry. Set ``role=writer`` on
+prefill and ``role=reader`` on decode. The reader remains read-only.
+The opt-in writer reclaims only unlocked extents when its namespace fills;
+request protection and leases prevent recycling active handoffs.
+
+The MP HTTP server exposes these synchronous control operations. Their
+request/response schemas are available in its OpenAPI document.
+
+#. ``POST /storage-pd/prepare`` with ``request_id``, ``model_name``,
+   ``token_ids`` and optional ``cache_salt`` before dispatching prefill.
+   This protects the resolved complete chunks from replacement.
+#. Dispatch prefill. ``POST /storage-pd/publish`` with ``request_id`` and
+   ``timeout_s`` waits for every object, forces the checkpoint persistence
+   barriers, and returns a READY receipt. Incomplete writes return 504.
+   Retrying the same prepared request returns the same completed receipt.
+#. ``POST /storage-pd/claim`` at the writer binds the lease to the consumer
+   incarnation and session. Its ``identity`` includes request id, consumer
+   instance id, rank zero, writer epoch, checkpoint sequence and manifest
+   digest. An ACK before claim cannot free extents.
+#. ``POST /storage-pd/adopt`` at the reader with ``manifest``, ``receipt``
+   and ``timeout_ms`` adopts a matching on-device checkpoint before lookup.
+   Mismatched namespace, writer epoch, manifest or registered tensor shape,
+   dtype or byte count returns 409. Both engines must use the same model
+   weights and canonical chunk layout; no layout conversion is supplied.
+#. Dispatch decode with the prefiller's first output token appended to the
+   prompt. After restore and decode finish, ``POST /storage-pd/ack`` at the
+   writer with the same claim body releases the extents. Exact retries
+   return ``ALREADY_APPLIED``. A wrong consumer or receipt is rejected.
+
+The caller orchestrates these operations. This API does not add an automatic
+router or make ordinary requests into P/D requests. Consumer death or failed
+restoration must retain the lease until a separately established safe
+release; a timeout alone never proves the reader stopped. Admission is
+bounded to 256 prepared/unacknowledged requests. One writer owns the
+namespace; restarting/reclaiming it while old readers remain active is
+outside this contract. Periodic checkpoints may continue, but READY always
+requires its own forced barrier. Close does not publish unfinished work.
+
+A dispatcher that abandons prefill can call ``POST /storage-pd/cancel``
+with ``request_id``. A true ``cancelled`` result prevents READY; publication
+already in flight retains its pins until completion. A false result does
+not authorize reclamation. If READY already exists but no reader was
+assigned, ``POST /storage-pd/unread`` takes ``request_id``, the exact
+``receipt`` and ``session_id``. It releases only an unclaimed publication;
+an exact duplicate is safe, and a claimed read still requires its ACK.
+A publication timeout alone does not cancel the request.
