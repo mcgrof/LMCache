@@ -333,3 +333,18 @@ or controller does not support the FDP status query, the test skips with the
 underlying capability error. A passing status probe only confirms that the live
 device can answer the FDP status query; full adapter initialization and KV write
 placement on hardware are separate validations.
+
+Read-only checkpoint consumers
+------------------------------
+
+Set ``"role": "reader"`` on a raw-block adapter to open an existing
+checkpoint without write permission. The default ``"writer"`` owns data
+slots and metadata. A reader restores stored objects, verifies their slot
+headers, rejects stores and deletes, and does not write a checkpoint on
+close. The global eviction controller skips read-only adapters.
+
+For example, a decoder can open a checkpoint from a completed prefill
+phase with the same model, key derivation and storage layout. Readers
+load the checkpoint at startup. This option does not supply request
+publication, acknowledgement or live checkpoint refresh; the caller must
+coordinate those operations and preserve the published extents.

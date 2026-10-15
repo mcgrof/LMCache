@@ -275,3 +275,14 @@ while the MP adapter uses the core's full-bitmap lookup/load API.
 - Shared core: `lmcache/v1/storage_backend/raw_block/core.py`
 - User docs: `docs/source/mp/l2_storage/raw_block.rst`
 - Rust device layer: `rust/raw_block/README.md`
+
+## Read-only checkpoint consumers
+
+The adapter's `role` selects the shared core's storage ownership. Writers
+allocate slots and checkpoint metadata. Readers open the target read-only,
+verify slot headers on loads, reject stores and deletes, and skip periodic
+and close-time checkpoint writes. They do not participate in global L2
+eviction. The adapter loads its reader checkpoint at startup; it does not
+add a request publication/acknowledgement protocol or refresh an index
+while requests run. External handoff coordination must preserve source
+extents and pair the checkpoint with compatible key and model metadata.
