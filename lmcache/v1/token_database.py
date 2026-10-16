@@ -25,6 +25,7 @@ from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.token_span import ExplicitTokenSpans
 
 logger = init_logger(__name__)
 
@@ -578,3 +579,74 @@ class SegmentTokenDatabase(TokenDatabase):
                 start_idx = end_idx
         else:
             raise ValueError("Either tokens or hashes must be provided.")
+
+    def process_explicit_spans(
+        self,
+        tokens: Union[torch.Tensor, List[int]],
+        explicit_spans: ExplicitTokenSpans,
+        mask: Optional[torch.Tensor] = None,
+        make_key: bool = True,
+        request_configs: Optional[dict] = None,
+    ) -> Iterable[ProcessTokensResult]:
+        """Hash exact caller-declared token slices without separator parsing.
+
+        The span declaration is control metadata only. Cache identity contains
+        the exact ``tokens[start:end]`` content plus the existing model/dtype
+        metadata and LMCache request tags; neither the span offsets nor the
+        cached recovery window enter :class:`CacheEngineKey`.
+
+        Args:
+            tokens: Token sequence described by ``explicit_spans``.
+            explicit_spans: Immutable validated span declaration.
+            mask: Optional legacy prefix mask. Spans beginning inside the
+                masked prefix are skipped as whole spans.
+            make_key: Return cache keys when true, raw hashes otherwise.
+            request_configs: Existing LMCache request tags used for key
+                isolation. The span declaration is never added to this value.
+
+        Returns:
+            An iterable of ``(start, end, key_or_hash)`` tuples, one for each
+            unmasked declared span.
+
+        Raises:
+            TypeError: If ``explicit_spans`` has the wrong type or the mask is
+                not a boolean tensor.
+            ValueError: If the token length differs from the declaration or
+                the mask is not a one-dimensional false-prefix/true-suffix
+                mask of the same length.
+        """
+        if not isinstance(explicit_spans, ExplicitTokenSpans):
+            raise TypeError("explicit_spans must be ExplicitTokenSpans")
+        explicit_spans.validate_token_count(len(tokens))
+
+        num_falses = 0
+        if mask is not None:
+            if not isinstance(mask, torch.Tensor) or mask.dtype is not torch.bool:
+                raise TypeError("explicit span mask must be a boolean tensor")
+            if mask.ndim != 1 or len(mask) != len(tokens):
+                raise ValueError(
+                    "explicit span mask must be one-dimensional and match tokens"
+                )
+            mask_cpu = mask.to(device="cpu")
+            num_falses = mask_cpu.numel() - int(mask_cpu.long().sum().item())
+            expected_mask = torch.arange(mask_cpu.numel()) >= num_falses
+            if not torch.equal(mask_cpu, expected_mask):
+                raise ValueError("explicit span mask must contain only a false prefix")
+
+            if any(span.start < num_falses < span.end for span in explicit_spans.spans):
+                raise ValueError(
+                    "explicit token spans must not cross the mask boundary"
+                )
+
+        for span in explicit_spans.spans:
+            if span.start < num_falses:
+                continue
+            hash_value = self._hash_tokens(tokens[span.start : span.end])
+            if make_key:
+                yield (
+                    span.start,
+                    span.end,
+                    self._make_key_by_hash(hash_value, request_configs),
+                )
+            else:
+                yield span.start, span.end, hash_value
