@@ -70,6 +70,20 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
         """Return whether this GPU allocator uses exact nonpaged reservations."""
         return isinstance(self.allocator, TensorMemoryAllocator)
 
+    def can_allocate_batch(
+        self,
+        shapes: Union[torch.Size, list[torch.Size]],
+        dtypes: Union[torch.dtype, list[torch.dtype]],
+        batch_size: int,
+    ) -> bool:
+        """Preflight one exact nonpaged equal-shape allocation batch."""
+        if not isinstance(self.allocator, TensorMemoryAllocator):
+            raise NotImplementedError(
+                "allocation preflight requires the exact nonpaged GPU allocator"
+            )
+        with self.device_mem_lock:
+            return self.allocator.can_allocate_batch(shapes, dtypes, batch_size)
+
     @_lmcache_nvtx_annotate
     def allocate(
         self,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Canonical runtime evidence for the bounded KMesh serial-PIC profile."""
+"""Canonical runtime evidence for the bounded KMesh PIC profiles."""
 
 # Future
 from __future__ import annotations
@@ -15,6 +15,7 @@ import torch
 # First Party
 from lmcache.integration.vllm.kmesh import KMeshRuntimeEvidence
 from lmcache.integration.vllm.target_profile import (
+    KMESH_PIC_V1_PROFILES,
     SERIAL_PIC_V1,
     validate_target_profile,
 )
@@ -138,6 +139,7 @@ def build_kmesh_runtime_evidence(
     lmcache_config: LMCacheEngineConfig,
     *,
     role: object,
+    target_profile: object = SERIAL_PIC_V1,
 ) -> KMeshRuntimeEvidence:
     """Revalidate and freeze cache-compatibility evidence for either role.
 
@@ -146,9 +148,11 @@ def build_kmesh_runtime_evidence(
     The result therefore matches between the scheduler and worker precisely
     when their execution and KV-layout configuration matches.
     """
+    if type(target_profile) is not str or target_profile not in KMESH_PIC_V1_PROFILES:
+        raise ValueError(f"unsupported KMesh PIC target profile {target_profile!r}")
     validate_target_profile(
         lmcache_config,
-        SERIAL_PIC_V1,
+        target_profile,
         role=role,
         vllm_config=vllm_config,
     )
@@ -322,7 +326,7 @@ def build_kmesh_runtime_evidence(
                 "model_config",
                 "max_model_len",
             ),
-            "profile": SERIAL_PIC_V1,
+            "profile": target_profile,
             "save_unfull_chunk": lmcache_config.save_unfull_chunk,
             "use_layerwise": lmcache_config.use_layerwise,
         },

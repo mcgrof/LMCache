@@ -2189,6 +2189,26 @@ class AddressManager:
     def compute_aligned_size(self, raw_size: int) -> int:
         return (raw_size + self._align - 1) & ~(self._align - 1)
 
+    def can_allocate_batch(self, raw_size: int, batch_size: int) -> bool:
+        """Return whether an equal-size batch fits without changing state.
+
+        The calculation follows the same aligned, per-free-range carving rule
+        as :meth:`batched_allocate_once`. It is therefore stronger than a
+        total-free-byte check when the address space is fragmented.
+        """
+        if type(raw_size) is not int or raw_size <= 0:
+            raise ValueError("allocation size must be a positive exact integer")
+        if type(batch_size) is not int or batch_size < 0:
+            raise ValueError("batch size must be a nonnegative exact integer")
+        if batch_size == 0:
+            return True
+        aligned_size = self.compute_aligned_size(raw_size)
+        with self._lock:
+            available = sum(
+                block.size // aligned_size for block in self._state.free_blocks
+            )
+            return available >= batch_size
+
     def _can_merge_with_prev(
         self, curr_block: FreeBlock, prev_block: FreeBlock
     ) -> bool:

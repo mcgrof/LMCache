@@ -61,6 +61,42 @@ class TestAddressManagerBasic:
 class TestAddressManagerAllocation:
     """Test allocation functionality."""
 
+    def test_batch_preflight_is_fragment_aware_and_nonmutating(self):
+        manager = AddressManager(32, align_bytes=8)
+        first = manager.allocate(8)
+        second = manager.allocate(8)
+        third = manager.allocate(8)
+        fourth = manager.allocate(8)
+        manager.free(*second)
+        manager.free(*fourth)
+
+        before = (
+            manager.get_free_size(),
+            manager.total_allocated_size,
+            manager.active_allocation_count,
+        )
+        assert manager.can_allocate_batch(5, 2)
+        assert not manager.can_allocate_batch(5, 3)
+        assert not manager.can_allocate_batch(9, 1)
+        assert manager.can_allocate_batch(5, 0)
+        assert before == (
+            manager.get_free_size(),
+            manager.total_allocated_size,
+            manager.active_allocation_count,
+        )
+
+        manager.free(*first)
+        manager.free(*third)
+
+    @pytest.mark.parametrize(
+        ("raw_size", "batch_size"),
+        [(0, 1), (-1, 1), (True, 1), (1, -1), (1, True)],
+    )
+    def test_batch_preflight_rejects_non_exact_bounds(self, raw_size, batch_size):
+        manager = AddressManager(32, align_bytes=8)
+        with pytest.raises(ValueError):
+            manager.can_allocate_batch(raw_size, batch_size)
+
     def test_single_allocation(self):
         """Test a single allocation."""
         size = 4096 * 10

@@ -34,7 +34,11 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.kmesh import (
+    KMESH_SCHEMA_VERSION,
+    KMeshCompatibilityKey,
+    KMeshGroupKind,
     KMeshPlanner,
+    KMeshRequestContext,
     KMeshRequestContextParseResult,
 )
 from vllm.v1.kmesh import (
@@ -42,6 +46,9 @@ from vllm.v1.kmesh import (
 )
 from vllm.v1.kmesh import (
     KMeshRequestObservation,
+    KMeshSegment,
+    KMeshSegmentKind,
+    KMeshStateKind,
 )
 from vllm.v1.request import Request
 from vllm.v1.utils import ConstantList
@@ -64,7 +71,12 @@ from lmcache.integration.vllm.kmesh import (
     KMeshRuntimeEvidence,
 )
 from lmcache.integration.vllm.lmcache_connector_v1 import LMCacheConnectorV1Dynamic
-from lmcache.integration.vllm.target_profile import SERIAL_PIC_V1
+from lmcache.integration.vllm.target_profile import (
+    COLLECTIVE_BATCHED_POSITION_RECOVERY_V1,
+    COLLECTIVE_BATCHED_QKV_V1,
+    COLLECTIVE_LOCKSTEP_V1,
+    SERIAL_PIC_V1,
+)
 from lmcache.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorMetadata,
     LMCacheConnectorV1Impl,
@@ -72,6 +84,13 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     ReqMeta,
     RequestTracker,
     SaveSpec,
+)
+from lmcache.v1.compute.blend import (
+    LMCBlendGroupMemberResult,
+    LMCBlendGroupOutcome,
+    LMCBlendGroupRequest,
+    LMCBlendGroupResult,
+    LMCBlendOperationCounts,
 )
 from lmcache.v1.lifecycle import RetainedCall
 from tests.v1.instruction_monitoring import (
@@ -187,6 +206,11 @@ class _Blender:
     def __init__(self) -> None:
         self.masks: dict[str, torch.Tensor | BaseException] = {}
         self.calls: list[dict[str, object]] = []
+        self.group_calls: list[tuple[LMCBlendGroupRequest, ...]] = []
+        self.group_collective_flags: list[bool] = []
+        self.group_qkv_flags: list[bool] = []
+        self.group_failures: dict[str, Exception] = {}
+        self.group_result_override: LMCBlendGroupResult | None = None
 
     def blend(
         self,
@@ -204,6 +228,86 @@ class _Blender:
         if isinstance(result, BaseException):
             raise result
         return result.clone()
+
+    def blend_group(
+        self,
+        requests: tuple[LMCBlendGroupRequest, ...],
+        *,
+        collective_position_recovery: bool = False,
+        collective_qkv: bool = False,
+    ) -> LMCBlendGroupResult:
+        self.group_calls.append(requests)
+        self.group_collective_flags.append(collective_position_recovery)
+        self.group_qkv_flags.append(collective_qkv)
+        if self.group_result_override is not None:
+            return self.group_result_override
+        members = []
+        for request in requests:
+            error = self.group_failures.get(request.request_id)
+            if error is not None:
+                members.append(
+                    LMCBlendGroupMemberResult(
+                        request_id=request.request_id,
+                        generation=request.generation,
+                        outcome=LMCBlendGroupOutcome.FAILED,
+                        retrieval_mask=None,
+                        operation_counts=LMCBlendOperationCounts(),
+                        error=error,
+                    )
+                )
+                continue
+            value = self.masks.get(
+                request.request_id,
+                torch.zeros(len(request.tokens), dtype=torch.bool),
+            )
+            if isinstance(value, BaseException):
+                raise value
+            recovered = bool(torch.any(value).item())
+            members.append(
+                LMCBlendGroupMemberResult(
+                    request_id=request.request_id,
+                    generation=request.generation,
+                    outcome=(
+                        LMCBlendGroupOutcome.RECOVERED
+                        if recovered
+                        else LMCBlendGroupOutcome.MISS
+                    ),
+                    retrieval_mask=value.clone(),
+                    operation_counts=(
+                        LMCBlendOperationCounts(
+                            serial_rope_operations=2,
+                            serial_diff_operations=1,
+                        )
+                        if recovered
+                        else LMCBlendOperationCounts()
+                    ),
+                )
+            )
+        return LMCBlendGroupResult(tuple(members))
+
+
+class _WorkerGPUConnector:
+    """Record exact collective capacity admission in CPU-only tests."""
+
+    def __init__(self) -> None:
+        self.capacity = True
+        self.preflight_calls: list[dict[str, object]] = []
+
+    def preflight_blend_group_capacity(
+        self,
+        kvcaches: list[torch.Tensor],
+        *,
+        num_tokens: int,
+        request_count: int,
+    ) -> bool:
+        self.preflight_calls.append(
+            {
+                "kvcaches": tuple(kvcaches),
+                "num_tokens": num_tokens,
+                "request_count": request_count,
+            }
+        )
+        return self.capacity
 
 
 class _WorkerStoreSession:
@@ -260,6 +364,7 @@ class _WorkerEngine:
         self.store_cleanup_calls = 0
         self.store_cleanup_failures = 0
         self.store_cleanup_pending = 0
+        self.gpu_connector = _WorkerGPUConnector()
 
     def register_lookup_cleanup(self, lookup_id: str) -> None:
         self.registered.append(lookup_id)
@@ -364,9 +469,12 @@ def _payload(
     tokens: tuple[int, ...] = TOKENS,
     cache_domain: str | None = "tenant-a",
     fallback: str | None = None,
+    span_payloads: tuple[tuple[object, ...], ...] | None = None,
 ) -> tuple[object, ...]:
     spans: tuple[tuple[object, ...], ...]
-    if fallback is None:
+    if fallback is None and span_payloads is not None:
+        spans = span_payloads
+    elif fallback is None:
         spans = (
             _span(tokens=tokens),
             _span(
@@ -453,7 +561,7 @@ def _adapter(
     state._role = role
     state._kmesh_runtime_evidence = runtime
     state._vllm_config = object()
-    state.config = SimpleNamespace()
+    state.config = SimpleNamespace(blend_check_layers=[1])
     state._kmesh_prepared_lookups = {}
     state._kmesh_prepared_request_objects = {}
     state._kmesh_allocated_requests = set()
@@ -656,14 +764,200 @@ def _plan_batch(*request_ids: str) -> object:
     return KMeshPlanner(block_size=4, clock_ns=lambda: 0).observe(observations)
 
 
+def _collective_context(request_id: str) -> KMeshRequestContext:
+    return KMeshRequestContext(
+        schema_version=KMESH_SCHEMA_VERSION,
+        enabled=True,
+        execution_id="execution-a",
+        group_kind=KMeshGroupKind.AGENT_ROUND,
+        group_id="group-a",
+        round_id=1,
+        branch_id=request_id,
+        parent_branch_id=None,
+        state_kind=KMeshStateKind.KV_CACHE,
+        cache_domain="tenant-a",
+        segments=(
+            KMeshSegment(
+                segment_id="shared-a",
+                kind=KMeshSegmentKind.TASK,
+                token_start=0,
+                token_end=3,
+                logical_order=0,
+                source_id="source-a",
+                shareable=True,
+                lineage_id="lineage-a",
+            ),
+            KMeshSegment(
+                segment_id=f"private-{request_id}",
+                kind=KMeshSegmentKind.PRIVATE_HISTORY,
+                token_start=3,
+                token_end=5,
+                logical_order=1,
+                source_id=f"private-source-{request_id}",
+                shareable=False,
+                lineage_id=f"private-lineage-{request_id}",
+            ),
+            KMeshSegment(
+                segment_id="shared-b",
+                kind=KMeshSegmentKind.TASK,
+                token_start=5,
+                token_end=8,
+                logical_order=2,
+                source_id="source-a",
+                shareable=True,
+                lineage_id="lineage-a",
+            ),
+        ),
+    )
+
+
+def _permuted_collective_context(request_id: str) -> KMeshRequestContext:
+    return KMeshRequestContext(
+        schema_version=KMESH_SCHEMA_VERSION,
+        enabled=True,
+        execution_id="execution-a",
+        group_kind=KMeshGroupKind.AGENT_ROUND,
+        group_id="group-a",
+        round_id=1,
+        branch_id=request_id,
+        parent_branch_id=None,
+        state_kind=KMeshStateKind.KV_CACHE,
+        cache_domain="tenant-a",
+        segments=(
+            KMeshSegment(
+                segment_id="shared-b",
+                kind=KMeshSegmentKind.TASK,
+                token_start=0,
+                token_end=3,
+                logical_order=0,
+                source_id="source-a",
+                shareable=True,
+                lineage_id="lineage-a",
+            ),
+            KMeshSegment(
+                segment_id=f"private-{request_id}",
+                kind=KMeshSegmentKind.PRIVATE_HISTORY,
+                token_start=3,
+                token_end=5,
+                logical_order=1,
+                source_id=f"private-source-{request_id}",
+                shareable=False,
+                lineage_id=f"private-lineage-{request_id}",
+            ),
+            KMeshSegment(
+                segment_id="shared-a",
+                kind=KMeshSegmentKind.TASK,
+                token_start=5,
+                token_end=8,
+                logical_order=2,
+                source_id="source-a",
+                shareable=True,
+                lineage_id="lineage-a",
+            ),
+        ),
+    )
+
+
+def _collective_key(context: KMeshRequestContext) -> KMeshCompatibilityKey:
+    return KMeshCompatibilityKey(
+        execution_id=context.execution_id,
+        group_id=context.group_id,
+        round_id=context.round_id,
+        model_id="Qwen/Qwen2.5-0.5B-Instruct",
+        model_revision="7ae55760",
+        tokenizer_id_or_revision="7ae55760",
+        dtype="bfloat16",
+        kv_cache_dtype="bfloat16",
+        kv_layout="NHD",
+        attention_kind="full",
+        rope_configuration='{"rope_theta":1000000.0}',
+        attention_backend="ROCM_ATTN",
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        lora_adapter_identity=None,
+        cache_salt=None,
+        cache_domain=context.cache_domain,
+        active_prompt_length=len(TOKENS),
+        cached_span=(0, 3),
+        prefill_chunk_span=(3, len(TOKENS)),
+    )
+
+
+def _collective_plan_batch(*request_ids: str) -> object:
+    observations = []
+    for request_id in request_ids:
+        context = _collective_context(request_id)
+        observations.append(
+            KMeshRequestObservation.from_context(
+                request_id,
+                context,
+                _collective_key(context),
+                TOKENS,
+            )
+        )
+    return KMeshPlanner(block_size=4, clock_ns=lambda: 0).observe(observations)
+
+
+def _partially_collective_plan_batch(
+    grouped_request_ids: tuple[str, ...],
+    fallback_request_ids: tuple[str, ...],
+) -> object:
+    observations = []
+    for request_id in grouped_request_ids:
+        context = _collective_context(request_id)
+        observations.append(
+            KMeshRequestObservation.from_context(
+                request_id,
+                context,
+                _collective_key(context),
+                TOKENS,
+            )
+        )
+    observations.extend(
+        KMeshRequestObservation(
+            request_id,
+            KMeshRequestContextParseResult.no_metadata(),
+            None,
+        )
+        for request_id in fallback_request_ids
+    )
+    return KMeshPlanner(block_size=4, clock_ns=lambda: 0).observe(observations)
+
+
+def _permuted_collective_plan_batch(
+    permuted_tokens: tuple[int, ...],
+) -> object:
+    context_a = _collective_context("request-a")
+    context_b = _permuted_collective_context("request-b")
+    observations = (
+        KMeshRequestObservation.from_context(
+            "request-a",
+            context_a,
+            _collective_key(context_a),
+            TOKENS,
+        ),
+        KMeshRequestObservation.from_context(
+            "request-b",
+            context_b,
+            _collective_key(context_b),
+            permuted_tokens,
+        ),
+    )
+    return KMeshPlanner(block_size=4, clock_ns=lambda: 0).observe(observations)
+
+
 def _kmesh_metadata(
     descriptors: tuple[VLLMKMeshRequestLookupDescriptor, ...],
     *,
     generation: int = 1,
+    plan_batch: object | None = None,
 ) -> KMeshConnectorMetadata:
     request_ids = tuple(descriptor.request_id for descriptor in descriptors)
     return KMeshConnectorMetadata(
-        cast(Any, _plan_batch(*request_ids)),
+        cast(
+            Any,
+            _plan_batch(*request_ids) if plan_batch is None else plan_batch,
+        ),
         tuple(sorted(descriptors, key=lambda item: item.request_id)),
         generation,
     )
@@ -688,6 +982,100 @@ def _bind_worker(
         )
     )
     return worker
+
+
+def _collective_worker(
+    runtime: KMeshRuntimeEvidence,
+    *,
+    lookup_result: int = 3,
+    request_ids: tuple[str, ...] = ("request-a", "request-b"),
+    plan_batch: object | None = None,
+    tamper_metadata: Callable[[LMCacheConnectorMetadata], None] | None = None,
+) -> tuple[LMCacheConnectorV1Impl, LMCacheConnectorMetadata]:
+    scheduler = _adapter(
+        KVConnectorRole.SCHEDULER,
+        runtime,
+        lookup_result=lookup_result,
+    )
+    requests = tuple(_request(request_id=request_id) for request_id in request_ids)
+    for request in requests:
+        _prepare_and_allocate(
+            scheduler,
+            request,
+            _sidecar(request_id=request.request_id),
+        )
+    metadata = scheduler.build_connector_meta(
+        _scheduler_output(
+            new_requests=[
+                _new_request_data(
+                    request,
+                    block_ids=(3 + 4 * index, 5 + 4 * index),
+                )
+                for index, request in enumerate(requests)
+            ],
+            num_scheduled_tokens={request.request_id: 8 for request in requests},
+        )
+    )
+    if tamper_metadata is not None:
+        tamper_metadata(metadata)
+    descriptors = tuple(
+        _vllm_descriptor(request_id=request_id) for request_id in request_ids
+    )
+    worker = _adapter(KVConnectorRole.WORKER, runtime)
+    state = cast(Any, worker)
+    state._target_profile = COLLECTIVE_LOCKSTEP_V1
+    state._test_parent._connector_metadata = metadata
+    worker.bind_peer_connector_metadata(
+        (
+            _kmesh_metadata(
+                descriptors,
+                plan_batch=(
+                    _collective_plan_batch(*request_ids)
+                    if plan_batch is None
+                    else plan_batch
+                ),
+            ),
+            metadata,
+        )
+    )
+    return worker, metadata
+
+
+def _collective_member(
+    default_request_id: str,
+    **changes: object,
+) -> LMCBlendGroupMemberResult:
+    values: dict[str, object] = {
+        "request_id": default_request_id,
+        "generation": 1,
+        "outcome": LMCBlendGroupOutcome.RECOVERED,
+        "retrieval_mask": torch.tensor(
+            [True, True, True, False, False, False, False, False]
+        ),
+        "operation_counts": LMCBlendOperationCounts(
+            serial_rope_operations=2,
+            serial_diff_operations=1,
+        ),
+        "error": None,
+    }
+    values.update(changes)
+    return LMCBlendGroupMemberResult(**cast(Any, values))
+
+
+def _assert_malformed_collective_result_fails_closed(
+    runtime: KMeshRuntimeEvidence,
+    result: LMCBlendGroupResult,
+) -> None:
+    worker, _metadata = _collective_worker(runtime)
+    state = cast(Any, worker)
+    state._test_blender.group_result_override = result
+
+    worker.start_load_kv(cast(Any, _forward_context()))
+
+    assert len(state._test_blender.group_calls) == 1
+    assert state._kmesh_collective_results == []
+    assert state._kmesh_failed_worker_requests == {"request-a", "request-b"}
+    assert state._invalid_block_ids == {3, 5, 7, 9}
 
 
 def _forward_context() -> SimpleNamespace:
@@ -2174,6 +2562,370 @@ def test_worker_positive_hit_loads_only_whole_spans_up_to_hit_end(
     assert call["generation"] == 1
 
 
+def test_collective_worker_executes_transport_plan_in_one_lockstep_group(
+    runtime: KMeshRuntimeEvidence,
+) -> None:
+    worker, _metadata = _collective_worker(runtime)
+    state = cast(Any, worker)
+    hit_mask = torch.tensor([True, True, True, False, False, False, False, False])
+    state._test_blender.masks.update({"request-a": hit_mask, "request-b": hit_mask})
+
+    step = state._kmesh_active_worker_step
+    assert len(step.plans) == 1
+    plan = step.plans[0]
+    assert tuple(member.request_id for member in plan.members) == (
+        "request-a",
+        "request-b",
+    )
+    assert [
+        (span.start, span.end) for span in plan.members[0].explicit_spans.spans
+    ] == [(0, 3), (5, 8)]
+
+    worker.start_load_kv(cast(Any, _forward_context()))
+
+    assert state._invalid_block_ids == set()
+    assert state._kmesh_failed_worker_requests == set()
+    assert state._test_blender.calls == []
+    assert len(state._test_blender.group_calls) == 1
+    group = state._test_blender.group_calls[0]
+    assert tuple(member.request_id for member in group) == (
+        "request-a",
+        "request-b",
+    )
+    assert all(
+        member.retrieve_kwargs["explicit_spans"] == plan.members[index].explicit_spans
+        for index, member in enumerate(group)
+    )
+    gpu_connector = state._test_worker_engine.gpu_connector
+    assert len(gpu_connector.preflight_calls) == 1
+    assert gpu_connector.preflight_calls[0]["num_tokens"] == 8
+    assert gpu_connector.preflight_calls[0]["request_count"] == 2
+    assert len(state._kmesh_collective_results) == 1
+    result = state._kmesh_collective_results[0][1]
+    assert [
+        member.operation_counts.serial_rope_operations for member in result.members
+    ] == [2, 2]
+    assert [
+        member.operation_counts.serial_diff_operations for member in result.members
+    ] == [1, 1]
+    assert all(
+        member.operation_counts.collective_rope_operations == 0
+        and member.operation_counts.collective_diff_operations == 0
+        for member in result.members
+    )
+
+
+def test_collective_worker_rejects_non_tuple_result_members(
+    runtime: KMeshRuntimeEvidence,
+) -> None:
+    members = [
+        _collective_member("request-a"),
+        _collective_member("request-b"),
+    ]
+    result = LMCBlendGroupResult(members=cast(Any, members))
+
+    _assert_malformed_collective_result_fails_closed(runtime, result)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        pytest.param({"request_id": "request-b"}, id="request-identity"),
+        pytest.param({"generation": 2}, id="generation"),
+    ],
+)
+def test_collective_worker_rejects_result_identity_drift(
+    runtime: KMeshRuntimeEvidence,
+    changes: dict[str, object],
+) -> None:
+    result = LMCBlendGroupResult(
+        members=(
+            _collective_member("request-a", **changes),
+            _collective_member("request-b"),
+        )
+    )
+
+    _assert_malformed_collective_result_fails_closed(runtime, result)
+
+
+@pytest.mark.parametrize(
+    "operation_counts",
+    [
+        pytest.param(SimpleNamespace(), id="wrong-container-type"),
+        pytest.param(
+            LMCBlendOperationCounts(serial_rope_operations=True),
+            id="bool-scalar",
+        ),
+        pytest.param(
+            LMCBlendOperationCounts(serial_rope_operations=-1),
+            id="negative-scalar",
+        ),
+        pytest.param(
+            LMCBlendOperationCounts(collective_rope_operations=1),
+            id="false-collective-claim",
+        ),
+        pytest.param(
+            LMCBlendOperationCounts(
+                serial_rope_operations=1,
+                serial_diff_operations=1,
+            ),
+            id="incomplete-recovered-work",
+        ),
+    ],
+)
+def test_collective_worker_rejects_invalid_operation_counts(
+    runtime: KMeshRuntimeEvidence,
+    operation_counts: object,
+) -> None:
+    result = LMCBlendGroupResult(
+        members=(
+            _collective_member(
+                "request-a",
+                operation_counts=operation_counts,
+            ),
+            _collective_member("request-b"),
+        )
+    )
+
+    _assert_malformed_collective_result_fails_closed(runtime, result)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        pytest.param(
+            {"outcome": "recovered"},
+            id="outcome-not-exact-enum",
+        ),
+        pytest.param(
+            {"error": RuntimeError("recovered member carried an error")},
+            id="recovered-with-error",
+        ),
+        pytest.param(
+            {"retrieval_mask": None},
+            id="recovered-without-mask",
+        ),
+        pytest.param(
+            {"retrieval_mask": torch.zeros(len(TOKENS), dtype=torch.bool)},
+            id="recovered-with-miss-mask",
+        ),
+        pytest.param(
+            {
+                "outcome": LMCBlendGroupOutcome.MISS,
+                "retrieval_mask": torch.zeros(len(TOKENS), dtype=torch.bool),
+                "operation_counts": LMCBlendOperationCounts(),
+                "error": RuntimeError("miss member carried an error"),
+            },
+            id="miss-with-error",
+        ),
+        pytest.param(
+            {
+                "outcome": LMCBlendGroupOutcome.MISS,
+                "retrieval_mask": torch.tensor(
+                    [True, True, True, False, False, False, False, False]
+                ),
+                "operation_counts": LMCBlendOperationCounts(),
+            },
+            id="miss-with-recovered-mask",
+        ),
+        pytest.param(
+            {
+                "outcome": LMCBlendGroupOutcome.FAILED,
+                "retrieval_mask": None,
+                "operation_counts": LMCBlendOperationCounts(),
+            },
+            id="failed-without-error",
+        ),
+        pytest.param(
+            {
+                "outcome": LMCBlendGroupOutcome.FAILED,
+                "retrieval_mask": torch.zeros(len(TOKENS), dtype=torch.bool),
+                "operation_counts": LMCBlendOperationCounts(),
+                "error": RuntimeError("synthetic failure"),
+            },
+            id="failed-with-mask",
+        ),
+        pytest.param(
+            {
+                "outcome": LMCBlendGroupOutcome.FAILED,
+                "retrieval_mask": None,
+                "operation_counts": LMCBlendOperationCounts(),
+                "error": "not an exception",
+            },
+            id="failed-with-non-exception-error",
+        ),
+    ],
+)
+def test_collective_worker_rejects_inconsistent_member_result(
+    runtime: KMeshRuntimeEvidence,
+    changes: dict[str, object],
+) -> None:
+    result = LMCBlendGroupResult(
+        members=(
+            _collective_member("request-a", **changes),
+            _collective_member("request-b"),
+        )
+    )
+
+    _assert_malformed_collective_result_fails_closed(runtime, result)
+
+
+def test_collective_worker_orders_spans_by_each_request_position(
+    runtime: KMeshRuntimeEvidence,
+) -> None:
+    permuted_tokens = (30, 31, 32, 20, 21, 10, 11, 12)
+    permuted_spans = (
+        _span(
+            segment_id="shared-b",
+            token_start=0,
+            token_end=3,
+            logical_order=0,
+            tokens=permuted_tokens,
+        ),
+        _span(
+            segment_id="shared-a",
+            token_start=5,
+            token_end=8,
+            logical_order=2,
+            tokens=permuted_tokens,
+        ),
+    )
+    scheduler = _adapter(KVConnectorRole.SCHEDULER, runtime, lookup_result=3)
+    request_a = _request(request_id="request-a")
+    request_b = _request(request_id="request-b", tokens=permuted_tokens)
+    _prepare_and_allocate(
+        scheduler,
+        request_a,
+        _sidecar(request_id="request-a"),
+    )
+    _prepare_and_allocate(
+        scheduler,
+        request_b,
+        _sidecar(
+            request_id="request-b",
+            tokens=permuted_tokens,
+            span_payloads=permuted_spans,
+        ),
+    )
+    lmcache_metadata = scheduler.build_connector_meta(
+        _scheduler_output(
+            new_requests=[
+                _new_request_data(request_a, block_ids=(3, 5)),
+                _new_request_data(request_b, block_ids=(7, 9)),
+            ],
+            num_scheduled_tokens={"request-a": 8, "request-b": 8},
+        )
+    )
+    descriptors = (
+        _vllm_descriptor(request_id="request-a"),
+        _vllm_descriptor(
+            request_id="request-b",
+            tokens=permuted_tokens,
+            span_payloads=permuted_spans,
+        ),
+    )
+    plan_batch = _permuted_collective_plan_batch(permuted_tokens)
+    public_b_mapping = cast(Any, plan_batch).plans[0].request_segment_maps[1]
+    assert [
+        (entry.token_start, entry.token_end) for entry in public_b_mapping.entries
+    ] == [(5, 8), (0, 3)]
+
+    worker = _adapter(KVConnectorRole.WORKER, runtime)
+    state = cast(Any, worker)
+    state._target_profile = COLLECTIVE_LOCKSTEP_V1
+    state._test_parent._connector_metadata = lmcache_metadata
+    worker.bind_peer_connector_metadata(
+        (
+            _kmesh_metadata(descriptors, plan_batch=plan_batch),
+            lmcache_metadata,
+        )
+    )
+
+    frozen_b_spans = state._kmesh_active_worker_step.plans[0].members[1].explicit_spans
+    assert [(span.start, span.end) for span in frozen_b_spans.spans] == [
+        (0, 3),
+        (5, 8),
+    ]
+
+
+def test_collective_worker_contains_one_member_failure_and_finishes_sibling(
+    runtime: KMeshRuntimeEvidence,
+) -> None:
+    worker, _metadata = _collective_worker(runtime)
+    state = cast(Any, worker)
+    hit_mask = torch.tensor([True, True, True, False, False, False, False, False])
+    state._test_blender.masks.update({"request-a": hit_mask, "request-b": hit_mask})
+    state._test_blender.group_failures["request-a"] = RuntimeError(
+        "synthetic member failure"
+    )
+
+    worker.start_load_kv(cast(Any, _forward_context()))
+
+    assert len(state._test_blender.group_calls) == 1
+    assert state._kmesh_failed_worker_requests == {"request-a"}
+    assert state._invalid_block_ids == {3, 5}
+    result = state._kmesh_collective_results[0][1]
+    assert [member.outcome for member in result.members] == [
+        LMCBlendGroupOutcome.FAILED,
+        LMCBlendGroupOutcome.RECOVERED,
+    ]
+
+
+def test_collective_worker_rejects_capacity_before_group_mutation(
+    runtime: KMeshRuntimeEvidence,
+) -> None:
+    worker, _metadata = _collective_worker(runtime)
+    state = cast(Any, worker)
+    state._test_worker_engine.gpu_connector.capacity = False
+
+    worker.start_load_kv(cast(Any, _forward_context()))
+
+    assert state._test_blender.group_calls == []
+    assert state._kmesh_collective_results == []
+    assert state._kmesh_failed_worker_requests == {"request-a", "request-b"}
+    assert state._invalid_block_ids == {3, 5, 7, 9}
+
+
+def test_collective_worker_runs_unplanned_actionable_request_serially(
+    runtime: KMeshRuntimeEvidence,
+) -> None:
+    request_ids = ("request-a", "request-b", "request-c")
+    plan_batch = _partially_collective_plan_batch(
+        ("request-a", "request-b"),
+        ("request-c",),
+    )
+    worker, _metadata = _collective_worker(
+        runtime,
+        request_ids=request_ids,
+        plan_batch=plan_batch,
+    )
+    state = cast(Any, worker)
+    hit_mask = torch.tensor([True, True, True, False, False, False, False, False])
+    state._test_blender.masks.update(
+        {request_id: hit_mask for request_id in request_ids}
+    )
+
+    worker.start_load_kv(cast(Any, _forward_context()))
+
+    assert len(state._test_blender.group_calls) == 1
+    assert tuple(
+        member.request_id for member in state._test_blender.group_calls[0]
+    ) == ("request-a", "request-b")
+    assert [call["request_id"] for call in state._test_blender.calls] == ["request-c"]
+    assert state._kmesh_failed_worker_requests == set()
+    assert state._invalid_block_ids == set()
+
+
+def test_collective_worker_rejects_cross_request_destination_collision(
+    runtime: KMeshRuntimeEvidence,
+) -> None:
+    def overlap_first_slot(metadata: LMCacheConnectorMetadata) -> None:
+        metadata.requests[1].slot_mapping[0] = metadata.requests[0].slot_mapping[0]
+
+    with pytest.raises(ValueError, match="share a destination slot"):
+        _collective_worker(runtime, tamper_metadata=overlap_first_slot)
+
+
 @pytest.mark.parametrize(
     ("mask", "expected_error"),
     [
@@ -3617,3 +4369,154 @@ def test_dynamic_wrapper_advertises_exact_protocol_and_forwards_handoff() -> Non
         ("clear",),
         ("shutdown",),
     ]
+
+
+def test_lockstep_profile_dispatches_per_member_group_execution(
+    runtime: KMeshRuntimeEvidence,
+) -> None:
+    worker, _metadata = _collective_worker(runtime)
+    state = cast(Any, worker)
+
+    worker.start_load_kv(cast(Any, _forward_context()))
+
+    assert state._test_blender.group_collective_flags == [False]
+
+
+def test_batched_profile_dispatches_collective_position_recovery(
+    runtime: KMeshRuntimeEvidence,
+) -> None:
+    worker, _metadata = _collective_worker(runtime)
+    state = cast(Any, worker)
+    state._target_profile = COLLECTIVE_BATCHED_POSITION_RECOVERY_V1
+    counts = LMCBlendOperationCounts(
+        serial_rope_operations=2,
+        serial_diff_operations=1,
+        position_recovery_collective_operations=2,
+    )
+    state._test_blender.group_result_override = LMCBlendGroupResult(
+        members=(
+            _collective_member("request-a", operation_counts=counts),
+            _collective_member("request-b", operation_counts=counts),
+        )
+    )
+
+    worker.start_load_kv(cast(Any, _forward_context()))
+
+    assert state._test_blender.group_collective_flags == [True]
+    assert state._kmesh_failed_worker_requests == set()
+    assert len(state._kmesh_collective_results) == 1
+    _plan_id, stored = state._kmesh_collective_results[0]
+    assert all(
+        member.operation_counts.position_recovery_collective_operations == 2
+        and member.operation_counts.position_recovery_serial_operations == 0
+        for member in stored.members
+    )
+
+
+def test_batched_profile_rejects_member_without_layerwise_recovery(
+    runtime: KMeshRuntimeEvidence,
+) -> None:
+    worker, _metadata = _collective_worker(runtime)
+    state = cast(Any, worker)
+    state._target_profile = COLLECTIVE_BATCHED_POSITION_RECOVERY_V1
+    state._test_blender.group_result_override = LMCBlendGroupResult(
+        members=(
+            _collective_member("request-a"),
+            _collective_member("request-b"),
+        )
+    )
+
+    worker.start_load_kv(cast(Any, _forward_context()))
+
+    assert state._kmesh_collective_results == []
+    assert state._kmesh_failed_worker_requests == {"request-a", "request-b"}
+    assert state._invalid_block_ids == {3, 5, 7, 9}
+
+
+def test_lockstep_profile_rejects_batched_recovery_claims(
+    runtime: KMeshRuntimeEvidence,
+) -> None:
+    counts = LMCBlendOperationCounts(
+        serial_rope_operations=2,
+        serial_diff_operations=1,
+        position_recovery_collective_operations=2,
+    )
+    _assert_malformed_collective_result_fails_closed(
+        runtime,
+        LMCBlendGroupResult(
+            members=(
+                _collective_member("request-a", operation_counts=counts),
+                _collective_member("request-b", operation_counts=counts),
+            )
+        ),
+    )
+
+
+def test_qkv_profile_dispatches_both_collective_flags(
+    runtime: KMeshRuntimeEvidence,
+) -> None:
+    worker, _metadata = _collective_worker(runtime)
+    state = cast(Any, worker)
+    state._target_profile = COLLECTIVE_BATCHED_QKV_V1
+    counts = LMCBlendOperationCounts(
+        collective_rope_operations=2,
+        collective_diff_operations=1,
+        position_recovery_collective_operations=2,
+    )
+    state._test_blender.group_result_override = LMCBlendGroupResult(
+        members=(
+            _collective_member("request-a", operation_counts=counts),
+            _collective_member("request-b", operation_counts=counts),
+        )
+    )
+
+    worker.start_load_kv(cast(Any, _forward_context()))
+
+    assert state._test_blender.group_collective_flags == [True]
+    assert state._test_blender.group_qkv_flags == [True]
+    assert state._kmesh_failed_worker_requests == set()
+    assert len(state._kmesh_collective_results) == 1
+
+
+def test_qkv_profile_rejects_serial_member_counts(
+    runtime: KMeshRuntimeEvidence,
+) -> None:
+    worker, _metadata = _collective_worker(runtime)
+    state = cast(Any, worker)
+    state._target_profile = COLLECTIVE_BATCHED_QKV_V1
+    state._test_blender.group_result_override = LMCBlendGroupResult(
+        members=(
+            _collective_member("request-a"),
+            _collective_member("request-b"),
+        )
+    )
+
+    worker.start_load_kv(cast(Any, _forward_context()))
+
+    assert state._kmesh_collective_results == []
+    assert state._kmesh_failed_worker_requests == {"request-a", "request-b"}
+
+
+def test_position_recovery_profile_rejects_model_side_collective_claims(
+    runtime: KMeshRuntimeEvidence,
+) -> None:
+    worker, _metadata = _collective_worker(runtime)
+    state = cast(Any, worker)
+    state._target_profile = COLLECTIVE_BATCHED_POSITION_RECOVERY_V1
+    counts = LMCBlendOperationCounts(
+        serial_rope_operations=2,
+        serial_diff_operations=1,
+        collective_rope_operations=2,
+        position_recovery_collective_operations=2,
+    )
+    state._test_blender.group_result_override = LMCBlendGroupResult(
+        members=(
+            _collective_member("request-a", operation_counts=counts),
+            _collective_member("request-b", operation_counts=counts),
+        )
+    )
+
+    worker.start_load_kv(cast(Any, _forward_context()))
+
+    assert state._kmesh_collective_results == []
+    assert state._kmesh_failed_worker_requests == {"request-a", "request-b"}

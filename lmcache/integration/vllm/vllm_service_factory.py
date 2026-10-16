@@ -26,7 +26,7 @@ from lmcache.integration.base_service_factory import (
     BaseServiceFactory,
     ServiceResultPublisher,
 )
-from lmcache.integration.vllm.target_profile import SERIAL_PIC_V1
+from lmcache.integration.vllm.target_profile import KMESH_PIC_V1_PROFILES
 from lmcache.logging import init_logger
 from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.config import LMCacheEngineConfig
@@ -69,6 +69,11 @@ class VllmServiceFactory(BaseServiceFactory):
         self.lmcache_config = lmcache_config
         self.vllm_config = vllm_config
         self.role = role
+        if target_profile is not None and (
+            type(target_profile) is not str
+            or target_profile not in KMESH_PIC_V1_PROFILES
+        ):
+            raise ValueError(f"unsupported LMCache target profile {target_profile!r}")
         self.target_profile = target_profile
         self.metadata: Optional[LMCacheMetadata] = None
         self.lmcache_engine: Optional[LMCacheEngine] = None
@@ -320,10 +325,10 @@ class VllmServiceFactory(BaseServiceFactory):
         )
 
     def maybe_create_offload_server(self) -> Optional[ZMQOffloadServer]:
-        # The bounded serial-PIC topology is one co-resident ``uni`` process.
+        # The bounded KMesh PIC topology is one co-resident ``uni`` process.
         # Its worker lookup server is the only admitted ZMQ data-plane service;
         # the independent offload server is deliberately outside the profile.
-        if self.target_profile == SERIAL_PIC_V1:
+        if self.target_profile in KMESH_PIC_V1_PROFILES:
             return None
 
         # Only worker needs offload server
@@ -346,8 +351,8 @@ class VllmServiceFactory(BaseServiceFactory):
         self,
     ) -> Optional[RuntimePluginLauncher]:
         # Even an empty launcher registers process-global cleanup state.  Do
-        # not construct it in the fixed-lifetime serial-PIC target profile.
-        if self.target_profile == SERIAL_PIC_V1:
+        # not construct it in either fixed-lifetime KMesh PIC target profile.
+        if self.target_profile in KMESH_PIC_V1_PROFILES:
             return None
 
         # First Party
@@ -374,7 +379,7 @@ class VllmServiceFactory(BaseServiceFactory):
     ) -> Optional[InternalAPIServer]:
         # The internal API object is an excluded administrative surface even
         # when its resolved config would leave the server thread disabled.
-        if self.target_profile == SERIAL_PIC_V1:
+        if self.target_profile in KMESH_PIC_V1_PROFILES:
             return None
 
         # First Party

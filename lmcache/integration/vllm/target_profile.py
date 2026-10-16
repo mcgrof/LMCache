@@ -39,6 +39,20 @@ def _freeze_contract_value(value: Any) -> Any:
 
 KMESH_TARGET_PROFILE_KEY = "kmesh_target_profile"
 SERIAL_PIC_V1 = "serial_pic_v1"
+COLLECTIVE_LOCKSTEP_V1 = "collective_lockstep_v1"
+COLLECTIVE_BATCHED_POSITION_RECOVERY_V1 = "collective_batched_position_recovery_v1"
+COLLECTIVE_BATCHED_QKV_V1 = "collective_batched_qkv_v1"
+# The collective names select sibling control planes, not broader runtimes;
+# the batched profile differs from lockstep only in the worker-side group
+# execution (one batched cached-K rotation per layer round).
+KMESH_COLLECTIVE_PROFILES = frozenset(
+    (
+        COLLECTIVE_LOCKSTEP_V1,
+        COLLECTIVE_BATCHED_POSITION_RECOVERY_V1,
+        COLLECTIVE_BATCHED_QKV_V1,
+    )
+)
+KMESH_PIC_V1_PROFILES = frozenset((SERIAL_PIC_V1, *KMESH_COLLECTIVE_PROFILES))
 
 
 @dataclass(frozen=True)
@@ -604,7 +618,7 @@ def validate_target_profile(
     """
     if profile is None:
         return
-    if profile != SERIAL_PIC_V1:
+    if type(profile) is not str or profile not in KMESH_PIC_V1_PROFILES:
         raise ValueError(f"unsupported LMCache target profile {profile!r}")
 
     raw_profile = (
@@ -626,4 +640,4 @@ def validate_target_profile(
     )
     if problems:
         details = "; ".join(problems)
-        raise ValueError(f"LMCache {SERIAL_PIC_V1} profile rejected: {details}")
+        raise ValueError(f"LMCache {profile} profile rejected: {details}")

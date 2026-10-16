@@ -167,3 +167,115 @@ class LMCBaseModel(nn.Module, ABC):
             hidden_states = layer.mlp(hidden_states)
 
             yield
+
+    def compute_layer_collective(
+        self,
+        input_ids: torch.Tensor,
+        session: "LMCBlendSession",
+    ):
+        """Layerwise compute that suspends at the QKV boundary.
+
+        Identical to :meth:`compute_layer` except that the per-member
+        ``blender.process_qkv`` call is replaced by a mid-layer suspension:
+        the generator yields an ``LMCQKVHandoff`` and resumes with the
+        ``LMCQKVCorrection`` a group coordinator produced from one batched
+        rotary application (and one batched check-layer difference pass)
+        covering every group member.  Each completed layer then yields
+        ``None``.  The method is intentionally not compiled: correctness
+        first, and the serial path stays byte-identical and untouched.
+        """
+        # First Party
+        from lmcache.v1.compute.blend.qkv_handoff import (
+            LMCQKVCorrection,
+            LMCQKVHandoff,
+        )
+
+        input_ids = input_ids.to(torch_device_type)
+        if hasattr(self.vllm_model, "get_input_embeddings"):
+            hidden_states = self.vllm_model.get_input_embeddings(input_ids)
+        elif hasattr(self.vllm_model, "embed_input_ids"):
+            hidden_states = self.vllm_model.embed_input_ids(input_ids)
+        elif hasattr(self.vllm_model, "model") and hasattr(
+            self.vllm_model.model, "embed_tokens"
+        ):
+            hidden_states = self.vllm_model.model.embed_tokens(input_ids)
+        else:
+            raise AttributeError(
+                f"{type(self.vllm_model).__name__} has no embedding method. "
+                f"Tried: get_input_embeddings, embed_input_ids, model.embed_tokens"
+            )
+        residual = None
+        attn_output = None
+        attn_metadata = self.lmc_attn_layers[0].init_attn_metadata(
+            input_ids=input_ids,
+        )
+
+        for idx, layer in enumerate(
+            self.vllm_model.model.layers[
+                self.vllm_model.model.start_layer : self.vllm_model.model.end_layer
+            ]
+        ):
+            if residual is None:
+                residual = hidden_states
+                hidden_states = layer.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = layer.input_layernorm(hidden_states, residual)
+
+            qkv, _ = layer.self_attn.qkv_proj(hidden_states)
+            q, k, v = qkv.split(
+                [
+                    layer.self_attn.q_size,
+                    layer.self_attn.kv_size,
+                    layer.self_attn.kv_size,
+                ],
+                dim=-1,
+            )
+
+            q, k, v = self._process_qkv(q, k, v, layer)
+
+            correction = yield LMCQKVHandoff(
+                layer_id=idx,
+                q=q,
+                k=k,
+                v=v,
+                residual=residual,
+                attn_output=attn_output,
+                attn_metadata=attn_metadata,
+            )
+            if type(correction) is not LMCQKVCorrection:
+                raise RuntimeError(
+                    "collective model layer resumed without a QKV correction"
+                )
+            q = correction.q
+            k = correction.k
+            v = correction.v
+            residual = correction.residual
+            attn_output = correction.attn_output
+            attn_metadata = correction.attn_metadata
+
+            num_heads = self.vllm_attn_layers[idx].num_heads
+            num_kv_heads = self.vllm_attn_layers[idx].num_kv_heads
+            head_size = self.vllm_attn_layers[idx].head_size
+
+            q = q.view(-1, num_heads, head_size)
+            k = k.view(-1, num_kv_heads, head_size)
+            v = v.view(-1, num_kv_heads, head_size)
+            attn_output = attn_output.view(-1, num_heads, head_size)
+
+            attn_output = self.lmc_attn_layers[idx].forward_contiguous(
+                q, k, v, attn_output, attn_metadata
+            )
+
+            attn_output = attn_output.view(-1, num_heads * head_size)
+            k = k.view(-1, num_kv_heads * head_size)
+            v = v.view(-1, num_kv_heads * head_size)
+
+            hidden_states, _ = layer.self_attn.o_proj(attn_output)
+
+            # Fully Connected
+            hidden_states, residual = layer.post_attention_layernorm(
+                hidden_states, residual
+            )
+            hidden_states = layer.mlp(hidden_states)
+
+            yield None

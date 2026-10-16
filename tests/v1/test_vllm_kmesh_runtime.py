@@ -11,7 +11,10 @@ import pytest
 # First Party
 from lmcache.integration.vllm import kmesh_runtime
 from lmcache.integration.vllm.kmesh_runtime import build_kmesh_runtime_evidence
-from lmcache.integration.vllm.target_profile import SERIAL_PIC_V1
+from lmcache.integration.vllm.target_profile import (
+    COLLECTIVE_LOCKSTEP_V1,
+    SERIAL_PIC_V1,
+)
 from lmcache.v1.config import LMCacheEngineConfig
 
 
@@ -166,8 +169,10 @@ def test_every_execution_or_layout_mutation_changes_runtime_fingerprint(
     assert changed.fingerprint != baseline.fingerprint
 
 
+@pytest.mark.parametrize("profile", [SERIAL_PIC_V1, COLLECTIVE_LOCKSTEP_V1])
 def test_runtime_builder_revalidates_named_profile_with_exact_role(
     monkeypatch: pytest.MonkeyPatch,
+    profile: str,
 ) -> None:
     calls: list[tuple[object, object, object, object]] = []
 
@@ -188,9 +193,30 @@ def test_runtime_builder_revalidates_named_profile_with_exact_role(
         vllm_config,
         lmcache_config,
         role="worker",
+        target_profile=profile,
     )
 
-    assert calls == [(lmcache_config, SERIAL_PIC_V1, "worker", vllm_config)]
+    assert calls == [(lmcache_config, profile, "worker", vllm_config)]
+
+
+def test_runtime_profile_identity_distinguishes_collective_from_serial() -> None:
+    vllm_config = _vllm_config()
+    lmcache_config = _lmcache_config()
+    serial = build_kmesh_runtime_evidence(
+        vllm_config,
+        lmcache_config,
+        role="worker",
+        target_profile=SERIAL_PIC_V1,
+    )
+    collective = build_kmesh_runtime_evidence(
+        vllm_config,
+        lmcache_config,
+        role="worker",
+        target_profile=COLLECTIVE_LOCKSTEP_V1,
+    )
+
+    assert serial.fingerprint != collective.fingerprint
+    assert COLLECTIVE_LOCKSTEP_V1 in collective.runtime_configuration
 
 
 @pytest.mark.parametrize(

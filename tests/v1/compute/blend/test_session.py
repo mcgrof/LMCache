@@ -16,6 +16,8 @@ from lmcache.v1.compute.attention.metadata import LMCTritonSparseMetadata
 from lmcache.v1.compute.blend import utils as blend_utils
 from lmcache.v1.compute.blend.blender import (
     LMCBlender,
+    LMCBlendGroupOutcome,
+    LMCBlendGroupRequest,
     LMCBlendOutcome,
     LMCBlendSession,
 )
@@ -45,16 +47,37 @@ class _FakeBuffer:
             raise RuntimeError("injected buffer release failure")
 
 
+@dataclass
+class _OperationRecorder:
+    rope_operations: int = 0
+    diff_operations: int = 0
+
+    def record_serial_operations(
+        self,
+        *,
+        rope_operations: int = 0,
+        diff_operations: int = 0,
+    ) -> None:
+        self.rope_operations += rope_operations
+        self.diff_operations += diff_operations
+
+
 class _FakeCacheEngine:
     def __init__(
         self,
         num_layers: int,
         failure: Optional[tuple[str, int]] = None,
+        fatal_failure: Optional[tuple[str, int]] = None,
+        events: Optional[list[str]] = None,
     ) -> None:
         self.num_layers = num_layers
         self.failure = failure
+        self.fatal_failure = fatal_failure
+        self.events = events if events is not None else []
         self.buffers: dict[str, list[_FakeBuffer]] = {}
         self.generators_closed: set[str] = set()
+        self.generator_close_counts: dict[str, int] = {}
+        self.retrieve_kwargs: dict[str, dict[str, Any]] = {}
 
     def retrieve_layer(
         self,
@@ -65,8 +88,9 @@ class _FakeCacheEngine:
         gap_pattern: tuple[int, ...] = (),
         **kwargs: Any,
     ) -> Generator[Optional[torch.Tensor], None, None]:
-        del mask, kwargs
+        del mask
         request_id = str(int(tokens[0].item()))
+        self.retrieve_kwargs[request_id] = dict(kwargs)
         buffers = [_FakeBuffer(request_id), _FakeBuffer(request_id)]
         self.buffers[request_id] = buffers
 
@@ -76,11 +100,17 @@ class _FakeCacheEngine:
         load_state.gap_positions = torch.tensor(gap_pattern, dtype=torch.int64)
 
         try:
+            self.events.append(f"prime:{request_id}")
             yield torch.tensor(len(tokens))
             for layer_id in range(self.num_layers):
                 buffer = buffers[layer_id % len(buffers)]
                 buffer.payload = (request_id, layer_id, gap_pattern)
                 load_state.buffer_mapping[layer_id] = cast(MemoryObj, buffer)
+                self.events.append(f"retrieve:{request_id}:{layer_id}")
+                if self.fatal_failure == (request_id, layer_id):
+                    raise KeyboardInterrupt(
+                        f"injected fatal retrieval failure for {request_id}:{layer_id}"
+                    )
                 if self.failure == (request_id, layer_id):
                     raise InjectedLayerFailure(
                         f"injected retrieval failure for {request_id}:{layer_id}"
@@ -88,17 +118,23 @@ class _FakeCacheEngine:
                 yield None
 
             load_state.buffer_mapping.clear()
+            self.events.append(f"finish:{request_id}")
             yield torch.ones(len(tokens), dtype=torch.bool)
         finally:
             self.generators_closed.add(request_id)
+            self.generator_close_counts[request_id] = (
+                self.generator_close_counts.get(request_id, 0) + 1
+            )
             load_state.release()
 
 
 class _FakeLayerwiseModel:
-    def __init__(self, num_layers: int) -> None:
+    def __init__(self, num_layers: int, events: Optional[list[str]] = None) -> None:
         self.num_layers = num_layers
+        self.events = events if events is not None else []
         self.outputs: dict[str, list[tuple[Any, ...]]] = {}
         self.generators_closed: set[str] = set()
+        self.generator_close_counts: dict[str, int] = {}
         self.generator_calls = 0
         self.layer_calls = 0
 
@@ -117,6 +153,7 @@ class _FakeLayerwiseModel:
         try:
             for layer_id in range(self.num_layers):
                 self.layer_calls += 1
+                self.events.append(f"model:{request_id}:{layer_id}")
                 if session.metadata.positions is None:
                     session.metadata.positions = torch.tensor([token_id])
 
@@ -130,9 +167,16 @@ class _FakeLayerwiseModel:
                     )
                 )
                 session.metadata.positions = session.metadata.positions + 1
+                session.record_serial_operations(
+                    rope_operations=1,
+                    diff_operations=int(layer_id == 1),
+                )
                 yield
         finally:
             self.generators_closed.add(request_id)
+            self.generator_close_counts[request_id] = (
+                self.generator_close_counts.get(request_id, 0) + 1
+            )
 
 
 class _FakeBlender(LMCBlender):
@@ -140,10 +184,40 @@ class _FakeBlender(LMCBlender):
         self,
         num_layers: int = 3,
         failure: Optional[tuple[str, int]] = None,
+        fatal_failure: Optional[tuple[str, int]] = None,
+        close_failure: Optional[str] = None,
     ) -> None:
         self.num_layers = num_layers
-        self.cache_engine = _FakeCacheEngine(num_layers, failure)
-        self.layerwise_model = _FakeLayerwiseModel(num_layers)
+        self.close_failure = close_failure
+        self.events: list[str] = []
+        self.cache_engine = _FakeCacheEngine(
+            num_layers,
+            failure,
+            fatal_failure,
+            self.events,
+        )
+        self.layerwise_model = _FakeLayerwiseModel(num_layers, self.events)
+        self.sessions: list[LMCBlendSession] = []
+        self.session_close_calls: dict[str, int] = {}
+
+    def create_session(self, *args: Any, **kwargs: Any) -> LMCBlendSession:
+        session = super().create_session(*args, **kwargs)
+        request_id = str(session.request_id)
+        original_close = session.close
+
+        def counted_close() -> None:
+            self.session_close_calls[request_id] = (
+                self.session_close_calls.get(request_id, 0) + 1
+            )
+            original_close()
+            if self.close_failure == request_id:
+                raise InjectedLayerFailure(
+                    f"injected session close failure for {request_id}"
+                )
+
+        cast(Any, session).close = counted_close
+        self.sessions.append(session)
+        return session
 
 
 def test_session_marks_only_explicit_spans_for_gap_recompute() -> None:
@@ -196,10 +270,12 @@ def test_gap_positions_are_mandatory_beyond_recompute_budget() -> None:
     load_state = LayerwiseLoadState()
     load_state.gap_positions = torch.arange(gap_count, dtype=torch.int64)
     metadata = SimpleNamespace(positions=None, imp_indices=None)
+    operation_recorder = _OperationRecorder()
     session = SimpleNamespace(
         load_state=load_state,
         metadata=metadata,
         requires_explicit_gap_recompute=True,
+        record_serial_operations=operation_recorder.record_serial_operations,
     )
 
     class _AttnMetadata:
@@ -233,6 +309,8 @@ def test_gap_positions_are_mandatory_beyond_recompute_budget() -> None:
     assert len(result[4]) == gap_count
     assert result[1][configured_topk].item() == 1.0
     assert result[2][configured_topk].item() == float(configured_topk)
+    assert operation_recorder.rope_operations == 1
+    assert operation_recorder.diff_operations == 1
 
 
 def test_precheck_layer_repairs_gap_kv_before_connector_writeback() -> None:
@@ -263,10 +341,12 @@ def test_precheck_layer_repairs_gap_kv_before_connector_writeback() -> None:
     )
     load_state = LayerwiseLoadState(gap_positions=gap_positions)
     metadata = SimpleNamespace(positions=None, imp_indices=None)
+    operation_recorder = _OperationRecorder()
     session = SimpleNamespace(
         load_state=load_state,
         metadata=metadata,
         requires_explicit_gap_recompute=True,
+        record_serial_operations=operation_recorder.record_serial_operations,
     )
     attn_metadata = SimpleNamespace(update_from_top_indices=lambda indices: None)
     q = torch.ones_like(current_k)
@@ -291,6 +371,8 @@ def test_precheck_layer_repairs_gap_kv_before_connector_writeback() -> None:
     retained_positions = torch.tensor([0, 2, 3, 5, 6, 7])
     assert torch.count_nonzero(old_k[retained_positions]).item() == 0
     assert torch.count_nonzero(old_v[retained_positions]).item() == 0
+    assert operation_recorder.rope_operations == 1
+    assert operation_recorder.diff_operations == 0
 
 
 def test_two_layer_explicit_gap_recompute_never_publishes_zeroed_kv() -> None:
@@ -344,10 +426,12 @@ def test_two_layer_explicit_gap_recompute_never_publishes_zeroed_kv() -> None:
     )
     load_state = LayerwiseLoadState(gap_positions=gap_positions)
     metadata = SimpleNamespace(positions=None, imp_indices=None)
+    operation_recorder = _OperationRecorder()
     session = SimpleNamespace(
         load_state=load_state,
         metadata=metadata,
         requires_explicit_gap_recompute=True,
+        record_serial_operations=operation_recorder.record_serial_operations,
     )
 
     class _AttnMetadata:
@@ -391,6 +475,8 @@ def test_two_layer_explicit_gap_recompute_never_publishes_zeroed_kv() -> None:
     assert torch.equal(result[2][gap_positions], current_v1[gap_positions])
     assert torch.count_nonzero(result[1][gap_positions]).item() == len(gap_positions)
     assert torch.count_nonzero(result[2][gap_positions]).item() == len(gap_positions)
+    assert operation_recorder.rope_operations == 2
+    assert operation_recorder.diff_operations == 1
 
 
 @pytest.mark.parametrize(
@@ -578,6 +664,241 @@ def test_two_sessions_match_serial_when_interleaved(reverse_order: bool) -> None
     assert blender.layerwise_model.outputs == expected
     assert blender.cache_engine.generators_closed == {"11", "22"}
     assert blender.layerwise_model.generators_closed == {"11", "22"}
+    for buffers in blender.cache_engine.buffers.values():
+        assert [buffer.release_count for buffer in buffers] == [1, 1]
+
+
+def test_group_runner_is_stable_layer_major_with_exact_operation_counts() -> None:
+    """The reference runs stable rounds without claiming collective work."""
+    blender = _FakeBlender()
+    explicit_spans = object()
+    result = blender.blend_group(
+        (
+            LMCBlendGroupRequest(
+                request_id="11",
+                generation=7,
+                tokens=torch.tensor([11]),
+                retrieve_kwargs={
+                    "explicit_spans": explicit_spans,
+                    "gap_pattern": (1,),
+                },
+            ),
+            LMCBlendGroupRequest(
+                request_id="22",
+                generation=8,
+                tokens=torch.tensor([22]),
+                retrieve_kwargs={"gap_pattern": (0, 2)},
+            ),
+        )
+    )
+
+    assert [member.request_id for member in result.members] == ["11", "22"]
+    assert [member.generation for member in result.members] == [7, 8]
+    assert [member.outcome for member in result.members] == [
+        LMCBlendGroupOutcome.RECOVERED,
+        LMCBlendGroupOutcome.RECOVERED,
+    ]
+    assert result.failed_members == ()
+    assert result.failed_request_ids == ()
+    for member in result.members:
+        assert member.error is None
+        assert member.retrieval_mask is not None
+        assert torch.equal(member.retrieval_mask, torch.ones(1, dtype=torch.bool))
+        assert member.operation_counts.serial_rope_operations == 3
+        assert member.operation_counts.serial_diff_operations == 1
+        assert member.operation_counts.collective_rope_operations == 0
+        assert member.operation_counts.collective_diff_operations == 0
+
+    assert blender.events == [
+        "prime:11",
+        "prime:22",
+        "retrieve:11:0",
+        "model:11:0",
+        "retrieve:22:0",
+        "model:22:0",
+        "retrieve:11:1",
+        "model:11:1",
+        "retrieve:22:1",
+        "model:22:1",
+        "retrieve:11:2",
+        "model:11:2",
+        "retrieve:22:2",
+        "model:22:2",
+        "finish:11",
+        "finish:22",
+    ]
+    assert (
+        blender.cache_engine.retrieve_kwargs["11"]["explicit_spans"] is explicit_spans
+    )
+    assert blender.session_close_calls == {"11": 1, "22": 1}
+    assert all(session.is_closed for session in blender.sessions)
+    assert blender.cache_engine.generator_close_counts == {"11": 1, "22": 1}
+    assert blender.layerwise_model.generator_close_counts == {"11": 1, "22": 1}
+    for buffers in blender.cache_engine.buffers.values():
+        assert [buffer.release_count for buffer in buffers] == [1, 1]
+
+
+def test_group_runner_isolates_member_failure_and_finishes_siblings() -> None:
+    """An ordinary member failure is returned for invalidation, not raised."""
+    expected_a = _run_serial("41", (2,))
+    expected_c = _run_serial("43", (0, 2))
+    blender = _FakeBlender(failure=("42", 1))
+
+    result = blender.blend_group(
+        (
+            LMCBlendGroupRequest(
+                request_id="41",
+                tokens=torch.tensor([41]),
+                retrieve_kwargs={"gap_pattern": (2,)},
+            ),
+            LMCBlendGroupRequest(
+                request_id="42",
+                tokens=torch.tensor([42]),
+                retrieve_kwargs={"gap_pattern": (0, 1)},
+            ),
+            LMCBlendGroupRequest(
+                request_id="43",
+                tokens=torch.tensor([43]),
+                retrieve_kwargs={"gap_pattern": (0, 2)},
+            ),
+        )
+    )
+
+    assert [member.outcome for member in result.members] == [
+        LMCBlendGroupOutcome.RECOVERED,
+        LMCBlendGroupOutcome.FAILED,
+        LMCBlendGroupOutcome.RECOVERED,
+    ]
+    assert result.failed_request_ids == ("42",)
+    failed = result.failed_members[0]
+    assert isinstance(failed.error, InjectedLayerFailure)
+    assert failed.retrieval_mask is None
+    assert failed.operation_counts.serial_rope_operations == 1
+    assert failed.operation_counts.serial_diff_operations == 0
+    assert failed.operation_counts.collective_rope_operations == 0
+    assert failed.operation_counts.collective_diff_operations == 0
+    assert blender.layerwise_model.outputs["41"] == expected_a
+    assert blender.layerwise_model.outputs["43"] == expected_c
+    assert "model:42:1" not in blender.events
+    assert "retrieve:42:2" not in blender.events
+    assert blender.session_close_calls == {"41": 1, "42": 1, "43": 1}
+    assert all(session.is_closed for session in blender.sessions)
+    assert blender.cache_engine.generator_close_counts == {
+        "41": 1,
+        "42": 1,
+        "43": 1,
+    }
+    assert blender.layerwise_model.generator_close_counts == {
+        "41": 1,
+        "42": 1,
+        "43": 1,
+    }
+    for buffers in blender.cache_engine.buffers.values():
+        assert [buffer.release_count for buffer in buffers] == [1, 1]
+
+
+def test_group_runner_surfaces_member_cleanup_failure_for_invalidation() -> None:
+    """A close failure invalidates only its member after siblings finish."""
+    blender = _FakeBlender(close_failure="82")
+
+    result = blender.blend_group(
+        (
+            LMCBlendGroupRequest(request_id="81", tokens=torch.tensor([81])),
+            LMCBlendGroupRequest(request_id="82", tokens=torch.tensor([82])),
+            LMCBlendGroupRequest(request_id="83", tokens=torch.tensor([83])),
+        )
+    )
+
+    assert [member.outcome for member in result.members] == [
+        LMCBlendGroupOutcome.RECOVERED,
+        LMCBlendGroupOutcome.FAILED,
+        LMCBlendGroupOutcome.RECOVERED,
+    ]
+    assert result.failed_request_ids == ("82",)
+    assert isinstance(result.failed_members[0].error, InjectedLayerFailure)
+    assert result.failed_members[0].retrieval_mask is None
+    assert blender.session_close_calls == {"81": 1, "82": 1, "83": 1}
+    assert all(session.is_closed for session in blender.sessions)
+    assert blender.cache_engine.generator_close_counts == {
+        "81": 1,
+        "82": 1,
+        "83": 1,
+    }
+    for buffers in blender.cache_engine.buffers.values():
+        assert [buffer.release_count for buffer in buffers] == [1, 1]
+
+
+def test_group_runner_reports_misses_without_model_operations() -> None:
+    """Miss members preserve lockstep choreography and report zero work."""
+    blender = _FakeBlender(num_layers=2)
+    miss_engine = _MissCacheEngine(blender.num_layers)
+    blender.cache_engine = miss_engine
+
+    result = blender.blend_group(
+        (
+            LMCBlendGroupRequest(request_id="51", tokens=torch.tensor([51])),
+            LMCBlendGroupRequest(request_id="52", tokens=torch.tensor([52])),
+        )
+    )
+
+    assert [member.outcome for member in result.members] == [
+        LMCBlendGroupOutcome.MISS,
+        LMCBlendGroupOutcome.MISS,
+    ]
+    for member in result.members:
+        assert member.retrieval_mask is not None
+        assert not bool(torch.any(member.retrieval_mask).item())
+        assert member.operation_counts.serial_rope_operations == 0
+        assert member.operation_counts.serial_diff_operations == 0
+        assert member.operation_counts.collective_rope_operations == 0
+        assert member.operation_counts.collective_diff_operations == 0
+    assert blender.layerwise_model.generator_calls == 0
+    assert blender.session_close_calls == {"51": 1, "52": 1}
+    assert all(session.is_closed for session in blender.sessions)
+    assert miss_engine.generators_closed == 2
+
+
+def test_group_preflight_finishes_before_any_session_creation() -> None:
+    """A later structural error cannot leave an earlier created session."""
+    blender = _FakeBlender()
+    requests = (
+        LMCBlendGroupRequest(request_id="61", tokens=torch.tensor([61])),
+        LMCBlendGroupRequest(
+            request_id="62",
+            tokens=torch.tensor([62]),
+            retrieve_kwargs={"load_state": object()},
+        ),
+    )
+
+    with pytest.raises(ValueError, match="load_state"):
+        blender.blend_group(requests)
+
+    assert blender.sessions == []
+    assert blender.events == []
+    assert blender.cache_engine.buffers == {}
+
+
+def test_group_runner_propagates_base_exception_after_exhaustive_close() -> None:
+    """Process-level failures are not isolated, but every session is closed."""
+    blender = _FakeBlender(fatal_failure=("72", 1))
+    requests = tuple(
+        LMCBlendGroupRequest(
+            request_id=request_id,
+            tokens=torch.tensor([int(request_id)]),
+        )
+        for request_id in ("71", "72", "73")
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="72:1"):
+        blender.blend_group(requests)
+
+    assert blender.session_close_calls == {"71": 1, "72": 1, "73": 1}
+    assert all(session.is_closed for session in blender.sessions)
+    assert blender.cache_engine.generator_close_counts == {
+        "71": 1,
+        "72": 1,
+        "73": 1,
+    }
     for buffers in blender.cache_engine.buffers.values():
         assert [buffer.release_count for buffer in buffers] == [1, 1]
 

@@ -15,7 +15,10 @@ from lmcache.v1.compute.blend.utils import LMCBlenderBuilder
 from lmcache.v1.gpu_connector.kv_format.contiguity import (
     attempt_permute_to_contiguous_view,
 )
-from lmcache.v1.gpu_connector.load_state import LayerwiseLoadState
+from lmcache.v1.gpu_connector.load_state import (
+    LayerwiseLoadState,
+    PendingPositionRecovery,
+)
 from lmcache.v1.gpu_connector.utils import (
     DiscoverableKVCache,
     LayoutHints,
@@ -1011,6 +1014,27 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         """Return true for explicit CacheBlend recovery-window support."""
         return True
 
+    def preflight_blend_group_capacity(
+        self,
+        kvcaches: List[torch.Tensor],
+        *,
+        num_tokens: int,
+        request_count: int,
+    ) -> bool:
+        """Check all ping-pong buffers before a blend group can mutate KV."""
+        if type(num_tokens) is not int or num_tokens <= 0:
+            raise ValueError("num_tokens must be a positive exact integer")
+        if type(request_count) is not int or request_count <= 0:
+            raise ValueError("request_count must be a positive exact integer")
+        self._lazy_initialize_buffer(kvcaches)
+        if self.gpu_buffer_allocator is None:
+            raise RuntimeError("GPU blend buffer allocator is unavailable")
+        return self.gpu_buffer_allocator.can_allocate_batch(
+            self.get_shape(num_tokens),
+            self.dtype,
+            request_count * 2,
+        )
+
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         """ """
 
@@ -1156,19 +1180,39 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                         compute_gpu_buffer_obj,
                     )
 
-                    if self.cache_positions:
+                    if self.cache_positions and state.defer_position_recovery:
+                        # A collective blend group applies one batched rotation
+                        # for every member between the retrieval and model
+                        # sub-steps of a layer round.  Publishing fails closed
+                        # if the previous layer's rotation was never applied,
+                        # and gap zeroing defers with the rotation because it
+                        # must run strictly after it.
                         assert compute_gpu_buffer_obj.tensor is not None
-
-                        compute_gpu_buffer_obj.tensor[0] = self.fused_rotary_emb(
-                            old_positions_full,
-                            new_positions_full,
-                            compute_gpu_buffer_obj.tensor[0],
+                        assert state.gap_positions is not None
+                        state.publish_pending_position_recovery(
+                            PendingPositionRecovery(
+                                layer_id=layer_id - 1,
+                                kv_buffer=compute_gpu_buffer_obj,
+                                old_positions=old_positions_full,
+                                new_positions=new_positions_full,
+                                gap_positions=state.gap_positions,
+                            )
                         )
+                    else:
+                        if self.cache_positions:
+                            assert compute_gpu_buffer_obj.tensor is not None
 
-                    # gap zeroing after RoPE
-                    assert state.gap_positions is not None
-                    if state.gap_positions.numel():
-                        compute_gpu_buffer_obj.tensor[:, state.gap_positions] = 0.0
+                            compute_gpu_buffer_obj.tensor[0] = self.fused_rotary_emb(
+                                old_positions_full,
+                                new_positions_full,
+                                compute_gpu_buffer_obj.tensor[0],
+                            )
+                            state.record_position_recovery(serial=1)
+
+                        # gap zeroing after RoPE
+                        assert state.gap_positions is not None
+                        if state.gap_positions.numel():
+                            compute_gpu_buffer_obj.tensor[:, state.gap_positions] = 0.0
 
                     state.buffer_mapping[layer_id - 1] = compute_gpu_buffer_obj
 

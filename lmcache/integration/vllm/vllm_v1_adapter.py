@@ -49,7 +49,10 @@ from lmcache.integration.vllm.kmesh import (
 )
 from lmcache.integration.vllm.kmesh_runtime import build_kmesh_runtime_evidence
 from lmcache.integration.vllm.target_profile import (
-    SERIAL_PIC_V1,
+    COLLECTIVE_BATCHED_POSITION_RECOVERY_V1,
+    COLLECTIVE_BATCHED_QKV_V1,
+    KMESH_COLLECTIVE_PROFILES,
+    KMESH_PIC_V1_PROFILES,
     requested_target_profile,
     validate_target_profile,
 )
@@ -64,12 +67,20 @@ from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate, cdiv
 from lmcache.v1.cache_engine import LMCacheEngine
-from lmcache.v1.compute.blend import LMCBlenderBuilder
+from lmcache.v1.compute.blend import (
+    LMCBlenderBuilder,
+    LMCBlendGroupMemberResult,
+    LMCBlendGroupOutcome,
+    LMCBlendGroupRequest,
+    LMCBlendGroupResult,
+    LMCBlendOperationCounts,
+)
 from lmcache.v1.compute.models.utils import VLLMModelTracker
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.lifecycle import RetainedCall
 from lmcache.v1.manager import LMCacheManager
+from lmcache.v1.token_span import ExplicitTokenSpans, TokenSpan
 
 if TYPE_CHECKING:
     # Third Party
@@ -261,11 +272,29 @@ class _KMeshWorkerRequestContract:
 
 
 @dataclass(frozen=True, slots=True)
+class _KMeshWorkerPlanMember:
+    """One plan-selected request and its exact local recovery spans."""
+
+    request_id: str
+    explicit_spans: ExplicitTokenSpans
+
+
+@dataclass(frozen=True, slots=True)
+class _KMeshWorkerReusePlan:
+    """Immutable worker-local projection of one transported reuse plan."""
+
+    plan_id: str
+    reuse_group_id: str
+    members: tuple[_KMeshWorkerPlanMember, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _KMeshWorkerStepContract:
     """Immutable composite handoff plus registered KV-layer identities."""
 
     generation: int
     requests: tuple[_KMeshWorkerRequestContract, ...]
+    plans: tuple[_KMeshWorkerReusePlan, ...]
     layer_names: tuple[str, ...]
     kv_cache_ids: tuple[int, ...]
 
@@ -821,8 +850,9 @@ class LMCacheConnectorV1Impl:
                 vllm_config,
                 config,
                 role=role,
+                target_profile=target_profile,
             )
-            if target_profile == SERIAL_PIC_V1
+            if target_profile in KMESH_PIC_V1_PROFILES
             else None
         )
 
@@ -834,7 +864,7 @@ class LMCacheConnectorV1Impl:
         )
 
         try:
-            if target_profile == SERIAL_PIC_V1:
+            if target_profile in KMESH_PIC_V1_PROFILES:
                 self._acquire_target_manager(config, service_factory, role)
             else:
                 # Preserve the established construction thread and lifecycle
@@ -901,7 +931,7 @@ class LMCacheConnectorV1Impl:
 
     def _release_target_manager_handoff(self) -> None:
         """Release the exact Manager receipt after full adapter construction."""
-        if self._target_profile != SERIAL_PIC_V1:
+        if self._target_profile not in KMESH_PIC_V1_PROFILES:
             return
         owner = getattr(self, "_manager_construction_owner", None)
         if owner is None:
@@ -1025,7 +1055,7 @@ class LMCacheConnectorV1Impl:
 
         self.force_skip_save = (
             False
-            if self._target_profile == SERIAL_PIC_V1
+            if self._target_profile in KMESH_PIC_V1_PROFILES
             else bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
         )
         self._requests_priority: dict[str, int] = {}
@@ -1085,48 +1115,48 @@ class LMCacheConnectorV1Impl:
 
     def _require_target_manager_ready(self, *, post_init: bool) -> None:
         """Reject degraded or incomplete target-profile service graphs."""
-        if self._target_profile != SERIAL_PIC_V1:
+        if self._target_profile not in KMESH_PIC_V1_PROFILES:
             return
+        profile = self._target_profile
 
         self._manager.raise_if_init_failed()
         if not self._manager.is_healthy():
-            raise RuntimeError("LMCache serial_pic_v1 manager is unhealthy")
+            raise RuntimeError(f"LMCache {profile} manager is unhealthy")
         if self.lmcache_engine_metadata is None:
-            raise RuntimeError("LMCache serial_pic_v1 metadata is unavailable")
+            raise RuntimeError(f"LMCache {profile} metadata is unavailable")
         if (
             self._manager.offload_server is not None
             or self._manager.api_server is not None
             or self._manager.runtime_plugin_launcher is not None
         ):
-            raise RuntimeError("LMCache serial_pic_v1 constructed an excluded service")
+            raise RuntimeError(f"LMCache {profile} constructed an excluded service")
 
         if self._role == KVConnectorRole.SCHEDULER:
             if self.lookup_client is None:
                 raise RuntimeError(
-                    "LMCache serial_pic_v1 scheduler lookup client is unavailable"
+                    f"LMCache {profile} scheduler lookup client is unavailable"
                 )
             if self.lmcache_engine is not None or self.lookup_server is not None:
                 raise RuntimeError(
-                    "LMCache serial_pic_v1 scheduler service graph is not exact"
+                    f"LMCache {profile} scheduler service graph is not exact"
                 )
         elif self._role == KVConnectorRole.WORKER:
             if self.lmcache_engine is None or self.lookup_server is None:
                 raise RuntimeError(
-                    "LMCache serial_pic_v1 worker engine or lookup server is "
-                    "unavailable"
+                    f"LMCache {profile} worker engine or lookup server is unavailable"
                 )
             if self.lookup_client is not None:
                 raise RuntimeError(
-                    "LMCache serial_pic_v1 worker service graph is not exact"
+                    f"LMCache {profile} worker service graph is not exact"
                 )
         else:
             raise RuntimeError(
-                f"LMCache serial_pic_v1 received unexpected role {self._role!r}"
+                f"LMCache {profile} received unexpected role {self._role!r}"
             )
 
         if post_init and self._manager.health_monitor is None:
             raise RuntimeError(
-                "LMCache serial_pic_v1 health monitor is unavailable after post-init"
+                f"LMCache {profile} health monitor is unavailable after post-init"
             )
 
     def _cleanup_target_manager_after_failure(
@@ -1135,7 +1165,7 @@ class LMCacheConnectorV1Impl:
         init_error: BaseException,
     ) -> None:
         """Quiesce partial target services while preserving both failures."""
-        if self._target_profile != SERIAL_PIC_V1:
+        if self._target_profile not in KMESH_PIC_V1_PROFILES:
             return
 
         manager = getattr(self, "_manager", None)
@@ -1440,9 +1470,24 @@ class LMCacheConnectorV1Impl:
                 )
         return first_error
 
-    def _is_kmesh_serial_pic_target(self) -> bool:
-        """Return whether this adapter uses the online serial-PIC target path."""
-        return getattr(self, "_target_profile", None) == SERIAL_PIC_V1
+    def _is_kmesh_pic_target(self) -> bool:
+        """Return whether this adapter uses either exact online PIC profile."""
+        return getattr(self, "_target_profile", None) in KMESH_PIC_V1_PROFILES
+
+    def _is_kmesh_collective_lockstep_target(self) -> bool:
+        """Return whether transported plans select worker group execution."""
+        return getattr(self, "_target_profile", None) in KMESH_COLLECTIVE_PROFILES
+
+    def _is_kmesh_batched_position_recovery_target(self) -> bool:
+        """Return whether group execution batches cached-K rotation."""
+        return getattr(self, "_target_profile", None) in (
+            COLLECTIVE_BATCHED_POSITION_RECOVERY_V1,
+            COLLECTIVE_BATCHED_QKV_V1,
+        )
+
+    def _is_kmesh_batched_qkv_target(self) -> bool:
+        """Return whether group execution also batches model-side QKV work."""
+        return getattr(self, "_target_profile", None) == COLLECTIVE_BATCHED_QKV_V1
 
     @staticmethod
     def _validate_kmesh_request_id_value(
@@ -1650,6 +1695,7 @@ class LMCacheConnectorV1Impl:
     def _validate_kmesh_retrieval_mask(
         contract: _KMeshWorkerRequestContract,
         ret_mask: object,
+        explicit_spans: Optional[ExplicitTokenSpans] = None,
     ) -> torch.Tensor:
         """Require a union of whole declared spans and no undeclared tokens."""
         if (
@@ -1660,9 +1706,17 @@ class LMCacheConnectorV1Impl:
         ):
             raise ValueError("KMesh CacheBlend returned an invalid token mask")
         mask = ret_mask.to(device="cpu", dtype=torch.bool)
+        spans = (
+            contract.execution.explicit_spans
+            if explicit_spans is None
+            else explicit_spans
+        )
+        if type(spans) is not ExplicitTokenSpans:
+            raise TypeError("KMesh recovery spans have an invalid exact type")
+        spans.validate_token_count(len(contract.token_ids))
         declared = torch.zeros(len(contract.token_ids), dtype=torch.bool)
         hit_end = contract.load_spec[1]
-        for span in contract.execution.explicit_spans.spans:
+        for span in spans.spans:
             span_mask = mask[span.start : span.end]
             if span.end > hit_end:
                 if bool(torch.any(span_mask).item()):
@@ -1688,6 +1742,7 @@ class LMCacheConnectorV1Impl:
             self._vllm_config,
             self.config,
             role=self._role,
+            target_profile=self._target_profile,
         )
         if current.to_canonical_payload() != initial.to_canonical_payload():
             raise ValueError("KMesh runtime configuration drifted after construction")
@@ -1743,6 +1798,174 @@ class LMCacheConnectorV1Impl:
         current = KMeshRequestExecutionEvidence.from_binding(binding)
         self._validate_same_kmesh_execution(prepared.execution, current)
         return current
+
+    def _validate_kmesh_worker_destination_ownership(
+        self,
+        contracts: tuple[_KMeshWorkerRequestContract, ...],
+    ) -> None:
+        """Require request-owned slots and blocks across the whole worker step."""
+        if type(self._block_size) is not int or self._block_size <= 0:
+            raise RuntimeError("KMesh worker block size is invalid")
+        slot_owner: dict[int, str] = {}
+        block_owner: dict[int, str] = {}
+        for contract in contracts:
+            for slot in contract.slot_mapping:
+                prior = slot_owner.setdefault(slot, contract.request_id)
+                if prior != contract.request_id:
+                    raise ValueError("KMesh worker requests share a destination slot")
+            for block_id in {
+                slot // self._block_size for slot in contract.slot_mapping
+            }:
+                prior = block_owner.setdefault(block_id, contract.request_id)
+                if prior != contract.request_id:
+                    raise ValueError("KMesh worker requests share a destination block")
+
+    def _freeze_kmesh_worker_plans(
+        self,
+        plan_batch: object,
+        contracts: tuple[_KMeshWorkerRequestContract, ...],
+    ) -> tuple[_KMeshWorkerReusePlan, ...]:
+        """Project transported public plans into strict LMCache-local state."""
+        # Third Party
+        from vllm.v1.kmesh import (
+            KMeshCompatibilityKey,
+            KMeshPlanBatch,
+            KMeshRequestSegmentMap,
+            KMeshReuseGroup,
+            KMeshReusePlan,
+            KMeshSegmentMapEntry,
+            KMeshSharedSegmentIdentity,
+        )
+
+        if type(plan_batch) is not KMeshPlanBatch:
+            raise TypeError("KMesh collective target requires exact plan-batch data")
+        if type(plan_batch.plans) is not tuple:
+            raise TypeError("KMesh plan batch must contain an immutable plan tuple")
+        by_request = {contract.request_id: contract for contract in contracts}
+        frozen: list[_KMeshWorkerReusePlan] = []
+        planned_requests: set[str] = set()
+        plan_ids: list[str] = []
+        reuse_group_ids: set[str] = set()
+        for plan_index, plan in enumerate(plan_batch.plans):
+            if type(plan) is not KMeshReusePlan:
+                raise TypeError(f"KMesh plans[{plan_index}] has an invalid exact type")
+            if type(plan.group) is not KMeshReuseGroup:
+                raise TypeError(f"KMesh plans[{plan_index}].group has an invalid type")
+            if type(plan.plan_id) is not str or not plan.plan_id:
+                raise TypeError("KMesh plan IDs must be nonempty exact strings")
+            if plan.plan_id in plan_ids or (plan_ids and plan.plan_id < plan_ids[-1]):
+                raise ValueError("KMesh worker plan IDs must be unique and sorted")
+            plan_ids.append(plan.plan_id)
+            if type(plan.request_segment_maps) is not tuple:
+                raise TypeError("KMesh request segment maps must be immutable")
+            if type(plan.block_size) is not int or plan.block_size != self._block_size:
+                raise ValueError("KMesh plan block size differs from the worker")
+            group = plan.group
+            if type(group.compatibility_key) is not KMeshCompatibilityKey:
+                raise TypeError("KMesh reuse-group compatibility has an invalid type")
+            KMeshCompatibilityKey.__post_init__(group.compatibility_key)
+            if type(group.shared_segments) is not tuple:
+                raise TypeError("KMesh shared segments must be immutable")
+            for shared_segment in group.shared_segments:
+                if type(shared_segment) is not KMeshSharedSegmentIdentity:
+                    raise TypeError("KMesh shared segment has an invalid exact type")
+                KMeshSharedSegmentIdentity.__post_init__(shared_segment)
+            if type(group.reuse_group_id) is not str or not group.reuse_group_id:
+                raise TypeError("KMesh reuse-group IDs must be nonempty exact strings")
+            if group.reuse_group_id in reuse_group_ids:
+                raise ValueError("KMesh worker plans repeat a reuse-group ID")
+            reuse_group_ids.add(group.reuse_group_id)
+            if type(group.request_ids) is not tuple:
+                raise TypeError("KMesh reuse-group membership must be immutable")
+            if group.request_ids != tuple(sorted(set(group.request_ids))):
+                raise ValueError(
+                    "KMesh reuse-group membership must be unique and sorted"
+                )
+            if len(group.request_ids) < 2:
+                raise ValueError("KMesh collective plans require at least two members")
+            if type(group.shared_segments) is not tuple or not group.shared_segments:
+                raise ValueError("KMesh reuse groups require immutable shared segments")
+            if len(plan.request_segment_maps) != len(group.request_ids):
+                raise ValueError("KMesh collective plan membership is incomplete")
+            KMeshReuseGroup.__post_init__(group)
+
+            members: list[_KMeshWorkerPlanMember] = []
+            for member_index, (request_id, mapping) in enumerate(
+                zip(
+                    group.request_ids,
+                    plan.request_segment_maps,
+                    strict=True,
+                )
+            ):
+                if type(request_id) is not str:
+                    raise TypeError("KMesh plan request IDs must be plain strings")
+                if request_id in planned_requests:
+                    raise ValueError("KMesh request entered more than one worker plan")
+                if type(mapping) is not KMeshRequestSegmentMap:
+                    raise TypeError(
+                        f"KMesh plan member {member_index} has an invalid map type"
+                    )
+                if mapping.request_id != request_id:
+                    raise ValueError("KMesh plan member order changed in transport")
+                if type(mapping.entries) is not tuple or not mapping.entries:
+                    raise ValueError(
+                        "KMesh plan member has no immutable selected spans"
+                    )
+                if len(mapping.entries) != len(group.shared_segments):
+                    raise ValueError("KMesh plan member selected the wrong segment set")
+                contract = by_request.get(request_id)
+                if contract is None:
+                    raise ValueError("KMesh plan member has no LMCache worker contract")
+
+                selected: list[TokenSpan] = []
+                declared_ranges = {
+                    (span.start, span.end)
+                    for span in contract.execution.explicit_spans.spans
+                }
+                for entry_index, entry in enumerate(mapping.entries):
+                    if type(entry) is not KMeshSegmentMapEntry:
+                        raise TypeError(
+                            f"KMesh plan entry {entry_index} has an invalid exact type"
+                        )
+                    KMeshSegmentMapEntry.__post_init__(entry)
+                    if entry.shared_segment != group.shared_segments[entry_index]:
+                        raise ValueError(
+                            "KMesh plan member segment order drifted in transport"
+                        )
+                    token_range = (entry.token_start, entry.token_end)
+                    if token_range not in declared_ranges:
+                        raise ValueError(
+                            "KMesh plan selected a span absent from worker evidence"
+                        )
+                    selected.append(TokenSpan(*token_range))
+
+                KMeshRequestSegmentMap.__post_init__(mapping)
+
+                # Plans are identity-major, while a request may place the
+                # same shared identities in a different logical order. LMCache
+                # explicit spans are request-position-major by contract.
+                selected.sort(key=lambda span: (span.start, span.end))
+
+                members.append(
+                    _KMeshWorkerPlanMember(
+                        request_id=request_id,
+                        explicit_spans=ExplicitTokenSpans(
+                            token_count=len(contract.token_ids),
+                            cached_span=TokenSpan(0, len(contract.token_ids)),
+                            spans=tuple(selected),
+                        ),
+                    )
+                )
+                planned_requests.add(request_id)
+            KMeshReusePlan.__post_init__(plan)
+            frozen.append(
+                _KMeshWorkerReusePlan(
+                    plan_id=plan.plan_id,
+                    reuse_group_id=group.reuse_group_id,
+                    members=tuple(members),
+                )
+            )
+        return tuple(frozen)
 
     def _validate_kmesh_peer_connector_metadata(
         self,
@@ -1969,6 +2192,12 @@ class LMCacheConnectorV1Impl:
             raise ValueError("KMesh and LMCache actionable request sets differ")
 
         ordered = tuple(contracts[key] for key in sorted(contracts))
+        self._validate_kmesh_worker_destination_ownership(ordered)
+        plans = (
+            self._freeze_kmesh_worker_plans(kmesh_metadata.plan_batch, ordered)
+            if self._is_kmesh_collective_lockstep_target()
+            else ()
+        )
         if len(self.kv_caches) != self.num_layers or not self.kv_caches:
             raise RuntimeError(
                 "KMesh worker must register every KV-cache layer before binding"
@@ -1982,6 +2211,7 @@ class LMCacheConnectorV1Impl:
         return _KMeshWorkerStepContract(
             generation=generation,
             requests=ordered,
+            plans=plans,
             layer_names=layer_names,
             kv_cache_ids=kv_cache_ids,
         )
@@ -1991,13 +2221,13 @@ class LMCacheConnectorV1Impl:
         peer_connector_metadata: tuple[KVConnectorMetadata, ...],
     ) -> None:
         """Validate the exact composite handoff without changing adapter state."""
-        if not self._is_kmesh_serial_pic_target():
+        if not self._is_kmesh_pic_target():
             return
         self._validate_kmesh_peer_connector_metadata(peer_connector_metadata)
 
     def begin_connector_metadata_transaction(self) -> None:
         """Checkpoint worker state for one composite metadata transaction."""
-        if not self._is_kmesh_serial_pic_target():
+        if not self._is_kmesh_pic_target():
             return
         if self._role != KVConnectorRole.WORKER:
             raise RuntimeError("KMesh metadata transactions belong to the worker")
@@ -2036,7 +2266,7 @@ class LMCacheConnectorV1Impl:
         peer_connector_metadata: tuple[KVConnectorMetadata, ...],
     ) -> None:
         """Bind one validated handoff without executing LMCache data I/O."""
-        if not self._is_kmesh_serial_pic_target():
+        if not self._is_kmesh_pic_target():
             return
         worker_step = self._validate_kmesh_peer_connector_metadata(
             peer_connector_metadata
@@ -2138,7 +2368,7 @@ class LMCacheConnectorV1Impl:
 
     def clear_peer_connector_metadata(self) -> None:
         """Clear one validated worker step while retaining replay protection."""
-        if not self._is_kmesh_serial_pic_target():
+        if not self._is_kmesh_pic_target():
             return
         if self._role != KVConnectorRole.WORKER:
             raise RuntimeError("KMesh peer metadata may only clear on the worker role")
@@ -2208,7 +2438,7 @@ class LMCacheConnectorV1Impl:
 
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
-        if self._is_kmesh_serial_pic_target():
+        if self._is_kmesh_pic_target():
             self._ensure_kmesh_store_session_lifecycle()
             with self._kmesh_store_sessions_lock:
                 self._require_kmesh_store_session_admission_open()
@@ -2269,6 +2499,322 @@ class LMCacheConnectorV1Impl:
             self._require_kmesh_store_session_admission_open()
             self._start_kmesh_load_kv_locked(forward_context, metadata)
 
+    def _run_kmesh_serial_load(
+        self,
+        contract: _KMeshWorkerRequestContract,
+        *,
+        generation: int,
+        kvcaches: list[torch.Tensor],
+        explicit_spans: Optional[ExplicitTokenSpans] = None,
+    ) -> None:
+        """Run one request-local recovery and contain ordinary failures."""
+        spans = (
+            contract.execution.explicit_spans
+            if explicit_spans is None
+            else explicit_spans
+        )
+        try:
+            token_mask = torch.ones(len(contract.token_ids), dtype=torch.bool)
+            slot_mapping = torch.tensor(
+                contract.slot_mapping,
+                dtype=torch.long,
+                device=self.device,
+            )
+            assert self.blender is not None
+            ret_mask = self.blender.blend(
+                list(contract.token_ids),
+                token_mask,
+                kvcaches=kvcaches,
+                slot_mapping=slot_mapping,
+                vllm_cached_tokens=0,
+                request_configs=contract.execution.as_request_configs(),
+                explicit_spans=spans,
+                req_id=contract.lookup_id,
+                request_id=contract.request_id,
+                generation=generation,
+            )
+            ret_mask = self._validate_kmesh_retrieval_mask(
+                contract,
+                ret_mask,
+                spans,
+            )
+            if not bool(torch.any(ret_mask).item()):
+                self._record_kmesh_load_failure(
+                    contract,
+                    "explicit lookup/retrieve race produced an all-false mask",
+                )
+        except Exception as error:
+            if contract.request_id not in self._kmesh_failed_worker_requests:
+                self._record_kmesh_load_failure(
+                    contract,
+                    f"request-local CacheBlend failure: {error}",
+                    invalidate_full_prompt=True,
+                )
+            logger.exception(
+                "KMesh request %s CacheBlend failed; siblings continue",
+                contract.request_id,
+            )
+
+    def _preflight_kmesh_collective_capacity(
+        self,
+        plan: _KMeshWorkerReusePlan,
+        contracts: dict[str, _KMeshWorkerRequestContract],
+        kvcaches: list[torch.Tensor],
+    ) -> None:
+        """Prove every group buffer fits before any member session advances."""
+        token_counts = {
+            len(contracts[member.request_id].token_ids) for member in plan.members
+        }
+        if len(token_counts) != 1:
+            raise ValueError("KMesh collective plan members differ in token count")
+        engine = self.lmcache_engine
+        if engine is None:
+            raise RuntimeError("KMesh collective target lost its LMCache engine")
+        gpu_connector = engine.gpu_connector
+        preflight = getattr(gpu_connector, "preflight_blend_group_capacity", None)
+        if not callable(preflight):
+            raise RuntimeError(
+                "KMesh collective target lacks exact GPU capacity preflight"
+            )
+        result = preflight(
+            kvcaches,
+            num_tokens=next(iter(token_counts)),
+            request_count=len(plan.members),
+        )
+        if type(result) is not bool:
+            raise TypeError("KMesh collective capacity preflight returned non-bool")
+        if not result:
+            raise MemoryError("KMesh collective group GPU capacity is insufficient")
+
+    def _validate_kmesh_collective_operation_counts(
+        self,
+        outcome: LMCBlendGroupOutcome,
+        counts: object,
+    ) -> None:
+        """Validate exact lockstep-reference operation evidence."""
+        if type(counts) is not LMCBlendOperationCounts:
+            raise TypeError("KMesh collective result has invalid operation counts")
+        values = (
+            counts.serial_rope_operations,
+            counts.serial_diff_operations,
+            counts.collective_rope_operations,
+            counts.collective_diff_operations,
+        )
+        if any(type(value) is not int or value < 0 for value in values):
+            raise ValueError("KMesh collective operation counts must be exact")
+        qkv = self._is_kmesh_batched_qkv_target()
+        if not qkv and (
+            counts.collective_rope_operations or counts.collective_diff_operations
+        ):
+            raise ValueError(
+                "only the batched-QKV profile batches model-side tensor operations"
+            )
+        recovery = (
+            counts.position_recovery_serial_operations,
+            counts.position_recovery_collective_operations,
+        )
+        if any(type(value) is not int or value < 0 for value in recovery):
+            raise ValueError("KMesh position-recovery counts must be exact nonnegative")
+        batched = self._is_kmesh_batched_position_recovery_target()
+        if outcome is LMCBlendGroupOutcome.RECOVERED:
+            if batched:
+                if (
+                    counts.position_recovery_collective_operations != self.num_layers
+                    or counts.position_recovery_serial_operations != 0
+                ):
+                    raise ValueError(
+                        "batched profile member lacks exactly one collective "
+                        "position recovery per layer"
+                    )
+            elif counts.position_recovery_collective_operations:
+                raise ValueError(
+                    "collective_lockstep_v1 cannot claim batched position recovery"
+                )
+        if outcome is LMCBlendGroupOutcome.RECOVERED:
+            expected_diff = len(set(self.config.blend_check_layers or ()))
+            if qkv:
+                if (
+                    counts.serial_rope_operations != 0
+                    or counts.serial_diff_operations != 0
+                    or counts.collective_rope_operations != self.num_layers
+                    or counts.collective_diff_operations != expected_diff
+                ):
+                    raise ValueError(
+                        "batched-QKV member lacks exactly one collective "
+                        "rotary per layer and one difference pass per "
+                        "check layer with zero serial work"
+                    )
+            elif (
+                counts.serial_rope_operations != self.num_layers
+                or counts.serial_diff_operations != expected_diff
+            ):
+                raise ValueError(
+                    "KMesh recovered member has incomplete serial operation counts"
+                )
+        elif outcome is LMCBlendGroupOutcome.MISS and any(values):
+            raise ValueError("KMesh missed member reported tensor operations")
+        elif outcome is LMCBlendGroupOutcome.FAILED:
+            expected_diff = len(set(self.config.blend_check_layers or ()))
+            if (
+                counts.serial_rope_operations > self.num_layers
+                or counts.serial_diff_operations > expected_diff
+            ):
+                raise ValueError(
+                    "KMesh failed member reported impossible serial operations"
+                )
+
+    def _run_kmesh_collective_plan(
+        self,
+        plan: _KMeshWorkerReusePlan,
+        *,
+        generation: int,
+        contracts: dict[str, _KMeshWorkerRequestContract],
+        kvcaches: list[torch.Tensor],
+    ) -> None:
+        """Execute one preflighted transported plan in stable lockstep."""
+        requests: list[LMCBlendGroupRequest] = []
+        for member in plan.members:
+            contract = contracts[member.request_id]
+            requests.append(
+                LMCBlendGroupRequest(
+                    request_id=contract.request_id,
+                    tokens=list(contract.token_ids),
+                    mask=torch.ones(len(contract.token_ids), dtype=torch.bool),
+                    generation=generation,
+                    retrieve_kwargs={
+                        "kvcaches": kvcaches,
+                        "slot_mapping": torch.tensor(
+                            contract.slot_mapping,
+                            dtype=torch.long,
+                            device=self.device,
+                        ),
+                        "vllm_cached_tokens": 0,
+                        "request_configs": (contract.execution.as_request_configs()),
+                        "explicit_spans": member.explicit_spans,
+                        "req_id": contract.lookup_id,
+                    },
+                )
+            )
+
+        assert self.blender is not None
+        result = self.blender.blend_group(
+            tuple(requests),
+            collective_position_recovery=(
+                self._is_kmesh_batched_position_recovery_target()
+            ),
+            collective_qkv=self._is_kmesh_batched_qkv_target(),
+        )
+        if type(result) is not LMCBlendGroupResult:
+            raise TypeError("KMesh collective runner returned an invalid result")
+        if type(result.members) is not tuple:
+            raise TypeError("KMesh collective result members must be immutable")
+        if len(result.members) != len(plan.members):
+            raise ValueError("KMesh collective result membership is incomplete")
+
+        validated_members: list[
+            tuple[_KMeshWorkerRequestContract, LMCBlendGroupMemberResult]
+        ] = []
+        for planned, member_result in zip(
+            plan.members,
+            result.members,
+            strict=True,
+        ):
+            contract = contracts[planned.request_id]
+            if type(member_result) is not LMCBlendGroupMemberResult:
+                raise TypeError("KMesh collective member result has invalid type")
+            if (
+                member_result.request_id != planned.request_id
+                or member_result.generation != generation
+                or type(member_result.outcome) is not LMCBlendGroupOutcome
+            ):
+                raise ValueError("KMesh collective result identity drifted")
+            self._validate_kmesh_collective_operation_counts(
+                member_result.outcome,
+                member_result.operation_counts,
+            )
+            counts = member_result.operation_counts
+            if member_result.outcome is LMCBlendGroupOutcome.FAILED:
+                if not isinstance(member_result.error, Exception):
+                    raise ValueError(
+                        "KMesh failed collective member requires an exception"
+                    )
+                if member_result.retrieval_mask is not None:
+                    raise ValueError(
+                        "KMesh failed collective member cannot publish a mask"
+                    )
+                frozen_mask = None
+            else:
+                if member_result.error is not None:
+                    raise ValueError(
+                        "KMesh terminal collective member cannot publish an error"
+                    )
+                frozen_mask = self._validate_kmesh_retrieval_mask(
+                    contract,
+                    member_result.retrieval_mask,
+                    planned.explicit_spans,
+                )
+                recovered = bool(torch.any(frozen_mask).item())
+                if member_result.outcome is LMCBlendGroupOutcome.RECOVERED:
+                    if not recovered:
+                        raise ValueError(
+                            "KMesh recovered collective member has an empty mask"
+                        )
+                elif recovered:
+                    raise ValueError(
+                        "KMesh missed collective member has a recovered mask"
+                    )
+                frozen_mask = frozen_mask.clone()
+
+            validated_members.append(
+                (
+                    contract,
+                    LMCBlendGroupMemberResult(
+                        request_id=member_result.request_id,
+                        generation=member_result.generation,
+                        outcome=member_result.outcome,
+                        retrieval_mask=frozen_mask,
+                        operation_counts=LMCBlendOperationCounts(
+                            serial_rope_operations=counts.serial_rope_operations,
+                            serial_diff_operations=counts.serial_diff_operations,
+                            collective_rope_operations=(
+                                counts.collective_rope_operations
+                            ),
+                            collective_diff_operations=(
+                                counts.collective_diff_operations
+                            ),
+                            position_recovery_serial_operations=(
+                                counts.position_recovery_serial_operations
+                            ),
+                            position_recovery_collective_operations=(
+                                counts.position_recovery_collective_operations
+                            ),
+                        ),
+                        error=member_result.error,
+                    ),
+                )
+            )
+
+        frozen_result = LMCBlendGroupResult(
+            tuple(member for _contract, member in validated_members)
+        )
+        self._kmesh_collective_results.append((plan.plan_id, frozen_result))
+
+        for contract, member_result in validated_members:
+            if member_result.outcome is LMCBlendGroupOutcome.FAILED:
+                assert member_result.error is not None
+                self._record_kmesh_load_failure(
+                    contract,
+                    "request-local collective CacheBlend failure: "
+                    f"{member_result.error}",
+                    invalidate_full_prompt=True,
+                )
+                continue
+            if member_result.outcome is LMCBlendGroupOutcome.MISS:
+                self._record_kmesh_load_failure(
+                    contract,
+                    "collective explicit lookup/retrieve produced a miss",
+                )
+
     def _start_kmesh_load_kv_locked(
         self,
         forward_context: "ForwardContext",
@@ -2296,48 +2842,81 @@ class LMCacheConnectorV1Impl:
                 "call connector.register_model(model) after construction."
             )
 
+        self._kmesh_collective_results: list[tuple[str, LMCBlendGroupResult]] = []
         for _request, contract in requests:
             self._stats_monitor.update_interval_vllm_hit_tokens(0)
             self._stats_monitor.update_interval_prompt_tokens(len(contract.token_ids))
+
+        if self._is_kmesh_collective_lockstep_target():
+            by_request = {
+                contract.request_id: contract for _request, contract in requests
+            }
+            planned: set[str] = set()
+            for plan in step.plans:
+                plan_contracts = [
+                    by_request[member.request_id] for member in plan.members
+                ]
+                planned.update(member.request_id for member in plan.members)
+                if not all(contract.load_spec[2] for contract in plan_contracts):
+                    for member, contract in zip(
+                        plan.members,
+                        plan_contracts,
+                        strict=True,
+                    ):
+                        if contract.load_spec[2]:
+                            self._run_kmesh_serial_load(
+                                contract,
+                                generation=generation,
+                                kvcaches=kvcaches,
+                                explicit_spans=member.explicit_spans,
+                            )
+                    continue
+                try:
+                    self._preflight_kmesh_collective_capacity(
+                        plan,
+                        by_request,
+                        kvcaches,
+                    )
+                    self._run_kmesh_collective_plan(
+                        plan,
+                        generation=generation,
+                        contracts=by_request,
+                        kvcaches=kvcaches,
+                    )
+                except Exception as error:
+                    for contract in plan_contracts:
+                        if (
+                            contract.request_id
+                            not in self._kmesh_failed_worker_requests
+                        ):
+                            self._record_kmesh_load_failure(
+                                contract,
+                                f"collective CacheBlend group failure: {error}",
+                                invalidate_full_prompt=True,
+                            )
+                    logger.exception(
+                        "KMesh collective plan %s failed; other plans continue",
+                        plan.plan_id,
+                    )
+
+            for _request, contract in requests:
+                if contract.request_id in planned or not contract.load_spec[2]:
+                    continue
+                self._run_kmesh_serial_load(
+                    contract,
+                    generation=generation,
+                    kvcaches=kvcaches,
+                )
+            return
+
+        for _request, contract in requests:
             if not contract.load_spec[2]:
                 continue
-            try:
-                token_mask = torch.ones(len(contract.token_ids), dtype=torch.bool)
-                slot_mapping = torch.tensor(
-                    contract.slot_mapping,
-                    dtype=torch.long,
-                    device=self.device,
-                )
-                assert self.blender is not None
-                ret_mask = self.blender.blend(
-                    list(contract.token_ids),
-                    token_mask,
-                    kvcaches=kvcaches,
-                    slot_mapping=slot_mapping,
-                    vllm_cached_tokens=0,
-                    request_configs=contract.execution.as_request_configs(),
-                    explicit_spans=contract.execution.explicit_spans,
-                    req_id=contract.lookup_id,
-                    request_id=contract.request_id,
-                    generation=generation,
-                )
-                ret_mask = self._validate_kmesh_retrieval_mask(contract, ret_mask)
-                if not bool(torch.any(ret_mask).item()):
-                    self._record_kmesh_load_failure(
-                        contract,
-                        "explicit lookup/retrieve race produced an all-false mask",
-                    )
-            except Exception as error:
-                if contract.request_id not in self._kmesh_failed_worker_requests:
-                    self._record_kmesh_load_failure(
-                        contract,
-                        f"request-local CacheBlend failure: {error}",
-                        invalidate_full_prompt=True,
-                    )
-                logger.exception(
-                    "KMesh request %s CacheBlend failed; siblings continue",
-                    contract.request_id,
-                )
+            self._run_kmesh_serial_load(
+                contract,
+                generation=generation,
+                kvcaches=kvcaches,
+            )
 
     def _start_load_kv_impl(
         self,
@@ -2580,7 +3159,7 @@ class LMCacheConnectorV1Impl:
 
     @_lmcache_nvtx_annotate
     def wait_for_layer_load(self, layer_name: str) -> None:
-        if self._is_kmesh_serial_pic_target():
+        if self._is_kmesh_pic_target():
             step = self._require_kmesh_worker_step()
             self._validate_kmesh_worker_layers(step)
             index = self._kmesh_next_wait_layer
@@ -2643,7 +3222,7 @@ class LMCacheConnectorV1Impl:
         attn_metadata: "AttentionMetadata",
         **kwargs,
     ) -> None:
-        if self._is_kmesh_serial_pic_target():
+        if self._is_kmesh_pic_target():
             self._ensure_kmesh_store_session_lifecycle()
             with self._kmesh_store_sessions_lock:
                 self._require_kmesh_store_session_admission_open()
@@ -3032,7 +3611,7 @@ class LMCacheConnectorV1Impl:
     def wait_for_save(self):
         """Blocking until the KV cache is saved to the connector buffer."""
 
-        if self._is_kmesh_serial_pic_target():
+        if self._is_kmesh_pic_target():
             self._ensure_kmesh_store_session_lifecycle()
             with self._kmesh_store_sessions_lock:
                 self._wait_for_kmesh_save_locked()
@@ -3291,10 +3870,7 @@ class LMCacheConnectorV1Impl:
         """Shutdown the connector by delegating to LMCacheManager."""
         logger.info("Starting LMCacheConnector shutdown...")
         try:
-            if (
-                self._is_kmesh_serial_pic_target()
-                and self._role == KVConnectorRole.WORKER
-            ):
+            if self._is_kmesh_pic_target() and self._role == KVConnectorRole.WORKER:
                 self._shutdown_kmesh_store_session_lifecycle()
 
             self._manager.stop_services()
@@ -3340,7 +3916,7 @@ class LMCacheConnectorV1Impl:
         peer_sidecars: tuple[KVConnectorRequestSidecar, ...],
     ) -> None:
         """Bind one target request to the exact KMesh scheduler sidecar."""
-        if not self._is_kmesh_serial_pic_target():
+        if not self._is_kmesh_pic_target():
             return
         if self._role != KVConnectorRole.SCHEDULER:
             raise RuntimeError("KMesh request evidence may only bind on the scheduler")
@@ -3560,7 +4136,7 @@ class LMCacheConnectorV1Impl:
         """Cancel probes that did not receive allocation in this round."""
         self._ensure_lookup_attempt_state()
         attempts = tuple(self._prealloc_lookup_ids.items())
-        if self._is_kmesh_serial_pic_target():
+        if self._is_kmesh_pic_target():
             first_error: Optional[BaseException] = None
             for request_id, lookup_id in attempts:
                 error = self._cancel_kmesh_prealloc_attempt(request_id, lookup_id)
@@ -3601,7 +4177,7 @@ class LMCacheConnectorV1Impl:
             the number of tokens that can be loaded from the
             external KV cache beyond what is already computed.
         """
-        if self._is_kmesh_serial_pic_target():
+        if self._is_kmesh_pic_target():
             if self._role != KVConnectorRole.SCHEDULER:
                 raise RuntimeError("KMesh target lookup may only run on the scheduler")
             request_id = self._kmesh_request_id(request)
@@ -3619,7 +4195,8 @@ class LMCacheConnectorV1Impl:
                 return 0
             if type(num_computed_tokens) is not int or num_computed_tokens != 0:
                 raise ValueError(
-                    "serial_pic_v1 requires exactly zero local computed tokens"
+                    f"{self._target_profile} requires exactly zero local "
+                    "computed tokens"
                 )
             if self.lookup_client is None:
                 raise RuntimeError("KMesh target requires a scheduler lookup client")
@@ -3879,7 +4456,7 @@ class LMCacheConnectorV1Impl:
         if the CacheManager this allocated blocks for us.
         """
 
-        if self._is_kmesh_serial_pic_target():
+        if self._is_kmesh_pic_target():
             if self._role != KVConnectorRole.SCHEDULER:
                 raise RuntimeError("KMesh allocation state belongs to the scheduler")
             if type(num_external_tokens) is not int or num_external_tokens < 0:
@@ -4752,7 +5329,7 @@ class LMCacheConnectorV1Impl:
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         """Build metadata and make its lookup ownership handoff transactional."""
-        if self._is_kmesh_serial_pic_target():
+        if self._is_kmesh_pic_target():
             try:
                 self._cancel_unscheduled_prealloc_lookups()
                 _new_ids, _cached_ids, finished_ids = (
@@ -5075,7 +5652,7 @@ class LMCacheConnectorV1Impl:
         ):
             self._layerwise_save_storers.pop(request.request_id, None)
 
-        if self._is_kmesh_serial_pic_target():
+        if self._is_kmesh_pic_target():
             if self._role != KVConnectorRole.SCHEDULER:
                 raise RuntimeError("KMesh request completion belongs to scheduler")
             request_id = self._kmesh_request_id(request)
