@@ -2,7 +2,7 @@
 
 # Standard
 from contextlib import nullcontext
-from typing import List, Optional, Union
+from typing import List, Optional, Sequence, Union, cast
 import threading
 
 # Third Party
@@ -18,6 +18,7 @@ from lmcache.v1.memory_allocators.paged_tensor_memory_allocator import (
 from lmcache.v1.memory_allocators.tensor_memory_allocator import TensorMemoryAllocator
 from lmcache.v1.memory_management import (
     AddressManager,
+    AllocationReceipt,
     MemoryAllocatorInterface,
     MemoryFormat,
     MemoryObj,
@@ -32,6 +33,25 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
               (2) byte_array buffer memory.
     """
 
+    _cpu_memory_allocation_receipt: memory_management.CPUMemoryAllocationReceipt
+
+    @staticmethod
+    def _prepare_partial_state(allocator: "MixedMemoryAllocator") -> None:
+        """Install close-safe defaults before reserving the pinned arena."""
+        allocator.numa_mapping = None
+        allocator.use_hugepages = False
+        allocator.align_bytes = AddressManager.ALIGN_BYTES
+        allocator.shm_name = None
+        allocator.size = 0
+        allocator._cpu_memory_allocation_receipt = (
+            memory_management.CPUMemoryAllocationReceipt()
+        )
+        allocator.buffer = None
+        allocator._unregistered = True
+        allocator.pin_allocator = cast(MemoryAllocatorInterface, None)
+        allocator.host_mem_lock = nullcontext()
+        allocator.buffer_allocator = cast(BufferAllocator, None)
+
     def __init__(
         self, size: int, use_paging: bool = False, use_hugepages: bool = False, **kwargs
     ) -> None:
@@ -40,6 +60,7 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
         :param bool use_hugepages: Whether to use hugepages.
         """
 
+        MixedMemoryAllocator._prepare_partial_state(self)
         self.numa_mapping = kwargs.get("numa_mapping", None)
         self.use_hugepages = use_hugepages
         self.align_bytes = kwargs.get("align_bytes", AddressManager.ALIGN_BYTES)
@@ -57,11 +78,38 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
 
         self.size = size
 
-        self.buffer = memory_management._allocate_cpu_memory(
-            size, self.numa_mapping, self.shm_name, use_hugepages=use_hugepages
-        )
-
+        # False means this retained allocator is responsible for either the
+        # receipt published above or for verifying that allocation unwound.
         self._unregistered = False
+        receipt = self._cpu_memory_allocation_receipt
+        buffer = memory_management._allocate_cpu_memory(
+            size,
+            self.numa_mapping,
+            self.shm_name,
+            use_hugepages=use_hugepages,
+            ownership_receipt=receipt,
+        )
+        if receipt.buffer is not buffer:
+            # Preserve compatibility with injected/legacy allocation helpers
+            # that accept but do not populate the new receipt. Production
+            # _allocate_cpu_memory has already adopted before returning.
+            free_size = self.size
+            free_numa_mapping = self.numa_mapping
+            free_shm_name = self.shm_name
+            free_use_hugepages = self.use_hugepages
+            receipt.retain_buffer(
+                buffer,
+                lambda: memory_management._free_cpu_memory(
+                    buffer,
+                    free_size,
+                    free_numa_mapping,
+                    free_shm_name,
+                    use_hugepages=free_use_hugepages,
+                ),
+            )
+        # This is now an operational mirror. The prepublished receipt remains
+        # the terminal owner if this STORE_ATTR is interrupted.
+        self.buffer = buffer
 
         self.pin_allocator: MemoryAllocatorInterface
         if use_paging:
@@ -79,13 +127,23 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
                 fmt=kwargs["fmt"],
             )
         else:
-            self.pin_allocator = TensorMemoryAllocator(
-                self.buffer, align_bytes=self.align_bytes
+            # The Tensor allocator does not own a second arena, but retaining
+            # its raw identity makes every nested construction state explicit.
+            pin_allocator = TensorMemoryAllocator.__new__(TensorMemoryAllocator)
+            self.pin_allocator = pin_allocator
+            TensorMemoryAllocator.__init__(
+                pin_allocator,
+                self.buffer,
+                align_bytes=self.align_bytes,
             )
 
         self.host_mem_lock = threading.Lock() if not use_paging else nullcontext()
 
         self.buffer_allocator = BufferAllocator("cpu")
+
+    def supports_allocation_receipts(self) -> bool:
+        """Return whether the selected pinned allocator has exact reservations."""
+        return isinstance(self.pin_allocator, TensorMemoryAllocator)
 
     @_lmcache_nvtx_annotate
     def allocate(
@@ -94,6 +152,7 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
         dtypes: Union[torch.dtype, list[torch.dtype]],
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         allocator_type: Optional[str] = None,
+        allocation_receipt: Optional[AllocationReceipt] = None,
     ) -> Optional[MemoryObj]:
         """Allocate one object from the mixed pinned/buffer allocator.
 
@@ -110,6 +169,10 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
             ValueError: If ``fmt`` is unsupported.
         """
         if fmt == MemoryFormat.BINARY_BUFFER:
+            if allocation_receipt is not None:
+                raise NotImplementedError(
+                    "buffer allocations do not support address receipts"
+                )
             return self.buffer_allocator.allocate(shapes, dtypes, fmt)
         elif fmt in [
             MemoryFormat.KV_2LTD,
@@ -119,8 +182,24 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
             MemoryFormat.EC_TD,
             MemoryFormat.HS_TD,
         ]:
+            if (
+                allocation_receipt is not None
+                and not self.supports_allocation_receipts()
+            ):
+                raise NotImplementedError(
+                    "paged mixed allocations are outside the exact receipt path"
+                )
             with self.host_mem_lock:
-                obj = self.pin_allocator.allocate(shapes, dtypes, fmt, str(self))
+                if allocation_receipt is None:
+                    obj = self.pin_allocator.allocate(shapes, dtypes, fmt, str(self))
+                else:
+                    obj = self.pin_allocator.allocate(
+                        shapes,
+                        dtypes,
+                        fmt,
+                        str(self),
+                        allocation_receipt=allocation_receipt,
+                    )
                 if isinstance(obj, TensorMemoryObj):
                     obj.parent_allocator = self
                 return obj
@@ -135,6 +214,7 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
         batch_size: int,
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         allocator_type: Optional[str] = None,
+        allocation_receipts: Optional[Sequence[AllocationReceipt]] = None,
     ) -> Optional[List[MemoryObj]]:
         """Allocate multiple objects from the mixed pinned/buffer allocator.
 
@@ -152,6 +232,10 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
             ValueError: If ``fmt`` is unsupported.
         """
         if fmt == MemoryFormat.BINARY_BUFFER:
+            if allocation_receipts is not None:
+                raise NotImplementedError(
+                    "buffer allocations do not support address receipts"
+                )
             return self.buffer_allocator.batched_allocate(
                 shapes, dtypes, batch_size, fmt
             )
@@ -163,10 +247,27 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
             MemoryFormat.EC_TD,
             MemoryFormat.HS_TD,
         ]:
-            with self.host_mem_lock:
-                objs = self.pin_allocator.batched_allocate(
-                    shapes, dtypes, batch_size, fmt, str(self)
+            if (
+                allocation_receipts is not None
+                and not self.supports_allocation_receipts()
+            ):
+                raise NotImplementedError(
+                    "paged mixed allocations are outside the exact receipt path"
                 )
+            with self.host_mem_lock:
+                if allocation_receipts is None:
+                    objs = self.pin_allocator.batched_allocate(
+                        shapes, dtypes, batch_size, fmt, str(self)
+                    )
+                else:
+                    objs = self.pin_allocator.batched_allocate(
+                        shapes,
+                        dtypes,
+                        batch_size,
+                        fmt,
+                        str(self),
+                        allocation_receipts=allocation_receipts,
+                    )
                 if objs is not None:
                     for obj in objs:
                         if isinstance(obj, TensorMemoryObj):
@@ -246,19 +347,19 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
 
     def close(self) -> None:
         """Release the owned pinned CPU arena."""
-        if not self._unregistered:
-            if torch_dev.is_available():
-                torch_dev.synchronize()
-            if self.buffer.numel() == 0:
-                return
-            memory_management._free_cpu_memory(
-                self.buffer,
-                self.size,
-                self.numa_mapping,
-                self.shm_name,
-                use_hugepages=self.use_hugepages,
-            )
-            self._unregistered = True
+        if getattr(self, "_unregistered", True):
+            return
+        receipt = getattr(self, "_cpu_memory_allocation_receipt", None)
+        if not isinstance(receipt, memory_management.CPUMemoryAllocationReceipt):
+            raise RuntimeError("pinned CPU arena has no exact ownership receipt")
+        receipt.finish_allocation_for_close()
+        if not receipt.outcome_known:
+            raise RuntimeError("pinned CPU arena allocation outcome is unresolved")
+        buffer = receipt.buffer
+        if buffer is not None and buffer.numel() != 0 and torch_dev.is_available():
+            torch_dev.synchronize()
+        receipt.release()
+        self._unregistered = receipt.released
 
     def get_paged_buffers(self) -> Optional[tuple[torch.Tensor, ...]]:
         """

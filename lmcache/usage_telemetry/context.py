@@ -11,6 +11,7 @@ from __future__ import annotations
 
 # Standard
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
 import threading
@@ -35,6 +36,8 @@ from lmcache.usage_telemetry.transport import (
     build_usage_payload,
     usage_server_url,
 )
+from lmcache.v1.lifecycle import RetainedCall
+from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
 
 if TYPE_CHECKING:
     # First Party
@@ -130,6 +133,98 @@ class UsageContext(UsageContextBase):
         super().__init__(DeploymentMode.SINGLE_PROCESS, local_log, sender)
         self._config = config
         self._metadata = metadata
+        self._thread_state_lock = threading.RLock()
+        self._closing = False
+        self._closed = False
+        # Publish the exact Thread before anyone can start it.  The engine can
+        # therefore retain this context before ``Thread.start()`` enters its
+        # ambiguous caller-interruption window.
+        self._report_thread = self._make_report_thread()
+        self._start_call = RetainedCall(
+            self._report_thread.start,
+            thread_name="lmcache-usage-report-start",
+        )
+        self._start_admitted = False
+
+    REPORT_THREAD_JOIN_TIMEOUT_SECONDS = 10.0
+
+    def _make_report_thread(self) -> threading.Thread:
+        """Build, but do not start, the one-shot reporting thread."""
+        return threading.Thread(
+            target=self.report_once,
+            daemon=True,
+            name="lmcache-usage-report",
+        )
+
+    @property
+    def report_thread(self) -> threading.Thread:
+        """Return the exact retained reporting thread."""
+        return self._report_thread
+
+    @property
+    def thread_alive(self) -> bool:
+        """Return whether the retained reporting thread is still live."""
+        return self._report_thread.is_alive()
+
+    @property
+    def closed(self) -> bool:
+        """Return whether terminal shutdown proved the thread is absent."""
+        with self._thread_state_lock:
+            return self._closed
+
+    def start_reporting(self) -> None:
+        """Start the retained thread unless terminal shutdown won the race."""
+        with self._thread_state_lock:
+            if self._closing or self._closed:
+                return
+            # Admission publishes before the retained attempt can start.  A
+            # concurrent close therefore waits for this exact attempt rather
+            # than mistaking its temporarily unstarted Thread for no work.
+            self._start_admitted = True
+            start_call = self._start_call
+        start_call.run()
+
+    def close(self) -> None:
+        """Fence startup and join the exact reporting thread.
+
+        A timeout is reported truthfully and leaves this context retryable.
+        Once close begins the startup fence is permanent, so a never-started
+        reporter can be declared closed without creating new background work.
+        """
+        with self._thread_state_lock:
+            if self._closed:
+                return
+            self._closing = True
+            thread = self._report_thread
+            start_admitted = self._start_admitted
+            start_call = self._start_call
+            if not start_admitted:
+                self._closed = True
+                return
+
+        try:
+            # If startup was admitted, first finish (or recover) its exact
+            # retained attempt.  Only then is never-started a stable fact.
+            start_call.run()
+        except BaseException as error:
+            if start_call.last_error is not error:
+                raise
+            # An exact Thread.start failure before its side effect is terminal
+            # and owns no thread.  A failure raised after start retains a
+            # populated Thread identity and must still be joined below.
+            if thread.ident is None:
+                with self._thread_state_lock:
+                    self._closed = True
+                return
+
+        if thread is threading.current_thread():
+            raise RuntimeError("usage reporting thread cannot join itself")
+        thread.join(timeout=self.REPORT_THREAD_JOIN_TIMEOUT_SECONDS)
+        if thread.is_alive():
+            raise LMCacheTimeoutError("usage reporting thread did not terminate")
+
+        with self._thread_state_lock:
+            self._closed = True
 
     def _collect_messages(self) -> list[UsageMessage]:
         metadata_message = MetadataMessage(
@@ -149,6 +244,7 @@ def InitializeUsageContext(
     metadata: LMCacheMetadata,
     local_log: str | None = None,
     sender: UsageMessageSender | None = None,
+    retain_context: Callable[[UsageContext], None] | None = None,
 ) -> UsageContext | None:
     """Start one-shot usage reporting for a single-process engine.
 
@@ -161,6 +257,8 @@ def InitializeUsageContext(
         local_log: Path of a local log of sent payloads; ``None`` disables
             local logging.
         sender: Message transport; ``None`` selects the default HTTP sender.
+        retain_context: Optional ownership callback invoked with the complete
+            context (including its unstarted Thread) before startup begins.
 
     Returns:
         The usage context, or ``None`` when usage tracking is disabled or
@@ -170,7 +268,7 @@ def InitializeUsageContext(
         return None
     logger.info("Initializing usage context.")
     context = UsageContext(config, metadata, local_log, sender)
-    threading.Thread(
-        target=context.report_once, daemon=True, name="lmcache-usage-report"
-    ).start()
+    if retain_context is not None:
+        retain_context(context)
+    context.start_reporting()
     return context

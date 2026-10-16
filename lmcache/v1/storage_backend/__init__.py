@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections import OrderedDict
-from typing import TYPE_CHECKING, AbstractSet, Optional
+from typing import TYPE_CHECKING, AbstractSet, Callable, Optional
 import asyncio
 import importlib  # Added for dynamic import
 
@@ -116,6 +116,7 @@ def CreateStorageBackends(
     lmcache_worker: Optional["LMCacheWorker"] = None,
     skip_backends: Optional[AbstractSet[str]] = None,
     existing_backends: Optional[OrderedDict[str, StorageBackendInterface]] = None,
+    retain_backend: Optional[Callable[[str, StorageBackendInterface], None]] = None,
 ) -> OrderedDict[str, StorageBackendInterface]:
     if is_cuda_worker(metadata):
         dst_device = f"{torch_device_type}:{torch_dev.current_device()}"
@@ -178,12 +179,28 @@ def CreateStorageBackends(
         if "LocalCPUBackend" in _skip:
             pass  # Skipped — already exists
         elif config.max_local_cpu_size > 0:
-            local_cpu_backend = LocalCPUBackend(
-                config,
-                metadata,
-                dst_device,
-                lmcache_worker,
-            )
+            if retain_backend is None:
+                local_cpu_backend = LocalCPUBackend(
+                    config,
+                    metadata,
+                    dst_device,
+                    lmcache_worker,
+                )
+            else:
+                # The target LocalCPU backend owns a pinned arena. Publish its
+                # raw identity into StorageManager before __init__ can allocate
+                # that arena or construct a controller sender. Constructor-side
+                # BaseException then leaves a reachable partial backend.
+                local_cpu_backend = LocalCPUBackend.__new__(LocalCPUBackend)
+                LocalCPUBackend._prepare_partial_state(local_cpu_backend)
+                retain_backend("LocalCPUBackend", local_cpu_backend)
+                LocalCPUBackend.__init__(
+                    local_cpu_backend,
+                    config,
+                    metadata,
+                    dst_device,
+                    lmcache_worker,
+                )
             backend_name = str(local_cpu_backend)
             storage_backends[backend_name] = local_cpu_backend
         else:

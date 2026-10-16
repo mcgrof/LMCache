@@ -59,7 +59,19 @@ class RpcClientTransport(abc.ABC):
 
     @abc.abstractmethod
     def close(self) -> None:
-        """Close the transport and release resources."""
+        """Close the transport and release every owned resource.
+
+        Implementations must surface incomplete closure and remain retryable;
+        callers cannot publish lifecycle completion while transport resources
+        are still live.
+
+        Raises:
+            RuntimeError: One or more transport resources remain live. A later
+                call may retry closure.
+
+        Returns:
+            None.
+        """
         raise NotImplementedError
 
 

@@ -43,16 +43,27 @@ class VLLMModelTracker:
         cls,
         instance_id: str,
         vllm_model: nn.Module,
-    ):
+    ) -> None:
         """
         Register a vllm model by instance_id.
+
+        Args:
+            instance_id: Engine instance that owns ``vllm_model``.
+            vllm_model: The loaded vLLM model used by CacheBlend.
+
+        Raises:
+            ValueError: If another model is already registered for the same
+                live engine instance.
         """
         logger.info(f"Registering vllm model for {instance_id}")
         if instance_id not in cls._vllm_models:
             cls._vllm_models[instance_id] = vllm_model
+        elif cls._vllm_models[instance_id] is vllm_model:
+            logger.info("vllm model for %s is already registered", instance_id)
         else:
-            logger.warning(
-                f"vllm model for {instance_id} already registered, doing nothing."
+            raise ValueError(
+                f"A different vllm model is already registered for {instance_id}. "
+                "Destroy the old LMCache engine before registering a replacement."
             )
 
     @classmethod
@@ -66,3 +77,19 @@ class VLLMModelTracker:
         if instance_id not in cls._vllm_models:
             raise ValueError(f"vllm model for {instance_id} not found.")
         return cls._vllm_models[instance_id]
+
+    @classmethod
+    def unregister_model(cls, instance_id: str) -> bool:
+        """Remove the model retained for an engine instance.
+
+        Args:
+            instance_id: Engine instance whose model should be forgotten.
+
+        Returns:
+            ``True`` when an entry existed, otherwise ``False``.
+        """
+        model = cls._vllm_models.pop(instance_id, None)
+        if model is None:
+            return False
+        logger.info("Unregistered vllm model for %s", instance_id)
+        return True

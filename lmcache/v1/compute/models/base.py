@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
 
 # Third Party
 from torch import nn
@@ -10,6 +11,10 @@ import torch
 from lmcache import torch_device_type
 from lmcache.v1.compute.attention.utils import infer_attn_backend_from_vllm
 from lmcache.v1.compute.positional_encoding import get_fused_rope
+
+if TYPE_CHECKING:
+    # First Party
+    from lmcache.v1.compute.blend.blender import LMCBlendSession
 
 # TODO(Jiayi): A few things need to be tested/supported:
 # TP, PP, Multimodal
@@ -68,6 +73,7 @@ class LMCBaseModel(nn.Module, ABC):
     def compute_layer(
         self,
         input_ids: torch.Tensor,
+        session: "LMCBlendSession",
     ):
         input_ids = input_ids.to(torch_device_type)
         # Compatible with both old vLLM (get_input_embeddings) and
@@ -125,7 +131,14 @@ class LMCBaseModel(nn.Module, ABC):
             q, k, v = self._process_qkv(q, k, v, layer)
 
             q, k, v, residual, attn_output, attn_metadata = self.blender.process_qkv(
-                q, k, v, residual, idx, attn_output, attn_metadata
+                q,
+                k,
+                v,
+                residual,
+                idx,
+                attn_output,
+                attn_metadata,
+                session,
             )
 
             num_heads = self.vllm_attn_layers[idx].num_heads

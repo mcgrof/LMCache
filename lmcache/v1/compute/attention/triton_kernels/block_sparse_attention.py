@@ -13,6 +13,9 @@ Sparse structure: block_indptr [num_q_blocks+1], block_indices [nnz_blocks]
 Output: O [M, H, D], LSE [M, H] (log-sum-exp for blending)
 """
 
+# Standard
+from typing import Optional
+
 # Third Party
 import torch
 import triton
@@ -28,6 +31,7 @@ def _block_sparse_attn_fwd_kernel(
     LSE_ptr,
     block_indices_ptr,  # [nnz_blocks] int32 — which KV blocks to attend
     block_indptr_ptr,  # [num_q_blocks+1] int32 — CSR row pointers
+    query_positions_ptr,  # [seq_len_q] int64 — original token positions
     sm_scale: tl.constexpr,
     seq_len_q,  # total query length
     seq_len_k,  # total KV length
@@ -51,6 +55,7 @@ def _block_sparse_attn_fwd_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,  # query block size (typically 64 or 128)
     BLOCK_N: tl.constexpr,  # KV block size (typically 64 or 128)
+    APPLY_CAUSAL_POSITIONS: tl.constexpr,
 ):
     """Block-sparse attention forward kernel.
 
@@ -106,6 +111,12 @@ def _block_sparse_attn_fwd_kernel(
         + d_offs[None, :] * stride_qd
     )
     q = tl.load(q_ptrs, mask=q_mask[:, None], other=0.0)
+    if APPLY_CAUSAL_POSITIONS:
+        query_positions = tl.load(
+            query_positions_ptr + q_offs,
+            mask=q_mask,
+            other=-1,
+        )
 
     # Online softmax accumulators
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
@@ -132,8 +143,18 @@ def _block_sparse_attn_fwd_kernel(
         # Compute QK^T: [BLOCK_M, BLOCK_N]
         qk = tl.dot(q, tl.trans(k)) * sm_scale
 
-        # Mask invalid KV positions
-        qk = tl.where(kv_mask[None, :], qk, float("-inf"))
+        # Mask invalid KV positions. CacheBlend's selected query rows retain
+        # their original prompt positions, so apply an exact causal boundary
+        # rather than treating the compacted query index as its token index.
+        if APPLY_CAUSAL_POSITIONS:
+            causal_mask = kv_offs[None, :] <= query_positions[:, None]
+            qk = tl.where(
+                kv_mask[None, :] & causal_mask,
+                qk,
+                float("-inf"),
+            )
+        else:
+            qk = tl.where(kv_mask[None, :], qk, float("-inf"))
 
         # Online softmax update
         m_ij = tl.max(qk, axis=1)
@@ -395,6 +416,8 @@ def block_sparse_attention(
     block_indptr: torch.Tensor,  # [num_q_blocks+1] int32
     sm_scale: float,
     block_size: int = 64,
+    *,
+    query_positions: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute block-sparse attention.
 
@@ -406,6 +429,8 @@ def block_sparse_attention(
         block_indptr: [num_q_blocks+1] CSR row pointers
         sm_scale: softmax scale (1/sqrt(head_dim))
         block_size: block size for both Q and KV (default 64)
+        query_positions: Optional original prompt position for every compacted
+            query row. When present, the kernel applies exact causal masking.
 
     Returns:
         output: [M, H, D] attention output
@@ -415,6 +440,18 @@ def block_sparse_attention(
     N = key.shape[0]
     KV_H = key.shape[1]  # num_kv_heads (may differ from H for GQA)
 
+    if query_positions is not None and (
+        type(query_positions) is not torch.Tensor
+        or query_positions.dtype != torch.int64
+        or query_positions.ndim != 1
+        or len(query_positions) != M
+        or query_positions.device != query.device
+        or not query_positions.is_contiguous()
+    ):
+        raise ValueError(
+            "query_positions must be a contiguous device-local int64 vector"
+        )
+
     output = torch.empty_like(query)
     lse = torch.empty(M, H, dtype=torch.float32, device=query.device)
 
@@ -423,6 +460,9 @@ def block_sparse_attention(
     num_csr_rows = block_indptr.shape[0] - 1
 
     grid = (num_q_blocks, H)
+    query_positions_arg = (
+        query_positions if query_positions is not None else block_indptr
+    )
 
     _block_sparse_attn_fwd_kernel[grid](
         query,
@@ -432,6 +472,7 @@ def block_sparse_attention(
         lse,
         block_indices,
         block_indptr,
+        query_positions_arg,
         sm_scale,
         M,
         N,
@@ -455,6 +496,7 @@ def block_sparse_attention(
         HEAD_DIM=D,
         BLOCK_M=block_size,
         BLOCK_N=block_size,
+        APPLY_CAUSAL_POSITIONS=query_positions is not None,
     )
 
     return output, lse

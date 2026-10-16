@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, cast
 import asyncio
 import threading
 
@@ -47,7 +47,6 @@ from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.rpc_utils import (
     DEFAULT_SOCKET_RECV_TIMEOUT_MS,
     DEFAULT_SOCKET_SEND_TIMEOUT_MS,
-    close_zmq_socket,
     get_ip,
     get_zmq_context,
     get_zmq_socket,
@@ -75,6 +74,7 @@ class LMCacheWorker:
         metadata: LMCacheMetadata,
         lmcache_engine: "LMCacheEngine",
     ):
+        LMCacheWorker._prepare_partial_state(self)
         # TODO (Jiayi): "instance_id" might not be needed anymore.
         # Please consider removing it.
         self.config = config
@@ -180,13 +180,15 @@ class LMCacheWorker:
         self.thread = threading.Thread(
             target=self.loop.run_forever, daemon=True, name="lmcache-worker-thread"
         )
+
+        # Publish all state consumed by the loop before Thread.start(). A
+        # constructor-side BaseException after startup can then stop and join
+        # the exact thread without racing missing queue state.
+        self.msg_queue: asyncio.Queue[WorkerMsg] = asyncio.Queue()
+        self._full_sync_sender: Optional["FullSyncSender"] = None
         self.thread.start()
         asyncio.run_coroutine_threadsafe(self.start_all(), self.loop)
-
-        self.msg_queue: asyncio.Queue[WorkerMsg] = asyncio.Queue()
-
-        # Full sync sender (initialized lazily when needed)
-        self._full_sync_sender: Optional["FullSyncSender"] = None
+        self._construction_complete = True
 
     async def register(self):
         """
@@ -650,16 +652,91 @@ class LMCacheWorker:
                 f"worker {self.worker_id} error: {e}"
             )
 
-    def close(self):
-        self.deregister()
-        if self.loop.is_running():
-            self.loop.call_soon_threadsafe(self.loop.stop)
-        if self.thread.is_alive():
-            self.thread.join()
-        self.loop.close()
-        close_zmq_socket(self.push_socket)
-        close_zmq_socket(self.reply_socket)
-        if self.heartbeat_socket is not None:
-            close_zmq_socket(self.heartbeat_socket)
-        if hasattr(self, "req_socket"):
-            close_zmq_socket(self.req_socket)
+    def close(self) -> None:
+        """Close every published child, including after partial construction."""
+        first_error: Optional[BaseException] = None
+
+        if self._construction_complete:
+            try:
+                self.deregister()
+            except BaseException as error:
+                first_error = error
+
+        loop = self.loop
+        thread = self.thread
+        if loop is not None:
+            try:
+                if not loop.is_closed() and (
+                    loop.is_running() or (thread is not None and thread.is_alive())
+                ):
+                    loop.call_soon_threadsafe(loop.stop)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+
+        if thread is not None:
+            try:
+                if thread.is_alive():
+                    thread.join(timeout=5.0)
+                    if thread.is_alive():
+                        raise RuntimeError("LMCacheWorker thread did not stop")
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+
+        if loop is not None:
+            try:
+                if not loop.is_closed() and (thread is None or not thread.is_alive()):
+                    loop.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+
+        for name in (
+            "push_socket",
+            "reply_socket",
+            "heartbeat_socket",
+            "req_socket",
+        ):
+            socket = getattr(self, name)
+            if socket is None:
+                continue
+            socket_error: Optional[BaseException] = None
+            try:
+                socket.setsockopt(zmq.LINGER, 0)  # type: ignore[attr-defined]
+            except BaseException as error:
+                socket_error = error
+            try:
+                socket.close()
+            except BaseException as error:
+                if socket_error is None:
+                    socket_error = error
+                else:
+                    error.__context__ = socket_error
+                    socket_error = error
+            else:
+                # LINGER is advisory for this terminal path. Once close itself
+                # succeeds, the exact resource is gone and must not leave a
+                # permanently failed construction owner behind.
+                socket_error = None
+                setattr(self, name, None)
+            if first_error is None and socket_error is not None:
+                first_error = socket_error
+
+        if first_error is not None:
+            raise first_error
+
+    @staticmethod
+    def _prepare_partial_state(worker: "LMCacheWorker") -> None:
+        """Install close-safe defaults before creating sockets or a thread."""
+        worker.lmcache_instance_id = None
+        worker.context = None
+        worker.push_socket = None
+        worker.reply_socket = None
+        worker.heartbeat_socket = None
+        worker.req_socket = None
+        # Public methods operate only on a constructed worker; terminal close
+        # deliberately tolerates these two pre-construction sentinels.
+        worker.loop = cast(asyncio.AbstractEventLoop, None)
+        worker.thread = cast(threading.Thread, None)
+        worker._construction_complete = False

@@ -1006,6 +1006,131 @@ def scenario_single_layer_kv_transfer(ops: Any, device: str) -> dict[str, torch.
     return results
 
 
+@pytest.mark.parametrize(
+    ("engine_kv_format", "is_hnd"),
+    [
+        (_py_ops.EngineKVFormat.NL_X_NB_NH_BS_CS, True),
+        (_py_ops.EngineKVFormat.NL_X_NB_BS_NH_CS, False),
+    ],
+)
+@pytest.mark.parametrize("token_major", [False, True])
+def test_single_layer_unified_kv_transfer_matches_packed_layout(
+    engine_kv_format: Any,
+    is_hnd: bool,
+    token_major: bool,
+) -> None:
+    """Check both transfer directions against independent packed-K/V layouts."""
+    num_tokens = 4
+    num_blocks = 2
+    block_size = 6
+    num_heads = 2
+    head_size = 3
+    hidden_size = num_heads * head_size
+    slot_mapping = torch.tensor([0, 5, -1, 11], dtype=torch.int64)
+    cache_shape = (
+        (num_blocks, num_heads, block_size, 2 * head_size)
+        if is_hnd
+        else (num_blocks, block_size, num_heads, 2 * head_size)
+    )
+
+    token_major_lmc = torch.arange(
+        1,
+        1 + num_tokens * 2 * hidden_size,
+        dtype=torch.float32,
+    ).reshape(num_tokens, 2, hidden_size)
+    lmc_h2d = (
+        token_major_lmc.clone()
+        if token_major
+        else token_major_lmc.permute(1, 0, 2).contiguous()
+    )
+    lmc_h2d_before = lmc_h2d.clone()
+    cache_h2d = torch.full(cache_shape, -1000.0)
+    expected_cache = cache_h2d.clone()
+    for token_index, slot in enumerate(slot_mapping.tolist()):
+        if slot < 0:
+            continue
+        block_index, block_offset = divmod(slot, block_size)
+        packed_token = torch.cat(
+            (
+                token_major_lmc[token_index, 0].reshape(num_heads, head_size),
+                token_major_lmc[token_index, 1].reshape(num_heads, head_size),
+            ),
+            dim=-1,
+        )
+        if is_hnd:
+            expected_cache[block_index, :, block_offset, :] = packed_token
+        else:
+            expected_cache[block_index, block_offset, :, :] = packed_token
+
+    _py_ops.single_layer_kv_transfer(
+        lmc_h2d,
+        cache_h2d,
+        slot_mapping,
+        _py_ops.TransferDirection.H2D,
+        engine_kv_format,
+        token_major,
+    )
+
+    torch.testing.assert_close(cache_h2d, expected_cache)
+    torch.testing.assert_close(lmc_h2d, lmc_h2d_before)
+
+    cache_d2h = torch.arange(
+        100,
+        100 + torch.tensor(cache_shape).prod().item(),
+        dtype=torch.float32,
+    ).reshape(cache_shape)
+    cache_d2h_before = cache_d2h.clone()
+    expected_token_major = torch.full(
+        (num_tokens, 2, hidden_size),
+        -2000.0,
+    )
+    for token_index, slot in enumerate(slot_mapping.tolist()):
+        if slot < 0:
+            continue
+        block_index, block_offset = divmod(slot, block_size)
+        packed_token = (
+            cache_d2h[block_index, :, block_offset, :]
+            if is_hnd
+            else cache_d2h[block_index, block_offset, :, :]
+        )
+        key_token, value_token = packed_token.split(head_size, dim=-1)
+        expected_token_major[token_index, 0] = key_token.reshape(hidden_size)
+        expected_token_major[token_index, 1] = value_token.reshape(hidden_size)
+    expected_lmc = (
+        expected_token_major
+        if token_major
+        else expected_token_major.permute(1, 0, 2).contiguous()
+    )
+    lmc_d2h = torch.full_like(expected_lmc, -2000.0)
+
+    _py_ops.single_layer_kv_transfer(
+        lmc_d2h,
+        cache_d2h,
+        slot_mapping,
+        _py_ops.TransferDirection.D2H,
+        engine_kv_format,
+        token_major,
+    )
+
+    torch.testing.assert_close(lmc_d2h, expected_lmc)
+    torch.testing.assert_close(cache_d2h, cache_d2h_before)
+
+
+def test_single_layer_unified_kv_transfer_rejects_odd_content_size() -> None:
+    lmc = torch.zeros((2, 1, 6), dtype=torch.float32)
+    cache = torch.zeros((1, 1, 2, 7), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="content size must be positive and even"):
+        _py_ops.single_layer_kv_transfer(
+            lmc,
+            cache,
+            torch.tensor([0], dtype=torch.int64),
+            _py_ops.TransferDirection.D2H,
+            _py_ops.EngineKVFormat.NL_X_NB_BS_NH_CS,
+            token_major=False,
+        )
+
+
 def scenario_single_layer_kv_transfer_sgl(
     ops: Any, device: str
 ) -> dict[str, torch.Tensor]:

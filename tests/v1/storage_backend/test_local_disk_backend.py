@@ -170,6 +170,213 @@ class TestLocalDiskBackend:
         assert str(local_disk_backend) == "LocalDiskBackend"
         local_disk_backend.local_cpu_backend.memory_allocator.close()
 
+    def test_batched_get_allocation_failure_rolls_back_transaction(
+        self,
+        local_disk_backend: LocalDiskBackend,
+        async_loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        keys = [create_test_key(10), create_test_key(11)]
+        disk_entries = [
+            DiskCacheMetadata(
+                path=f"/tmp/nonexistent-{index}",
+                size=1,
+                shape=torch.Size([1]),
+                dtype=torch.float32,
+                fmt=MemoryFormat.KV_2LTD,
+            )
+            for index in range(2)
+        ]
+        with local_disk_backend.disk_lock:
+            for key, disk_entry in zip(keys, disk_entries, strict=True):
+                local_disk_backend.dict[key] = disk_entry
+                local_disk_backend.cache_policy.update_on_put(key)
+
+        staging_obj = MagicMock(spec=MemoryObj)
+        with patch.object(
+            local_disk_backend.local_cpu_backend,
+            "allocate",
+            side_effect=[staging_obj, None],
+        ):
+            with patch.object(
+                local_disk_backend.disk_worker,
+                "submit_task",
+            ) as submit_task:
+                with pytest.raises(MemoryError, match="staging allocation failed"):
+                    async_loop.run_until_complete(
+                        local_disk_backend.batched_get_non_blocking(
+                            "allocation-failure",
+                            keys,
+                        )
+                    )
+
+        submit_task.assert_not_called()
+        assert [entry.pin_count for entry in disk_entries] == [0, 0]
+        staging_obj.pin.assert_called_once_with()
+        staging_obj.unpin.assert_called_once_with()
+        staging_obj.ref_count_down.assert_called_once_with()
+        assert local_disk_backend.disk_lock.acquire(blocking=False)
+        local_disk_backend.disk_lock.release()
+        local_disk_backend.local_cpu_backend.memory_allocator.close()
+
+    @pytest.mark.parametrize("outcome", ["success", "read_failure", "cancelled"])
+    def test_batched_get_releases_exact_owners_after_disk_task(
+        self,
+        local_disk_backend: LocalDiskBackend,
+        async_loop: asyncio.AbstractEventLoop,
+        outcome: str,
+    ) -> None:
+        keys = [create_test_key(12), create_test_key(13)]
+        disk_entries = [
+            DiskCacheMetadata(
+                path=f"/tmp/nonexistent-{index}",
+                size=1,
+                shape=torch.Size([1]),
+                dtype=torch.float32,
+                fmt=MemoryFormat.KV_2LTD,
+            )
+            for index in range(2)
+        ]
+        with local_disk_backend.disk_lock:
+            for key, disk_entry in zip(keys, disk_entries, strict=True):
+                local_disk_backend.dict[key] = disk_entry
+                local_disk_backend.cache_policy.update_on_put(key)
+
+        staging_objs = [MagicMock(spec=MemoryObj), MagicMock(spec=MemoryObj)]
+
+        async def execute_disk_task(task_type, task, **kwargs):
+            assert task_type == "prefetch"
+            if outcome == "cancelled":
+                raise asyncio.CancelledError
+            return task(**kwargs)
+
+        read_side_effect = [None, OSError("injected disk read failure")]
+        with patch.object(
+            local_disk_backend.local_cpu_backend,
+            "allocate",
+            side_effect=staging_objs,
+        ):
+            with patch.object(
+                local_disk_backend.disk_worker,
+                "submit_task",
+                side_effect=execute_disk_task,
+            ):
+                with patch.object(
+                    local_disk_backend,
+                    "read_file",
+                    side_effect=read_side_effect if outcome == "read_failure" else None,
+                ):
+                    operation = local_disk_backend.batched_get_non_blocking(
+                        "disk-task",
+                        keys,
+                    )
+                    if outcome == "read_failure":
+                        with pytest.raises(OSError, match="disk read failure"):
+                            async_loop.run_until_complete(operation)
+                    elif outcome == "cancelled":
+                        with pytest.raises(asyncio.CancelledError):
+                            async_loop.run_until_complete(operation)
+                    else:
+                        result = async_loop.run_until_complete(operation)
+                        assert result == staging_objs
+
+        # Disk-entry pins are internal to the I/O transaction and are released
+        # exactly once on both paths.
+        assert [entry.pin_count for entry in disk_entries] == [0, 0]
+        for staging_obj in staging_objs:
+            staging_obj.pin.assert_called_once_with()
+            if outcome != "success":
+                staging_obj.unpin.assert_called_once_with()
+                staging_obj.ref_count_down.assert_called_once_with()
+            else:
+                staging_obj.unpin.assert_not_called()
+                staging_obj.ref_count_down.assert_not_called()
+        local_disk_backend.local_cpu_backend.memory_allocator.close()
+
+    def test_batched_get_cancellation_drains_inflight_disk_read(
+        self,
+        local_disk_backend: LocalDiskBackend,
+        async_loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        keys = [create_test_key(14), create_test_key(15)]
+        disk_entries = [
+            DiskCacheMetadata(
+                path=f"/tmp/nonexistent-{index}",
+                size=1,
+                shape=torch.Size([1]),
+                dtype=torch.float32,
+                fmt=MemoryFormat.KV_2LTD,
+            )
+            for index in range(2)
+        ]
+        with local_disk_backend.disk_lock:
+            for key, disk_entry in zip(keys, disk_entries, strict=True):
+                local_disk_backend.dict[key] = disk_entry
+                local_disk_backend.cache_policy.update_on_put(key)
+
+        staging_objs = [MagicMock(spec=MemoryObj), MagicMock(spec=MemoryObj)]
+        read_started = threading.Event()
+        release_read = threading.Event()
+
+        def blocked_read(*args) -> None:
+            del args
+            read_started.set()
+            assert release_read.wait(timeout=5)
+
+        async def cancel_inflight_read() -> None:
+            operation = asyncio.create_task(
+                local_disk_backend.batched_get_non_blocking(
+                    "inflight-cancellation",
+                    keys,
+                )
+            )
+            assert await asyncio.to_thread(read_started.wait, 2)
+
+            operation.cancel()
+            await asyncio.sleep(0.01)
+            operation.cancel()
+            await asyncio.sleep(0.01)
+
+            # Cancellation must not release resources while the thread can
+            # still touch either staging buffer.
+            assert not operation.done()
+            assert [entry.pin_count for entry in disk_entries] == [1, 1]
+            for staging_obj in staging_objs:
+                staging_obj.unpin.assert_not_called()
+                staging_obj.ref_count_down.assert_not_called()
+
+            release_read.set()
+            with pytest.raises(asyncio.CancelledError):
+                await operation
+
+            assert [entry.pin_count for entry in disk_entries] == [0, 0]
+            for staging_obj in staging_objs:
+                staging_obj.unpin.assert_called_once_with()
+                staging_obj.ref_count_down.assert_called_once_with()
+
+            # A cancelled caller must not cancel the executor's completion
+            # Future and kill its reusable workers via InvalidStateError.
+            assert all(
+                not worker.done()
+                for worker in local_disk_backend.disk_worker.executor._workers
+            )
+            await local_disk_backend.disk_worker.executor.shutdown_async(wait=True)
+
+        with patch.object(
+            local_disk_backend.local_cpu_backend,
+            "allocate",
+            side_effect=staging_objs,
+        ):
+            with patch.object(
+                local_disk_backend,
+                "read_file",
+                side_effect=blocked_read,
+            ) as read_file:
+                async_loop.run_until_complete(cancel_inflight_read())
+
+        assert read_file.call_count == 2
+        local_disk_backend._read_thread_pool.shutdown(wait=True)
+        local_disk_backend.local_cpu_backend.memory_allocator.close()
+
     def test_key_to_path(self, local_disk_backend):
         """Test key to path conversion."""
         key = create_test_key(1)
@@ -186,6 +393,33 @@ class TestLocalDiskBackend:
         assert not local_disk_backend.contains(key)
         assert not local_disk_backend.contains(key, pin=True)
 
+        local_disk_backend.local_cpu_backend.memory_allocator.close()
+
+    def test_nonterminal_remove_refuses_pinned_entry(self, local_disk_backend) -> None:
+        key = create_test_key(20)
+        path = local_disk_backend._key_to_path(key)
+        with open(path, "wb") as disk_file:
+            disk_file.write(b"x")
+        metadata = DiskCacheMetadata(
+            path=path,
+            size=1,
+            shape=torch.Size([1]),
+            dtype=torch.float32,
+            fmt=MemoryFormat.KV_2LTD,
+        )
+        with local_disk_backend.disk_lock:
+            local_disk_backend.dict[key] = metadata
+            local_disk_backend.usage = 1
+
+        assert local_disk_backend.pin(key)
+        assert not local_disk_backend.remove(key, force=False)
+        assert key in local_disk_backend.dict
+        assert os.path.exists(path)
+
+        assert local_disk_backend.unpin(key)
+        assert local_disk_backend.remove(key, force=False)
+        assert key not in local_disk_backend.dict
+        assert not os.path.exists(path)
         local_disk_backend.local_cpu_backend.memory_allocator.close()
 
     def test_get_blocking_key_not_exists(self, local_disk_backend):

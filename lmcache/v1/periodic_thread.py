@@ -193,6 +193,19 @@ class PeriodicThread(ABC):
         return self._running and self._thread is not None and self._thread.is_alive()
 
     @property
+    def thread_alive(self) -> bool:
+        """Return whether the backing thread remains alive.
+
+        Unlike :attr:`is_running`, this stays true after a bounded stop has
+        requested shutdown but the current execution has not returned yet.
+        Lifecycle owners use it to avoid releasing a still-live thread.
+
+        Returns:
+            ``True`` while the backing thread is alive; otherwise ``False``.
+        """
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
     def stop_requested(self) -> bool:
         """Whether a stop has been requested (set by stop, reset by start)."""
         return self._stop_event.is_set()
@@ -261,18 +274,23 @@ class PeriodicThread(ABC):
         Args:
             timeout: Maximum time to wait for thread termination in seconds
         """
-        if not self._running:
+        thread = self._thread
+        if not self._running and (thread is None or not thread.is_alive()):
             return
 
-        logger.info("Stopping PeriodicThread: %s", self._name)
-        self._running = False
-        self._stop_event.set()
-        # Break the interval sleep so the loop notices stop immediately.
-        self._wake_event.set()
+        if self._running:
+            logger.info("Stopping PeriodicThread: %s", self._name)
+            self._running = False
+            self._stop_event.set()
+            # Break the interval sleep so the loop notices stop immediately.
+            self._wake_event.set()
 
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=timeout)
-            if self._thread.is_alive():
+        # A previous bounded stop may have set _running=False while the thread
+        # was still inside _execute(). Retry the join instead of treating that
+        # state as already stopped.
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+            if thread.is_alive():
                 logger.warning(
                     "PeriodicThread %s did not terminate within %.1fs timeout",
                     self._name,
@@ -461,12 +479,23 @@ class PeriodicThreadRegistry:
 
         Args:
             thread: The PeriodicThread to register
+
+        Raises:
+            RuntimeError: A different exact thread instance already owns the
+                same name. Ownership lasts until explicit unregistration,
+                including before start and after stop.
+
+        Returns:
+            None.
         """
         with self._registry_lock:
-            if thread.name in self._threads:
-                logger.warning(
-                    "PeriodicThread %s is already registered, replacing",
-                    thread.name,
+            registered = self._threads.get(thread.name)
+            if registered is thread:
+                return
+            if registered is not None:
+                raise RuntimeError(
+                    f"PeriodicThread {thread.name} is already registered by "
+                    "a different instance"
                 )
             self._threads[thread.name] = thread
             logger.debug("Registered PeriodicThread: %s", thread.name)
@@ -486,6 +515,26 @@ class PeriodicThreadRegistry:
             if thread:
                 logger.debug("Unregistered PeriodicThread: %s", name)
             return thread
+
+    def unregister_instance(self, thread: PeriodicThread) -> bool:
+        """Unregister a specific periodic-thread instance atomically.
+
+        A later thread may reuse the same name. Identity matching prevents
+        cleanup of an older failed construction from unregistering that newer
+        owner.
+
+        Args:
+            thread: The exact periodic-thread instance to unregister.
+
+        Returns:
+            True if this instance was registered and removed; otherwise False.
+        """
+        with self._registry_lock:
+            if self._threads.get(thread.name) is not thread:
+                return False
+            del self._threads[thread.name]
+            logger.debug("Unregistered PeriodicThread: %s", thread.name)
+            return True
 
     def unregister_all(self) -> None:
         """Unregister all periodic threads."""

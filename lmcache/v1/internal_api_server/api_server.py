@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 import asyncio
 import os
 import threading
@@ -20,6 +20,8 @@ if TYPE_CHECKING:
     from lmcache.v1.manager import LMCacheManager
 
 logger = init_logger(__name__)
+
+_INTERNAL_API_SERVER_CLOSE_TIMEOUT_SECONDS = 5.0
 
 
 def _build_app() -> FastAPI:
@@ -61,6 +63,7 @@ class InternalAPIServer:
         include_index_list = config.internal_api_server_include_index_list
 
         self.enable = True
+        self.thread: Optional[threading.Thread] = None
         if not config.internal_api_server_enabled or (
             include_index_list and port_offset not in include_index_list
         ):
@@ -116,13 +119,17 @@ class InternalAPIServer:
     def start(self):
         if not self.enable:
             return
+        if self.thread is not None and self.thread.is_alive():
+            logger.info("LMCache internal API server is already running")
+            return
         logger.info("Starting LMCache internal API server on %s", self.server_log_info)
-        threading.Thread(
+        self.thread = threading.Thread(
             target=asyncio.run,
             args=(self.run(),),
             daemon=True,
             name="api-server-thread",
-        ).start()
+        )
+        self.thread.start()
 
     def stop(self):
         if not self.enable:
@@ -132,3 +139,12 @@ class InternalAPIServer:
             self.server.should_exit = True
             if self.socket_path and os.path.exists(self.socket_path):
                 os.unlink(self.socket_path)
+        thread = self.thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=_INTERNAL_API_SERVER_CLOSE_TIMEOUT_SECONDS)
+            if thread.is_alive():
+                raise RuntimeError(
+                    "internal API server thread did not terminate within "
+                    f"{_INTERNAL_API_SERVER_CLOSE_TIMEOUT_SECONDS:.1f}s"
+                )
+        self.thread = None

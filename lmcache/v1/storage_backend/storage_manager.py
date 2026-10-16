@@ -5,6 +5,7 @@ from concurrent.futures import Future
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Coroutine,
     Dict,
     Generator,
@@ -18,6 +19,7 @@ from typing import (
 import asyncio
 import functools
 import threading
+import weakref
 
 # Third Party
 import torch
@@ -33,9 +35,12 @@ from lmcache.utils import (
 )
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager, EventStatus, EventType
+from lmcache.v1.lifecycle import RetainedCall
 from lmcache.v1.memory_management import (
+    AllocationReceipt,
     MemoryFormat,
     MemoryObj,
+    RefCountDownReceipt,
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend import CreateStorageBackends, is_cuda_worker
@@ -66,6 +71,9 @@ def allocate_and_copy_objects(
     keys: Sequence[CacheEngineKey],
     src_memory_objs: list[MemoryObj],
     stream: Any,
+    on_allocate: Optional[Callable[[MemoryObj], None]] = None,
+    on_copy_start: Optional[Callable[[Any], None]] = None,
+    on_copy_synchronized: Optional[Callable[[Any], None]] = None,
 ) -> tuple[Sequence[CacheEngineKey], list[MemoryObj]]:
     """
     Allocate the memory objects and copy the data from src_memory_objs to
@@ -78,6 +86,12 @@ def allocate_and_copy_objects(
         src_memory_objs: the memory objects to copy from
         stream: the device-specific GPU stream to run the copy in
             (e.g., torch_dev.Stream on CUDA or XPU)
+        on_allocate: Callback that adopts each object immediately after
+            allocation and before any tensor access, copy, or synchronize.
+        on_copy_start: Callback that arms retry ownership immediately before
+            the first asynchronous copy is submitted to ``stream``.
+        on_copy_synchronized: Callback after all submitted copies have been
+            proven complete by a successful stream synchronization.
 
     Returns:
         - list of cache engine keys that corresponds to the memory objects
@@ -85,6 +99,7 @@ def allocate_and_copy_objects(
         - list of the memory objects that has been successfully allocated
     """
     allocated_objects = []
+    copy_fence_armed = False
     for key, src_memory_obj in zip(keys, src_memory_objs, strict=False):
         if allocator_backend.contains(key):
             continue
@@ -99,6 +114,9 @@ def allocate_and_copy_objects(
         if memory_obj is None:
             break
 
+        if on_allocate is not None:
+            on_allocate(memory_obj)
+
         if memory_obj.tensor is None:
             # This should not happen with current implementation,
             # but handle it defensively to avoid memory leak
@@ -106,15 +124,22 @@ def allocate_and_copy_objects(
                 "Allocated MemoryObj has None tensor, this is unexpected. "
                 "Releasing the memory object."
             )
-            memory_obj.ref_count_down()
+            if on_allocate is None:
+                memory_obj.ref_count_down()
             break
 
+        if stream is not None and not copy_fence_armed:
+            if on_copy_start is not None:
+                on_copy_start(stream)
+            copy_fence_armed = True
         with torch_dev.stream(stream):
             memory_obj.tensor.copy_(src_memory_obj.tensor, non_blocking=True)
         allocated_objects.append(memory_obj)
 
     if stream is not None:
         stream.synchronize()
+        if copy_fence_armed and on_copy_synchronized is not None:
+            on_copy_synchronized(stream)
     return keys[: len(allocated_objects)], allocated_objects
 
 
@@ -215,11 +240,373 @@ class AsyncSingleSerializer:
 AsyncSerializer = Union[AsyncSingleSerializer, AsyncMultiSerializer]
 
 
+class StorageManagerClosedError(RuntimeError):
+    """Put admission was refused without consuming caller-owned references."""
+
+
+class PutOwnershipReceipt:
+    """Shared proof of an all-or-nothing batched-put ownership transfer."""
+
+    _NOT_ADOPTED = object()
+
+    def __init__(
+        self,
+        memory_objs: Sequence[MemoryObj],
+        ref_count_down_receipts: Optional[
+            Sequence[Optional[RefCountDownReceipt]]
+        ] = None,
+    ):
+        self._memory_obj_ids = tuple(id(memory_obj) for memory_obj in memory_objs)
+        self._ref_count_down_receipts: tuple[Optional[RefCountDownReceipt], ...]
+        if ref_count_down_receipts is None:
+            self._ref_count_down_receipts = tuple(None for _ in memory_objs)
+        else:
+            if len(ref_count_down_receipts) != len(memory_objs):
+                raise ValueError("batched-put release receipt count does not match")
+            self._ref_count_down_receipts = tuple(ref_count_down_receipts)
+        self._attachment_token: Optional[object] = None
+        self._adopted_attachment_token: object = self._NOT_ADOPTED
+        self._lock = threading.RLock()
+
+    @property
+    def adopted(self) -> bool:
+        with self._lock:
+            return self._adopted_attachment_token is not self._NOT_ADOPTED
+
+    def owns(self, memory_obj: MemoryObj) -> bool:
+        """Return whether StorageManager adopted this exact batch member."""
+        with self._lock:
+            return (
+                self._adopted_attachment_token is not self._NOT_ADOPTED
+                and id(memory_obj) in self._memory_obj_ids
+            )
+
+    def owns_for(self, attachment_token: object, memory_obj: MemoryObj) -> bool:
+        """Return whether one exact outer owner transferred this member."""
+        with self._lock:
+            return (
+                self._adopted_attachment_token is attachment_token
+                and id(memory_obj) in self._memory_obj_ids
+            )
+
+    def matches(self, memory_objs: Sequence[MemoryObj]) -> bool:
+        """Return whether this receipt describes exactly ``memory_objs``."""
+        with self._lock:
+            return self._memory_obj_ids == tuple(
+                id(memory_obj) for memory_obj in memory_objs
+            )
+
+    def _adopt(self) -> None:
+        """Commit transfer while both caller and manager share this receipt."""
+        with self._lock:
+            self._adopted_attachment_token = self._attachment_token
+
+    def _attach(self) -> object:
+        """Bind this receipt to one outer cleanup owner exactly once."""
+        with self._lock:
+            if self._attachment_token is not None:
+                raise RuntimeError("batched-put ownership receipt was reattached")
+            if self._adopted_attachment_token is not self._NOT_ADOPTED:
+                raise RuntimeError("adopted batched-put receipt cannot be attached")
+            attachment_token = object()
+            self._attachment_token = attachment_token
+            return attachment_token
+
+    def _release_receipts(self) -> tuple[Optional[RefCountDownReceipt], ...]:
+        """Return the exact per-reference receipts transferred on adoption."""
+        with self._lock:
+            return self._ref_count_down_receipts
+
+
+class _PutOperationLease:
+    """Weakly observed proof that a batched-put call is still live."""
+
+
+class _PutRefCleanupOwner:
+    """Retry owner for references consumed by one batched put."""
+
+    def __init__(
+        self,
+        memory_objs: Sequence[MemoryObj],
+        ownership_receipt: Optional[PutOwnershipReceipt] = None,
+        operation_lease: Optional[_PutOperationLease] = None,
+    ):
+        self._memory_objs = list(memory_objs)
+        self._ownership_receipt = ownership_receipt
+        self._release_receipts: dict[int, Optional[RefCountDownReceipt]] = {}
+        if ownership_receipt is not None:
+            self._release_receipts.update(
+                enumerate(ownership_receipt._release_receipts())
+            )
+        # Duck-typed test objects do not implement the production receipt API.
+        # Their legacy markers remain test-only; every concrete runtime
+        # MemoryObj used by serial_pic_v1 supplies an object-owned receipt.
+        self._legacy_released: set[int] = set()
+        self._copy_sync_stream: Any = None
+        self._copy_sync_pending = False
+        self._pending = False
+        self._operation_lease_ref = (
+            weakref.ref(operation_lease) if operation_lease is not None else None
+        )
+        self._lock = threading.RLock()
+
+    @property
+    def pending(self) -> bool:
+        with self._lock:
+            return self._pending
+
+    @property
+    def complete(self) -> bool:
+        with self._lock:
+            if (
+                self._ownership_receipt is not None
+                and not self._ownership_receipt.adopted
+            ):
+                return True
+            return not self._copy_sync_pending and all(
+                self._release_complete(index, memory_obj)
+                for index, memory_obj in enumerate(self._memory_objs)
+            )
+
+    @property
+    def operation_alive(self) -> bool:
+        """Return whether the batched-put frame still owns its strong lease."""
+        lease_ref = self._operation_lease_ref
+        return lease_ref is None or lease_ref() is not None
+
+    def add(self, memory_objs: Sequence[MemoryObj]) -> None:
+        """Add newly allocated references before backend submission."""
+        with self._lock:
+            if self._pending:
+                raise RuntimeError("cannot add references to pending put cleanup")
+            self._memory_objs.extend(memory_objs)
+
+    def _receipt_for(
+        self,
+        index: int,
+        memory_obj: MemoryObj,
+    ) -> Optional[RefCountDownReceipt]:
+        if index in self._release_receipts:
+            return self._release_receipts[index]
+        try:
+            receipt = memory_obj.make_ref_count_down_receipt()
+        except (AttributeError, NotImplementedError):
+            if isinstance(memory_obj, MemoryObj):
+                raise RuntimeError(
+                    f"{type(memory_obj).__name__} lacks an exact release receipt"
+                ) from None
+            receipt = None
+        self._release_receipts[index] = receipt
+        return receipt
+
+    def _release_complete(self, index: int, memory_obj: MemoryObj) -> bool:
+        receipt = self._release_receipts.get(index)
+        if receipt is None:
+            return index in self._legacy_released
+        return memory_obj.ref_count_down_receipt_complete(receipt)
+
+    def mark_pending(self) -> None:
+        """Publish terminal cleanup with one non-fallible pointer assignment."""
+        self._pending = True
+
+    def arm_copy_sync(self, stream: Any) -> None:
+        """Fence references before asynchronous copy submission."""
+        with self._lock:
+            if self._pending:
+                raise RuntimeError("cannot arm copy sync on pending put cleanup")
+            if self._copy_sync_pending and self._copy_sync_stream is not stream:
+                raise RuntimeError("put cleanup already owns another copy stream")
+            self._copy_sync_stream = stream
+            self._copy_sync_pending = True
+
+    def mark_copy_synchronized(self, stream: Any) -> None:
+        """Record proof that every armed copy on ``stream`` completed."""
+        with self._lock:
+            if not self._copy_sync_pending or self._copy_sync_stream is not stream:
+                raise RuntimeError("put cleanup has no matching copy sync fence")
+            self._copy_sync_pending = False
+            self._copy_sync_stream = None
+
+    def drain(self) -> Optional[BaseException]:
+        """Release every outstanding reference, retaining failed entries."""
+        first_error: Optional[BaseException] = None
+        with self._lock:
+            if not self._pending:
+                return None
+            if (
+                self._ownership_receipt is not None
+                and not self._ownership_receipt.adopted
+            ):
+                return None
+            if self._copy_sync_pending:
+                try:
+                    self._copy_sync_stream.synchronize()
+                except BaseException as error:
+                    return error
+                self._copy_sync_pending = False
+                self._copy_sync_stream = None
+            for index, memory_obj in enumerate(self._memory_objs):
+                receipt = self._receipt_for(index, memory_obj)
+                if receipt is None and index in self._legacy_released:
+                    continue
+                try:
+                    if receipt is None:
+                        memory_obj.ref_count_down()
+                    else:
+                        memory_obj.ref_count_down_once(receipt)
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+                else:
+                    if receipt is None:
+                        self._legacy_released.add(index)
+        return first_error
+
+
+class _BackendCloseOwner:
+    """Retained completion receipt for one storage-backend close."""
+
+    def __init__(self, manager: "StorageManager", name: str, backend: Any):
+        self.backend = backend
+        retry_capability = getattr(backend, "close_failure_is_retry_safe", None)
+
+        def retry_safe(error: BaseException) -> bool:
+            if retry_capability is None:
+                return False
+            return bool(retry_capability(error))
+
+        self._call = RetainedCall(
+            backend.close,
+            retry_safe_failure=retry_safe,
+            thread_name=f"lmcache-close-{name}",
+            on_worker_start=manager._register_backend_close_worker,
+            on_worker_finish=manager._unregister_backend_close_worker,
+        )
+
+    @property
+    def complete(self) -> bool:
+        return self._call.complete
+
+    def close(self) -> None:
+        self._call.run()
+
+
 # TODO: extend this class to implement caching policies and eviction policies
 class StorageManager:
     """
     The StorageManager is responsible for managing the storage backends.
     """
+
+    config: LMCacheEngineConfig
+    metadata: LMCacheMetadata
+    event_manager: EventManager
+    lmcache_worker: Optional["LMCacheWorker"]
+    async_lookup_server: Optional["LMCacheAsyncLookupServer"]
+    loop: asyncio.AbstractEventLoop
+    thread: threading.Thread
+    storage_backends: OrderedDict[str, StorageBackendInterface]
+    manager_lock: Any
+    _put_cleanup_lock: Any
+    _put_cleanup_condition: threading.Condition
+    _put_cleanup_owners: dict[int, _PutRefCleanupOwner]
+    _put_cleanup_closed: bool
+    _put_cleanup_teardown_active: bool
+    _put_cleanup_teardown_owner: Optional[int]
+    _put_cleanup_teardown_token: Optional[object]
+    _closed_storage_backend_ids: set[int]
+    _storage_backend_close_owners: dict[int, _BackendCloseOwner]
+    _backend_close_worker_ids: set[int]
+    non_allocator_backends: list[str]
+    enable_pd: bool
+    allocator_backend: Optional[AllocatorBackendInterface]
+    local_cpu_backend: Optional[StorageBackendInterface]
+    instance_id: Any
+    worker_id: int
+    async_serializer: Optional[AsyncSerializer]
+    internal_copy_stream: Any
+    _freeze: bool
+    _freeze_lock: Any
+    _bypassed_backends: set[str]
+    _bypass_lock: Any
+
+    @staticmethod
+    def _prepare_partial_state(
+        manager: "StorageManager",
+        config: LMCacheEngineConfig,
+        metadata: LMCacheMetadata,
+        event_manager: EventManager,
+        lmcache_worker: Optional["LMCacheWorker"] = None,
+        async_lookup_server: Optional["LMCacheAsyncLookupServer"] = None,
+    ) -> None:
+        """Install a close-safe owner before construction starts resources.
+
+        ``LMCacheEngine.post_init`` calls this on a raw, already retained
+        manager.  ``__init__`` repeats it before opening the event loop so an
+        internal constructor failure at every later stage can be drained by
+        :meth:`close` without guessing which attributes exist.
+        """
+        manager.config = config
+        manager.metadata = metadata
+        manager.event_manager = event_manager
+        manager.lmcache_worker = lmcache_worker
+        manager.async_lookup_server = async_lookup_server
+
+        # The public surface requires constructed loop/thread values. Close is
+        # the sole partial-state consumer and explicitly handles these sentinels.
+        manager.loop = cast(asyncio.AbstractEventLoop, None)
+        manager.thread = cast(threading.Thread, None)
+        manager.storage_backends = OrderedDict()
+        manager.manager_lock = threading.Lock()
+        manager._put_cleanup_lock = threading.RLock()
+        manager._put_cleanup_condition = threading.Condition(manager._put_cleanup_lock)
+        manager._put_cleanup_owners = {}
+        manager._put_cleanup_closed = False
+        manager._put_cleanup_teardown_active = False
+        manager._put_cleanup_teardown_owner = None
+        manager._put_cleanup_teardown_token = None
+        manager._closed_storage_backend_ids = set()
+        manager._storage_backend_close_owners = {}
+        manager._backend_close_worker_ids = set()
+
+        manager.non_allocator_backends = []
+        manager.enable_pd = False
+        manager.allocator_backend = None
+        manager.local_cpu_backend = None
+        manager.instance_id = getattr(config, "lmcache_instance_id", "")
+        manager.worker_id = getattr(metadata, "worker_id", 0)
+        manager.async_serializer = None
+        manager.internal_copy_stream = None
+        manager._freeze = False
+        manager._freeze_lock = threading.RLock()
+        manager._bypassed_backends = set()
+        manager._bypass_lock = threading.RLock()
+
+    @staticmethod
+    def _create_and_publish_event_loop(manager: "StorageManager") -> None:
+        """Publish a new event loop or close the exact unpublished result.
+
+        ``asyncio.new_event_loop()`` returns a live resource. Keep it local
+        while publishing so an interruption before ``STORE_ATTR`` closes that
+        exact loop. If the assignment already committed, partial-construction
+        cleanup through :meth:`close` remains its sole terminal owner.
+        """
+        loop = asyncio.new_event_loop()
+        try:
+            manager.loop = loop
+        except BaseException as publication_error:
+            if manager.loop is loop:
+                raise
+            try:
+                loop.close()
+            except BaseException as cleanup_error:
+                # A failed close must not erase the exact loop. Replay the
+                # local publication so the retained manager can retry it.
+                try:
+                    manager.loop = loop
+                except BaseException:
+                    manager.loop = loop
+                raise publication_error from cleanup_error
+            raise
 
     def __init__(
         self,
@@ -229,9 +616,15 @@ class StorageManager:
         lmcache_worker: Optional["LMCacheWorker"] = None,
         async_lookup_server: Optional["LMCacheAsyncLookupServer"] = None,
     ):
-        self.config = config
-        self.metadata = metadata
-        self.loop = asyncio.new_event_loop()
+        StorageManager._prepare_partial_state(
+            self,
+            config,
+            metadata,
+            event_manager,
+            lmcache_worker,
+            async_lookup_server,
+        )
+        StorageManager._create_and_publish_event_loop(self)
 
         self.thread = threading.Thread(
             target=start_loop_in_thread_with_exceptions,
@@ -239,10 +632,6 @@ class StorageManager:
             name="storage-manager-event-loop",
         )
         self.thread.start()
-
-        self.storage_backends: OrderedDict[str, StorageBackendInterface] = OrderedDict()
-        self.manager_lock = threading.Lock()
-        self.lmcache_worker = lmcache_worker
 
         # Use the unified create path so that init and
         # dynamic creation share the same logic.
@@ -253,35 +642,16 @@ class StorageManager:
 
         self.enable_pd = config.enable_pd
 
-        self.allocator_backend = None
         if metadata.role != "scheduler":
             self.allocator_backend = self._get_allocator_backend(config)
 
         self.local_cpu_backend = self.storage_backends.get("LocalCPUBackend", None)
-
-        self.instance_id = config.lmcache_instance_id
-        self.worker_id = metadata.worker_id
-
-        self.event_manager = event_manager
-
-        self.async_lookup_server: Optional["LMCacheAsyncLookupServer"] = (
-            async_lookup_server
-        )
-        self.async_serializer: Optional[AsyncSerializer] = None
 
         # The GPU stream for internal copies during put
         if is_cuda_worker(metadata):
             self.internal_copy_stream = torch_dev.Stream()
         else:
             self.internal_copy_stream = None
-
-        # freeze mode: only use local_cpu backend for retrieval
-        self._freeze = False
-        self._freeze_lock = threading.RLock()
-
-        # Backend bypass mode: skip specific backends during health check failures
-        self._bypassed_backends: set[str] = set()
-        self._bypass_lock = threading.RLock()
 
         if not self.enable_pd and self.config.enable_async_loading:
             assert self.allocator_backend is not None
@@ -309,6 +679,152 @@ class StorageManager:
                 )
             )
 
+    def _ensure_put_cleanup_state(self) -> None:
+        """Initialize retry state for lightweight test and recovery objects."""
+        if not hasattr(self, "_put_cleanup_lock"):
+            self._put_cleanup_lock = threading.RLock()
+        if not hasattr(self, "_put_cleanup_condition"):
+            self._put_cleanup_condition = threading.Condition(self._put_cleanup_lock)
+        if not hasattr(self, "_put_cleanup_owners"):
+            self._put_cleanup_owners = {}
+        if not hasattr(self, "_put_cleanup_closed"):
+            self._put_cleanup_closed = False
+        if not hasattr(self, "_put_cleanup_teardown_active"):
+            self._put_cleanup_teardown_active = False
+        if not hasattr(self, "_put_cleanup_teardown_owner"):
+            self._put_cleanup_teardown_owner = None
+        if not hasattr(self, "_put_cleanup_teardown_token"):
+            self._put_cleanup_teardown_token = None
+        if not hasattr(self, "_closed_storage_backend_ids"):
+            self._closed_storage_backend_ids = set()
+        if not hasattr(self, "_storage_backend_close_owners"):
+            self._storage_backend_close_owners = {}
+        if not hasattr(self, "_backend_close_worker_ids"):
+            self._backend_close_worker_ids = set()
+
+    def _register_backend_close_worker(self) -> None:
+        self._ensure_put_cleanup_state()
+        with self._put_cleanup_lock:
+            self._backend_close_worker_ids.add(threading.get_ident())
+
+    def _unregister_backend_close_worker(self) -> None:
+        self._ensure_put_cleanup_state()
+        with self._put_cleanup_lock:
+            self._backend_close_worker_ids.discard(threading.get_ident())
+
+    def _register_put_cleanup(
+        self,
+        owner: _PutRefCleanupOwner,
+        ownership_receipt: Optional[PutOwnershipReceipt],
+    ) -> bool:
+        """Atomically admit a put and publish its reference ownership."""
+        self._ensure_put_cleanup_state()
+        with self._put_cleanup_lock:
+            if self._put_cleanup_closed:
+                return False
+
+            if ownership_receipt is None:
+                self._put_cleanup_owners[id(owner)] = owner
+                return True
+
+            # Serialize receipt adoption with both this manager's admission
+            # seal and accidental cross-manager receipt reuse. If an
+            # interruption lands after owner publication but before adoption,
+            # batched_put's finally block removes the unadopted owner without
+            # consuming caller references.
+            with ownership_receipt._lock:
+                if ownership_receipt.adopted:
+                    raise RuntimeError("batched-put ownership receipt was reused")
+                self._put_cleanup_owners[id(owner)] = owner
+                ownership_receipt._adopt()
+                return True
+
+    def _has_put_cleanup_owner(self, owner: _PutRefCleanupOwner) -> bool:
+        """Return whether ``owner`` was published in the manager ledger."""
+        self._ensure_put_cleanup_state()
+        with self._put_cleanup_lock:
+            return self._put_cleanup_owners.get(id(owner)) is owner
+
+    def finalize_put_cleanup(self, owner: _PutRefCleanupOwner) -> bool:
+        """Atomically publish put cleanup and verify its exact ledger owner.
+
+        Pending is the helper's first state transition under the ledger lock.
+        If interruption lands at any later boundary, public drains can recover
+        the registered owner. An unregistered rejection is marked only on its
+        private local object and remains a no-op.
+        """
+        self._ensure_put_cleanup_state()
+        with self._put_cleanup_lock:
+            owner.mark_pending()
+            return self._put_cleanup_owners.get(id(owner)) is owner
+
+    def _seal_put_cleanup_admission(self) -> None:
+        """Permanently reject new backend I/O before terminal cleanup."""
+        self._ensure_put_cleanup_state()
+        with self._put_cleanup_lock:
+            self._put_cleanup_closed = True
+
+    def _begin_put_cleanup_teardown(self, teardown_token: object) -> None:
+        """Seal admission and serialize retryable terminal teardown."""
+        self._ensure_put_cleanup_state()
+        with self._put_cleanup_condition:
+            caller = threading.get_ident()
+            while self._put_cleanup_teardown_token is not None:
+                if (
+                    self._put_cleanup_teardown_owner == caller
+                    or caller in self._backend_close_worker_ids
+                ):
+                    raise RuntimeError("storage manager close is reentrant")
+                self._put_cleanup_condition.wait()
+            self._put_cleanup_closed = True
+            owners = tuple(self._put_cleanup_owners.values())
+            active_put_count = sum(
+                owner.operation_alive and not owner.pending for owner in owners
+            )
+            if active_put_count != 0:
+                raise RuntimeError(
+                    "storage manager retained "
+                    f"{active_put_count} active batched-put owner(s)"
+                )
+            # Admission remains sealed permanently. Rejected puts return
+            # immediately and retain their caller-owned references, including
+            # puts re-entered synchronously from a backend close callback.
+            # The caller supplies the token before entering this method, so
+            # its finally block can release teardown even if interruption
+            # lands after publication but before this method returns.
+            self._put_cleanup_teardown_token = teardown_token
+            self._put_cleanup_teardown_owner = caller
+            self._put_cleanup_teardown_active = True
+
+    def _finish_put_cleanup_teardown(self, teardown_token: object) -> None:
+        """Release the teardown serializer and wake concurrent closers."""
+        self._ensure_put_cleanup_state()
+        with self._put_cleanup_condition:
+            if self._put_cleanup_teardown_token is not teardown_token:
+                return
+            # Clear the authoritative token first. The remaining fields are
+            # diagnostics; waiters use the token and cannot be stranded by an
+            # interruption between these assignments.
+            try:
+                self._put_cleanup_teardown_token = None
+                self._put_cleanup_teardown_active = False
+                self._put_cleanup_teardown_owner = None
+            finally:
+                self._put_cleanup_condition.notify_all()
+
+    def _active_put_cleanup_count(self) -> int:
+        """Return admitted puts that have not entered cleanup yet."""
+        self._ensure_put_cleanup_state()
+        with self._put_cleanup_lock:
+            owners = tuple(self._put_cleanup_owners.values())
+        return sum(owner.operation_alive and not owner.pending for owner in owners)
+
+    def _put_cleanup_owner_count(self) -> int:
+        """Return every active or pending batched-put owner."""
+        self._ensure_put_cleanup_state()
+        with self._put_cleanup_lock:
+            return len(self._put_cleanup_owners)
+
     def _get_allocator_backend(
         self, config: LMCacheEngineConfig
     ) -> AllocatorBackendInterface:
@@ -332,6 +848,7 @@ class StorageManager:
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction=True,
         busy_loop=True,
+        allocation_receipt: Optional[AllocationReceipt] = None,
     ) -> Optional[MemoryObj]:
         """
         Allocate memory object with memory allocator.
@@ -340,8 +857,25 @@ class StorageManager:
         # TODO (Jiayi): We might need to pre-allocate and management
         # disk in a similar way as CPU.
         assert self.allocator_backend is not None
+        if allocation_receipt is not None:
+            return self.allocator_backend.allocate(
+                shapes,
+                dtypes,
+                fmt,
+                eviction=eviction,
+                busy_loop=busy_loop,
+                allocation_receipt=allocation_receipt,
+            )
         return self.allocator_backend.allocate(
             shapes, dtypes, fmt, eviction=eviction, busy_loop=busy_loop
+        )
+
+    def supports_allocation_receipts(self) -> bool:
+        """Return whether the active allocation backend is exact-reservation safe."""
+        backend = getattr(self, "allocator_backend", None)
+        return bool(
+            backend is not None
+            and getattr(backend, "supports_allocation_receipts", lambda: False)()
         )
 
     @_lmcache_nvtx_annotate
@@ -353,6 +887,7 @@ class StorageManager:
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction=True,
         busy_loop=True,
+        allocation_receipts: Optional[Sequence[AllocationReceipt]] = None,
     ) -> Optional[list[MemoryObj]]:
         """
         Batched allocate memory object with memory allocator.
@@ -362,6 +897,16 @@ class StorageManager:
         # disk in a similar way as CPU.
         if self.allocator_backend is None:
             raise RuntimeError("Allocator backend not available for scheduler role")
+        if allocation_receipts is not None:
+            return self.allocator_backend.batched_allocate(
+                shapes,
+                dtypes,
+                batch_size,
+                fmt,
+                eviction=eviction,
+                busy_loop=busy_loop,
+                allocation_receipts=allocation_receipts,
+            )
         return self.allocator_backend.batched_allocate(
             shapes, dtypes, batch_size, fmt, eviction=eviction, busy_loop=busy_loop
         )
@@ -387,50 +932,149 @@ class StorageManager:
         memory_objs: List[MemoryObj],
         transfer_spec=None,
         location: Optional[str] = None,
+        ownership_receipt: Optional[PutOwnershipReceipt] = None,
     ) -> None:
         """
         Non-blocking function to batched put the memory objects into the
         storage backends.
         Do not store if the same object is being stored (handled here by
         storage manager) or has been stored (handled by storage backend).
+
+        An admitted call consumes one caller-owned reference per input object,
+        including when later backend work fails. A call rejected after close
+        raises :class:`StorageManagerClosedError` without consuming any input
+        reference. Callers that have an outer cleanup owner should pass a
+        matching :class:`PutOwnershipReceipt` and consult it after any
+        interruption to determine which owner committed the transfer.
         """
         # The dictionary from backend cname to objects and keys
         obj_dict: dict[
             str,
             tuple[Sequence[CacheEngineKey], list[MemoryObj]],
         ] = {}
-        if self.allocator_backend is None:
-            # For scheduler role, no allocator backend available
-            raise RuntimeError("Batched put not available for scheduler role")
-        obj_dict[get_backend_cname(self.allocator_backend)] = (
-            keys,
+        self._ensure_put_cleanup_state()
+        if ownership_receipt is not None and not ownership_receipt.matches(memory_objs):
+            raise ValueError(
+                "batched-put ownership receipt does not match memory objects"
+            )
+        operation_lease: Optional[_PutOperationLease] = _PutOperationLease()
+        cleanup_owner = _PutRefCleanupOwner(
             memory_objs,
+            ownership_receipt,
+            operation_lease,
         )
 
-        for backend_name, backend in self.storage_backends.items():
-            if location and backend_name != location:
-                continue
-            # Skip bypassed backends
-            with self._bypass_lock:
-                if backend_name in self._bypassed_backends:
-                    continue
-
-            allocator_backend = backend.get_allocator_backend()
-            cname = get_backend_cname(allocator_backend)
-            if cname not in obj_dict:
-                new_keys, new_objs = allocate_and_copy_objects(
-                    allocator_backend, keys, memory_objs, self.internal_copy_stream
+        # Once admission adopts the optional receipt, this call consumes one
+        # caller-owned reference for every input object even when later work
+        # raises. Before admission, the caller remains the sole owner.
+        operation_error: Optional[BaseException] = None
+        try:
+            io_admitted = self._register_put_cleanup(
+                cleanup_owner,
+                ownership_receipt,
+            )
+            if not io_admitted:
+                raise StorageManagerClosedError(
+                    "storage manager close has begun; caller retains "
+                    "batched-put references"
                 )
-                obj_dict[cname] = (new_keys, new_objs)
+            # Do not admit another put over failed release ownership. This
+            # call's owner is still active and is therefore not drained.
+            self.drain_pending_put_cleanups()
+            if self.allocator_backend is None:
+                raise RuntimeError("Batched put not available for scheduler role")
+            obj_dict[get_backend_cname(self.allocator_backend)] = (
+                keys,
+                memory_objs,
+            )
+            for backend_name, backend in self.storage_backends.items():
+                if location and backend_name != location:
+                    continue
+                # Skip bypassed backends
+                with self._bypass_lock:
+                    if backend_name in self._bypassed_backends:
+                        continue
 
-            # NOTE: the handling of exists_in_put_tasks
-            # is done in the backend
-            ks, objs = obj_dict[cname]
-            backend.batched_submit_put_task(ks, objs, transfer_spec=transfer_spec)
+                allocator_backend = backend.get_allocator_backend()
+                cname = get_backend_cname(allocator_backend)
+                if cname not in obj_dict:
+                    new_keys, new_objs = allocate_and_copy_objects(
+                        allocator_backend,
+                        keys,
+                        memory_objs,
+                        self.internal_copy_stream,
+                        on_allocate=lambda memory_obj: cleanup_owner.add([memory_obj]),
+                        on_copy_start=cleanup_owner.arm_copy_sync,
+                        on_copy_synchronized=cleanup_owner.mark_copy_synchronized,
+                    )
+                    obj_dict[cname] = (new_keys, new_objs)
 
-        for cname, (ks, objs) in obj_dict.items():
-            for memory_obj in objs:
-                memory_obj.ref_count_down()
+                # NOTE: the handling of exists_in_put_tasks
+                # is done in the backend
+                ks, objs = obj_dict[cname]
+                backend.batched_submit_put_task(
+                    ks,
+                    objs,
+                    transfer_spec=transfer_spec,
+                )
+        except BaseException as error:
+            operation_error = error
+            raise
+        finally:
+            # A dead lease lets public drains recover even if interruption
+            # lands on the finalization helper's first executable line.
+            operation_lease = None
+            # Registration can itself be interrupted after owner publication.
+            # Consult the ledger instead of a local flag so that exact owner is
+            # always finalized. An unadopted receipt makes drain non-consuming.
+            if self.finalize_put_cleanup(cleanup_owner):
+                cleanup_error = self._drain_put_cleanup_owner(cleanup_owner)
+                if cleanup_error is not None:
+                    if operation_error is None:
+                        raise cleanup_error
+                    logger.error(
+                        "Batched put reference cleanup also failed after %s: %s",
+                        operation_error,
+                        cleanup_error,
+                    )
+
+    def _drain_put_cleanup_owner(
+        self,
+        owner: _PutRefCleanupOwner,
+    ) -> Optional[BaseException]:
+        """Drain one pending owner and forget it only after exact release."""
+        error = owner.drain()
+        if owner.complete:
+            with self._put_cleanup_lock:
+                self._put_cleanup_owners.pop(id(owner), None)
+        return error
+
+    def drain_pending_put_cleanups(self) -> None:
+        """Retry every failed batched-put reference release exhaustively."""
+        self._ensure_put_cleanup_state()
+        first_error: Optional[BaseException] = None
+        with self._put_cleanup_lock:
+            owners = tuple(self._put_cleanup_owners.values())
+        for owner in owners:
+            if not owner.pending:
+                if owner.operation_alive:
+                    continue
+                if not self.finalize_put_cleanup(owner):
+                    continue
+            error = self._drain_put_cleanup_owner(owner)
+            if first_error is None and error is not None:
+                first_error = error
+        if first_error is not None:
+            raise first_error
+
+    def pending_put_cleanup_count(self) -> int:
+        """Return the number of retry-owned batched-put cleanup states."""
+        self._ensure_put_cleanup_state()
+        with self._put_cleanup_lock:
+            return sum(
+                owner.pending or not owner.operation_alive
+                for owner in self._put_cleanup_owners.values()
+            )
 
     def get(
         self,
@@ -538,6 +1182,16 @@ class StorageManager:
             coro = backend.batched_get_non_blocking("fake_lookup_id", keys_multi_chunk)
             task = asyncio.run_coroutine_threadsafe(coro, self.loop)
             yield task
+
+    def layerwise_batched_get_returns_pinned(
+        self,
+        location: Optional[str] = None,
+    ) -> bool:
+        """Whether layerwise get returns one caller-owned pin per object."""
+        if location is None:
+            location = "LocalCPUBackend"
+        backend = self.storage_backends[location]
+        return backend.batched_get_non_blocking_returns_pinned()
 
     def prefetch_single_done_callback(
         self,
@@ -1007,6 +1661,46 @@ class StorageManager:
 
         return total_hit_chunks, block_mapping
 
+    def iter_lookup_pins(
+        self,
+        keys: List[CacheEngineKey],
+        search_range: Optional[List[str]] = None,
+    ) -> Generator[Tuple[str, CacheEngineKey], None, None]:
+        """Yield progress after each exception-atomic lookup pin.
+
+        The full backend set is validated before the first ownership change.
+        Explicit-span pinning therefore fails closed when any selected backend
+        cannot guarantee that an exception leaves the current key unpinned.
+        """
+        active_backends = list(
+            self.get_active_storage_backends(search_range=search_range)
+        )
+        unsupported = [
+            backend_name
+            for backend_name, backend in active_backends
+            if not backend.supports_lookup_pin_progress()
+        ]
+        if unsupported:
+            raise NotImplementedError(
+                "explicit-span pinned lookup requires progress-safe backends; "
+                f"unsupported active backends: {unsupported}"
+            )
+
+        remaining = list(keys)
+        for backend_name, backend in active_backends:
+            hit_count = 0
+            for key in remaining:
+                if not backend.pin_for_lookup(key):
+                    break
+                hit_count += 1
+                # Control returns to the engine after every physical pin, so
+                # it can ledger this key before acquisition proceeds.
+                yield backend_name, key
+            if hit_count == len(remaining):
+                return
+            if hit_count:
+                remaining = remaining[hit_count:]
+
     def get_block_mapping(
         self, chunk_infos: List[Tuple[CacheEngineKey, int, int]]
     ) -> Dict[str, List[Tuple[CacheEngineKey, int, int]]]:
@@ -1046,6 +1740,7 @@ class StorageManager:
         self,
         key: CacheEngineKey,
         locations: Optional[List[str]] = None,
+        force: bool = True,
     ) -> int:
         """
         Remove the key and the corresponding cache in the specified
@@ -1066,7 +1761,7 @@ class StorageManager:
         for backend_name, backend in self.storage_backends.items():
             # TODO(Jiayi): need to handle remove in non-cpu backends
             if locations is None or backend_name in locations:
-                num_removed += backend.remove(key)
+                num_removed += backend.remove(key, force=force)
 
         return num_removed
 
@@ -1074,6 +1769,7 @@ class StorageManager:
         self,
         keys: List[CacheEngineKey],
         locations: Optional[List[str]] = None,
+        force: bool = True,
     ) -> int:
         """
         Batched remove the keys and the corresponding cache in the specified
@@ -1092,7 +1788,7 @@ class StorageManager:
         num_removed = 0
         for backend_name, backend in self.storage_backends.items():
             if locations is None or backend_name in locations:
-                num_removed += backend.batched_remove(keys)
+                num_removed += backend.batched_remove(keys, force=force)
 
         return num_removed
 
@@ -1114,11 +1810,16 @@ class StorageManager:
         for backend_name, backend in self.storage_backends.items():
             if locations is None or backend_name in locations:
                 for key in keys:
-                    backend.unpin(key)
+                    if not backend.unpin(key):
+                        raise RuntimeError(
+                            "lookup pin owner is missing from storage backend "
+                            f"{backend_name}: {key}"
+                        )
 
     def clear(
         self,
         locations: Optional[List[str]] = None,
+        force: bool = False,
     ) -> int:
         """
         Clear all caches in the specified locations.
@@ -1137,7 +1838,7 @@ class StorageManager:
             # TODO(Jiayi): need to handle remove in non-cpu backends
             if locations is None or backend_name in locations:
                 if hasattr(backend, "clear"):
-                    num_cleared_tokens += backend.clear()
+                    num_cleared_tokens += backend.clear(force=force)
                 else:
                     logger.warning(
                         "Storage backend %s does not support "
@@ -1287,6 +1988,7 @@ class StorageManager:
                 lmcache_worker=self.lmcache_worker,
                 skip_backends=existing_names,
                 existing_backends=self.storage_backends,
+                retain_backend=self._retain_constructing_backend,
             )
 
             created: Dict[str, str] = {}
@@ -1306,6 +2008,22 @@ class StorageManager:
                 self.local_cpu_backend = cpu
 
             return created
+
+    def _retain_constructing_backend(
+        self,
+        name: str,
+        backend: StorageBackendInterface,
+    ) -> None:
+        """Publish one raw backend before its constructor starts resources.
+
+        ``create_backends`` owns ``manager_lock`` while this callback runs.
+        Keeping the write lock-free here avoids re-entering that non-reentrant
+        lock and makes the identity publication the only state transition.
+        """
+        existing = self.storage_backends.get(name)
+        if existing is not None and existing is not backend:
+            raise RuntimeError(f"storage backend {name} changed identity")
+        self.storage_backends[name] = backend
 
     def recreate_backend(self, backend_name: str) -> Dict[str, str]:
         """
@@ -1388,38 +2106,102 @@ class StorageManager:
 
     def close(self):
         logger.info("Closing StorageManager...")
-
-        # Close all backends
-        for name, backend in self.storage_backends.items():
-            try:
-                logger.info("Closing storage backend: %s", name)
-                backend.close()
-                logger.info("Storage backend %s closed successfully", name)
-            except Exception as e:
-                logger.error("Error closing backend %s: %s", name, e)
-
-        # Stop event loop
+        teardown_token = object()
         try:
-            if self.loop.is_running():
-                logger.info("Stopping event loop...")
-                self.loop.call_soon_threadsafe(self.loop.stop)
-                logger.info("Event loop stop signaled")
-        except Exception as e:
-            logger.error("Error stopping event loop: %s", e)
-
-        # Wait for thread with timeout
-        if self.thread.is_alive():
-            logger.info("Waiting for storage manager thread to finish...")
-            self.thread.join(timeout=10.0)
-
-            if self.thread.is_alive():
-                logger.warning(
-                    "Storage manager thread did not terminate within 10s timeout. "
-                    "Proceeding with shutdown anyway."
+            self._begin_put_cleanup_teardown(teardown_token)
+            self.drain_pending_put_cleanups()
+            put_owner_count = self._put_cleanup_owner_count()
+            if put_owner_count != 0:
+                raise RuntimeError(
+                    "storage manager retained "
+                    f"{put_owner_count} batched-put cleanup owner(s)"
                 )
-            else:
-                logger.info("Storage manager thread terminated successfully")
-        else:
-            logger.info("Storage manager thread already stopped")
 
-        logger.info("Storage manager closed.")
+            first_error: Optional[BaseException] = None
+
+            # A backend that closed successfully is committed and skipped on
+            # retry.  Failed backends remain reachable and are retried while
+            # every other terminal resource is still attempted exhaustively.
+            for name, backend in self.storage_backends.items():
+                backend_id = id(backend)
+                owner = self._storage_backend_close_owners.get(backend_id)
+                if owner is None:
+                    owner = _BackendCloseOwner(self, name, backend)
+                    self._storage_backend_close_owners[backend_id] = owner
+                elif owner.backend is not backend:
+                    raise RuntimeError("storage backend identity was recycled")
+                if owner.complete:
+                    self._closed_storage_backend_ids.add(backend_id)
+                    continue
+                try:
+                    logger.info("Closing storage backend: %s", name)
+                    owner.close()
+                except BaseException as error:
+                    logger.error("Error closing backend %s: %s", name, error)
+                    if first_error is None:
+                        first_error = error
+                if owner.complete:
+                    self._closed_storage_backend_ids.add(backend_id)
+                    logger.info("Storage backend %s closed successfully", name)
+
+            # A failed backend may require the manager event loop to remain
+            # alive for its next close attempt. Preserve that dependency and
+            # propagate the exact backend failure before touching the loop.
+            if first_error is not None:
+                raise first_error
+
+            loop = getattr(self, "loop", None)
+            thread = getattr(self, "thread", None)
+
+            try:
+                # Queue stop even in the small interval after Thread.start()
+                # but before run_forever() publishes is_running(). The queued
+                # callback will stop the loop as soon as it begins running.
+                if (
+                    loop is not None
+                    and not loop.is_closed()
+                    and (
+                        loop.is_running() or (thread is not None and thread.is_alive())
+                    )
+                ):
+                    logger.info("Stopping event loop...")
+                    loop.call_soon_threadsafe(loop.stop)
+                    logger.info("Event loop stop signaled")
+            except BaseException as error:
+                logger.error("Error stopping storage event loop: %s", error)
+                if first_error is None:
+                    first_error = error
+
+            try:
+                if thread is not None and thread.is_alive():
+                    logger.info("Waiting for storage manager thread to finish...")
+                    thread.join(timeout=10.0)
+                    if thread.is_alive():
+                        raise RuntimeError(
+                            "storage manager thread did not terminate within 10s"
+                        )
+                    logger.info("Storage manager thread terminated successfully")
+                else:
+                    logger.info("Storage manager thread already stopped")
+            except BaseException as error:
+                logger.error("Error joining storage manager thread: %s", error)
+                if first_error is None:
+                    first_error = error
+
+            try:
+                if (
+                    loop is not None
+                    and not loop.is_closed()
+                    and (thread is None or not thread.is_alive())
+                ):
+                    loop.close()
+            except BaseException as error:
+                logger.error("Error closing storage event loop: %s", error)
+                if first_error is None:
+                    first_error = error
+
+            if first_error is not None:
+                raise first_error
+            logger.info("Storage manager closed.")
+        finally:
+            self._finish_put_cleanup_teardown(teardown_token)

@@ -1982,7 +1982,7 @@ class LMCacheStatsLogger:
             self.shutdown_event.wait(self.log_interval)
 
     def shutdown(self):
-        """Shutdown the stats logger gracefully with immediate wake-up"""
+        """Stop the exact worker, failing while that worker remains alive."""
         logger.info("Shutting down LMCacheStatsLogger...")
 
         # Signal the worker thread to stop
@@ -2000,21 +2000,19 @@ class LMCacheStatsLogger:
                 f"Waiting for stats logger thread to finish (timeout: {timeout}s)..."
             )
 
-            try:
-                self.thread.join(timeout=timeout)
+            self.thread.join(timeout=timeout)
 
-                if self.thread.is_alive():
-                    logger.warning(
-                        f"Stats logger thread did not terminate "
-                        f"within {timeout}s timeout. "
-                        "Thread may be blocked in logging operations. "
-                        "Proceeding with shutdown anyway."
-                    )
-                else:
-                    logger.info("Stats logger thread terminated successfully")
-            except Exception as e:
-                logger.error("Error waiting for stats logger thread: %s", e)
+            if self.thread.is_alive():
+                raise RuntimeError(
+                    f"stats logger thread did not terminate within {timeout}s timeout"
+                )
+            logger.info("Stats logger thread terminated successfully")
         else:
             logger.info("Stats logger thread already stopped")
 
         logger.info("LMCacheStatsLogger shutdown complete")
+
+    def shutdown_failure_is_retry_safe(self, error: BaseException) -> bool:
+        """Return true: retry only signals and joins this same worker."""
+        del error
+        return True

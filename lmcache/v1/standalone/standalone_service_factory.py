@@ -9,7 +9,10 @@ Creates LMCache service components without vLLM dependencies.
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 # First Party
-from lmcache.integration.base_service_factory import BaseServiceFactory
+from lmcache.integration.base_service_factory import (
+    BaseServiceFactory,
+    ServiceResultPublisher,
+)
 from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.health_monitor.base import HealthMonitor
@@ -45,8 +48,13 @@ class StandaloneServiceFactory(BaseServiceFactory):
     def get_or_create_metadata(self) -> Optional[LMCacheMetadata]:
         return self._metadata
 
-    def get_or_create_lmcache_engine(self) -> Optional[LMCacheEngine]:
+    def get_or_create_lmcache_engine(
+        self,
+        result_publisher: Optional[ServiceResultPublisher] = None,
+    ) -> Optional[LMCacheEngine]:
         if self._engine is not None:
+            if result_publisher is not None:
+                result_publisher.publish_final(self._engine)
             return self._engine
 
         instance_id = self._config.lmcache_instance_id
@@ -58,15 +66,21 @@ class StandaloneServiceFactory(BaseServiceFactory):
             broadcast_fn=self._broadcast_fn,
             broadcast_object_fn=self._broadcast_object_fn,
         )
+        if result_publisher is not None:
+            result_publisher.publish_final(self._engine)
         return self._engine
 
-    def maybe_create_lookup_client(self):
+    def maybe_create_lookup_client(self, result_publisher=None):
+        if result_publisher is not None:
+            result_publisher.publish_final(None)
         return None
 
     def maybe_create_prometheus_logger(self):
         return None
 
-    def maybe_create_lookup_server(self):
+    def maybe_create_lookup_server(self, result_publisher=None):
+        if result_publisher is not None:
+            result_publisher.publish_final(None)
         return None
 
     def maybe_create_offload_server(self):

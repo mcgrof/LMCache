@@ -2,7 +2,7 @@
 
 # Standard
 from contextlib import nullcontext
-from typing import List, Optional, Union
+from typing import List, Optional, Sequence, Union
 import threading
 
 # Third Party
@@ -16,6 +16,7 @@ from lmcache.v1.memory_allocators.paged_tensor_memory_allocator import (
 )
 from lmcache.v1.memory_allocators.tensor_memory_allocator import TensorMemoryAllocator
 from lmcache.v1.memory_management import (
+    AllocationReceipt,
     MemoryAllocatorInterface,
     MemoryFormat,
     MemoryObj,
@@ -65,6 +66,10 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
 
         self.device_mem_lock = threading.Lock() if not use_paging else nullcontext()
 
+    def supports_allocation_receipts(self) -> bool:
+        """Return whether this GPU allocator uses exact nonpaged reservations."""
+        return isinstance(self.allocator, TensorMemoryAllocator)
+
     @_lmcache_nvtx_annotate
     def allocate(
         self,
@@ -72,6 +77,7 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
         dtypes: Union[torch.dtype, list[torch.dtype]],
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         allocator_type: Optional[str] = None,
+        allocation_receipt: Optional[AllocationReceipt] = None,
     ) -> Optional[MemoryObj]:
         """Allocate one GPU-backed memory object.
 
@@ -84,8 +90,20 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
         Returns:
             A memory object, or ``None`` if the inner allocator is full.
         """
+        if allocation_receipt is not None and not self.supports_allocation_receipts():
+            raise NotImplementedError(
+                "paged GPU allocations are outside the exact receipt path"
+            )
         with self.device_mem_lock:
-            return self.allocator.allocate(shapes, dtypes, fmt, str(self))
+            if allocation_receipt is None:
+                return self.allocator.allocate(shapes, dtypes, fmt, str(self))
+            return self.allocator.allocate(
+                shapes,
+                dtypes,
+                fmt,
+                str(self),
+                allocation_receipt=allocation_receipt,
+            )
 
     @_lmcache_nvtx_annotate
     def batched_allocate(
@@ -95,6 +113,7 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
         batch_size: int,
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         allocator_type: Optional[str] = None,
+        allocation_receipts: Optional[Sequence[AllocationReceipt]] = None,
     ) -> Optional[List[MemoryObj]]:
         """Allocate multiple GPU-backed memory objects.
 
@@ -108,9 +127,22 @@ class GPUMemoryAllocator(MemoryAllocatorInterface):
         Returns:
             Memory objects, or ``None`` if the inner allocator is full.
         """
+        if allocation_receipts is not None and not self.supports_allocation_receipts():
+            raise NotImplementedError(
+                "paged GPU allocations are outside the exact receipt path"
+            )
         with self.device_mem_lock:
+            if allocation_receipts is None:
+                return self.allocator.batched_allocate(
+                    shapes, dtypes, batch_size, fmt, str(self)
+                )
             return self.allocator.batched_allocate(
-                shapes, dtypes, batch_size, fmt, str(self)
+                shapes,
+                dtypes,
+                batch_size,
+                fmt,
+                str(self),
+                allocation_receipts=allocation_receipts,
             )
 
     def free(self, memory_obj: MemoryObj, allocator_type: Optional[str] = None) -> None:

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import Literal, Optional
+from typing import Any, Callable, Literal, Optional, cast
 import os
 import socket
 
@@ -14,6 +14,51 @@ from lmcache.logging import init_logger
 logger = init_logger(__name__)
 
 ServiceKind = Literal["lookup", "offload", "lookup_worker", "lookup_scheduler"]
+_LINUX_UNIX_SOCKET_PATH_MAX_BYTES = 107
+
+
+def _close_socket_after_construction_failure(
+    socket: zmq.asyncio.Socket,
+    construction_error: BaseException,
+) -> None:
+    """Retain an unpublished socket until its close returns successfully."""
+    # Local import avoids pulling the lookup-client package (whose public
+    # ``__init__`` imports the engine-backed factory) into rpc_utils while the
+    # cache engine itself is still importing.
+    # First Party
+    from lmcache.v1.construction import (
+        CloseMethodCleanupOwner,
+        drain_lookup_construction_cleanup,
+        retain_lookup_construction_cleanup,
+    )
+
+    cleanup_owner: Any = None
+
+    def attach_and_drain() -> None:
+        nonlocal cleanup_owner
+        if cleanup_owner is None:
+            cleanup_owner = CloseMethodCleanupOwner(
+                socket,
+                method_kwargs={"linger": 0},
+                # PyZMQ Socket.close() is terminal and repeatable. ``closed``
+                # also proves completion if close consumed the socket before
+                # raising.
+                retry_safe_failure=True,
+                completion_probe=(lambda: getattr(socket, "closed", False) is True),
+            )
+        retain_lookup_construction_cleanup(
+            construction_error,
+            cleanup_owner,
+        )
+        drain_lookup_construction_cleanup(construction_error)
+
+    try:
+        attach_and_drain()
+    except BaseException as cleanup_error:
+        if cleanup_error is construction_error:
+            raise
+        attach_and_drain()
+
 
 # Default timeout constants for socket operations (in milliseconds)
 DEFAULT_SOCKET_RECV_TIMEOUT_MS = 30000
@@ -27,20 +72,141 @@ def get_zmq_context(use_asyncio: bool = True):
         return zmq.Context.instance()
 
 
+def _publish_socket_result(
+    result_publisher: Callable[[Any], None],
+    socket: Any,
+) -> None:
+    """Replay one interrupted exact socket-ownership publication."""
+    try:
+        result_publisher(socket)
+    except BaseException:
+        result_publisher(socket)
+
+
+def _new_zmq_socket(
+    context: Any,
+    role: Any,
+    *,
+    result_publisher: Optional[Callable[[Any], None]] = None,
+) -> Any:
+    """Create a real PyZMQ socket from a prepublished resource-free shell.
+
+    ``Context.socket()`` constructs a live C socket before returning it. An
+    instruction-level interruption at its caller's STORE_FAST would otherwise
+    erase the only Python reference. For real PyZMQ contexts, allocate the
+    closed shell first, keep it locally reachable, and ask ``Context.socket``
+    to initialize that exact object. Test doubles without a real socket class
+    retain the legacy call shape.
+    """
+    socket_class = getattr(context, "_socket_class", None)
+    if not (isinstance(socket_class, type) and issubclass(socket_class, zmq.Socket)):
+        socket = context.socket(role)
+        if result_publisher is not None:
+            _publish_socket_result(result_publisher, socket)
+        return socket
+
+    # ``Socket.__new__`` has no live C handle (``closed`` is true). Losing it
+    # before this assignment is resource-free; every later boundary has the
+    # exact shell in ``raw_socket``.
+    raw_socket = cast(Any, socket_class).__new__(socket_class)
+
+    def initialize_exact_socket(
+        exact_context: Any,
+        socket_type: Any,
+        **kwargs: Any,
+    ) -> Any:
+        cast(Any, socket_class).__init__(
+            raw_socket,
+            exact_context,
+            socket_type,
+            **kwargs,
+        )
+        return raw_socket
+
+    try:
+        socket = context.socket(
+            role,
+            socket_class=initialize_exact_socket,
+        )
+        if socket is not raw_socket:
+            raise RuntimeError("PyZMQ context replaced the prepublished socket")
+        if result_publisher is not None:
+            _publish_socket_result(result_publisher, raw_socket)
+    except BaseException as construction_error:
+        try:
+            _close_socket_after_construction_failure(
+                raw_socket,
+                construction_error,
+            )
+        except BaseException as cleanup_error:
+            if cleanup_error is construction_error:
+                raise
+            _close_socket_after_construction_failure(
+                raw_socket,
+                construction_error,
+            )
+        raise
+    return raw_socket
+
+
 def get_zmq_socket(
-    context, socket_path: str, protocol: str, role, bind_or_connect: str
+    context,
+    socket_path: str,
+    protocol: str,
+    role,
+    bind_or_connect: str,
+    *,
+    result_publisher: Optional[Callable[[Any], None]] = None,
 ):
     """
     Create a ZeroMQ socket with the specified protocol and role.
     """
     socket_addr = f"{protocol}://{socket_path}"
-    socket = context.socket(role)
-    if bind_or_connect == "bind":
-        socket.bind(socket_addr)
-    elif bind_or_connect == "connect":
-        socket.connect(socket_addr)
-    else:
-        raise ValueError(f"Invalid bind_or_connect: {bind_or_connect}")
+    socket: Any = None
+
+    def publish_raw_socket(exact_socket: Any) -> None:
+        nonlocal socket
+        if socket is not None and socket is not exact_socket:
+            raise RuntimeError("raw ZMQ socket ownership changed")
+        try:
+            socket = exact_socket
+        except BaseException:
+            socket = exact_socket
+
+    try:
+        created_socket = _new_zmq_socket(
+            context,
+            role,
+            result_publisher=publish_raw_socket,
+        )
+        if socket is None:
+            # Compatibility for a test double that ignores the publisher.
+            _publish_socket_result(publish_raw_socket, created_socket)
+        elif socket is not created_socket:
+            raise RuntimeError("raw ZMQ socket result identity changed")
+        if bind_or_connect == "bind":
+            socket.bind(socket_addr)
+        elif bind_or_connect == "connect":
+            socket.connect(socket_addr)
+        else:
+            raise ValueError(f"Invalid bind_or_connect: {bind_or_connect}")
+        if result_publisher is not None:
+            _publish_socket_result(result_publisher, socket)
+    except BaseException as construction_error:
+        if socket is not None:
+            try:
+                _close_socket_after_construction_failure(
+                    socket,
+                    construction_error,
+                )
+            except BaseException as cleanup_error:
+                if cleanup_error is construction_error:
+                    raise
+                _close_socket_after_construction_failure(
+                    socket,
+                    construction_error,
+                )
+        raise
 
     return socket
 
@@ -53,6 +219,8 @@ def get_zmq_socket_with_timeout(
     bind_or_connect: str,
     recv_timeout_ms: int,
     send_timeout_ms: int,
+    *,
+    result_publisher: Optional[Callable[[Any], None]] = None,
 ) -> zmq.asyncio.Socket:
     """
     Create a ZeroMQ socket with timeout settings.
@@ -63,11 +231,16 @@ def get_zmq_socket_with_timeout(
         protocol,
         role,
         bind_or_connect,
+        result_publisher=result_publisher,
     )
-    # Only set RCVTIMEO for client role connect sockets
-    if bind_or_connect == "connect":
-        socket.setsockopt(zmq.RCVTIMEO, recv_timeout_ms)
-    socket.setsockopt(zmq.SNDTIMEO, send_timeout_ms)
+    try:
+        # Only set RCVTIMEO for client role connect sockets
+        if bind_or_connect == "connect":
+            socket.setsockopt(zmq.RCVTIMEO, recv_timeout_ms)
+        socket.setsockopt(zmq.SNDTIMEO, send_timeout_ms)
+    except BaseException as construction_error:
+        _close_socket_after_construction_failure(socket, construction_error)
+        raise
     return socket
 
 
@@ -161,5 +334,18 @@ def get_zmq_rpc_path_lmcache(
         f"{base_url}/engine_{engine_id}_service_{service_name}_"
         f"lmcache_rpc_port_{rpc_port}"
     )
+
+    # Every caller below uses the result as an IPC filesystem endpoint.  Check
+    # the final value at the construction boundary as well as in any optional
+    # integration profile: environment-backed base paths can drift between an
+    # earlier admission check and socket creation.
+    if "\0" in socket_path:
+        raise ValueError("LMCache IPC socket path must not contain NUL")
+    socket_path_bytes = len(os.fsencode(socket_path))
+    if socket_path_bytes > _LINUX_UNIX_SOCKET_PATH_MAX_BYTES:
+        raise ValueError(
+            "LMCache IPC socket path exceeds Linux sockaddr_un limit: "
+            f"{socket_path_bytes} > {_LINUX_UNIX_SOCKET_PATH_MAX_BYTES} bytes"
+        )
 
     return socket_path

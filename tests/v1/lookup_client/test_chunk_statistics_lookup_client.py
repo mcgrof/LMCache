@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from typing import Any, Optional, Union
+from unittest.mock import MagicMock, patch
 import shutil
 import tempfile
 import time
@@ -16,6 +17,7 @@ from lmcache.v1.lookup_client.chunk_statistics_lookup_client import (
     ChunkStatisticsLookupClient,
 )
 from lmcache.v1.lookup_client.record_strategies import _get_strategies
+from lmcache.v1.token_span import ExplicitTokenSpans
 from lmcache.v1.utils.bloom_filter import BloomFilter
 
 
@@ -43,6 +45,7 @@ class MockLookupClient(BaseMockClient):
         token_ids: Union[torch.Tensor, list[int]],
         lookup_id: str,
         request_configs: Optional[dict] = None,
+        explicit_spans: Optional[ExplicitTokenSpans] = None,
     ) -> Optional[int]:
         self.lookup_calls.append((token_ids, lookup_id, request_configs))
         return len(token_ids) // 2
@@ -54,6 +57,7 @@ class FastMissLookupClient(BaseMockClient):
         token_ids: Union[torch.Tensor, list[int]],
         lookup_id: str,
         request_configs: Optional[dict] = None,
+        explicit_spans: Optional[ExplicitTokenSpans] = None,
     ) -> Optional[int]:
         time.sleep(0.008)
         return 0
@@ -213,6 +217,55 @@ class TestChunkStatisticsMetrics(BaseTestCase):
 
 
 class TestChunkStatisticsLifecycle(BaseTestCase):
+    def test_dynamic_close_failure_preserves_wrapper_resources(self):
+        client = self.create_stats_client()
+        inner = MagicMock(spec=LookupClientInterface)
+        inner.close.side_effect = RuntimeError("cleanup remains")
+        client.actual_lookup_client = inner
+        client.enabled = True
+
+        with (
+            patch.object(client, "stop_statistics") as stop_statistics,
+            patch.object(client.recorder, "close") as close_recorder,
+            pytest.raises(RuntimeError, match="cleanup remains"),
+        ):
+            client.close()
+
+        stop_statistics.assert_not_called()
+        close_recorder.assert_not_called()
+        assert client.enabled is True
+
+        # Release the real recorder thread owned by this test object.
+        inner.close.side_effect = None
+        client.close()
+
+    def test_force_close_quiesces_inner_before_wrapper_resources(self):
+        client = self.create_stats_client()
+        events = []
+        inner = MagicMock(spec=LookupClientInterface)
+        inner.force_close.side_effect = lambda: events.append("inner")
+        client.actual_lookup_client = inner
+        client.enabled = True
+
+        with (
+            patch.object(
+                client,
+                "stop_statistics",
+                side_effect=lambda: events.append("statistics"),
+            ),
+            patch.object(
+                client.recorder,
+                "close",
+                side_effect=lambda: events.append("recorder"),
+            ),
+        ):
+            client.force_close()
+
+        assert events == ["inner", "statistics", "recorder"]
+
+        # Release the real recorder thread whose close was mocked above.
+        client.recorder.close()
+
     def test_reset_statistics(self):
         stats_client, _ = self.setup_stats_client()
         stats_client.lookup(list(range(256)), "req_1")

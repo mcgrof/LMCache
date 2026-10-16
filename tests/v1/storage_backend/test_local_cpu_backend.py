@@ -336,6 +336,43 @@ class TestLocalCPUBackend:
 
         local_cpu_backend.memory_allocator.close()
 
+    def test_nonterminal_clear_rechecks_pin_after_candidate_scan(
+        self,
+        local_cpu_backend,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        key = create_test_key("clear-pin-race")
+        memory_obj = create_test_memory_obj()
+        local_cpu_backend.submit_put_task(key, memory_obj)
+        # Leave the backend as the sole reference, so the initial clear scan
+        # observes an evictable object.
+        memory_obj.ref_count_down()
+        assert memory_obj.can_evict
+
+        ordinary_remove = local_cpu_backend.remove
+        remove_calls = 0
+
+        def pin_between_scan_and_remove(remove_key, force=True):
+            nonlocal remove_calls
+            remove_calls += 1
+            assert remove_key == key
+            assert force is False
+            assert local_cpu_backend.pin(key)
+            return ordinary_remove(remove_key, force=force)
+
+        monkeypatch.setattr(local_cpu_backend, "remove", pin_between_scan_and_remove)
+        assert local_cpu_backend.clear(force=False) == 0
+
+        assert remove_calls == 1
+        assert key in local_cpu_backend.hot_cache
+        assert memory_obj.is_pinned
+
+        monkeypatch.setattr(local_cpu_backend, "remove", ordinary_remove)
+        assert local_cpu_backend.unpin(key)
+        assert local_cpu_backend.clear(force=False) > 0
+        assert key not in local_cpu_backend.hot_cache
+        local_cpu_backend.memory_allocator.close()
+
     def test_remove_with_worker(self, memory_allocator, lmcache_engine_metadata):
         """Test remove() with LMCacheWorker."""
         config = create_test_config()

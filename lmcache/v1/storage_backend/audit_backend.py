@@ -155,6 +155,10 @@ class AuditBackend(StorageBackendInterface):
             )
             raise
 
+    def batched_get_non_blocking_returns_pinned(self) -> bool:
+        """Preserve the wrapped backend's batched-get ownership contract."""
+        return self.real_backend.batched_get_non_blocking_returns_pinned()
+
     async def batched_async_contains(
         self,
         lookup_id: str,

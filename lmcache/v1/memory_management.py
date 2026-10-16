@@ -2,8 +2,9 @@
 # Standard
 from dataclasses import dataclass
 from enum import Enum, auto
-from functools import cache, wraps
-from typing import Any, List, Optional, Tuple, Union
+from functools import cache, partial, wraps
+from types import MappingProxyType
+from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple, Union
 import abc
 import ctypes
 import os
@@ -20,6 +21,7 @@ from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import _lmcache_nvtx_annotate
+from lmcache.v1.lifecycle import RetainedCall, _run_under_interrupt_safe_rlock
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.platform import current_device_spec as current_device_spec  # noqa: F401
 from lmcache.v1.system_detection import NUMAMapping
@@ -221,6 +223,218 @@ class MemoryObjMetadata:
         return self.shape.numel() * self.dtype.itemsize  # type: ignore
 
 
+@dataclass(frozen=True)
+class RefCountUpReceipt:
+    """Identity of one exactly-once reference acquisition."""
+
+    allocation_epoch: int
+    allocation_token: object
+    token: object
+
+
+@dataclass(frozen=True)
+class RefCountDownReceipt:
+    """Identity of one already-counted reference release.
+
+    ``allocation_epoch`` prevents a delayed cleanup owner from consuming a
+    reference after a page-backed ``TensorMemoryObj`` has been recycled for a
+    later allocation. ``allocation_token`` is the stable object identity, and
+    ``token`` is committed in the same immutable state assignment as the
+    authoritative reference-count decrement.
+    """
+
+    allocation_epoch: int
+    allocation_token: object
+    token: object
+
+
+@dataclass(frozen=True)
+class _TensorRefState:
+    """Authoritative, atomically replaced TensorMemoryObj reference state."""
+
+    count: int
+    allocation_epoch: int
+    allocation_token: object
+    up_applied_tokens: frozenset[object]
+    up_completed_tokens: frozenset[object]
+    applied_tokens: frozenset[object]
+    completed_tokens: frozenset[object]
+
+
+@dataclass(frozen=True)
+class _AllocationReceiptState:
+    """Atomically replaced ownership state for one address reservation."""
+
+    manager: Optional[Any]
+    memory_obj: Optional[Any]
+    ref_count_down_receipt: Optional[RefCountDownReceipt]
+    address_release_started: bool
+    address_release_complete: bool
+
+
+class AllocationReceipt:
+    """Pre-published owner for one exact address allocation.
+
+    A caller creates and retains this receipt *before* entering an allocator.
+    ``AddressManager.allocate_once`` binds it before changing free space, and
+    the tensor allocator adopts the constructed object with one immutable
+    state replacement before returning it. Cleanup can therefore recover
+    either the raw reservation or the object's initial reference, including
+    when an asynchronous exception lands between those stages.
+    """
+
+    def __init__(self) -> None:
+        self.token = object()
+        self._lock = threading.RLock()
+        self._state = _AllocationReceiptState(
+            manager=None,
+            memory_obj=None,
+            ref_count_down_receipt=None,
+            address_release_started=False,
+            address_release_complete=False,
+        )
+
+    @property
+    def adopted(self) -> bool:
+        with self._lock:
+            return self._state.memory_obj is not None
+
+    @property
+    def memory_obj(self) -> Optional[Any]:
+        with self._lock:
+            return self._state.memory_obj
+
+    @property
+    def ref_count_down_receipt(self) -> Optional[RefCountDownReceipt]:
+        with self._lock:
+            return self._state.ref_count_down_receipt
+
+    def _bind_address_manager(self, manager: Any) -> None:
+        """Publish the manager binding before it can reserve address space."""
+        with self._lock:
+            state = self._state
+            if state.address_release_started:
+                raise RuntimeError("allocation receipt has already been released")
+            if state.manager is not None:
+                if state.manager is not manager:
+                    raise ValueError("allocation receipt belongs to another manager")
+                return
+            self._state = _AllocationReceiptState(
+                manager=manager,
+                memory_obj=state.memory_obj,
+                ref_count_down_receipt=state.ref_count_down_receipt,
+                address_release_started=False,
+                address_release_complete=False,
+            )
+
+    def _allocation_may_commit(self, manager: Any) -> bool:
+        """Recheck cancellation while AddressManager holds its state lock."""
+        with self._lock:
+            state = self._state
+            return state.manager is manager and not state.address_release_started
+
+    def adopt(self, memory_obj: Any) -> RefCountDownReceipt:
+        """Atomically replace raw-reservation ownership with object ownership."""
+        # Constructing the ref receipt has no ownership side effect. If an
+        # interruption lands here, the outer owner still sees the raw address
+        # reservation and can release it by this AllocationReceipt.
+        ref_receipt = memory_obj.make_ref_count_down_receipt()
+        with self._lock:
+            state = self._state
+            if state.address_release_started:
+                raise RuntimeError("cannot adopt a released allocation receipt")
+            if state.memory_obj is not None:
+                if state.memory_obj is not memory_obj:
+                    raise ValueError(
+                        "allocation receipt already adopted another object"
+                    )
+                assert state.ref_count_down_receipt is not None
+                return state.ref_count_down_receipt
+            self._state = _AllocationReceiptState(
+                manager=state.manager,
+                memory_obj=memory_obj,
+                ref_count_down_receipt=ref_receipt,
+                address_release_started=False,
+                address_release_complete=False,
+            )
+            return ref_receipt
+
+    def _begin_address_release(self, manager: Any) -> bool:
+        """Publish release intent before the manager changes free space."""
+        with self._lock:
+            state = self._state
+            if state.manager is not None and state.manager is not manager:
+                raise ValueError("allocation receipt belongs to another manager")
+            if state.address_release_complete:
+                return False
+            self._state = _AllocationReceiptState(
+                manager=manager if state.manager is None else state.manager,
+                memory_obj=state.memory_obj,
+                ref_count_down_receipt=state.ref_count_down_receipt,
+                address_release_started=True,
+                address_release_complete=False,
+            )
+            return True
+
+    def _finish_address_release(self, manager: Any) -> None:
+        with self._lock:
+            state = self._state
+            if state.manager is not manager:
+                raise ValueError("allocation receipt belongs to another manager")
+            self._state = _AllocationReceiptState(
+                manager=state.manager,
+                memory_obj=state.memory_obj,
+                ref_count_down_receipt=state.ref_count_down_receipt,
+                address_release_started=True,
+                address_release_complete=True,
+            )
+
+    def release_once(self) -> None:
+        """Release the owned object reference or an unadopted reservation."""
+        with self._lock:
+            state = self._state
+            memory_obj = state.memory_obj
+            ref_receipt = state.ref_count_down_receipt
+            manager = state.manager
+        if memory_obj is not None:
+            assert ref_receipt is not None
+            memory_obj.ref_count_down_once(ref_receipt)
+            return
+        if manager is None:
+            # The allocation call never reached AddressManager. Publish a
+            # terminal no-reservation state so repeated drains are exact.
+            with self._lock:
+                state = self._state
+                if state.memory_obj is not None:
+                    memory_obj = state.memory_obj
+                    ref_receipt = state.ref_count_down_receipt
+                else:
+                    self._state = _AllocationReceiptState(
+                        manager=None,
+                        memory_obj=None,
+                        ref_count_down_receipt=None,
+                        address_release_started=True,
+                        address_release_complete=True,
+                    )
+                    return
+            assert memory_obj is not None and ref_receipt is not None
+            memory_obj.ref_count_down_once(ref_receipt)
+            return
+        manager.free_once(self)
+
+    def release_complete(self) -> bool:
+        """Return whether this owner's exact release has completed."""
+        with self._lock:
+            state = self._state
+            memory_obj = state.memory_obj
+            ref_receipt = state.ref_count_down_receipt
+            address_complete = state.address_release_complete
+        if memory_obj is None:
+            return address_complete
+        assert ref_receipt is not None
+        return memory_obj.ref_count_down_receipt_complete(ref_receipt)
+
+
 class MemoryObj(metaclass=abc.ABCMeta):
     """
     MemoryObj interface.
@@ -231,6 +445,55 @@ class MemoryObj(metaclass=abc.ABCMeta):
 
     def __init__(self, metadata: MemoryObjMetadata):
         self.meta = metadata
+
+    def make_ref_count_up_receipt(self) -> RefCountUpReceipt:
+        """Create an exact-once acquisition token when supported."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no exact ref-count acquisition receipt"
+        )
+
+    def ref_count_up_once(self, receipt: RefCountUpReceipt) -> None:
+        """Acquire the reference named by ``receipt`` exactly once."""
+        del receipt
+        raise NotImplementedError(
+            f"{type(self).__name__} has no exact ref-count acquisition receipt"
+        )
+
+    def ref_count_up_receipt_complete(self, receipt: RefCountUpReceipt) -> bool:
+        """Return whether an exact acquisition completed."""
+        del receipt
+        return False
+
+    def ref_count_up_receipt_applied(self, receipt: RefCountUpReceipt) -> bool:
+        """Return whether the acquisition changed authoritative state."""
+        del receipt
+        return False
+
+    def make_ref_count_down_receipt(self) -> RefCountDownReceipt:
+        """Create an exact-once release token when the object supports it.
+
+        Concrete runtime objects override this method.  The base error keeps
+        unsupported memory implementations fail-closed instead of silently
+        claiming an exact cleanup receipt.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} has no exact ref-count release receipt"
+        )
+
+    def ref_count_down_once(self, receipt: RefCountDownReceipt) -> None:
+        """Consume the reference named by ``receipt`` exactly once."""
+        del receipt
+        raise NotImplementedError(
+            f"{type(self).__name__} has no exact ref-count release receipt"
+        )
+
+    def ref_count_down_receipt_complete(
+        self,
+        receipt: RefCountDownReceipt,
+    ) -> bool:
+        """Return whether ``receipt`` completed for this allocation."""
+        del receipt
+        return False
 
     @abc.abstractmethod
     def invalidate(self):
@@ -461,6 +724,186 @@ class PinnedAllocFree:
         self.free_fn(ptr, *self.free_args)
 
 
+@dataclass
+class _CPUMemoryAllocation:
+    """One exact native CPU allocation retained by a public receipt."""
+
+    pointer: Optional[int]
+    release_call: RetainedCall
+    buffer: Optional[torch.Tensor] = None
+
+
+class CPUMemoryAllocationReceipt:
+    """Retain a native pinned arena across its Tensor return handoff.
+
+    ``_allocate_cpu_memory`` normally returns a Tensor wrapping memory whose
+    lifetime is controlled by an LMCache native free routine.  The Tensor does
+    not own that free operation.  A caller that publishes this receipt before
+    invoking the helper therefore remains able to release the exact native
+    allocation even if an interruption lands after the helper returns but
+    before the Tensor reaches the caller's normal attribute.
+    """
+
+    def __init__(self) -> None:
+        self._allocation: Optional[_CPUMemoryAllocation] = None
+        self._no_allocation = False
+        self._allocation_call: Optional[RetainedCall] = None
+        self._lock = threading.RLock()
+
+    @property
+    def outcome_known(self) -> bool:
+        """Whether allocation either escaped into this receipt or unwound."""
+        with self._lock:
+            return self._allocation is not None or self._no_allocation
+
+    @property
+    def buffer(self) -> Optional[torch.Tensor]:
+        """Return the exact Tensor wrapper, once one has been published."""
+        with self._lock:
+            allocation = self._allocation
+            return allocation.buffer if allocation is not None else None
+
+    @property
+    def released(self) -> bool:
+        """Whether this receipt proves that no native allocation remains."""
+        with self._lock:
+            allocation = self._allocation
+            if allocation is None:
+                return self._no_allocation
+            return allocation.release_call.complete
+
+    def run_allocation(self, call: Callable[[], torch.Tensor]) -> torch.Tensor:
+        """Run one native allocation attempt on a retained worker.
+
+        Native allocation and receipt publication happen on the worker.  A
+        caller-side asynchronous exception can therefore only interrupt this
+        method's wait; the same attempt remains reachable for terminal drain.
+        """
+        with self._lock:
+            attempt = self._allocation_call
+            if attempt is None:
+                if self._allocation is not None or self._no_allocation:
+                    raise RuntimeError("CPU allocation receipt already has an outcome")
+
+                def run_once() -> None:
+                    call()
+
+                attempt = RetainedCall(
+                    run_once,
+                    thread_name="lmcache-pinned-cpu-allocation",
+                )
+                # Publish the whole retained attempt before it can start.
+                self._allocation_call = attempt
+        attempt.run()
+        buffer = self.buffer
+        if buffer is None:
+            raise RuntimeError("CPU allocation completed without a Tensor")
+        return buffer
+
+    def finish_allocation_for_close(self) -> None:
+        """Finish an interrupted allocation attempt before terminal release."""
+        with self._lock:
+            attempt = self._allocation_call
+            if attempt is None:
+                # No retained worker could have acquired memory.  This also
+                # covers caller interruption before publication of the local
+                # RetainedCall in ``run_allocation``.
+                if self._allocation is None:
+                    self._no_allocation = True
+                return
+        try:
+            attempt.run()
+        except BaseException as error:
+            # The worker's construction failure is context, not a terminal
+            # cleanup failure.  A newly interrupted waiter is distinct and
+            # must leave close retryable.
+            if attempt.last_error is not error:
+                raise
+
+    def retain_raw(
+        self,
+        resolved: PinnedAllocFree,
+        pointer: int,
+    ) -> _CPUMemoryAllocation:
+        """Publish exact native free authority before building its Tensor."""
+        allocation = _CPUMemoryAllocation(
+            pointer=pointer,
+            release_call=RetainedCall(
+                lambda: resolved.free(pointer),
+                thread_name="lmcache-pinned-cpu-free",
+            ),
+        )
+        with self._lock:
+            if self._no_allocation or self._allocation is not None:
+                raise RuntimeError("CPU allocation receipt already has an outcome")
+            # One pointer assignment publishes the exact pointer, its free
+            # authority, and the retained free attempt together.
+            self._allocation = allocation
+        return allocation
+
+    def retain_buffer(
+        self,
+        buffer: torch.Tensor,
+        release_call: Callable[[], None],
+    ) -> None:
+        """Adopt a returned buffer from a compatibility allocation helper."""
+        allocation = _CPUMemoryAllocation(
+            pointer=buffer.data_ptr() if buffer.numel() != 0 else None,
+            release_call=RetainedCall(
+                release_call,
+                thread_name="lmcache-pinned-cpu-compat-free",
+            ),
+            buffer=buffer,
+        )
+        with self._lock:
+            if self._no_allocation or self._allocation is not None:
+                raise RuntimeError("CPU allocation receipt already has an outcome")
+            self._allocation = allocation
+
+    def publish_buffer(
+        self,
+        allocation: _CPUMemoryAllocation,
+        buffer: torch.Tensor,
+    ) -> None:
+        """Attach the Tensor wrapper to the exact retained raw allocation."""
+        with self._lock:
+            if self._allocation is not allocation or allocation.release_call.complete:
+                raise RuntimeError("CPU allocation receipt changed before publication")
+            allocation.buffer = buffer
+
+    def owns_pointer(self, pointer: int) -> bool:
+        """Return whether this receipt owns the supplied native pointer."""
+        with self._lock:
+            allocation = self._allocation
+            return (
+                allocation is not None
+                and allocation.pointer == pointer
+                and not allocation.release_call.complete
+            )
+
+    def mark_no_allocation(self) -> None:
+        """Publish proof that a failed attempt acquired no native allocation."""
+        with self._lock:
+            if self._allocation is not None:
+                raise RuntimeError("cannot discard a retained CPU allocation")
+            self._no_allocation = True
+
+    def release(self) -> None:
+        """Release the exact retained allocation, preserving failure state."""
+        with self._lock:
+            allocation = self._allocation
+            no_allocation = self._no_allocation
+        if allocation is None:
+            if not no_allocation:
+                raise RuntimeError("CPU allocation outcome remains unresolved")
+            return
+        # The native side effect and its success receipt belong to a retained
+        # worker.  Caller interruption resumes this same attempt; a native
+        # free error is deliberately sticky because replay is not provably
+        # safe after an arbitrary allocator failure.
+        allocation.release_call.run()
+
+
 def _resolve_pinned_alloc_free(
     numa_mapping: Optional[NUMAMapping] = None,
     shm_name: Optional[str] = None,
@@ -551,48 +994,114 @@ def _allocate_cpu_memory(
     numa_mapping: Optional[NUMAMapping] = None,
     shm_name: Optional[str] = None,
     use_hugepages: bool = False,
+    ownership_receipt: Optional[CPUMemoryAllocationReceipt] = None,
 ) -> torch.Tensor:
-    if size == 0:
-        return torch.empty(0, dtype=torch.uint8)
-
-    resolved = _resolve_pinned_alloc_free(
+    if ownership_receipt is not None:
+        return ownership_receipt.run_allocation(
+            lambda: _allocate_cpu_memory_once(
+                size,
+                numa_mapping,
+                shm_name,
+                use_hugepages,
+                ownership_receipt,
+            )
+        )
+    return _allocate_cpu_memory_once(
+        size,
         numa_mapping,
         shm_name,
-        size,
         use_hugepages,
+        None,
     )
 
+
+def _allocate_cpu_memory_once(
+    size: int,
+    numa_mapping: Optional[NUMAMapping],
+    shm_name: Optional[str],
+    use_hugepages: bool,
+    ownership_receipt: Optional[CPUMemoryAllocationReceipt],
+) -> torch.Tensor:
+    """Allocate and wrap one arena on the current (possibly retained) worker."""
+    if size == 0:
+        buffer = torch.empty(0, dtype=torch.uint8)
+        if ownership_receipt is not None:
+            ownership_receipt.retain_buffer(buffer, lambda: None)
+        return buffer
+
     try:
-        ptr = resolved.alloc()
-    except RuntimeError as e:
-        if use_hugepages and "mmap failed" in str(e):
-            diag = _read_hugepage_info()
-            if diag is not None:
-                total, free, page_mb = diag
-                page_bytes = page_mb * 1024 * 1024
-                needed = (size + page_bytes - 1) // page_bytes
-                logger.error(
-                    "Failed to allocate huge pages. "
-                    "Pool has %d pages (%d free, each %d MiB). "
-                    "Requested %d bytes (%d pages). "
-                    "Please grow the %d MiB hugepage pool.",
-                    total,
-                    free,
-                    page_mb,
-                    size,
-                    needed,
-                    page_mb,
-                )
-            else:
-                logger.error(
-                    "Failed to allocate huge pages. "
-                    "Please grow the 2 MiB hugepage pool."
-                )
+        resolved = _resolve_pinned_alloc_free(
+            numa_mapping,
+            shm_name,
+            size,
+            use_hugepages,
+        )
+    except BaseException:
+        if ownership_receipt is not None:
+            ownership_receipt.mark_no_allocation()
         raise
 
-    array_type = ctypes.c_uint8 * size
-    buf = array_type.from_address(ptr)
-    buffer = torch.frombuffer(buf, dtype=torch.uint8)
+    ptr: Optional[int] = None
+    allocation: Optional[_CPUMemoryAllocation] = None
+    try:
+        # Allocation and every ownership-publication step share one rollback
+        # region.  In particular, a traced BaseException on the first line
+        # after ``alloc`` observes ``ptr`` and cannot strand the native arena.
+        ptr = resolved.alloc()
+        if ownership_receipt is not None:
+            allocation = ownership_receipt.retain_raw(resolved, ptr)
+        array_type = ctypes.c_uint8 * size
+        buf = array_type.from_address(ptr)
+        buffer = torch.frombuffer(buf, dtype=torch.uint8)
+        if ownership_receipt is not None:
+            assert allocation is not None
+            ownership_receipt.publish_buffer(allocation, buffer)
+    except BaseException as construction_error:
+        if ptr is None:
+            if ownership_receipt is not None:
+                ownership_receipt.mark_no_allocation()
+            if (
+                isinstance(construction_error, RuntimeError)
+                and use_hugepages
+                and "mmap failed" in str(construction_error)
+            ):
+                diag = _read_hugepage_info()
+                if diag is not None:
+                    total, free, page_mb = diag
+                    page_bytes = page_mb * 1024 * 1024
+                    needed = (size + page_bytes - 1) // page_bytes
+                    logger.error(
+                        "Failed to allocate huge pages. "
+                        "Pool has %d pages (%d free, each %d MiB). "
+                        "Requested %d bytes (%d pages). "
+                        "Please grow the %d MiB hugepage pool.",
+                        total,
+                        free,
+                        page_mb,
+                        size,
+                        needed,
+                        page_mb,
+                    )
+                else:
+                    logger.error(
+                        "Failed to allocate huge pages. "
+                        "Please grow the 2 MiB hugepage pool."
+                    )
+            raise
+
+        # The raw pointer either remains local or has already moved into the
+        # caller-published receipt.  Reclaim through exactly one authority and
+        # retain a failed free in the receipt for outer terminal retry.
+        try:
+            if ownership_receipt is not None and ownership_receipt.owns_pointer(ptr):
+                ownership_receipt.release()
+            else:
+                resolved.free(ptr)
+                if ownership_receipt is not None:
+                    ownership_receipt.mark_no_allocation()
+        except BaseException as cleanup_error:
+            raise construction_error from cleanup_error
+        raise
 
     return buffer
 
@@ -645,13 +1154,27 @@ class TensorMemoryObj(MemoryObj):
         raw_data: torch.Tensor,
         metadata: MemoryObjMetadata,
         parent_allocator: Optional["MemoryAllocatorInterface"],
+        allocation_receipt: Optional[AllocationReceipt] = None,
     ):
         assert metadata.dtype is not None, "dtype must be specified for TensorMemoryObj"
         super().__init__(metadata)
         self.raw_data = raw_data
         self.valid = True
-        self.lock = threading.Lock()
+        # Receipt operations need owner-aware recursion depth so one
+        # caller-side asynchronous interruption can restore precisely the
+        # ownership level acquired by that operation.
+        self.lock = threading.RLock()
         self.parent_allocator = parent_allocator
+        self.allocation_receipt = allocation_receipt
+        self._ref_state = _TensorRefState(
+            count=metadata.ref_count,
+            allocation_epoch=0,
+            allocation_token=object(),
+            up_applied_tokens=frozenset(),
+            up_completed_tokens=frozenset(),
+            applied_tokens=frozenset(),
+            completed_tokens=frozenset(),
+        )
         # ``None`` means "use the layout-derived size from
         # group_prefix_sum"; a non-None value narrows the logical view to
         # exactly that many bytes (see set_used_size).  Allocator reuse
@@ -677,13 +1200,14 @@ class TensorMemoryObj(MemoryObj):
         called properly somewhere in the code path.
         """
         if self.parent_allocator is not None and self.is_valid():
-            if self.meta.ref_count > 0 or self.meta.pin_count > 0:
+            ref_count = self._ref_state.count
+            if ref_count > 0 or self.meta.pin_count > 0:
                 logger.warning(
                     "MemoryObj at %s is being garbage collected "
                     "with ref_count=%d, pin_count=%d. "
                     "This indicates ref_count_down()/unpin() was not called properly.",
                     self.meta.address,
-                    self.meta.ref_count,
+                    ref_count,
                     self.meta.pin_count,
                 )
             self.parent_allocator.free(self)
@@ -754,29 +1278,286 @@ class TensorMemoryObj(MemoryObj):
 
     def ref_count_up(self):
         with self.lock:
-            self.meta.ref_count += 1
+            state = self._ref_state
+            next_state = _TensorRefState(
+                count=state.count + 1,
+                allocation_epoch=state.allocation_epoch,
+                allocation_token=state.allocation_token,
+                up_applied_tokens=state.up_applied_tokens,
+                up_completed_tokens=state.up_completed_tokens,
+                applied_tokens=state.applied_tokens,
+                completed_tokens=state.completed_tokens,
+            )
+            self._ref_state = next_state
+            self.meta.ref_count = next_state.count
 
     def ref_count_down(self):
         with self.lock:
-            self.meta.ref_count -= 1
-            if self.meta.ref_count < 0:
+            state = self._ref_state
+            next_count = state.count - 1
+            if next_count < 0:
                 logger.warning(
                     f"Ref count of MemoryObj {self.meta.address}"
-                    f"is negative: {self.meta.ref_count}."
+                    f"is negative: {next_count}."
                     "Double free occurred somewhere."
                     "Setting ref count back to 0 as a hack but please find the bug."
                 )
-                self.meta.ref_count = 0
+                next_count = 0
+            next_state = _TensorRefState(
+                count=next_count,
+                allocation_epoch=state.allocation_epoch,
+                allocation_token=state.allocation_token,
+                up_applied_tokens=state.up_applied_tokens,
+                up_completed_tokens=state.up_completed_tokens,
+                applied_tokens=state.applied_tokens,
+                completed_tokens=state.completed_tokens,
+            )
+            self._ref_state = next_state
+            self.meta.ref_count = next_state.count
             if (
-                self.meta.ref_count == 0
+                next_state.count == 0
                 and self.parent_allocator is not None
                 and self.meta.pin_count == 0
             ):
                 self.parent_allocator.free(self)
 
     def get_ref_count(self) -> int:
+        return _run_under_interrupt_safe_rlock(
+            self.lock,
+            lambda: self._ref_state.count,
+        )
+
+    def make_ref_count_up_receipt(self) -> RefCountUpReceipt:
+        """Name one exact acquisition in the current allocation epoch."""
+        return _run_under_interrupt_safe_rlock(
+            self.lock,
+            self._make_ref_count_up_receipt_locked,
+        )
+
+    def _make_ref_count_up_receipt_locked(self) -> RefCountUpReceipt:
+        return RefCountUpReceipt(
+            allocation_epoch=self._ref_state.allocation_epoch,
+            allocation_token=self._ref_state.allocation_token,
+            token=object(),
+        )
+
+    def _validate_ref_count_up_receipt(
+        self,
+        receipt: RefCountUpReceipt,
+    ) -> _TensorRefState:
+        state = self._ref_state
+        if receipt.allocation_token is not state.allocation_token:
+            raise ValueError("ref-count receipt belongs to another memory object")
+        if receipt.allocation_epoch > state.allocation_epoch:
+            raise ValueError("ref-count receipt belongs to a future allocation")
+        return state
+
+    def ref_count_up_once(self, receipt: RefCountUpReceipt) -> None:
+        """Atomically commit one receipt and its reference acquisition."""
+        _run_under_interrupt_safe_rlock(
+            self.lock,
+            partial(self._ref_count_up_once_locked, receipt),
+        )
+
+    def _ref_count_up_once_locked(self, receipt: RefCountUpReceipt) -> None:
+        state = self._validate_ref_count_up_receipt(receipt)
+        if receipt.allocation_epoch < state.allocation_epoch:
+            pass
+        elif receipt.token in state.up_completed_tokens:
+            self.meta.ref_count = state.count
+        else:
+            if receipt.token not in state.up_applied_tokens:
+                state = _TensorRefState(
+                    count=state.count + 1,
+                    allocation_epoch=state.allocation_epoch,
+                    allocation_token=state.allocation_token,
+                    up_applied_tokens=state.up_applied_tokens | {receipt.token},
+                    up_completed_tokens=state.up_completed_tokens,
+                    applied_tokens=state.applied_tokens,
+                    completed_tokens=state.completed_tokens,
+                )
+                self._ref_state = state
+            self.meta.ref_count = state.count
+            if receipt.token not in state.up_completed_tokens:
+                state = _TensorRefState(
+                    count=state.count,
+                    allocation_epoch=state.allocation_epoch,
+                    allocation_token=state.allocation_token,
+                    up_applied_tokens=state.up_applied_tokens,
+                    up_completed_tokens=state.up_completed_tokens | {receipt.token},
+                    applied_tokens=state.applied_tokens,
+                    completed_tokens=state.completed_tokens,
+                )
+                self._ref_state = state
+                self.meta.ref_count = state.count
+
+    def ref_count_up_receipt_complete(self, receipt: RefCountUpReceipt) -> bool:
+        """Return exact acquisition completion, including after page reuse."""
+        return _run_under_interrupt_safe_rlock(
+            self.lock,
+            partial(self._ref_count_up_receipt_complete_locked, receipt),
+        )
+
+    def _ref_count_up_receipt_complete_locked(
+        self,
+        receipt: RefCountUpReceipt,
+    ) -> bool:
+        state = self._validate_ref_count_up_receipt(receipt)
+        return (
+            receipt.allocation_epoch < state.allocation_epoch
+            or receipt.token in state.up_completed_tokens
+        )
+
+    def ref_count_up_receipt_applied(self, receipt: RefCountUpReceipt) -> bool:
+        """Return whether this acquisition incremented its allocation."""
+        return _run_under_interrupt_safe_rlock(
+            self.lock,
+            partial(self._ref_count_up_receipt_applied_locked, receipt),
+        )
+
+    def _ref_count_up_receipt_applied_locked(
+        self,
+        receipt: RefCountUpReceipt,
+    ) -> bool:
+        state = self._validate_ref_count_up_receipt(receipt)
+        return (
+            receipt.allocation_epoch == state.allocation_epoch
+            and receipt.token in state.up_applied_tokens
+        )
+
+    def make_ref_count_down_receipt(self) -> RefCountDownReceipt:
+        """Name one reference in the current allocation epoch."""
+        return _run_under_interrupt_safe_rlock(
+            self.lock,
+            self._make_ref_count_down_receipt_locked,
+        )
+
+    def _make_ref_count_down_receipt_locked(self) -> RefCountDownReceipt:
+        return RefCountDownReceipt(
+            allocation_epoch=self._ref_state.allocation_epoch,
+            allocation_token=self._ref_state.allocation_token,
+            token=object(),
+        )
+
+    def _validate_ref_count_down_receipt(
+        self,
+        receipt: RefCountDownReceipt,
+    ) -> _TensorRefState:
+        state = self._ref_state
+        if receipt.allocation_token is not state.allocation_token:
+            raise ValueError("ref-count receipt belongs to another memory object")
+        if receipt.allocation_epoch > state.allocation_epoch:
+            raise ValueError("ref-count receipt belongs to a future allocation")
+        return state
+
+    def ref_count_down_once(self, receipt: RefCountDownReceipt) -> None:
+        """Atomically commit one receipt and its reference decrement.
+
+        The first ``_ref_state`` pointer assignment contains both the new
+        count and ``receipt.token``.  An interruption can therefore observe
+        neither transition or both, never a decrement without ownership proof.
+        Reclamation is retryable under the same token and completion is
+        published only after the allocator returns.
+        """
+        _run_under_interrupt_safe_rlock(
+            self.lock,
+            partial(self._ref_count_down_once_locked, receipt),
+        )
+
+    def _ref_count_down_once_locked(self, receipt: RefCountDownReceipt) -> None:
+        state = self._validate_ref_count_down_receipt(receipt)
+        if receipt.allocation_epoch < state.allocation_epoch:
+            pass
+        elif receipt.token in state.completed_tokens:
+            self.meta.ref_count = state.count
+        else:
+            if receipt.token not in state.applied_tokens:
+                if state.count <= 0:
+                    raise RuntimeError(
+                        "cannot consume a ref-count receipt from a zero-count object"
+                    )
+                state = _TensorRefState(
+                    count=state.count - 1,
+                    allocation_epoch=state.allocation_epoch,
+                    allocation_token=state.allocation_token,
+                    up_applied_tokens=state.up_applied_tokens,
+                    up_completed_tokens=state.up_completed_tokens,
+                    applied_tokens=state.applied_tokens | {receipt.token},
+                    completed_tokens=state.completed_tokens,
+                )
+                # Atomic ownership commit: count and receipt move together.
+                self._ref_state = state
+
+            # ``meta.ref_count`` is a compatibility mirror, never authority.
+            self.meta.ref_count = state.count
+            if (
+                state.count == 0
+                and self.parent_allocator is not None
+                and self.meta.pin_count == 0
+                and self.is_valid()
+            ):
+                self.parent_allocator.free(self)
+
+            state = self._ref_state
+            if (
+                receipt.allocation_epoch >= state.allocation_epoch
+                and receipt.token not in state.completed_tokens
+            ):
+                state = _TensorRefState(
+                    count=state.count,
+                    allocation_epoch=state.allocation_epoch,
+                    allocation_token=state.allocation_token,
+                    up_applied_tokens=state.up_applied_tokens,
+                    up_completed_tokens=state.up_completed_tokens,
+                    applied_tokens=state.applied_tokens,
+                    completed_tokens=state.completed_tokens | {receipt.token},
+                )
+                self._ref_state = state
+                self.meta.ref_count = state.count
+
+    def ref_count_down_receipt_complete(
+        self,
+        receipt: RefCountDownReceipt,
+    ) -> bool:
+        """Return exact completion, including after page reuse."""
+        return _run_under_interrupt_safe_rlock(
+            self.lock,
+            partial(self._ref_count_down_receipt_complete_locked, receipt),
+        )
+
+    def _ref_count_down_receipt_complete_locked(
+        self,
+        receipt: RefCountDownReceipt,
+    ) -> bool:
+        state = self._validate_ref_count_down_receipt(receipt)
+        return (
+            receipt.allocation_epoch < state.allocation_epoch
+            or receipt.token in state.completed_tokens
+        )
+
+    def reset_ref_count_for_reuse(self, count: int = 1) -> None:
+        """Begin a fresh page-backed allocation epoch."""
+        if count < 0:
+            raise ValueError("allocation ref count cannot be negative")
         with self.lock:
-            return self.meta.ref_count
+            self._reset_ref_count_for_reuse_locked(count)
+
+    def _reset_ref_count_for_reuse_locked(self, count: int = 1) -> None:
+        """Reset a page while the caller holds ``self.lock``."""
+        state = self._ref_state
+        next_state = _TensorRefState(
+            count=count,
+            allocation_epoch=state.allocation_epoch + 1,
+            # Object identity is stable across page reuse. The epoch names the
+            # particular allocation of that object.
+            allocation_token=state.allocation_token,
+            up_applied_tokens=frozenset(),
+            up_completed_tokens=frozenset(),
+            applied_tokens=frozenset(),
+            completed_tokens=frozenset(),
+        )
+        self._ref_state = next_state
+        self.meta.ref_count = count
 
     def get_num_tokens(self) -> int:
         with self.lock:
@@ -785,36 +1566,50 @@ class TensorMemoryObj(MemoryObj):
 
     def pin(self) -> bool:
         with self.lock:
-            # if pin_count is 0, indicates that the object is pinned for the first time
-            if self.meta.pin_count == 0:
-                TensorMemoryObj.monitor.update_pinned_memory_objs_count(1)
-
+            first_pin = self.meta.pin_count == 0
             self.meta.pin_count += 1
-
-            # Register/update with PinMonitor for timeout tracking on every pin
-            pin_monitor = PinMonitor.GetOrCreate()
-            pin_monitor.on_pin(self)
+            # Monitoring is observational: once ownership changes, failures in
+            # metrics or timeout bookkeeping must not escape and make callers
+            # believe the pin was never published.
+            if first_pin:
+                try:
+                    TensorMemoryObj.monitor.update_pinned_memory_objs_count(1)
+                except Exception:
+                    logger.exception("Failed to update pinned-memory metrics")
+            try:
+                PinMonitor.GetOrCreate().on_pin(self)
+            except Exception:
+                logger.exception("Failed to register pinned memory object")
             return True
 
     def unpin(self) -> bool:
         with self.lock:
             self.meta.pin_count -= 1
 
-            # if pin_count is 0, indicates that the object is unpinned
+            # Once the count changes, all bookkeeping and reclamation is
+            # best-effort so a caller can treat return/raise as an exact
+            # ownership boundary.
             if self.meta.pin_count == 0:
-                TensorMemoryObj.monitor.update_pinned_memory_objs_count(-1)
-                # Unregister from PinMonitor when fully unpinned
-                pin_monitor = PinMonitor.GetOrCreate()
-                pin_monitor.on_unpin(self)
+                try:
+                    TensorMemoryObj.monitor.update_pinned_memory_objs_count(-1)
+                except Exception:
+                    logger.exception("Failed to update pinned-memory metrics")
+                try:
+                    PinMonitor.GetOrCreate().on_unpin(self)
+                except Exception:
+                    logger.exception("Failed to unregister pinned memory object")
 
-            if self.meta.pin_count <= 0 and self.meta.ref_count <= 0:
+            if self.meta.pin_count <= 0 and self._ref_state.count <= 0:
                 if self.parent_allocator is None:
                     logger.error(
                         "Parent allocator is None when trying to free MemoryObj."
                         "This could cause memory leak"
                     )
                 else:
-                    self.parent_allocator.free(self)
+                    try:
+                        self.parent_allocator.free(self)
+                    except Exception:
+                        logger.exception("Failed to reclaim unpinned memory object")
 
             if self.meta.pin_count < 0:
                 logger.warning(
@@ -829,6 +1624,10 @@ class TensorMemoryObj(MemoryObj):
     @property
     def metadata(self) -> MemoryObjMetadata:
         with self.lock:
+            # ``_ref_state`` is the ownership authority.  Keep the public
+            # compatibility metadata coherent even if an interruption landed
+            # after the atomic state commit and before the eager mirror write.
+            self.meta.ref_count = self._ref_state.count
             return self.meta
 
     @property
@@ -991,8 +1790,39 @@ class BytesBufferMemoryObj(MemoryObj):
     def ref_count_up(self):
         pass
 
+    def make_ref_count_up_receipt(self) -> RefCountUpReceipt:
+        """Create a receipt for this non-owning immutable byte buffer."""
+        return RefCountUpReceipt(0, self, object())
+
+    def ref_count_up_once(self, receipt: RefCountUpReceipt) -> None:
+        if receipt.allocation_token is not self or receipt.allocation_epoch != 0:
+            raise ValueError("byte-buffer ref-count receipt does not match object")
+
+    def ref_count_up_receipt_complete(self, receipt: RefCountUpReceipt) -> bool:
+        self.ref_count_up_once(receipt)
+        return True
+
+    def ref_count_up_receipt_applied(self, receipt: RefCountUpReceipt) -> bool:
+        self.ref_count_up_once(receipt)
+        return True
+
     def ref_count_down(self):
         pass
+
+    def make_ref_count_down_receipt(self) -> RefCountDownReceipt:
+        """Create a receipt for this non-owning immutable byte buffer."""
+        return RefCountDownReceipt(0, self, object())
+
+    def ref_count_down_once(self, receipt: RefCountDownReceipt) -> None:
+        if receipt.allocation_token is not self or receipt.allocation_epoch != 0:
+            raise ValueError("byte-buffer ref-count receipt does not match object")
+
+    def ref_count_down_receipt_complete(
+        self,
+        receipt: RefCountDownReceipt,
+    ) -> bool:
+        self.ref_count_down_once(receipt)
+        return True
 
     def get_ref_count(self) -> int:
         return 1
@@ -1180,6 +2010,7 @@ class MemoryAllocatorInterface(metaclass=abc.ABCMeta):
         dtypes: Union[torch.dtype, list[torch.dtype]],
         fmt: MemoryFormat = MemoryFormat.UNDEFINED,
         allocator_type: Optional[str] = None,
+        allocation_receipt: Optional[AllocationReceipt] = None,
     ) -> Optional[MemoryObj]:
         """
         Allocates the memory to hold a tensor of the given shape.
@@ -1203,6 +2034,7 @@ class MemoryAllocatorInterface(metaclass=abc.ABCMeta):
         batch_size: int,
         fmt: MemoryFormat = MemoryFormat.UNDEFINED,
         allocator_type: Optional[str] = None,
+        allocation_receipts: Optional[Sequence[AllocationReceipt]] = None,
     ) -> Optional[List[MemoryObj]]:
         """
         Batched allocate the memory to hold a tensor of the given shape.
@@ -1285,332 +2117,415 @@ class MemoryAllocatorInterface(metaclass=abc.ABCMeta):
         return shapes, dtypes
 
 
+@dataclass(frozen=True)
+class _AddressBlock:
+    start: int
+    size: int
+
+
+@dataclass(frozen=True)
+class _AddressAllocation:
+    start: int
+    size: int
+    generation: int
+
+
+@dataclass(frozen=True)
+class _AddressManagerState:
+    """One immutable snapshot of free space, live identities, and accounting."""
+
+    heap_size: int
+    free_blocks: tuple[_AddressBlock, ...]
+    live_allocations: Mapping[object, _AddressAllocation]
+    total_allocated_size: int
+    next_generation: int
+
+
 class AddressManager:
-    """
-    Manages a virtual address space starting from 0 for memory allocation.
+    """Manage aligned virtual addresses with exact allocation identities.
 
-    Key interfaces:
-    - allocate(size): Allocate a block of memory of the given size. The starting
-      address and the actual allocated size will be aligned.
-
-    - free(address, size): Free a previously allocated region. Note that if the
-      region is not "allocated" before, it may have internal errors.
-
-    - sbrk(size): Expand the virtual address space by the given size. The size
-      will be aligned internally.
-
-    Core assumptions:
-    - The allocated size should be aligned with ALIGN_BYTES.
+    Legacy ``allocate``/``free`` remain available. Exact cleanup owners use
+    ``allocate_once``/``batched_allocate_once`` and ``free_once`` so a delayed
+    retry can only release the generation named by its opaque receipt.
     """
 
     ALIGN_BYTES = 4096
 
     def __init__(self, size: int, align_bytes: int = ALIGN_BYTES):
-        """
-        Initializes the AddressManager with a given size.
-
-        Args:
-            size: The initial size of the virtual address space.
-            align_bytes: The alignment requirement for allocations.
-        """
-        self._size = size
+        if size < 0:
+            raise ValueError("address-space size cannot be negative")
+        if align_bytes <= 0 or align_bytes & (align_bytes - 1) != 0:
+            raise ValueError("align_bytes must be a positive power of two")
         self._align = align_bytes
-
-        # Current implementation: explicit list
-        self._explicit_list: SortedList[FreeBlock] = SortedList(key=lambda x: x.start)
-        self._explicit_list.add(FreeBlock(start=0, size=size))
-
-        # thread safe lock
         self._lock = threading.Lock()
+        initial_blocks = () if size == 0 else (_AddressBlock(0, size),)
+        self._state = _AddressManagerState(
+            heap_size=size,
+            free_blocks=initial_blocks,
+            live_allocations=MappingProxyType({}),
+            total_allocated_size=0,
+            next_generation=0,
+        )
 
-        # For debugging purposes
-        self.total_allocated_size = 0
+    @property
+    def total_allocated_size(self) -> int:
+        """Authoritative allocated bytes from the immutable state snapshot."""
+        return self._state.total_allocated_size
+
+    @property
+    def active_allocation_count(self) -> int:
+        """Return the number of exact live allocation generations."""
+        return len(self._state.live_allocations)
+
+    @property
+    def _explicit_list(self) -> SortedList[FreeBlock]:
+        """Compatibility snapshot for diagnostics that inspected the old list."""
+        snapshot: SortedList[FreeBlock] = SortedList(key=lambda item: item.start)
+        snapshot.update(
+            FreeBlock(block.start, block.size) for block in self._state.free_blocks
+        )
+        return snapshot
 
     def compute_aligned_size(self, raw_size: int) -> int:
-        """
-        Helper function to compute the aligned size for a given raw size.
-
-        Args:
-            raw_size: The raw size to be aligned.
-
-        Returns:
-            The aligned size.
-        """
         return (raw_size + self._align - 1) & ~(self._align - 1)
 
     def _can_merge_with_prev(
         self, curr_block: FreeBlock, prev_block: FreeBlock
     ) -> bool:
-        """Hook: Check if curr_block can merge with prev_block."""
         return prev_block.can_be_coalesced(curr_block)
 
     def _can_merge_with_succ(
         self, curr_block: FreeBlock, succ_block: FreeBlock
     ) -> bool:
-        """Hook: Check if curr_block can merge with succ_block."""
         return curr_block.can_be_coalesced(succ_block)
 
-    @_lmcache_nvtx_annotate
-    def _coalesce(
-        self,
-        curr_block: FreeBlock,
-        prev_block: Optional[FreeBlock],
-        succ_block: Optional[FreeBlock],
-    ):
-        """
-        Coalesces the current block with the previous and/or successor block.
-        This assumes the curr_block is NOT in self._explicit_list
-
-        Returns True if the current block was coalesced, otherwise False.
-        """
-        merge_prev = prev_block is not None and self._can_merge_with_prev(
-            curr_block, prev_block
-        )
-        merge_succ = succ_block is not None and self._can_merge_with_succ(
-            curr_block, succ_block
-        )
-
-        if merge_prev and merge_succ:
-            prev_block.size += curr_block.size + succ_block.size  # type: ignore
-            self._explicit_list.remove(succ_block)
-        elif merge_prev:
-            prev_block.size += curr_block.size  # type: ignore
-        elif merge_succ:
-            # NOTE: logically, this won't change the order of the succ_block,
-            #       so we don't need to do a "remove" and "reinsert" here
-            self._explicit_list.remove(succ_block)
-            succ_block.start -= curr_block.size  # type: ignore
-            succ_block.size += curr_block.size  # type: ignore
-            self._explicit_list.add(succ_block)
-
-        return merge_prev or merge_succ
-
-    @_lmcache_nvtx_annotate
-    @synchronized("_lock")
-    def allocate(self, size: int) -> tuple[int, int]:
-        """
-        Allocate a block of memory from the virtual address space of a given
-        size. The actual allocated size could be larger than the requested size
-        in order to satisfy alignment requirements.
-
-        Args:
-            size: The requested size of the memory block. Should be greater
-                than 0.
-
-        Returns:
-            A tuple (address, allocated_size) where address is the starting
-            address of the allocated block and allocated_size is the actual
-            size of the allocated block.
-
-        Raises:
-            RuntimeError: If no memory is available to allocate.
-        """
-        aligned_size = self.compute_aligned_size(size)
-        for block in self._explicit_list:
-            if block.size >= aligned_size:
-                break
-        else:
-            logger.warning(
-                "Failed to allocate memory block of size %d "
-                "because no memory is available",
-                size,
-            )
-            raise RuntimeError(
-                f"Failed to allocate memory block of size {size} "
-                "because no memory is available"
-            )
-
-        self._explicit_list.remove(block)
-        if block.size > aligned_size:
-            self._explicit_list.add(
-                FreeBlock(
-                    start=block.start + aligned_size,
-                    size=block.size - aligned_size,
-                )
-            )
-
-        # For debug
-        self.total_allocated_size += aligned_size
-
-        return block.start, aligned_size
-
-    @_lmcache_nvtx_annotate
-    @synchronized("_lock")
-    def batched_allocate(self, size: int, batch_size: int) -> list[tuple[int, int]]:
-        """
-        Allocate blocks of memory from the virtual address space of a given
-        size and batch size. The actual allocated size could be larger than
-        the requested size in order to satisfy alignment requirements.
-
-        Args:
-            size: The requested size of the memory block. Should be greater
-                than 0.
-            batch_size: The number of memory blocks to allocate.
-
-        Returns:
-            A list of tuple (address, allocated_size) where address is the starting
-            address of the allocated block and allocated_size is the actual size of
-            the allocated block.
-            Note: the length of the return list is the same as the batch_size.
-
-        Raises:
-            RuntimeError: If no memory is available to allocate.
-        """
-        aligned_size = self.compute_aligned_size(size)
-        remaining = batch_size
-        allocate_result: list[tuple[int, int]] = []
-
-        blocks_to_remove: list[FreeBlock] = []
-        blocks_to_add: list[FreeBlock] = []
-
-        for block in self._explicit_list:
-            if remaining <= 0:
-                break
-            if block.size < aligned_size:
+    def _merge_free_blocks(
+        self, blocks: Sequence[_AddressBlock]
+    ) -> tuple[_AddressBlock, ...]:
+        if not blocks:
+            return ()
+        ordered = sorted(blocks, key=lambda block: block.start)
+        merged: list[_AddressBlock] = []
+        for block in ordered:
+            if block.size <= 0:
                 continue
+            if not merged:
+                merged.append(block)
+                continue
+            prev = merged[-1]
+            prev_end = prev.start + prev.size
+            if block.start < prev_end:
+                raise RuntimeError("free ranges overlap")
+            if self._can_merge_with_succ(
+                FreeBlock(prev.start, prev.size),
+                FreeBlock(block.start, block.size),
+            ):
+                merged[-1] = _AddressBlock(prev.start, prev.size + block.size)
+            else:
+                merged.append(block)
+        return tuple(merged)
 
-            # Greedily carve out as many aligned_size chunks as possible
-            num_from_block = min(remaining, block.size // aligned_size)
-            start = block.start
-            for i in range(num_from_block):
-                allocate_result.append((start + i * aligned_size, aligned_size))
-            remaining -= num_from_block
+    def _new_state(
+        self,
+        *,
+        heap_size: int,
+        free_blocks: Sequence[_AddressBlock],
+        live_allocations: Mapping[object, _AddressAllocation],
+        next_generation: int,
+    ) -> _AddressManagerState:
+        frozen_blocks = tuple(free_blocks)
+        total_allocated = heap_size - sum(block.size for block in frozen_blocks)
+        return _AddressManagerState(
+            heap_size=heap_size,
+            free_blocks=frozen_blocks,
+            live_allocations=MappingProxyType(dict(live_allocations)),
+            total_allocated_size=total_allocated,
+            next_generation=next_generation,
+        )
 
-            # Mark the original block for removal
-            blocks_to_remove.append(block)
-
-            # Keep the remaining tail as a new free block if any space is left
-            used = num_from_block * aligned_size
+    def _carve_batch(
+        self,
+        blocks: Sequence[_AddressBlock],
+        aligned_size: int,
+        batch_size: int,
+    ) -> tuple[list[tuple[int, int]], tuple[_AddressBlock, ...]]:
+        remaining = batch_size
+        results: list[tuple[int, int]] = []
+        replacement: list[_AddressBlock] = []
+        for block in blocks:
+            if remaining <= 0 or block.size < aligned_size:
+                replacement.append(block)
+                continue
+            count = min(remaining, block.size // aligned_size)
+            results.extend(
+                (block.start + index * aligned_size, aligned_size)
+                for index in range(count)
+            )
+            remaining -= count
+            used = count * aligned_size
             if block.size > used:
-                blocks_to_add.append(
-                    FreeBlock(start=block.start + used, size=block.size - used)
-                )
-
+                replacement.append(_AddressBlock(block.start + used, block.size - used))
         if remaining > 0:
-            # Not enough memory; free list is untouched, no rollback needed
             logger.warning(
                 "Failed to batched allocate %d memory blocks of size %d "
                 "because no enough memory is available (short by %d blocks)",
                 batch_size,
-                size,
+                aligned_size,
                 remaining,
             )
             raise RuntimeError(
                 f"Failed to batched allocate {batch_size} memory blocks "
-                f"of size {size} because no enough memory is available"
+                f"of size {aligned_size} because no enough memory is available"
             )
-        if len(allocate_result) != batch_size:
-            # The length of allocate_result is not equal to batch_size;
-            # free list is untouched, no rollback needed
-            logger.warning(
-                "Failed to batched allocate %d memory blocks of size %d "
-                "because the length of allocate_result %d is not equal to batch_size",
-                batch_size,
-                size,
-                len(allocate_result),
-            )
-            raise RuntimeError(
-                f"Failed to batched allocate {batch_size} memory blocks "
-                f"of size {size} because the length of allocate_result "
-                f"{len(allocate_result)} is not equal to batch_size"
-            )
-
-        # Allocation succeeded; batch-update the free list
-        for block in blocks_to_remove:
-            self._explicit_list.remove(block)
-        for block in blocks_to_add:
-            self._explicit_list.add(block)
-
-        # Update debug statistics
-        total_allocated = aligned_size * batch_size
-        self.total_allocated_size += total_allocated
-
-        return allocate_result
+        return results, tuple(replacement)
 
     @_lmcache_nvtx_annotate
-    @synchronized("_lock")
-    def free(self, address: int, size: int):
-        """
-        Free a previously allocated block of memory.
+    def allocate_once(self, size: int, receipt: AllocationReceipt) -> tuple[int, int]:
+        """Allocate or replay the generation named by ``receipt``."""
+        if size <= 0:
+            raise ValueError("allocation size must be positive")
+        receipt._bind_address_manager(self)
+        aligned_size = self.compute_aligned_size(size)
+        with self._lock:
+            if not receipt._allocation_may_commit(self):
+                raise RuntimeError("allocation receipt release has begun")
+            state = self._state
+            existing = state.live_allocations.get(receipt.token)
+            if existing is not None:
+                if existing.size != aligned_size:
+                    raise ValueError("allocation receipt replay changed size")
+                return existing.start, existing.size
+            try:
+                results, free_blocks = self._carve_batch(
+                    state.free_blocks, aligned_size, 1
+                )
+            except RuntimeError:
+                raise RuntimeError(
+                    f"Failed to allocate memory block of size {size} "
+                    "because no memory is available"
+                ) from None
+            start, allocated_size = results[0]
+            live_allocations = dict(state.live_allocations)
+            live_allocations[receipt.token] = _AddressAllocation(
+                start=start,
+                size=allocated_size,
+                generation=state.next_generation,
+            )
+            next_state = self._new_state(
+                heap_size=state.heap_size,
+                free_blocks=free_blocks,
+                live_allocations=live_allocations,
+                next_generation=state.next_generation + 1,
+            )
+            # Free ranges, generation identity, and accounting publish together.
+            self._state = next_state
+            return start, allocated_size
 
-        Args:
-            address: The starting address of the block to free.
-            size: The size of the block to free. Should be greater than 0.
-        """
-        new_free_block = FreeBlock(start=address, size=size)
-        index = self._explicit_list.bisect_left(new_free_block)
-        prev_block = self._explicit_list[index - 1] if index > 0 else None
-        succ_block = (
-            self._explicit_list[index] if index < len(self._explicit_list) else None
+    @_lmcache_nvtx_annotate
+    def allocate(self, size: int) -> tuple[int, int]:
+        """Legacy allocation API; exact allocator paths retain their receipt."""
+        return self.allocate_once(size, AllocationReceipt())
+
+    @_lmcache_nvtx_annotate
+    def batched_allocate_once(
+        self,
+        size: int,
+        receipts: Sequence[AllocationReceipt],
+    ) -> list[tuple[int, int]]:
+        """Atomically allocate or replay one generation per receipt."""
+        if size <= 0:
+            raise ValueError("allocation size must be positive")
+        if len({id(receipt) for receipt in receipts}) != len(receipts):
+            raise ValueError("batched allocation receipts must be unique")
+        for receipt in receipts:
+            receipt._bind_address_manager(self)
+        if not receipts:
+            return []
+        aligned_size = self.compute_aligned_size(size)
+        with self._lock:
+            if not all(receipt._allocation_may_commit(self) for receipt in receipts):
+                raise RuntimeError("batched allocation receipt release has begun")
+            state = self._state
+            existing = [state.live_allocations.get(item.token) for item in receipts]
+            if any(item is not None for item in existing):
+                if not all(item is not None for item in existing):
+                    raise RuntimeError("batched allocation receipt replay is partial")
+                replay = []
+                for item in existing:
+                    assert item is not None
+                    if item.size != aligned_size:
+                        raise ValueError("allocation receipt replay changed size")
+                    replay.append((item.start, item.size))
+                return replay
+
+            results, free_blocks = self._carve_batch(
+                state.free_blocks, aligned_size, len(receipts)
+            )
+            live_allocations = dict(state.live_allocations)
+            generation = state.next_generation
+            for receipt, (start, allocated_size) in zip(receipts, results, strict=True):
+                live_allocations[receipt.token] = _AddressAllocation(
+                    start=start,
+                    size=allocated_size,
+                    generation=generation,
+                )
+                generation += 1
+            next_state = self._new_state(
+                heap_size=state.heap_size,
+                free_blocks=free_blocks,
+                live_allocations=live_allocations,
+                next_generation=generation,
+            )
+            # The whole batch has one authoritative publication boundary.
+            self._state = next_state
+            return results
+
+    @_lmcache_nvtx_annotate
+    def batched_allocate(self, size: int, batch_size: int) -> list[tuple[int, int]]:
+        if batch_size < 0:
+            raise ValueError("batch size cannot be negative")
+        return self.batched_allocate_once(
+            size, [AllocationReceipt() for _ in range(batch_size)]
         )
 
-        coalesced = self._coalesce(new_free_block, prev_block, succ_block)
-        if not coalesced:
-            self._explicit_list.add(new_free_block)
+    def _free_range_locked(
+        self,
+        state: _AddressManagerState,
+        address: int,
+        size: int,
+        *,
+        exact_token: Optional[object] = None,
+    ) -> tuple[_AddressManagerState, bool]:
+        end = address + size
+        if address < 0 or end > state.heap_size:
+            raise ValueError("free range lies outside the address space")
+        if any(
+            block.start <= address and block.start + block.size >= end
+            for block in state.free_blocks
+        ):
+            return state, False
+        for block in state.free_blocks:
+            block_end = block.start + block.size
+            if address < block_end and end > block.start:
+                raise RuntimeError("free range partially overlaps existing free space")
 
-        # For debug
-        self.total_allocated_size -= size
+        live_allocations = dict(state.live_allocations)
+        if exact_token is not None:
+            allocation = live_allocations.get(exact_token)
+            if allocation is None:
+                return state, False
+            if allocation.start != address or allocation.size != size:
+                raise RuntimeError("allocation receipt range changed unexpectedly")
+            del live_allocations[exact_token]
+        else:
+            overlapping_tokens: list[object] = []
+            for token, allocation in live_allocations.items():
+                allocation_end = allocation.start + allocation.size
+                if address < allocation_end and end > allocation.start:
+                    if allocation.start < address or allocation_end > end:
+                        raise RuntimeError("free range splits a live allocation")
+                    overlapping_tokens.append(token)
+            if not overlapping_tokens:
+                raise RuntimeError("free range does not name a live allocation")
+            for token in overlapping_tokens:
+                del live_allocations[token]
 
-    @synchronized("_lock")
-    def sbrk(self, size: int):
-        """
-        Expand the virtual address space by a given size.
+        free_blocks = self._merge_free_blocks(
+            (*state.free_blocks, _AddressBlock(address, size))
+        )
+        return (
+            self._new_state(
+                heap_size=state.heap_size,
+                free_blocks=free_blocks,
+                live_allocations=live_allocations,
+                next_generation=state.next_generation,
+            ),
+            True,
+        )
 
-        Args:
-            size: The size to expand the address space. Will be aligned internally
-                with the ALIGN_BYTES
-        """
+    @_lmcache_nvtx_annotate
+    def free_once(self, receipt: AllocationReceipt) -> bool:
+        """Free only the live generation named by ``receipt``."""
+        if not receipt._begin_address_release(self):
+            return False
+        changed = False
+        with self._lock:
+            state = self._state
+            allocation = state.live_allocations.get(receipt.token)
+            if allocation is not None:
+                next_state, changed = self._free_range_locked(
+                    state,
+                    allocation.start,
+                    allocation.size,
+                    exact_token=receipt.token,
+                )
+                # Token removal, free-space publication, and accounting are one
+                # pointer assignment, so delayed retries cannot free reuse.
+                self._state = next_state
+        receipt._finish_address_release(self)
+        return changed
+
+    @_lmcache_nvtx_annotate
+    def free(self, address: int, size: int) -> None:
+        """Legacy range free, atomically retiring every covered generation."""
+        if size <= 0:
+            raise ValueError("free size must be positive")
+        with self._lock:
+            next_state, changed = self._free_range_locked(self._state, address, size)
+            if changed:
+                self._state = next_state
+
+    def sbrk(self, size: int) -> None:
         size = self.compute_aligned_size(size)
-        new_block = FreeBlock(start=self._size, size=size)
-        prev_block = self._explicit_list[-1] if len(self._explicit_list) > 0 else None
-        succ_block = None
-        coalesced = self._coalesce(new_block, prev_block, succ_block)
-        if not coalesced:
-            self._explicit_list.add(new_block)
-
-        self._size += size
+        if size <= 0:
+            return
+        with self._lock:
+            state = self._state
+            free_blocks = self._merge_free_blocks(
+                (*state.free_blocks, _AddressBlock(state.heap_size, size))
+            )
+            self._state = self._new_state(
+                heap_size=state.heap_size + size,
+                free_blocks=free_blocks,
+                live_allocations=state.live_allocations,
+                next_generation=state.next_generation,
+            )
 
     def get_heap_size(self) -> int:
-        """
-        Get the total size of the address space.
-
-        Returns:
-            The total size in bytes.
-        """
-        return self._size
+        return self._state.heap_size
 
     def get_free_size(self) -> int:
-        """
-        Get the total free size in the address space.
-
-        Returns:
-            The total free size in bytes.
-        """
-        return self._size - self.total_allocated_size
+        state = self._state
+        return state.heap_size - state.total_allocated_size
 
     def check_consistency(self) -> bool:
-        """
-        Check if the address manager is consistent.
-
-        Returns:
-            True if consistent, False otherwise.
-        """
-        # Check if free blocks are properly coalesced
+        state = self._state
         for prev, succ in zip(
-            self._explicit_list[:-1], self._explicit_list[1:], strict=False
+            state.free_blocks[:-1], state.free_blocks[1:], strict=False
         ):
-            if prev.can_be_coalesced(succ):
+            if prev.start + prev.size >= succ.start:
                 return False
-
-        # Check if total size matches
-        total_free_size = sum(block.size for block in self._explicit_list)
-        if total_free_size + self.total_allocated_size != self._size:
+        total_free_size = sum(block.size for block in state.free_blocks)
+        if total_free_size + state.total_allocated_size != state.heap_size:
             return False
-
+        allocations = sorted(
+            state.live_allocations.values(), key=lambda allocation: allocation.start
+        )
+        if (
+            sum(allocation.size for allocation in allocations)
+            != state.total_allocated_size
+        ):
+            return False
+        for prev_allocation, succ_allocation in zip(
+            allocations[:-1], allocations[1:], strict=False
+        ):
+            if prev_allocation.start + prev_allocation.size > succ_allocation.start:
+                return False
         return True
 
 
 _CORE_EXPORTS = [
+    "AllocationReceipt",
     "AddressManager",
     "BytesBufferMemoryObj",
     "FreeBlock",

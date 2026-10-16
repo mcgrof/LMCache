@@ -2,9 +2,6 @@
 # Standard
 from typing import TYPE_CHECKING, Dict
 
-# Third Party
-from torch import nn
-
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.compute.blend.blender import LMCBlender
@@ -29,7 +26,7 @@ class LMCBlenderBuilder:
         cache_engine: "LMCacheEngine",
         gpu_connector: "GPUConnectorInterface",
         config: "LMCacheEngineConfig",
-    ):
+    ) -> LMCBlender:
         """
         Get or create a blender for the given instance_id.
         """
@@ -54,10 +51,26 @@ class LMCBlenderBuilder:
     def get(
         cls,
         instance_id: str,
-    ) -> nn.Module:
+    ) -> LMCBlender:
         """
         Get the blender by instance_id.
         """
         if instance_id not in cls._blenders:
             raise ValueError(f"Blender for {instance_id} not found.")
         return cls._blenders[instance_id]
+
+    @classmethod
+    def drop(cls, instance_id: str) -> bool:
+        """Remove the blender retained for an engine instance.
+
+        Args:
+            instance_id: Engine instance whose blender should be forgotten.
+
+        Returns:
+            ``True`` when an entry existed, otherwise ``False``.
+        """
+        blender = cls._blenders.pop(instance_id, None)
+        if blender is None:
+            return False
+        logger.info("Dropped blender for %s", instance_id)
+        return True

@@ -15,6 +15,7 @@ from lmcache.v1.storage_backend.connector.mooncakestore_connector import (
     MooncakeStoreConfig,
     setup_mooncake_store,
 )
+from lmcache.v1.token_span import ExplicitTokenSpans
 
 logger = init_logger(__name__)
 
@@ -63,7 +64,12 @@ class MooncakeLookupClient(LookupClientInterface):
         token_ids: Union[torch.Tensor, list[int]],
         lookup_id: Optional[str] = None,
         request_configs: Optional[dict] = None,
+        explicit_spans: Optional[ExplicitTokenSpans] = None,
     ) -> Optional[int]:
+        if explicit_spans is not None:
+            raise NotImplementedError(
+                "Mooncake lookup does not support explicit token spans"
+            )
         # process token_ids to cacheengine keys
         keys = []
         ends = []

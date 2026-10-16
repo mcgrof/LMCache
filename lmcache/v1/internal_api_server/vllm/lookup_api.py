@@ -69,6 +69,8 @@ async def close_lookup(request: Request):
         return _json_response({"error": "Unknown role"}, 400)
 
     result["role"] = role
+    if "error" in result:
+        return _json_response(result, 400)
     return _json_response(result)
 
 

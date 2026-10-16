@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from typing import Any, cast
+import ctypes
+import inspect
 import threading
 import time
 
@@ -20,6 +23,7 @@ from lmcache.v1.memory_allocators.pin_memory_allocator import PinMemoryAllocator
 from lmcache.v1.memory_allocators.tensor_memory_allocator import TensorMemoryAllocator
 from lmcache.v1.memory_management import (
     BytesBufferMemoryObj,
+    MemoryAllocatorInterface,
     MemoryFormat,
     MemoryObjMetadata,
     TensorMemoryObj,
@@ -28,8 +32,16 @@ from lmcache.v1.memory_management import (
     _read_hugepage_info,
 )
 from lmcache.v1.pin_monitor import PinMonitor
+import lmcache.v1.memory_management as memory_management
 
 HUGEPAGE_SIZE = 2 * 1024 * 1024  # MAP_HUGE_2MB
+
+
+@pytest.fixture(autouse=True)
+def isolate_pin_monitor():
+    PinMonitor.DestroyInstance()
+    yield
+    PinMonitor.DestroyInstance()
 
 
 def check_allocator(allocator, max_size):
@@ -414,8 +426,7 @@ def test_pin_timeout(alloc_cls, custom_timeout, elapsed_time):
     # Also reset the class variable to use the new singleton
     TensorMemoryObj.monitor = LMCStatsMonitor.GetOrCreate()
 
-    # Reset and initialize PinMonitor
-    PinMonitor._instance = None
+    # Initialize PinMonitor
     config = LMCacheEngineConfig.from_defaults()
     PinMonitor.GetOrCreate(config)
 
@@ -489,9 +500,6 @@ def test_pin_monitor_timeout():
             if self.meta.pin_count < 0:
                 self.meta.pin_count = 0
 
-    # Reset PinMonitor singleton for testing
-    PinMonitor._instance = None
-
     # Create PinMonitor with short timeout for testing
     config = LMCacheEngineConfig.from_defaults(
         pin_timeout_sec=1, pin_check_interval_sec=1
@@ -539,8 +547,7 @@ def test_pin_monitor_timeout():
 
 def test_pin_monitor_background_thread():
     """Test that PinMonitor background thread starts correctly."""
-    # Reset singleton and create with config
-    PinMonitor._instance = None
+    # Create with config
     config = LMCacheEngineConfig.from_defaults()
     pin_monitor = PinMonitor.GetOrCreate(config)
 
@@ -580,7 +587,7 @@ def test_tensor_memory_obj_pin_monitor_integration():
     memory_obj = TensorMemoryObj(raw_data, metadata, allocator)
 
     # Get PinMonitor instance
-    pin_monitor = PinMonitor.GetOrCreate()
+    pin_monitor = PinMonitor.GetOrCreate(LMCacheEngineConfig.from_defaults())
     initial_count = pin_monitor.get_monitored_count()
 
     # Test pinning registers with PinMonitor
@@ -601,6 +608,54 @@ def test_tensor_memory_obj_pin_monitor_integration():
 
     memory_obj.unpin()
     assert pin_monitor.get_monitored_count() == initial_count  # Fully unregistered
+
+
+def test_tensor_memory_obj_pin_ownership_survives_observer_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FailingAllocator:
+        def __init__(self) -> None:
+            self.free_calls = 0
+
+        def free(self, obj) -> None:
+            del obj
+            self.free_calls += 1
+            if self.free_calls == 1:
+                raise RuntimeError("injected allocator observer failure")
+
+    raw_data = torch.empty(1, dtype=torch.float32)
+    metadata = MemoryObjMetadata(
+        shape=torch.Size([1]),
+        dtype=torch.float32,
+        address=12345,
+        phy_size=4,
+        fmt=MemoryFormat.KV_2LTD,
+        ref_count=0,
+    )
+    allocator = _FailingAllocator()
+    memory_obj = TensorMemoryObj(
+        raw_data,
+        metadata,
+        cast(MemoryAllocatorInterface, allocator),
+    )
+    pin_monitor = PinMonitor.GetOrCreate(LMCacheEngineConfig.from_defaults())
+
+    def fail_pin(obj) -> None:
+        del obj
+        raise RuntimeError("injected post-count pin monitor failure")
+
+    def fail_unpin(obj) -> None:
+        del obj
+        raise RuntimeError("injected post-count unpin monitor failure")
+
+    monkeypatch.setattr(pin_monitor, "on_pin", fail_pin)
+    monkeypatch.setattr(pin_monitor, "on_unpin", fail_unpin)
+
+    assert memory_obj.pin()
+    assert memory_obj.metadata.pin_count == 1
+    assert memory_obj.unpin()
+    assert memory_obj.metadata.pin_count == 0
+    assert allocator.free_calls == 1
 
 
 # =============================================================================
@@ -969,6 +1024,281 @@ def _get_num_free_hugepages() -> int:
         return 0
     _, free, _ = info
     return free
+
+
+class _PinnedArenaBoundaryInterrupt(BaseException):
+    pass
+
+
+def _install_fake_pinned_arena(
+    monkeypatch: pytest.MonkeyPatch,
+    size: int = 8192,
+) -> tuple[ctypes.Array, int, list[int]]:
+    """Install one process-local native arena with an observable exact free."""
+    native = ctypes.create_string_buffer(size)
+    pointer = ctypes.addressof(native)
+    freed: list[int] = []
+    resolved = memory_management.PinnedAllocFree(
+        alloc_fn=lambda: pointer,
+        alloc_args=(),
+        free_fn=lambda raw_pointer: freed.append(raw_pointer),
+        free_args=(),
+    )
+    monkeypatch.setattr(
+        memory_management,
+        "_resolve_pinned_alloc_free",
+        lambda *args, **kwargs: resolved,
+    )
+    monkeypatch.setattr(
+        "lmcache.v1.memory_allocators.mixed_memory_allocator.torch_dev.is_available",
+        lambda: False,
+    )
+    return native, pointer, freed
+
+
+@pytest.mark.parametrize("interrupt_after_publish", [False, True])
+def test_mixed_allocator_raw_receipt_boundary_frees_exact_pointer_once(
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt_after_publish: bool,
+) -> None:
+    """Both sides of raw-pointer publication retain exactly one free owner."""
+    _native, pointer, freed = _install_fake_pinned_arena(monkeypatch)
+    original_retain = memory_management.CPUMemoryAllocationReceipt.retain_raw
+    error = _PinnedArenaBoundaryInterrupt("raw receipt boundary")
+
+    def interrupt_retain(self, resolved, raw_pointer):
+        if interrupt_after_publish:
+            original_retain(self, resolved, raw_pointer)
+        raise error
+
+    monkeypatch.setattr(
+        memory_management.CPUMemoryAllocationReceipt,
+        "retain_raw",
+        interrupt_retain,
+    )
+    allocator = MixedMemoryAllocator.__new__(MixedMemoryAllocator)
+    with pytest.raises(_PinnedArenaBoundaryInterrupt) as failure:
+        MixedMemoryAllocator.__init__(allocator, 8192)
+    assert failure.value is error
+
+    allocator.close()
+    allocator.close()
+    assert freed == [pointer]
+    assert allocator._unregistered
+
+
+def test_mixed_allocator_first_post_alloc_trace_line_rolls_back_pointer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker-side trace interrupt immediately after alloc cannot leak."""
+    _native, pointer, freed = _install_fake_pinned_arena(monkeypatch)
+    source, first_line = inspect.getsourcelines(
+        memory_management._allocate_cpu_memory_once
+    )
+    alloc_index = next(
+        index for index, line in enumerate(source) if "ptr = resolved.alloc()" in line
+    )
+    post_alloc_line = next(
+        first_line + index
+        for index, line in enumerate(source[alloc_index + 1 :], alloc_index + 1)
+        if "if ownership_receipt is not None:" in line
+    )
+    error = _PinnedArenaBoundaryInterrupt("first post-alloc trace line")
+    interrupted = False
+
+    def interrupt_trace(frame, event, arg):
+        del arg
+        nonlocal interrupted
+        if (
+            not interrupted
+            and event == "line"
+            and frame.f_code is memory_management._allocate_cpu_memory_once.__code__
+            and frame.f_lineno == post_alloc_line
+        ):
+            interrupted = True
+            raise error
+        return interrupt_trace
+
+    threading.settrace(interrupt_trace)
+    allocator = MixedMemoryAllocator.__new__(MixedMemoryAllocator)
+    try:
+        with pytest.raises(_PinnedArenaBoundaryInterrupt) as failure:
+            MixedMemoryAllocator.__init__(allocator, 8192)
+    finally:
+        threading.settrace(cast(Any, None))
+    assert failure.value is error
+    assert interrupted
+
+    allocator.close()
+    allocator.close()
+    assert freed == [pointer]
+    assert allocator._unregistered
+
+
+@pytest.mark.parametrize("interrupt_after_publish", [False, True])
+def test_mixed_allocator_tensor_receipt_boundary_frees_exact_pointer_once(
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt_after_publish: bool,
+) -> None:
+    """Tensor publication cannot displace the receipt's raw free authority."""
+    _native, pointer, freed = _install_fake_pinned_arena(monkeypatch)
+    original_publish = memory_management.CPUMemoryAllocationReceipt.publish_buffer
+    error = _PinnedArenaBoundaryInterrupt("Tensor receipt boundary")
+
+    def interrupt_publish(self, allocation, buffer):
+        if interrupt_after_publish:
+            original_publish(self, allocation, buffer)
+        raise error
+
+    monkeypatch.setattr(
+        memory_management.CPUMemoryAllocationReceipt,
+        "publish_buffer",
+        interrupt_publish,
+    )
+    allocator = MixedMemoryAllocator.__new__(MixedMemoryAllocator)
+    with pytest.raises(_PinnedArenaBoundaryInterrupt) as failure:
+        MixedMemoryAllocator.__init__(allocator, 8192)
+    assert failure.value is error
+
+    allocator.close()
+    allocator.close()
+    assert freed == [pointer]
+    assert allocator._unregistered
+
+
+@pytest.mark.parametrize("interrupt_after_publish", [False, True])
+def test_mixed_allocator_buffer_attribute_is_not_native_ownership_proof(
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt_after_publish: bool,
+) -> None:
+    """The retained receipt survives either side of ``self.buffer`` STORE_ATTR."""
+    _native, pointer, freed = _install_fake_pinned_arena(monkeypatch)
+    original_setattr = MixedMemoryAllocator.__setattr__
+    error = _PinnedArenaBoundaryInterrupt("buffer attribute boundary")
+
+    def interrupt_buffer_setattr(self, name, value):
+        if (
+            name == "buffer"
+            and isinstance(value, torch.Tensor)
+            and getattr(self, "_cpu_memory_allocation_receipt", None) is not None
+            and self._cpu_memory_allocation_receipt.buffer is value
+        ):
+            if interrupt_after_publish:
+                original_setattr(self, name, value)
+            raise error
+        original_setattr(self, name, value)
+
+    monkeypatch.setattr(MixedMemoryAllocator, "__setattr__", interrupt_buffer_setattr)
+    allocator = MixedMemoryAllocator.__new__(MixedMemoryAllocator)
+    with pytest.raises(_PinnedArenaBoundaryInterrupt) as failure:
+        MixedMemoryAllocator.__init__(allocator, 8192)
+    assert failure.value is error
+
+    allocator.close()
+    allocator.close()
+    assert freed == [pointer]
+    assert allocator._unregistered
+
+
+def test_mixed_allocator_allocation_wait_interrupt_retains_worker_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Caller interruption after allocation cannot strand the worker's arena."""
+    _native, pointer, freed = _install_fake_pinned_arena(monkeypatch)
+    original_run = memory_management.RetainedCall.run
+    error = _PinnedArenaBoundaryInterrupt("allocation waiter boundary")
+    interrupted = False
+
+    def interrupt_after_allocation(self):
+        nonlocal interrupted
+        original_run(self)
+        if self._thread_name == "lmcache-pinned-cpu-allocation" and not interrupted:
+            interrupted = True
+            raise error
+
+    monkeypatch.setattr(
+        memory_management.RetainedCall,
+        "run",
+        interrupt_after_allocation,
+    )
+    allocator = MixedMemoryAllocator.__new__(MixedMemoryAllocator)
+    with pytest.raises(_PinnedArenaBoundaryInterrupt) as failure:
+        MixedMemoryAllocator.__init__(allocator, 8192)
+    assert failure.value is error
+
+    allocator.close()
+    assert freed == [pointer]
+    assert allocator._unregistered
+
+
+def test_mixed_allocator_free_success_publication_is_replay_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An interrupted close resumes one completed retained native free."""
+    _native, pointer, freed = _install_fake_pinned_arena(monkeypatch)
+    allocator = MixedMemoryAllocator(8192)
+    receipt = allocator._cpu_memory_allocation_receipt
+    assert receipt._allocation is not None
+    release_call = receipt._allocation.release_call
+    original_run = release_call.run
+    error = _PinnedArenaBoundaryInterrupt("free success boundary")
+    interrupted = False
+
+    def interrupt_after_free() -> None:
+        nonlocal interrupted
+        original_run()
+        if not interrupted:
+            interrupted = True
+            raise error
+
+    monkeypatch.setattr(release_call, "run", interrupt_after_free)
+    with pytest.raises(_PinnedArenaBoundaryInterrupt) as failure:
+        allocator.close()
+    assert failure.value is error
+    assert freed == [pointer]
+    assert not allocator._unregistered
+
+    allocator.close()
+    assert freed == [pointer]
+    assert allocator._unregistered
+
+
+def test_mixed_allocator_native_free_failure_is_sticky(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An arbitrary native free error is reported without unsafe replay."""
+    native = ctypes.create_string_buffer(8192)
+    pointer = ctypes.addressof(native)
+    free_calls: list[int] = []
+    error = RuntimeError("injected native free failure")
+
+    def fail_free(raw_pointer: int) -> None:
+        free_calls.append(raw_pointer)
+        raise error
+
+    resolved = memory_management.PinnedAllocFree(
+        alloc_fn=lambda: pointer,
+        alloc_args=(),
+        free_fn=fail_free,
+        free_args=(),
+    )
+    monkeypatch.setattr(
+        memory_management,
+        "_resolve_pinned_alloc_free",
+        lambda *args, **kwargs: resolved,
+    )
+    monkeypatch.setattr(
+        "lmcache.v1.memory_allocators.mixed_memory_allocator.torch_dev.is_available",
+        lambda: False,
+    )
+    allocator = MixedMemoryAllocator(8192)
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError) as failure:
+            allocator.close()
+        assert failure.value is error
+    assert free_calls == [pointer]
+    assert not allocator._unregistered
 
 
 @pytest.mark.skipif(

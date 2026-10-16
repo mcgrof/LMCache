@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future
-from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Union, cast
 import threading
 import time
 
@@ -17,14 +16,18 @@ from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.lifecycle import RetainedCall, _run_under_interrupt_safe_rlock
 from lmcache.v1.memory_allocators.mixed_memory_allocator import MixedMemoryAllocator
 from lmcache.v1.memory_allocators.paged_cpu_gpu_memory_allocator import (
     PagedCpuGpuMemoryAllocator,
 )
 from lmcache.v1.memory_management import (
+    AllocationReceipt,
     MemoryAllocatorInterface,
     MemoryFormat,
     MemoryObj,
+    RefCountDownReceipt,
+    RefCountUpReceipt,
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
@@ -39,12 +42,215 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+_MISSING_CACHE_ENTRY = object()
+
+
+class _LocalCPUCacheAdmissionReceipt:
+    """Retain one cache acquisition until its map publication completes."""
+
+    def __init__(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
+        self.key = key
+        self.memory_obj = memory_obj
+        self.ref_count_up_receipt: RefCountUpReceipt = (
+            memory_obj.make_ref_count_up_receipt()
+        )
+
+    def run(self, backend: "LocalCPUBackend") -> None:
+        """Acquire the cache reference once and publish its exact object."""
+        _run_under_interrupt_safe_rlock(
+            backend.cpu_lock,
+            lambda: self._run_locked(backend),
+        )
+
+    def _run_locked(self, backend: "LocalCPUBackend") -> None:
+        cached = backend.hot_cache.get(self.key, _MISSING_CACHE_ENTRY)
+        if cached is not _MISSING_CACHE_ENTRY and cached is not self.memory_obj:
+            raise RuntimeError("LocalCPU cache key changed during admission recovery")
+        self.memory_obj.ref_count_up_once(self.ref_count_up_receipt)
+        backend.hot_cache[self.key] = self.memory_obj
+
+    def complete(self, backend: "LocalCPUBackend") -> bool:
+        """Prove both the exact acquisition and map publication."""
+        return _run_under_interrupt_safe_rlock(
+            backend.cpu_lock,
+            lambda: self._complete_locked(backend),
+        )
+
+    def _complete_locked(self, backend: "LocalCPUBackend") -> bool:
+        cached = backend.hot_cache.get(self.key, _MISSING_CACHE_ENTRY)
+        if cached is not _MISSING_CACHE_ENTRY and cached is not self.memory_obj:
+            raise RuntimeError("LocalCPU cache key changed during admission recovery")
+        return cached is self.memory_obj and (
+            self.memory_obj.ref_count_up_receipt_complete(self.ref_count_up_receipt)
+        )
+
+    def applied(self) -> bool:
+        """Return whether the cache acquisition owns a live reference."""
+        return self.memory_obj.ref_count_up_receipt_applied(self.ref_count_up_receipt)
+
+
+class _LocalCPUCacheReleaseReceipt:
+    """Retain one cache reference across removal interruptions."""
+
+    def __init__(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
+        self.key = key
+        self.memory_obj = memory_obj
+        self.ref_count_down_receipt: RefCountDownReceipt = (
+            memory_obj.make_ref_count_down_receipt()
+        )
+
+    def run(self, backend: "LocalCPUBackend") -> None:
+        """Remove the entry and consume its exact cache reference once."""
+        _run_under_interrupt_safe_rlock(
+            backend.cpu_lock,
+            lambda: self._run_locked(backend),
+        )
+
+    def _run_locked(self, backend: "LocalCPUBackend") -> None:
+        cached = backend.hot_cache.get(self.key, _MISSING_CACHE_ENTRY)
+        if cached is self.memory_obj:
+            backend.hot_cache.pop(self.key)
+        elif cached is not _MISSING_CACHE_ENTRY:
+            raise RuntimeError("LocalCPU cache key changed during terminal cleanup")
+        self.memory_obj.ref_count_down_once(self.ref_count_down_receipt)
+
+    def complete(self, backend: "LocalCPUBackend") -> bool:
+        """Prove both map removal and the exact reference decrement."""
+        return _run_under_interrupt_safe_rlock(
+            backend.cpu_lock,
+            lambda: self._complete_locked(backend),
+        )
+
+    def _complete_locked(self, backend: "LocalCPUBackend") -> bool:
+        cached = backend.hot_cache.get(self.key, _MISSING_CACHE_ENTRY)
+        if cached is self.memory_obj:
+            return False
+        if cached is not _MISSING_CACHE_ENTRY:
+            raise RuntimeError("LocalCPU cache key changed during terminal cleanup")
+        return self.memory_obj.ref_count_down_receipt_complete(
+            self.ref_count_down_receipt
+        )
+
+
+class _LocalCPUBackendCloseStage:
+    """One exact LocalCPU terminal stage with audited retry semantics."""
+
+    def __init__(
+        self,
+        call: Callable[[], None],
+        *,
+        completion_probe: Callable[[], bool],
+        retry_safe_failure: Callable[[BaseException], bool],
+        thread_name: str,
+    ) -> None:
+        self._completion_probe = completion_probe
+        self._completed_by_probe = False
+        self._call = RetainedCall(
+            call,
+            retry_safe_failure=retry_safe_failure,
+            thread_name=thread_name,
+        )
+
+    @property
+    def complete(self) -> bool:
+        """Return whether the call or its exact state probe proves completion."""
+        return self._completed_by_probe or self._call.complete
+
+    def run(self) -> None:
+        """Resume this stage without hiding a process-control interruption."""
+        if self.complete:
+            return
+        try:
+            self._call.run()
+        except BaseException:
+            # Preserve the interrupt for Manager's exhaustive cleanup/error
+            # publication, but remember a callee-side terminal state that
+            # proves the resource method returned before the interrupt.
+            if self._completion_probe():
+                self._completed_by_probe = True
+            raise
+
+
+class _LocalCPUBackendCloseOwner:
+    """Retain exact progress across LocalCPUBackend terminal stages.
+
+    The StorageManager wraps a backend's complete ``close()`` in one retained
+    call.  LocalCPU cleanup itself has three independently fallible stages,
+    though: stop the optional controller sender, evict cache references, and
+    release the pinned allocator.  A process-control interruption between
+    those calls must resume at the next stage without repeating an earlier
+    non-idempotent close.
+
+    Each stage therefore owns its own sticky retained receipt.  The outer
+    backend call may be retried safely: completed stages return immediately,
+    while a real stage failure re-raises from that exact receipt rather than
+    invoking the stage again.
+    """
+
+    def __init__(self, backend: "LocalCPUBackend") -> None:
+        self._sender_call = _LocalCPUBackendCloseStage(
+            backend._close_batched_message_sender,
+            completion_probe=backend._batched_message_sender_close_complete,
+            retry_safe_failure=backend._batched_message_sender_close_retry_safe,
+            thread_name="lmcache-local-cpu-close-sender",
+        )
+        self._cache_call = _LocalCPUBackendCloseStage(
+            backend._clear_for_close,
+            completion_probe=backend._cache_clear_complete,
+            retry_safe_failure=lambda _error: True,
+            thread_name="lmcache-local-cpu-close-cache",
+        )
+        self._allocator_call = _LocalCPUBackendCloseStage(
+            backend._close_memory_allocator,
+            completion_probe=backend._memory_allocator_close_complete,
+            retry_safe_failure=backend._memory_allocator_close_retry_safe,
+            thread_name="lmcache-local-cpu-close-allocator",
+        )
+
+    @property
+    def complete(self) -> bool:
+        """Return whether every exact terminal stage completed."""
+        return (
+            self._sender_call.complete
+            and self._cache_call.complete
+            and self._allocator_call.complete
+        )
+
+    def run(self) -> None:
+        """Resume the first incomplete stage in dependency order."""
+        self._sender_call.run()
+        self._cache_call.run()
+        self._allocator_call.run()
+
+
 class LocalCPUBackend(AllocatorBackendInterface):
     """
     Even if local_cpu is False (the hot_cache is not used), contains(),
     insert_key(), remove(), get_blocking(), get_keys(), and clear()
     are still callable by the storage manager.
     """
+
+    _close_owner_lock: Any
+    _close_owner: Optional[_LocalCPUBackendCloseOwner]
+    _cache_admission_receipts: list[_LocalCPUCacheAdmissionReceipt]
+    _cache_release_receipts: list[_LocalCPUCacheReleaseReceipt]
+
+    @staticmethod
+    def _prepare_partial_state(backend: "LocalCPUBackend") -> None:
+        """Make a retained raw backend safe for terminal cleanup."""
+        backend.batched_msg_sender = None
+        backend.memory_allocator = cast(MemoryAllocatorInterface, None)
+        backend.hot_cache = {}
+        backend.use_hot = False
+        backend.cpu_lock = threading.RLock()
+        backend.keys_in_request = []
+        backend.config = None
+        backend.metadata = None
+        backend.lmcache_worker = None
+        backend._close_owner_lock = threading.RLock()
+        backend._close_owner = None
+        backend._cache_admission_receipts = []
+        backend._cache_release_receipts = []
 
     def __init__(
         self,
@@ -54,6 +260,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         lmcache_worker: Optional["LMCacheWorker"] = None,
         memory_allocator: Optional[MemoryAllocatorInterface] = None,
     ):
+        LocalCPUBackend._prepare_partial_state(self)
         if torch_dev.is_available():
             super().__init__(dst_device)
         else:
@@ -74,7 +281,11 @@ class LocalCPUBackend(AllocatorBackendInterface):
         )
         self.lmcache_worker = lmcache_worker
         self.instance_id = config.lmcache_instance_id
-        self.cpu_lock = threading.Lock()
+        # Eviction already holds this lock while calling ``remove`` through
+        # the generic batched API. A reentrant lock lets every public remove
+        # take the same atomic membership/pin-state lock without deadlocking
+        # that internal eviction path.
+        self.cpu_lock = threading.RLock()
 
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
 
@@ -134,6 +345,25 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 self.keys_in_request.append(key)
             return True
 
+    def supports_lookup_pin_progress(self) -> bool:
+        return True
+
+    def pin_for_lookup(self, key: CacheEngineKey) -> bool:
+        """Pin one local object without a post-publication exception."""
+        with self.cpu_lock:
+            memory_obj = self.hot_cache.get(key)
+            if memory_obj is None:
+                return False
+            memory_obj.pin()
+            try:
+                self.keys_in_request.append(key)
+            except BaseException:
+                # Tensor/bytes pin transitions are exception-atomic, and their
+                # unpin bookkeeping is best-effort after the count changes.
+                memory_obj.unpin()
+                raise
+            return True
+
     def touch_cache(self):
         # flip the order of the keys in the request
         with self.cpu_lock:
@@ -147,6 +377,23 @@ class LocalCPUBackend(AllocatorBackendInterface):
         """
         return False
 
+    def _drain_cache_admission_receipts_locked(self) -> None:
+        """Finish every prepublished cache-reference acquisition."""
+        for receipt in tuple(self._cache_admission_receipts):
+            if not receipt.applied():
+                self._cache_admission_receipts.remove(receipt)
+            else:
+                receipt.run(self)
+                if receipt.complete(self):
+                    self._cache_admission_receipts.remove(receipt)
+
+    def _drain_cache_release_receipts_locked(self) -> None:
+        """Finish every prepublished cache-reference release."""
+        for receipt in tuple(self._cache_release_receipts):
+            receipt.run(self)
+            if receipt.complete(self):
+                self._cache_release_receipts.remove(receipt)
+
     def submit_put_task(
         self,
         key: CacheEngineKey,
@@ -159,13 +406,21 @@ class LocalCPUBackend(AllocatorBackendInterface):
         :param on_complete_callback: Optional callback invoked after the
             synchronous put completes. Callback exceptions are caught and logged.
         """
-        stored = False
-        with self.cpu_lock:
-            if key in self.hot_cache:
-                return None
 
-            memory_obj.ref_count_up()
-            self.hot_cache[key] = memory_obj
+        def put_locked() -> bool:
+            self._drain_cache_release_receipts_locked()
+            self._drain_cache_admission_receipts_locked()
+            if key in self.hot_cache:
+                return False
+
+            admission = _LocalCPUCacheAdmissionReceipt(key, memory_obj)
+            # Retain the exact acquisition before it can increment the
+            # object. Recovery can then complete both sides of the former
+            # ref_count_up-to-hot_cache publication window.
+            self._cache_admission_receipts.append(admission)
+            admission.run(self)
+            if admission.complete(self):
+                self._cache_admission_receipts.remove(admission)
 
             self.cache_policy.update_on_put(key)
 
@@ -175,7 +430,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     op_type=OpType.ADMIT,
                     key=key.chunk_hash,
                 )
-            stored = True
+            return True
+
+        stored = _run_under_interrupt_safe_rlock(self.cpu_lock, put_locked)
 
         # Call callback after put completes (outside lock)
         if stored and on_complete_callback is not None:
@@ -236,6 +493,11 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 mem_objs.append(mem_obj)
         return mem_objs
 
+    def batched_get_non_blocking_returns_pinned(self) -> bool:
+        # Local objects remain owned by the cache. A lookup may have pinned
+        # them independently, but retrieval itself acquires references only.
+        return False
+
     async def batched_async_contains(
         self,
         lookup_id: str,
@@ -272,16 +534,28 @@ class LocalCPUBackend(AllocatorBackendInterface):
             return True
 
     def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
-        lock_context = self.cpu_lock if force else nullcontext()
-        with lock_context:
-            if key not in self.hot_cache:
+        def remove_locked() -> bool:
+            self._drain_cache_release_receipts_locked()
+            self._drain_cache_admission_receipts_locked()
+            memory_obj = self.hot_cache.get(key)
+            if memory_obj is None or (not force and not memory_obj.can_evict):
                 return False
 
-            memory_obj = self.hot_cache.pop(key)
-            memory_obj.ref_count_down()
+            release = _LocalCPUCacheReleaseReceipt(key, memory_obj)
+            # Publish the exact release before removing the map entry.
+            self._cache_release_receipts.append(release)
+            release.run(self)
+            if release.complete(self):
+                self._cache_release_receipts.remove(release)
 
             if force:
                 self.cache_policy.update_on_force_evict(key)
+            return True
+
+        removed = _run_under_interrupt_safe_rlock(self.cpu_lock, remove_locked)
+
+        if not removed:
+            return False
 
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.add_kv_op(
@@ -448,7 +722,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                         cpu_size_bytes,
                         aligned_size,
                     )
-                return MixedMemoryAllocator(
+                return self._construct_mixed_allocator(
                     aligned_size,
                     use_paging=True,
                     use_hugepages=use_hugepages,
@@ -537,7 +811,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                         else {}
                     ),
                 }
-                return MixedMemoryAllocator(
+                return self._construct_mixed_allocator(
                     align_cpu_size_bytes,
                     use_paging=True,
                     use_hugepages=False,
@@ -546,22 +820,47 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
             # Default: use non-paged allocator
             if allocator_align_bytes is not None:
-                return MixedMemoryAllocator(
+                return self._construct_mixed_allocator(
                     cpu_size_bytes,
                     numa_mapping=numa_mapping,
                     align_bytes=allocator_align_bytes,
                     use_hugepages=use_hugepages,
                 )
-            return MixedMemoryAllocator(
+            return self._construct_mixed_allocator(
                 cpu_size_bytes,
                 numa_mapping=numa_mapping,
                 config=config,
                 use_hugepages=use_hugepages,
             )
 
+    def _construct_mixed_allocator(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> MixedMemoryAllocator:
+        """Publish the target allocator before its arena construction."""
+        allocator = MixedMemoryAllocator.__new__(MixedMemoryAllocator)
+        prepare_partial_state = getattr(
+            MixedMemoryAllocator,
+            "_prepare_partial_state",
+            None,
+        )
+        if prepare_partial_state is not None:
+            prepare_partial_state(allocator)
+        self.memory_allocator = allocator
+        MixedMemoryAllocator.__init__(allocator, *args, **kwargs)
+        return allocator
+
     @staticmethod
     def _is_power_of_two(value: int) -> bool:
         return value > 0 and (value & (value - 1)) == 0
+
+    def supports_allocation_receipts(self) -> bool:
+        """Return whether this backend's allocator has exact reservations."""
+        return bool(
+            isinstance(self.memory_allocator, MixedMemoryAllocator)
+            and self.memory_allocator.supports_allocation_receipts()
+        )
 
     def _resolve_local_cpu_allocator_alignment(
         self, config: LMCacheEngineConfig
@@ -629,6 +928,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         fmt: Optional[MemoryFormat] = None,
         eviction: bool = True,
         busy_loop: bool = True,
+        allocation_receipt: Optional[AllocationReceipt] = None,
     ) -> Optional[MemoryObj]:
         """
         Allocate a memory object of shape and dtype
@@ -660,7 +960,19 @@ class LocalCPUBackend(AllocatorBackendInterface):
             else:
                 fmt = MemoryFormat.KV_2LTD
 
-        memory_obj = self.memory_allocator.allocate(shapes, dtypes, fmt)
+        if allocation_receipt is not None and not self.supports_allocation_receipts():
+            raise NotImplementedError(
+                "configured LocalCPU allocator does not support exact receipts"
+            )
+        if allocation_receipt is None:
+            memory_obj = self.memory_allocator.allocate(shapes, dtypes, fmt)
+        else:
+            memory_obj = self.memory_allocator.allocate(
+                shapes,
+                dtypes,
+                fmt,
+                allocation_receipt=allocation_receipt,
+            )
         if memory_obj is not None or not eviction:
             return memory_obj
 
@@ -712,7 +1024,15 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 # do not hold the lock during sleep
                 time.sleep(time_to_wait)
 
-            memory_obj = self.memory_allocator.allocate(shapes, dtypes, fmt)
+            if allocation_receipt is None:
+                memory_obj = self.memory_allocator.allocate(shapes, dtypes, fmt)
+            else:
+                memory_obj = self.memory_allocator.allocate(
+                    shapes,
+                    dtypes,
+                    fmt,
+                    allocation_receipt=allocation_receipt,
+                )
             if memory_obj is not None:
                 break
 
@@ -735,6 +1055,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         fmt: Optional[MemoryFormat] = None,
         eviction: bool = True,
         busy_loop: bool = True,
+        allocation_receipts: Optional[Sequence[AllocationReceipt]] = None,
     ) -> Optional[List[MemoryObj]]:
         """
         Batched allocate `batch_size` memory objects of shape and dtype
@@ -767,9 +1088,22 @@ class LocalCPUBackend(AllocatorBackendInterface):
             else:
                 fmt = MemoryFormat.KV_2LTD
 
-        memory_objs = self.memory_allocator.batched_allocate(
-            shapes, dtypes, batch_size, fmt
-        )
+        if allocation_receipts is not None and not self.supports_allocation_receipts():
+            raise NotImplementedError(
+                "configured LocalCPU allocator does not support exact receipts"
+            )
+        if allocation_receipts is None:
+            memory_objs = self.memory_allocator.batched_allocate(
+                shapes, dtypes, batch_size, fmt
+            )
+        else:
+            memory_objs = self.memory_allocator.batched_allocate(
+                shapes,
+                dtypes,
+                batch_size,
+                fmt,
+                allocation_receipts=allocation_receipts,
+            )
 
         if memory_objs is not None or not eviction:
             return memory_objs
@@ -848,9 +1182,18 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 # do not hold the lock during sleep
                 time.sleep(time_to_wait)
 
-            memory_objs = self.memory_allocator.batched_allocate(
-                shapes, dtypes, batch_size, fmt
-            )
+            if allocation_receipts is None:
+                memory_objs = self.memory_allocator.batched_allocate(
+                    shapes, dtypes, batch_size, fmt
+                )
+            else:
+                memory_objs = self.memory_allocator.batched_allocate(
+                    shapes,
+                    dtypes,
+                    batch_size,
+                    fmt,
+                    allocation_receipts=allocation_receipts,
+                )
             if memory_objs is not None:
                 break
 
@@ -931,25 +1274,29 @@ class LocalCPUBackend(AllocatorBackendInterface):
         with self.cpu_lock:
             return list(self.hot_cache.keys())
 
-    def clear(self) -> int:
+    def clear(self, force: bool = False) -> int:
         """
         counts the number of memory objects removed
         """
         if not self.use_hot:
             return 0
         clear_keys = []
-        num_cleared_tokens = 0
+        tokens_by_key: dict[CacheEngineKey, int] = {}
         with self.cpu_lock:
             for key in self.hot_cache:
                 memory_obj = self.hot_cache[key]
-                if not memory_obj.can_evict:
+                if not force and not memory_obj.can_evict:
                     continue
                 clear_keys.append(key)
-                num_cleared_tokens += memory_obj.get_num_tokens()
+                tokens_by_key[key] = memory_obj.get_num_tokens()
 
-        # TODO(Jiayi): might not be accurate if we don't calculate
-        # `num_cleared_token` and remove the keys in an atomic way.
-        self.batched_remove(clear_keys)
+        # A lookup may pin a scanned candidate before removal. ``remove``
+        # rechecks can_evict under cpu_lock, so count only keys whose ownership
+        # transition actually completed.
+        num_cleared_tokens = 0
+        for key in clear_keys:
+            if self.remove(key, force=force):
+                num_cleared_tokens += tokens_by_key[key]
 
         return num_cleared_tokens
 
@@ -959,8 +1306,132 @@ class LocalCPUBackend(AllocatorBackendInterface):
     def get_memory_allocator(self):
         return self.memory_allocator
 
+    def _close_batched_message_sender(self) -> None:
+        """Close the exact optional controller sender once."""
+        batched_msg_sender = getattr(self, "batched_msg_sender", None)
+        if batched_msg_sender is not None:
+            batched_msg_sender.close()
+
+    def _batched_message_sender_close_complete(self) -> bool:
+        """Prove terminal state only for the in-tree sender implementation."""
+        sender = getattr(self, "batched_msg_sender", None)
+        if sender is None:
+            return True
+        if not isinstance(sender, BatchedMessageSender):
+            return False
+        thread = getattr(sender, "thread", None)
+        return not bool(getattr(sender, "running", True)) and (
+            thread is None or not thread.is_alive()
+        )
+
+    def _batched_message_sender_close_retry_safe(
+        self,
+        error: BaseException,
+    ) -> bool:
+        """Retry only the audited monotonic in-tree sender shutdown."""
+        del error
+        sender = getattr(self, "batched_msg_sender", None)
+        return sender is None or isinstance(sender, BatchedMessageSender)
+
+    def _clear_for_close(self) -> None:
+        """Release terminal cache ownership through per-entry receipts."""
+        while True:
+
+            def prepare_locked() -> Optional[_LocalCPUCacheReleaseReceipt]:
+                self._drain_cache_release_receipts_locked()
+                self._drain_cache_admission_receipts_locked()
+                if not self.hot_cache:
+                    return None
+                key = next(iter(self.hot_cache))
+                pending = _LocalCPUCacheReleaseReceipt(
+                    key,
+                    self.hot_cache[key],
+                )
+                # Publish the exact object/release receipt before removing the
+                # map entry. A retry can therefore finish either side of the
+                # former pop-to-ref_count_down interruption window.
+                self._cache_release_receipts.append(pending)
+                return pending
+
+            pending = _run_under_interrupt_safe_rlock(
+                self.cpu_lock,
+                prepare_locked,
+            )
+            if pending is None:
+                return
+            pending.run(self)
+
+    def _cache_clear_complete(self) -> bool:
+        """Prove no cache entry or receipted cache reference remains."""
+
+        def complete_locked() -> bool:
+            complete = not self._cache_admission_receipts and not self.hot_cache
+            if complete:
+                complete = all(
+                    receipt.complete(self) for receipt in self._cache_release_receipts
+                )
+            if complete:
+                # Every exact release is already authoritative. Dropping these
+                # diagnostic owners is safe even if the caller is interrupted
+                # immediately after this probe returns.
+                self._cache_release_receipts.clear()
+            return complete
+
+        return _run_under_interrupt_safe_rlock(self.cpu_lock, complete_locked)
+
+    def _close_memory_allocator(self) -> None:
+        """Close the exact allocator retained by this backend."""
+        memory_allocator = getattr(self, "memory_allocator", None)
+        if memory_allocator is not None:
+            memory_allocator.close()
+
+    def _memory_allocator_close_complete(self) -> bool:
+        """Prove release only for the target MixedMemoryAllocator receipt."""
+        allocator = getattr(self, "memory_allocator", None)
+        if allocator is None:
+            return True
+        if not isinstance(allocator, MixedMemoryAllocator):
+            return False
+        if bool(getattr(allocator, "_unregistered", False)):
+            return True
+        receipt = getattr(allocator, "_cpu_memory_allocation_receipt", None)
+        if receipt is not None and receipt.released:
+            # An instruction-level interruption can land after
+            # ``receipt.release()`` returns but before MixedMemoryAllocator
+            # publishes its diagnostic mirror bit.  The receipt is the exact
+            # ownership authority, so make the mirror truthful while proving
+            # that this stage is complete.
+            allocator._unregistered = True
+            return True
+        return False
+
+    def _memory_allocator_close_retry_safe(
+        self,
+        error: BaseException,
+    ) -> bool:
+        """Retry only the receipt-backed target allocator implementation."""
+        del error
+        allocator = getattr(self, "memory_allocator", None)
+        return allocator is None or isinstance(allocator, MixedMemoryAllocator)
+
     def close(self) -> None:
-        if self.batched_msg_sender is not None:
-            self.batched_msg_sender.close()
-        self.memory_allocator.close()
-        self.clear()
+        """Close each terminal child through its retained stage receipt."""
+        with self._close_owner_lock:
+            owner = self._close_owner
+            if owner is None:
+                owner = _LocalCPUBackendCloseOwner(self)
+                self._close_owner = owner
+        owner.run()
+        if not owner.complete:
+            raise RuntimeError("LocalCPUBackend terminal cleanup is incomplete")
+
+    def close_failure_is_retry_safe(self, error: BaseException) -> bool:
+        """Allow only the staged outer dispatcher to be resumed.
+
+        Individual sender/cache/allocator failures remain sticky in their
+        inner retained calls.  Retrying this outer method can therefore only
+        resume a stage that was never called or cross an interruption between
+        two already-published stage receipts.
+        """
+        del error
+        return True
