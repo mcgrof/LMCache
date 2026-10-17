@@ -10,15 +10,18 @@ services resolved from the app context, so these inject a fake engine via
 
 # Standard
 from dataclasses import dataclass, field, replace
+from types import SimpleNamespace
 from typing import Optional
+import hashlib
 
 # Third Party
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
+import torch
 
 # First Party
-from lmcache.lmcache_native import Bitmap
+from lmcache.lmcache_native import Bitmap, EngineKVFormat
 from lmcache.v1.distributed.api import (
     DEFAULT_ATTN_WINDOW_DESC,
     AttnWindowDesc,
@@ -671,3 +674,40 @@ class TestClearEndpoint:
         client = TestClient(_make_clear_app(_ClearEngine()))
         resp = client.post("/cache/checksums", json={"block_ids": [0], "chunk_size": 1})
         assert resp.status_code == 501
+
+
+@pytest.mark.parametrize(
+    ("format_name", "shape"),
+    [
+        ("NL_X_NB_BS_NH_CS", (4, 3, 2, 8)),
+        ("NL_X_NB_NH_BS_CS", (4, 2, 3, 8)),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_packed_kv_checksum_endpoint(
+    format_name: str, shape: tuple[int, ...], dtype: torch.dtype
+) -> None:
+    """Hash selected packed K/V blocks in request order, including a short chunk."""
+    tensor = torch.arange(192, dtype=torch.float32).reshape(shape).to(dtype)
+    context = SimpleNamespace(
+        kv_tensors=[tensor],
+        engine_kv_format_per_layer=lambda: [getattr(EngineKVFormat, format_name)],
+    )
+    client = TestClient(_make_clear_app(_ClearEngine(cache_contexts={42: context})))
+    response = client.post(
+        "/cache/checksums",
+        json={
+            "instance_id": 42,
+            "block_ids": [3, 1, 0],
+            "chunk_size": 2,
+            "layerwise": True,
+        },
+    )
+    assert response.status_code == 200, response.text
+    selected = tensor[[3, 1, 0]].to(torch.float32)
+    expected = [
+        hashlib.md5(selected[start : start + 2].numpy().tobytes()).hexdigest()
+        for start in (0, 2)
+    ]
+    assert response.json()["num_chunks"] == 2
+    assert response.json()["chunk_checksums"] == {"layer_0": expected}

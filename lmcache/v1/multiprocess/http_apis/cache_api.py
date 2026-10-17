@@ -154,6 +154,8 @@ _BLOCK_AXIS_BY_FORMAT: dict[Any, int] = {
     lmcache_native.EngineKVFormat.NL_X_NB_BSV_BSS: 0,  # DSA indexer: [NB, BS, 132]
     lmcache_native.EngineKVFormat.NL_X_TWO_NB_NH_BS_HS: 1,  # [2, NB, NH, BS, HS]
     lmcache_native.EngineKVFormat.NL_X_NB_TWO_NH_BS_HS: 0,  # [NB, 2, NH, BS, HS]
+    lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_CS: 0,  # [NB, BS, NH, CS]
+    lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_CS: 0,  # [NB, NH, BS, CS]
 }
 
 
