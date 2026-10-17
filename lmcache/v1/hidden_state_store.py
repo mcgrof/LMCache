@@ -62,14 +62,20 @@ class HiddenStateStore:
             so chunk boundaries and keys match KV exactly.
     """
 
+    _config: LMCacheEngineConfig
+    _token_database: TokenDatabase
+    _storage_manager: Optional["StorageManager"]
+    _allocator: MixedMemoryAllocator
+    _chunks: Dict[CacheEngineKey, Dict[int, MemoryObj]]
+    _lru: "OrderedDict[CacheEngineKey, None]"
+    _layer_allowlist: Optional[set[int]]
+
     def __init__(
         self,
         config: LMCacheEngineConfig,
         token_database: TokenDatabase,
     ) -> None:
-        self._config = config
-        self._token_database = token_database
-        self._storage_manager: Optional["StorageManager"] = None
+        HiddenStateStore._prepare_partial_state(self, config, token_database)
 
         size_bytes = int(config.max_hidden_state_cpu_size * _GIB)
         if size_bytes <= 0:
@@ -78,7 +84,11 @@ class HiddenStateStore:
                 "enable_hidden_state_cache=True"
             )
 
-        self._allocator = MixedMemoryAllocator(size_bytes, config=config)
+        # Publish a close-safe raw allocator before entering the pinned-arena
+        # allocation path. An asynchronous BaseException after the arena is
+        # reserved can then be recovered through this store's exact identity.
+        allocator = self._allocator
+        MixedMemoryAllocator.__init__(allocator, size_bytes, config=config)
 
         # CacheEngineKey -> {layer_idx: MemoryObj}. OrderedDict-like for LRU
         # via a separate _lru ordering (cheap, lets us update on access).
@@ -306,6 +316,23 @@ class HiddenStateStore:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _prepare_partial_state(
+        store: "HiddenStateStore",
+        config: LMCacheEngineConfig,
+        token_database: TokenDatabase,
+    ) -> None:
+        """Install close-safe state before any fallible resource creation."""
+        store._config = config
+        store._token_database = token_database
+        store._storage_manager = None
+        store._chunks = {}
+        store._lru = OrderedDict()
+        store._layer_allowlist = None
+        allocator = MixedMemoryAllocator.__new__(MixedMemoryAllocator)
+        MixedMemoryAllocator._prepare_partial_state(allocator)
+        store._allocator = allocator
 
     def _chunk(
         self, token_ids: Union[torch.Tensor, List[int]]

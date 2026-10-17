@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
 import os
@@ -138,7 +137,11 @@ class LocalDiskBackend(StorageBackendInterface):
 
         self.local_cpu_backend = local_cpu_backend
 
-        self.disk_lock = threading.Lock()
+        # Disk-space eviction calls remove through the batched interface while
+        # already holding this lock. Public nonterminal removes must also take
+        # the lock for an atomic pin-state recheck, so make that nesting
+        # intentional rather than bypassing synchronization.
+        self.disk_lock = threading.RLock()
 
         assert config.local_disk is not None
 
@@ -233,6 +236,23 @@ class LocalDiskBackend(StorageBackendInterface):
                 self.keys_in_request.append(key)
             return True
 
+    def supports_lookup_pin_progress(self) -> bool:
+        return True
+
+    def pin_for_lookup(self, key: CacheEngineKey) -> bool:
+        """Atomically pin one disk-cache metadata entry for lookup."""
+        with self.disk_lock:
+            metadata = self.dict.get(key)
+            if metadata is None:
+                return False
+            metadata.pin()
+            try:
+                self.keys_in_request.append(key)
+            except BaseException:
+                metadata.unpin()
+                raise
+            return True
+
     def touch_cache(self):
         # flip the order of the keys in the request
         with self.disk_lock:
@@ -270,11 +290,14 @@ class LocalDiskBackend(StorageBackendInterface):
         key: CacheEngineKey,
         force: bool = True,
     ) -> bool:
-        lock_context = self.disk_lock if force else nullcontext()
-        with lock_context:
-            if not (meta := self.dict.pop(key, None)):
+        with self.disk_lock:
+            meta = self.dict.get(key)
+            if meta is None:
+                return False
+            if not force and not meta.can_evict:
                 return False
 
+            self.dict.pop(key)
             path = meta.path
             size = meta.size
             self.usage -= size
@@ -599,60 +622,122 @@ class LocalDiskBackend(StorageBackendInterface):
     ) -> list[MemoryObj]:
         mem_objs: list[MemoryObj] = []
         paths: list[str] = []
+        pinned_disk_entries: list[DiskCacheMetadata] = []
 
         logger.debug(
             "lookup_id: %s; Prefetching %s keys from disk.", lookup_id, len(keys)
         )
-        for key in keys:
-            self.disk_lock.acquire()
-            assert key in self.dict, f"Key {key} not found in disk cache after pinning"
+        try:
+            for key in keys:
+                # Pin the disk entry while holding the lock, then release the
+                # lock before allocating staging memory. If any allocation
+                # fails, the exception handler rolls back every pin and staging
+                # reference acquired by this batch.
+                with self.disk_lock:
+                    assert key in self.dict, (
+                        f"Key {key} not found in disk cache after pinning"
+                    )
+                    disk_entry = self.dict[key]
+                    path = disk_entry.path
+                    dtype = disk_entry.dtype
+                    shape = disk_entry.shape
+                    fmt = disk_entry.fmt
 
-            path = self.dict[key].path
-            dtype = self.dict[key].dtype
-            shape = self.dict[key].shape
-            fmt = self.dict[key].fmt
+                    assert dtype is not None
+                    assert shape is not None
 
-            assert dtype is not None
-            assert shape is not None
+                    disk_entry.pin()
+                    pinned_disk_entries.append(disk_entry)
 
-            # busy_loop=False prevents spinning on the event loop thread;
-            # if staging memory is exhausted the caller will get a logged
-            # error rather than a silent deadlock.
-            memory_obj = self.local_cpu_backend.allocate(
-                shape,
-                dtype,
-                fmt,
-                busy_loop=False,
-            )
+                    # NOTE(Jiayi): Currently, we consider prefetch as cache hit.
+                    # Update cache recency
+                    self.cache_policy.update_on_hit(key, self.dict)
 
-            if memory_obj is None:
-                logger.error(
-                    "Memory allocation failed during async disk load for key %s. "
-                    "CPU staging pool may be exhausted (unpin() not called after "
-                    "a previous retrieve). Returning partial results.",
-                    key,
+                # busy_loop=False prevents spinning on the event loop thread.
+                memory_obj = self.local_cpu_backend.allocate(
+                    shape,
+                    dtype,
+                    fmt,
+                    busy_loop=False,
                 )
-                return mem_objs
 
-            self.dict[key].pin()
+                if memory_obj is None:
+                    raise MemoryError(
+                        "CPU staging allocation failed during async disk load "
+                        f"for key {key}"
+                    )
 
-            # NOTE(Jiayi): Currently, we consider prefetch as cache hit.
-            # Update cache recency
-            self.cache_policy.update_on_hit(key, self.dict)
+                logger.debug("Prefetching %s from disk.", key)
+                memory_obj.pin()
+                mem_objs.append(memory_obj)
+                paths.append(path)
+        except Exception:
+            # Preparation is transactional: no partial result escapes, the
+            # disk lock is already released by its context manager, and every
+            # resource acquired by this batch is returned exactly once.
+            with self.disk_lock:
+                for disk_entry in pinned_disk_entries:
+                    disk_entry.unpin()
+            for memory_obj in mem_objs:
+                memory_obj.unpin()
+                memory_obj.ref_count_down()
+            raise
 
-            self.disk_lock.release()
-            logger.debug("Prefetching %s from disk.", key)
-            memory_obj.pin()
-            mem_objs.append(memory_obj)
-            paths.append(path)
-
-        return await self.disk_worker.submit_task(
-            "prefetch",
-            self.batched_async_load_bytes_from_disk,
-            paths=paths,
-            keys=keys,
-            memory_objs=mem_objs,
+        load_task = asyncio.create_task(
+            self.disk_worker.submit_task(
+                "prefetch",
+                self.batched_async_load_bytes_from_disk,
+                paths=paths,
+                keys=keys,
+                memory_objs=mem_objs,
+                disk_entries=pinned_disk_entries,
+            )
         )
+        try:
+            # Shield the retained task so cancellation of this caller cannot
+            # cancel its completion Future while the underlying thread is
+            # still reading into staging memory.
+            result = await asyncio.shield(load_task)
+        except asyncio.CancelledError:
+            # A thread-backed disk operation cannot be stopped safely. Keep
+            # both staging and disk-entry pins alive until it actually exits,
+            # even if this coroutine receives repeated cancellation requests.
+            while not load_task.done():
+                try:
+                    await asyncio.shield(load_task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if not load_task.cancelled():
+                try:
+                    load_task.result()
+                except Exception:
+                    pass
+            for memory_obj in mem_objs:
+                memory_obj.unpin()
+                memory_obj.ref_count_down()
+            raise
+        except Exception:
+            # The caller never receives these objects when submission or disk
+            # loading fails, so ownership remains here.
+            for memory_obj in mem_objs:
+                memory_obj.unpin()
+                memory_obj.ref_count_down()
+            raise
+        finally:
+            # Disk-entry pins belong to this I/O transaction and never escape
+            # the backend. Release them once after either success or failure.
+            with self.disk_lock:
+                for disk_entry in pinned_disk_entries:
+                    disk_entry.unpin()
+
+        return result
+
+    def batched_get_non_blocking_returns_pinned(self) -> bool:
+        # The returned CPU staging objects are pinned above until the GPU copy
+        # is synchronized. This is separate from pins on disk-cache entries.
+        return True
 
     async def batched_async_contains(
         self,
@@ -728,6 +813,7 @@ class LocalDiskBackend(StorageBackendInterface):
         paths: list[str],
         keys: list[CacheEngineKey],
         memory_objs: list[MemoryObj],
+        disk_entries: list[DiskCacheMetadata],
         write_back: bool = False,
     ) -> list[MemoryObj]:
         """
@@ -735,18 +821,19 @@ class LocalDiskBackend(StorageBackendInterface):
         """
 
         logger.debug("Executing `async_load_bytes` from disk.")
-        # TODO (Jiayi): handle the case where loading fails.
-        for path, key, mem_obj in zip(paths, keys, memory_objs, strict=False):
+        for path, key, mem_obj, disk_entry in zip(
+            paths,
+            keys,
+            memory_objs,
+            disk_entries,
+            strict=True,
+        ):
             buffer = mem_obj.byte_array
             self.read_file(key, buffer, path)
 
             # TODO(Jiayi): Please recover the metadata in a more
             # elegant way in the future.
-            cached_positions = self.dict[key].cached_positions
-            mem_obj.metadata.cached_positions = cached_positions
-
-            with self.disk_lock:
-                self.dict[key].unpin()
+            mem_obj.metadata.cached_positions = disk_entry.cached_positions
 
         return memory_objs
 

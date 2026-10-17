@@ -19,6 +19,7 @@ from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
+    AllocationReceipt,
     MemoryAllocatorInterface,
     MemoryFormat,
     MemoryObj,
@@ -187,6 +188,7 @@ class MaruBackend(AllocatorBackendInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
+        allocation_receipt: Optional[AllocationReceipt] = None,
     ) -> Optional[MemoryObj]:
         """Allocate CXL-backed memory via CxlMemoryAdapter.
 
@@ -196,10 +198,15 @@ class MaruBackend(AllocatorBackendInterface):
             fmt: Memory format.
             eviction: Unused.
             busy_loop: Unused.
+            allocation_receipt: Unsupported exact-reservation receipt.
 
         Returns:
             MemoryObj backed by CXL memory, or None on failure.
         """
+        if allocation_receipt is not None:
+            raise NotImplementedError(
+                "MaruBackend does not support allocation receipts"
+            )
         obj = self.memory_allocator.allocate(shapes, dtypes, fmt)
         if obj is not None:
             logger.debug(
@@ -218,6 +225,7 @@ class MaruBackend(AllocatorBackendInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
+        allocation_receipts: Optional[Sequence[AllocationReceipt]] = None,
     ) -> Optional[list[MemoryObj]]:
         """Allocate multiple CXL-backed MemoryObjs.
 
@@ -228,10 +236,15 @@ class MaruBackend(AllocatorBackendInterface):
             fmt: Memory format.
             eviction: Unused.
             busy_loop: Unused.
+            allocation_receipts: Unsupported exact-reservation receipts.
 
         Returns:
             List of MemoryObj, or None if any allocation fails.
         """
+        if allocation_receipts is not None:
+            raise NotImplementedError(
+                "MaruBackend does not support allocation receipts"
+            )
         return self.memory_allocator.batched_allocate(shapes, dtypes, batch_size, fmt)
 
     # =========================================================================
@@ -600,6 +613,9 @@ class MaruBackend(AllocatorBackendInterface):
             return results
 
         return await asyncio.to_thread(_batch_get)
+
+    def batched_get_non_blocking_returns_pinned(self) -> bool:
+        return True
 
     # =========================================================================
     # Contains / Pin / Unpin / Remove

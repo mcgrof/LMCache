@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
-from typing import List, Optional, Union
+from typing import List, Optional, Sequence, Union
 
 # Third Party
 import torch
@@ -11,6 +11,7 @@ from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import _lmcache_nvtx_annotate, get_size_bytes
 from lmcache.v1.memory_management import (
     AddressManager,
+    AllocationReceipt,
     MemoryAllocatorInterface,
     MemoryFormat,
     MemoryObj,
@@ -56,10 +57,12 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             allocation_boundary_bytes,
         )
 
-        # For debugging purposes
-        self.num_active_allocations = 0
-
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
+
+    @property
+    def num_active_allocations(self) -> int:
+        """Authoritative live object count from AddressManager state."""
+        return self.address_manager.active_allocation_count
 
     @property
     def total_allocated_size(self) -> int:
@@ -73,6 +76,7 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         dtypes: Union[torch.dtype, list[torch.dtype]],
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         allocator_type: Optional[str] = None,
+        allocation_receipt: Optional[AllocationReceipt] = None,
     ) -> Optional[TensorMemoryObj]:
         """Allocate one tensor-backed memory object.
 
@@ -90,25 +94,22 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         # Calculate the size of the tensor
         raw_size = get_size_bytes(shapes, dtypes)
 
-        # Allocate from address manager
+        receipt = allocation_receipt or AllocationReceipt()
+
+        # Allocate from address manager. The receipt is bound before the
+        # immutable address-state publication, so an outer owner can recover
+        # even if this call never constructs or returns a MemoryObj.
         try:
-            block_start, aligned_size = self.address_manager.allocate(raw_size)
+            block_start, aligned_size = self.address_manager.allocate_once(
+                raw_size, receipt
+            )
         except RuntimeError:
             # No block found
             return None
 
-        # For debug
-        self.num_active_allocations += 1
-
-        # Update stats
-        self.stats_monitor.update_local_cache_usage(
-            self.address_manager.total_allocated_size
-        )
-        self.stats_monitor.update_active_memory_objs_count(self.num_active_allocations)
-
         # Allocate the block
         raw_data = self._get_buffer_slice(block_start, raw_size)
-        return TensorMemoryObj(
+        memory_obj = TensorMemoryObj(
             raw_data=raw_data,
             physical_data=self._get_buffer_slice(block_start, aligned_size),
             metadata=MemoryObjMetadata(
@@ -123,11 +124,24 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
                 dtypes=dtypes,
             ),
             parent_allocator=self,
+            allocation_receipt=receipt,
         )
+        # This one immutable receipt-state assignment publishes the object and
+        # its initial-reference release token before the object can escape.
+        receipt.adopt(memory_obj)
+        self._sync_debug_stats()
+        return memory_obj
 
     def _get_buffer_slice(self, start: int, size: int) -> torch.Tensor:
         """Hook: Get buffer slice. Override for custom buffer access."""
         return self.buffer[start : start + size]
+
+    def _sync_debug_stats(self) -> None:
+        """Refresh observational metrics from authoritative address state."""
+        self.stats_monitor.update_local_cache_usage(
+            self.address_manager.total_allocated_size
+        )
+        self.stats_monitor.update_active_memory_objs_count(self.num_active_allocations)
 
     @_lmcache_nvtx_annotate
     def batched_allocate(
@@ -137,6 +151,7 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         batch_size: int,
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         allocator_type: Optional[str] = None,
+        allocation_receipts: Optional[Sequence[AllocationReceipt]] = None,
     ) -> Optional[List[TensorMemoryObj]]:
         """Allocate multiple equal-sized tensor-backed memory objects.
 
@@ -157,9 +172,19 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         unit_raw_size = get_size_bytes(shapes, dtypes)
         unit_aligned_size = self.address_manager.compute_aligned_size(unit_raw_size)
 
+        if batch_size < 0:
+            return None
+
+        if allocation_receipts is None:
+            receipts = [AllocationReceipt() for _ in range(batch_size)]
+        else:
+            if len(allocation_receipts) != batch_size:
+                raise ValueError("allocation receipt count does not match batch size")
+            receipts = list(allocation_receipts)
+
         try:
-            alloc_results = self.address_manager.batched_allocate(
-                unit_aligned_size, batch_size
+            alloc_results = self.address_manager.batched_allocate_once(
+                unit_aligned_size, receipts
             )
         except RuntimeError:
             return None
@@ -168,35 +193,30 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             self._get_buffer_slice(addr, unit_aligned_size) for addr in addresses
         ]
 
-        # For debug
-        self.num_active_allocations += batch_size
-
-        # Update stats
-        self.stats_monitor.update_local_cache_usage(
-            self.address_manager.total_allocated_size
-        )
-        self.stats_monitor.update_active_memory_objs_count(self.num_active_allocations)
-
         tensor_mem_objs = []
-        for raw_data, address in zip(raw_datas, addresses, strict=True):
-            tensor_mem_objs.append(
-                TensorMemoryObj(
-                    raw_data=raw_data,
-                    metadata=MemoryObjMetadata(
-                        shapes[0],
-                        dtypes[0],
-                        address,
-                        unit_aligned_size,
-                        1,
-                        0,
-                        fmt,
-                        shapes=shapes,
-                        dtypes=dtypes,
-                    ),
-                    parent_allocator=self,
-                )
+        for raw_data, address, receipt in zip(
+            raw_datas, addresses, receipts, strict=True
+        ):
+            memory_obj = TensorMemoryObj(
+                raw_data=raw_data,
+                metadata=MemoryObjMetadata(
+                    shapes[0],
+                    dtypes[0],
+                    address,
+                    unit_aligned_size,
+                    1,
+                    0,
+                    fmt,
+                    shapes=shapes,
+                    dtypes=dtypes,
+                ),
+                parent_allocator=self,
+                allocation_receipt=receipt,
             )
+            receipt.adopt(memory_obj)
+            tensor_mem_objs.append(memory_obj)
 
+        self._sync_debug_stats()
         return tensor_mem_objs
 
     @_lmcache_nvtx_annotate
@@ -207,20 +227,25 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             memory_obj: Memory object to release back to the allocator.
             allocator_type: Optional allocator type string.
         """
+        receipt = (
+            memory_obj.allocation_receipt
+            if isinstance(memory_obj, TensorMemoryObj)
+            else None
+        )
+        if receipt is not None:
+            # Run this even for an invalidated object: interruption may have
+            # landed after the address-state commit but before the receipt's
+            # completion publication. Replaying the token cannot touch reuse.
+            self.address_manager.free_once(receipt)
+            memory_obj.invalidate()
+            self._sync_debug_stats()
+            return
         if not memory_obj.is_valid():
             return
 
         self.address_manager.free(memory_obj.meta.address, memory_obj.meta.phy_size)
         memory_obj.invalidate()
-
-        # For debug
-        self.num_active_allocations -= 1
-
-        # Update stats
-        self.stats_monitor.update_local_cache_usage(
-            self.address_manager.total_allocated_size
-        )
-        self.stats_monitor.update_active_memory_objs_count(self.num_active_allocations)
+        self._sync_debug_stats()
 
     @_lmcache_nvtx_annotate
     def batched_free(
@@ -242,15 +267,34 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         if not memory_objs:
             return
 
-        # Coalesce adjacent memory objects before freeing to reduce
+        exact_memory_objs: list[MemoryObj] = []
+        legacy_memory_objs: list[MemoryObj] = []
+        for memory_obj in memory_objs:
+            if (
+                isinstance(memory_obj, TensorMemoryObj)
+                and memory_obj.allocation_receipt is not None
+            ):
+                exact_memory_objs.append(memory_obj)
+            else:
+                legacy_memory_objs.append(memory_obj)
+
+        # Exact generations cannot be coalesced by address: their individual
+        # tokens are what prevent a delayed free from touching address reuse.
+        for memory_obj in exact_memory_objs:
+            assert isinstance(memory_obj, TensorMemoryObj)
+            assert memory_obj.allocation_receipt is not None
+            self.address_manager.free_once(memory_obj.allocation_receipt)
+            memory_obj.invalidate()
+
+        # Coalesce adjacent legacy objects before freeing to reduce
         # the number of free operations
         coalesced_blocks: list[tuple[int, int, int]] = []  # (address, size, count)
         curr_start = None
         curr_size = 0
         curr_count = 0
 
-        memory_objs.sort(key=lambda x: x.meta.address)
-        for memory_obj in memory_objs:
+        legacy_memory_objs.sort(key=lambda x: x.meta.address)
+        for memory_obj in legacy_memory_objs:
             if not memory_obj.is_valid():
                 logger.warning("Trying to free an invalidated MemoryObj")
                 continue
@@ -275,21 +319,11 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             coalesced_blocks.append((curr_start, curr_size, curr_count))
 
         # Free all coalesced blocks
-        total_count = 0
-        for address, size, count in coalesced_blocks:
+        for address, size, _count in coalesced_blocks:
             self.address_manager.free(address, size)
-            total_count += count
-
-        # For debug
-        self.num_active_allocations -= total_count
 
         if update_stats:
-            self.stats_monitor.update_local_cache_usage(
-                self.address_manager.total_allocated_size
-            )
-            self.stats_monitor.update_active_memory_objs_count(
-                self.num_active_allocations
-            )
+            self._sync_debug_stats()
 
     def memcheck(self) -> bool:
         """Check allocator consistency for debugging.

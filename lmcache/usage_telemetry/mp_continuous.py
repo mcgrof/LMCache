@@ -28,7 +28,10 @@ import time
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.usage_telemetry.flush import start_usage_flush_thread
+from lmcache.usage_telemetry.flush import (
+    start_usage_flush_thread,
+    stop_usage_flush_thread,
+)
 from lmcache.usage_telemetry.guard import swallow_telemetry_errors
 from lmcache.usage_telemetry.identity import (
     get_usage_identity,
@@ -136,7 +139,7 @@ class MPContinuousUsageReporter(EventSubscriber):
 
         Called by ``EventBus.stop()``.
         """
-        self._flush_thread.stop()
+        stop_usage_flush_thread(self._flush_thread)
         self.flush()
 
     @swallow_telemetry_errors

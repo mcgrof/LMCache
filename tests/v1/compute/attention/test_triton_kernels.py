@@ -14,7 +14,10 @@ import torch
 
 # First Party
 from lmcache import torch_dev, torch_device_type
-from lmcache.v1.compute.attention.metadata import _block_mask_to_csr
+from lmcache.v1.compute.attention.metadata import (
+    LMCTritonSparseMetadata,
+    _block_mask_to_csr,
+)
 from lmcache.v1.compute.attention.triton_kernels import (
     block_sparse_attention,
     causal_prefill_attention,
@@ -94,6 +97,21 @@ def _ref_sparse_attention(q, k, v, block_indices, block_indptr, sm_scale, block_
                 torch.exp(scores - scores.max(dim=1, keepdim=True).values).sum(dim=1)
             )
     return out.to(q.dtype), lse
+
+
+def _ref_position_causal_attention(q, k, v, query_positions, sm_scale):
+    """Dense reference for compacted queries at original prompt positions."""
+    gqa_ratio = q.shape[1] // k.shape[1]
+    expanded_k = k.repeat_interleave(gqa_ratio, dim=1)
+    expanded_v = v.repeat_interleave(gqa_ratio, dim=1)
+    scores = torch.einsum("mhd,nhd->hmn", q.float(), expanded_k.float()) * sm_scale
+    key_positions = torch.arange(k.shape[0], device=k.device)
+    causal_mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+    scores.masked_fill_(~causal_mask.unsqueeze(0), float("-inf"))
+    probabilities = torch.softmax(scores, dim=-1)
+    output = torch.einsum("hmn,nhd->mhd", probabilities, expanded_v.float()).to(q.dtype)
+    lse = torch.logsumexp(scores, dim=-1).transpose(0, 1).contiguous()
+    return output, lse
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +252,92 @@ class TestBlockSparseAttention:
         )
         assert out.shape == (M, H, D)
         assert not torch.isnan(out).any()
+
+    @pytest.mark.parametrize("position_pattern", ["early", "spread", "tiny"])
+    def test_original_query_positions_match_dense_causal_tail(self, position_pattern):
+        """Compacted target-shape queries keep original causal boundaries."""
+        N, H, KV_H, D = 257, 14, 2, 64
+        dtype = torch.bfloat16
+        block_size = 32
+        if position_pattern == "early":
+            M = 39
+            query_positions = torch.arange(M, dtype=torch.int64, device="cuda")
+        elif position_pattern == "spread":
+            M = 39
+            query_positions = (
+                torch.linspace(0, N - 1, steps=M, device="cuda")
+                .round()
+                .to(torch.int64)
+                .contiguous()
+            )
+            assert len(torch.unique(query_positions)) == M
+        else:
+            query_positions = torch.tensor(
+                [5, 40, 72, 103], dtype=torch.int64, device="cuda"
+            )
+            M = len(query_positions)
+        q = torch.randn(M, H, D, device="cuda", dtype=dtype)
+        k = torch.randn(N, KV_H, D, device="cuda", dtype=dtype)
+        v = torch.randn(N, KV_H, D, device="cuda", dtype=dtype)
+        sm_scale = 1.0 / math.sqrt(D)
+        metadata = LMCTritonSparseMetadata(
+            seq_len=N,
+            sparse_blk_row_size=block_size,
+            sparse_blk_col_size=block_size,
+        )
+        metadata.update_from_top_indices(query_positions)
+        assert metadata.block_indices is not None
+        assert metadata.block_indptr is not None
+        assert metadata.query_positions is not None
+
+        out, lse = block_sparse_attention(
+            q,
+            k,
+            v,
+            metadata.block_indices,
+            metadata.block_indptr,
+            sm_scale,
+            block_size=block_size,
+            query_positions=metadata.query_positions,
+        )
+        reference, reference_lse = _ref_position_causal_attention(
+            q,
+            k,
+            v,
+            query_positions,
+            sm_scale,
+        )
+
+        torch.testing.assert_close(out, reference, atol=3e-2, rtol=3e-2)
+        torch.testing.assert_close(lse, reference_lse, atol=3e-2, rtol=3e-2)
+
+    def test_original_position_zero_cannot_observe_future_values(self):
+        """The first original query sees key/value row zero and nothing later."""
+        M, N, H, KV_H, D = 1, 64, 14, 2, 64
+        query_positions = torch.zeros(M, dtype=torch.int64, device="cuda")
+        q = torch.zeros(M, H, D, device="cuda", dtype=torch.bfloat16)
+        k = torch.zeros(N, KV_H, D, device="cuda", dtype=torch.bfloat16)
+        v = torch.full((N, KV_H, D), 100, device="cuda", dtype=torch.bfloat16)
+        v[0].fill_(1)
+        metadata = LMCTritonSparseMetadata(seq_len=N)
+        metadata.update_from_top_indices(query_positions)
+        assert metadata.block_indices is not None
+        assert metadata.block_indptr is not None
+        assert metadata.query_positions is not None
+
+        out, lse = block_sparse_attention(
+            q,
+            k,
+            v,
+            metadata.block_indices,
+            metadata.block_indptr,
+            1.0 / math.sqrt(D),
+            block_size=32,
+            query_positions=metadata.query_positions,
+        )
+
+        torch.testing.assert_close(out, torch.ones_like(out), atol=0, rtol=0)
+        torch.testing.assert_close(lse, torch.zeros_like(lse), atol=0, rtol=0)
 
 
 class TestMergeAttentionOutputs:

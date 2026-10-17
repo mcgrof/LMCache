@@ -16,6 +16,7 @@ import uuid
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.memory_management import AllocationReceipt
 from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
 from lmcache.v1.storage_backend.abstract_backend import (
     AllocatorBackendInterface,
@@ -2175,7 +2176,12 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         fmt: Any = None,
         eviction: bool = True,
         busy_loop: bool = True,
+        allocation_receipt: Optional[AllocationReceipt] = None,
     ) -> Optional[MemoryObj]:
+        if allocation_receipt is not None:
+            raise NotImplementedError(
+                "exact allocation receipts are unsupported by this allocator"
+            )
         # First Party
         from lmcache.v1.memory_management import MemoryFormat
 
@@ -2199,7 +2205,12 @@ class RustRawBlockBackend(StoragePluginInterface, AllocatorBackendInterface):
         fmt: Any = None,
         eviction: bool = True,
         busy_loop: bool = True,
+        allocation_receipts: Optional[Sequence[AllocationReceipt]] = None,
     ) -> Optional[list[MemoryObj]]:
+        if allocation_receipts is not None:
+            raise NotImplementedError(
+                "exact allocation receipts are unsupported by this allocator"
+            )
         # First Party
         from lmcache.v1.memory_management import MemoryFormat
 

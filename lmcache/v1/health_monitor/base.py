@@ -186,7 +186,21 @@ class HealthMonitor(PeriodicThread):
         self,
         manager: "LMCacheManager",
         ping_interval: float = DEFAULT_PING_INTERVAL,
-    ):
+        register_with_global_registry: bool = True,
+    ) -> None:
+        """Initialize a health monitor.
+
+        Args:
+            manager: Manager whose engine and services are checked.
+            ping_interval: Seconds between health-check cycles.
+            register_with_global_registry: Whether construction should publish
+                this instance immediately. Service factories disable this so
+                registration is covered by their rollback ownership.
+
+        Raises:
+            RuntimeError: A different periodic-thread instance already owns
+                the health-monitor registry name.
+        """
         # Initialize PeriodicThread base class
         super().__init__(
             name="health-monitor-thread",
@@ -221,8 +235,8 @@ class HealthMonitor(PeriodicThread):
         # Auto-discover and instantiate health checks
         self._discover_health_checks()
 
-        # Register with the global registry
-        PeriodicThreadRegistry.get_instance().register(self)
+        if register_with_global_registry:
+            PeriodicThreadRegistry.get_instance().register(self)
 
     def _discover_health_checks(self) -> None:
         """
@@ -530,11 +544,27 @@ class HealthMonitor(PeriodicThread):
         return thread
 
     def stop(self, timeout: float = 5.0) -> None:
-        """Stop the health monitor thread"""
-        # Unregister from the global registry
-        PeriodicThreadRegistry.get_instance().unregister(self.name)
-        # Use base class stop method
+        """Stop and unregister this exact health-monitor instance.
+
+        Args:
+            timeout: Maximum seconds to wait for the monitor thread to exit.
+
+        Raises:
+            RuntimeError: The monitor thread remains alive after ``timeout``.
+
+        Returns:
+            None.
+        """
+        # A failed join leaves the exact live instance registered so its owner
+        # can retry and no same-name replacement can hide it.
         super().stop(timeout)
+        if self.thread_alive:
+            raise RuntimeError(
+                f"health monitor thread did not terminate within {timeout:.1f}s"
+            )
+        # A failed older construction must not unregister a newer monitor that
+        # reused the process-global name.
+        PeriodicThreadRegistry.get_instance().unregister_instance(self)
 
     def _execute(self) -> ThreadRunSummary:
         """

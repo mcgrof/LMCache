@@ -18,6 +18,8 @@ from lmcache.v1.rpc_utils import (
     get_zmq_socket,
 )
 
+_OFFLOAD_SERVER_CLOSE_TIMEOUT_SECONDS = 5.0
+
 
 class ZMQOffloadServer(OffloadServerInterface):
     def __init__(
@@ -105,18 +107,18 @@ class ZMQOffloadServer(OffloadServerInterface):
         except Exception as e:
             logger.warning("Error closing ZMQ socket: %s", e)
 
-        # Wait for thread with timeout to prevent deadlock
+        # The thread can be past recv() and blocked inside lmcache_engine.store().
+        # A closed socket does not quiesce that engine call, so terminal manager
+        # shutdown must treat a live thread as a hard engine-destroy blocker.
         if self.thread.is_alive():
             logger.info("Waiting for offload server thread to finish...")
-            self.thread.join(timeout=5.0)
+            self.thread.join(timeout=_OFFLOAD_SERVER_CLOSE_TIMEOUT_SECONDS)
 
             if self.thread.is_alive():
-                logger.warning(
-                    "Offload server thread did not terminate within timeout. "
-                    "Thread may be stuck in blocking recv(). "
-                    "Proceeding with shutdown anyway."
+                raise RuntimeError(
+                    "offload server thread did not terminate within "
+                    f"{_OFFLOAD_SERVER_CLOSE_TIMEOUT_SECONDS:.1f}s"
                 )
-            else:
-                logger.info("Offload server thread terminated successfully")
+            logger.info("Offload server thread terminated successfully")
         else:
             logger.info("Offload server thread already stopped")

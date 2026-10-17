@@ -59,6 +59,7 @@ from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import EventBus, EventBusConfig
 from lmcache.v1.multiprocess.config import MPServerConfig
+from lmcache.v1.periodic_thread import PeriodicThreadRegistry
 
 
 class RecordingSender(UsageMessageSender):
@@ -266,10 +267,14 @@ class TestUsageContext:
 class TestInitializeUsageContext:
     def test_returns_none_when_disabled(self, usage_env, monkeypatch):
         monkeypatch.setenv("LMCACHE_TRACK_USAGE", "false")
+        retained: list[UsageContext] = []
         context = InitializeUsageContext(
-            LMCacheEngineConfig.from_defaults(), make_metadata()
+            LMCacheEngineConfig.from_defaults(),
+            make_metadata(),
+            retain_context=retained.append,
         )
         assert context is None
+        assert retained == []
 
     def test_reports_from_background_thread(self, usage_env):
         sender = RecordingSender()
@@ -281,6 +286,243 @@ class TestInitializeUsageContext:
         while time.monotonic() < deadline and len(sender.sent) < 3:
             time.sleep(0.01)
         assert len(sender.sent) == 3
+        context.close()
+
+    def test_start_side_effect_then_interrupt_remains_joinable(
+        self,
+        usage_env,
+        monkeypatch,
+    ):
+        """The owner callback precedes an ambiguous ``Thread.start`` return."""
+
+        class _StartBoundaryInterrupt(BaseException):
+            pass
+
+        error = _StartBoundaryInterrupt("start returned, caller interrupted")
+        release_report = threading.Event()
+        report_entered = threading.Event()
+
+        class BlockingSender(UsageMessageSender):
+            def send(self, url, payload):
+                del url, payload
+                report_entered.set()
+                assert release_report.wait(timeout=5.0)
+
+        class StartThenInterruptThread(threading.Thread):
+            def start(self):
+                super().start()
+                raise error
+
+        def make_interrupting_thread(context):
+            return StartThenInterruptThread(
+                target=context.report_once,
+                daemon=True,
+                name="lmcache-usage-report-test",
+            )
+
+        monkeypatch.setattr(
+            UsageContext,
+            "_make_report_thread",
+            make_interrupting_thread,
+        )
+        retained: list[UsageContext] = []
+        with pytest.raises(_StartBoundaryInterrupt) as failure:
+            InitializeUsageContext(
+                LMCacheEngineConfig.from_defaults(),
+                make_metadata(),
+                sender=BlockingSender(),
+                retain_context=retained.append,
+            )
+        assert failure.value is error
+        assert len(retained) == 1
+        context = retained[0]
+        assert report_entered.wait(timeout=5.0)
+        assert context.thread_alive
+
+        release_report.set()
+        context.close()
+        assert context.closed
+        assert not context.thread_alive
+
+    @pytest.mark.parametrize("interrupt_after_start", [False, True])
+    def test_caller_interrupt_around_retained_start_is_recovered_by_close(
+        self,
+        usage_env,
+        monkeypatch,
+        interrupt_after_start,
+    ):
+        """Both sides of the caller wait retain the one admitted start."""
+
+        class _CallerStartInterrupt(BaseException):
+            pass
+
+        error = _CallerStartInterrupt("caller interrupted around retained start")
+        sender = RecordingSender()
+        retained: list[UsageContext] = []
+        interrupted = False
+
+        def retain_and_inject(context):
+            nonlocal interrupted
+            original_run = context._start_call.run
+
+            def interrupt_start_wait():
+                nonlocal interrupted
+                if not interrupt_after_start and not interrupted:
+                    interrupted = True
+                    raise error
+                original_run()
+                if interrupt_after_start and not interrupted:
+                    interrupted = True
+                    raise error
+
+            monkeypatch.setattr(context._start_call, "run", interrupt_start_wait)
+            retained.append(context)
+
+        with pytest.raises(_CallerStartInterrupt) as failure:
+            InitializeUsageContext(
+                LMCacheEngineConfig.from_defaults(),
+                make_metadata(),
+                sender=sender,
+                retain_context=retain_and_inject,
+            )
+        assert failure.value is error
+        assert interrupted
+        assert len(retained) == 1
+        context = retained[0]
+        assert context._start_admitted
+        if not interrupt_after_start:
+            assert context.report_thread.ident is None
+
+        context.close()
+        assert context.closed
+        assert not context.thread_alive
+        assert len(sender.sent) == 3
+
+    def test_close_waits_for_concurrent_admitted_start(
+        self,
+        usage_env,
+        monkeypatch,
+    ):
+        """Close cannot classify an admitted but incomplete start as absent."""
+        start_entered = threading.Event()
+        release_start = threading.Event()
+        report_entered = threading.Event()
+        release_report = threading.Event()
+
+        class BlockingSender(UsageMessageSender):
+            def send(self, url, payload):
+                del url, payload
+                report_entered.set()
+                assert release_report.wait(timeout=5.0)
+
+        class PausedStartThread(threading.Thread):
+            def start(self):
+                start_entered.set()
+                assert release_start.wait(timeout=5.0)
+                super().start()
+
+        def make_paused_start_thread(context):
+            return PausedStartThread(
+                target=context.report_once,
+                daemon=True,
+                name="lmcache-usage-report-paused-start",
+            )
+
+        monkeypatch.setattr(
+            UsageContext,
+            "_make_report_thread",
+            make_paused_start_thread,
+        )
+        context = UsageContext(
+            LMCacheEngineConfig.from_defaults(),
+            make_metadata(),
+            sender=BlockingSender(),
+        )
+        start_errors: list[BaseException] = []
+        close_errors: list[BaseException] = []
+        start_done = threading.Event()
+        close_done = threading.Event()
+
+        def start_context():
+            try:
+                context.start_reporting()
+            except BaseException as error:
+                start_errors.append(error)
+            finally:
+                start_done.set()
+
+        def close_context():
+            try:
+                context.close()
+            except BaseException as error:
+                close_errors.append(error)
+            finally:
+                close_done.set()
+
+        start_waiter = threading.Thread(target=start_context)
+        close_waiter = threading.Thread(target=close_context)
+        start_waiter.start()
+        assert start_entered.wait(timeout=5.0)
+        close_waiter.start()
+        try:
+            assert not close_done.wait(timeout=0.05)
+            release_start.set()
+            assert report_entered.wait(timeout=5.0)
+            assert not close_done.wait(timeout=0.05)
+        finally:
+            release_start.set()
+            release_report.set()
+            start_waiter.join(timeout=5.0)
+            close_waiter.join(timeout=5.0)
+
+        assert not start_waiter.is_alive()
+        assert not close_waiter.is_alive()
+        assert start_done.is_set()
+        assert close_done.is_set()
+        assert start_errors == []
+        assert close_errors == []
+        assert context.closed
+        assert not context.thread_alive
+
+    def test_close_timeout_is_truthful_and_retryable(self, usage_env):
+        release_report = threading.Event()
+        report_entered = threading.Event()
+
+        class BlockingSender(UsageMessageSender):
+            def send(self, url, payload):
+                del url, payload
+                report_entered.set()
+                assert release_report.wait(timeout=5.0)
+
+        context = UsageContext(
+            LMCacheEngineConfig.from_defaults(),
+            make_metadata(),
+            sender=BlockingSender(),
+        )
+        context.REPORT_THREAD_JOIN_TIMEOUT_SECONDS = 0.01
+        context.start_reporting()
+        assert report_entered.wait(timeout=5.0)
+
+        with pytest.raises(TimeoutError, match="did not terminate"):
+            context.close()
+        assert not context.closed
+        assert context.thread_alive
+
+        release_report.set()
+        context.close()
+        assert context.closed
+        assert not context.thread_alive
+
+    def test_close_fences_a_never_started_context(self, usage_env):
+        context = UsageContext(
+            LMCacheEngineConfig.from_defaults(),
+            make_metadata(),
+            sender=RecordingSender(),
+        )
+        context.close()
+        context.start_reporting()
+        assert context.closed
+        assert context.report_thread.ident is None
 
 
 class TestContinuousUsageContext:
@@ -970,3 +1212,26 @@ class TestEndToEnd:
         # Histogram keys are bucket bounds (stringified by JSON); the 1.0 s
         # sample falls in the [1, 5) bin, keyed "5".
         assert received[1][1]["cache_lifespan_histogram"]["5"] == 1
+
+
+def test_stopped_usage_reporter_allows_replacement_and_old_cleanup(usage_env):
+    registry = PeriodicThreadRegistry.get_instance()
+    first_bus = EventBus(EventBusConfig(enabled=True))
+    first_bus.start()
+    first = InitializeMPContinuousUsage(first_bus, 256, sender=RecordingSender())
+    assert first is not None
+    first_bus.stop()
+    assert registry.get("lmcache-usage-continuous") is None
+
+    second_bus = EventBus(EventBusConfig(enabled=True))
+    second_bus.start()
+    try:
+        second = InitializeMPContinuousUsage(second_bus, 256, sender=RecordingSender())
+        assert second is not None
+        replacement = registry.get("lmcache-usage-continuous")
+        assert replacement is not None
+        first.shutdown()
+        assert registry.get("lmcache-usage-continuous") is replacement
+    finally:
+        second_bus.stop()
+    assert registry.get("lmcache-usage-continuous") is None

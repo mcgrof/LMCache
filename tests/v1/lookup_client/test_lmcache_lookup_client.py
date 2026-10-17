@@ -325,7 +325,8 @@ class TestLMCacheLookupClientServer:
         server = self._create_server(lmcache_engine)
         time.sleep(0.5)
 
-        with self._create_client(lmcache_engine) as client:
+        client = self._create_client(lmcache_engine)
+        try:
             # Close server to simulate timeout
             server.close()
             time.sleep(0.5)
@@ -338,6 +339,11 @@ class TestLMCacheLookupClientServer:
 
             # Should return 0 on timeout
             assert result == 0
+        finally:
+            # The test intentionally removes every cancel recipient. Terminal
+            # fixture teardown must force-fence the client rather than asking
+            # non-lossy dynamic close to abandon an unacknowledged owner.
+            client.force_close()
 
     def test_socket_recreation_on_error(self, lmcache_engine):
         """Test socket recreation when ZMQ error occurs."""
@@ -361,7 +367,9 @@ class TestLMCacheLookupClientServer:
         with self._create_server(lmcache_engine) as server:
             time.sleep(0.5)
 
-            with self._create_client(lmcache_engine) as client:
+            client = self._create_client(lmcache_engine)
+            replacement = None
+            try:
                 # First lookup - should hit cache
                 token_ids = tokens.tolist()
                 result1 = client.lookup(token_ids, "test_1")
@@ -376,12 +384,20 @@ class TestLMCacheLookupClientServer:
                 assert result2 == 0
 
                 # Recreate server
-                with self._create_server(lmcache_engine):
-                    time.sleep(0.5)
+                replacement = self._create_server(lmcache_engine)
+                time.sleep(0.5)
 
-                    # Should work again after socket recreation and hit cache
-                    result3 = client.lookup(token_ids, "test_3")
-                    assert result3 == num_tokens
+                # Should work again after socket recreation and hit cache
+                result3 = client.lookup(token_ids, "test_3")
+                assert result3 == num_tokens
+
+                # Keep the replacement server alive through non-lossy client
+                # close so every lookup owner receives its cleanup ACK.
+                client.close()
+            finally:
+                client.force_close()
+                if replacement is not None:
+                    replacement.close()
 
     def test_close_methods(self, lmcache_engine):
         """Test proper cleanup of client and server close methods."""

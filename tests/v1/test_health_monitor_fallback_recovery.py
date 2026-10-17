@@ -6,7 +6,8 @@ Tests the health check lifecycle: healthy -> failure -> LOCAL_CPU fallback -> re
 """
 
 # Standard
-from typing import List, Optional
+from collections.abc import Callable, Iterator
+from typing import Any, List, Optional
 from unittest.mock import MagicMock
 import asyncio
 import threading
@@ -141,6 +142,23 @@ def controllable_connector():
 
 
 @pytest.fixture
+def health_monitor_factory() -> Iterator[Callable[[Any, float], HealthMonitor]]:
+    """Create health monitors and stop each exact instance after a test."""
+    monitors: list[HealthMonitor] = []
+
+    def create(manager: Any, ping_interval: float) -> HealthMonitor:
+        monitor = HealthMonitor(manager=manager, ping_interval=ping_interval)
+        monitors.append(monitor)
+        return monitor
+
+    try:
+        yield create
+    finally:
+        for monitor in reversed(monitors):
+            monitor.stop()
+
+
+@pytest.fixture
 def mock_remote_backend(event_loop_thread, test_config, controllable_connector):
     backend = MagicMock(spec=RemoteBackend)
     backend.remote_url = "controllable://test:1234"
@@ -223,9 +241,10 @@ class TestRemoteBackendHealthCheckFallbackRecovery:
         mock_storage_manager,
         controllable_connector,
         event_loop_thread,
+        health_monitor_factory,
     ):
         """Test complete fallback and recovery cycle."""
-        monitor = HealthMonitor(manager=mock_manager, ping_interval=0.1)
+        monitor = health_monitor_factory(mock_manager, 0.1)
         assert len(monitor._health_checks) == 1
 
         # Initially healthy
@@ -261,9 +280,10 @@ class TestRemoteBackendHealthCheckFallbackRecovery:
         mock_storage_manager,
         controllable_connector,
         event_loop_thread,
+        health_monitor_factory,
     ):
         """Test fallback/recovery using the monitor thread."""
-        monitor = HealthMonitor(manager=mock_manager, ping_interval=0.05)
+        monitor = health_monitor_factory(mock_manager, 0.05)
         controllable_connector.set_ping_error_code(0)
 
         thread = monitor.start()
@@ -360,9 +380,10 @@ class TestRemoteBackendHealthCheckFallbackRecovery:
         mock_storage_manager,
         controllable_connector,
         event_loop_thread,
+        health_monitor_factory,
     ):
         """Test that consecutive failures don't duplicate fallback actions."""
-        monitor = HealthMonitor(manager=mock_manager, ping_interval=0.1)
+        monitor = health_monitor_factory(mock_manager, 0.1)
 
         controllable_connector.set_ping_error_code(0)
         monitor._run_all_checks()
@@ -384,6 +405,7 @@ class TestRemoteBackendHealthCheckFallbackRecovery:
         mock_storage_manager,
         event_loop_thread,
         test_config,
+        health_monitor_factory,
     ):
         """
         Test that original_hot_cache is preserved correctly when multiple backends
@@ -439,7 +461,7 @@ class TestRemoteBackendHealthCheckFallbackRecovery:
         check_b._backend_name = "RemoteBackend_B"
 
         # Create monitor and manually set health checks
-        monitor = HealthMonitor(manager=manager, ping_interval=0.1)
+        monitor = health_monitor_factory(manager, 0.1)
         monitor._health_checks = [check_a, check_b]
         monitor._previous_check_status = {
             check_a.name(): True,
@@ -584,9 +606,10 @@ class TestFallbackWithCacheEngineOperations:
         mock_storage_manager,
         controllable_connector,
         event_loop_thread,
+        health_monitor_factory,
     ):
         """Test operations bypass RemoteBackend during fallback."""
-        monitor = HealthMonitor(manager=mock_manager, ping_interval=0.1)
+        monitor = health_monitor_factory(mock_manager, 0.1)
 
         # Start healthy
         controllable_connector.set_ping_error_code(0)

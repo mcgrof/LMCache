@@ -16,6 +16,7 @@ import os
 from lmcache.logging import init_logger
 from lmcache.v1.periodic_thread import (
     PeriodicThread,
+    PeriodicThreadRegistry,
     ThreadLevel,
     ThreadRunSummary,
     create_periodic_thread,
@@ -72,3 +73,17 @@ def start_usage_flush_thread(name: str, flush: Callable[[], None]) -> PeriodicTh
     )
     thread.start()
     return thread
+
+
+def stop_usage_flush_thread(thread: PeriodicThread) -> None:
+    """Stop one reporter and release its exact registry entry once quiescent.
+
+    Args:
+        thread: The flush worker owned by the reporter being shut down.
+
+    A bounded stop that leaves a live worker retains its registry ownership.
+    Retrying cleanup of an older reporter cannot remove a replacement worker.
+    """
+    thread.stop()
+    if not thread.thread_alive:
+        PeriodicThreadRegistry.get_instance().unregister_instance(thread)

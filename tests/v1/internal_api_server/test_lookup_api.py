@@ -131,6 +131,22 @@ class TestLookupAPI:
         assert data["role"] == "worker"
         mock_worker_manager.close_lookup_server.assert_called_once()
 
+    def test_close_lookup_error_is_not_reported_as_success(
+        self, scheduler_client, mock_scheduler_manager
+    ):
+        mock_scheduler_manager.close_lookup_client.return_value = {
+            "old": "LMCacheLookupClient",
+            "error": "pending cancellation did not drain",
+        }
+
+        response = scheduler_client.post("/lookup/close")
+
+        assert response.status_code == 400
+        data = json.loads(response.text)
+        assert data["old"] == "LMCacheLookupClient"
+        assert data["error"] == "pending cancellation did not drain"
+        assert data["role"] == "scheduler"
+
     # ==================== POST /lookup/create Tests ====================
 
     def test_create_lookup_scheduler(self, scheduler_client, mock_scheduler_manager):

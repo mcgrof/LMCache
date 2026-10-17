@@ -8,6 +8,7 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
+    KVConnectorRequestSidecar,
     KVConnectorRole,
 )
 from vllm.logger import init_logger
@@ -15,6 +16,10 @@ from vllm.v1.core.sched.output import SchedulerOutput
 import torch
 
 # First Party
+from lmcache.integration.vllm.connector_construction import (
+    RetainedConnectorConstructionOwner,
+    cleanup_failed_connector_construction,
+)
 from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
 
 if TYPE_CHECKING:
@@ -28,6 +33,8 @@ logger = init_logger(__name__)
 
 
 class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
+    KMESH_HANDOFF_PROTOCOL_VERSION = 2
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -42,12 +49,40 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             )
         else:
             super().__init__(vllm_config=vllm_config, role=role)
-        self._lmcache_engine = LMCacheConnectorV1Impl(vllm_config, role, self)
+        owner = RetainedConnectorConstructionOwner(
+            lambda publish: LMCacheConnectorV1Impl(
+                vllm_config,
+                role,
+                self,
+                publish,
+            ),
+            thread_name=("lmcache-vllm-wrapper-construction-" + role.name.lower()),
+        )
+        self._lmcache_engine_construction_owner: Optional[
+            RetainedConnectorConstructionOwner[LMCacheConnectorV1Impl]
+        ] = owner
+        try:
+            owner.invoke()
+            connector = owner.connector
+            self._lmcache_engine = connector
+            owner.release_provisional_manager()
+            self._lmcache_engine_construction_owner = None
+        except BaseException as init_error:
+            cleanup_failed_connector_construction(owner, init_error)
+            raise
 
     # ==============================
     # Worker-side methods
     # ==============================
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+    def register_model(self, model: torch.nn.Module) -> None:
+        """Register the worker's loaded model for CacheBlend sessions.
+
+        Args:
+            model: Loaded vLLM model owned by this worker.
+        """
+        self._lmcache_engine.register_model(model)
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """
         Initialize with the KV caches. Useful for pre-registering the
         KV Caches in the KVConnector (e.g. for NIXL).
@@ -135,17 +170,59 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         """Return block IDs that failed to load during the last interval."""
         return self._lmcache_engine.get_block_ids_with_load_errors()
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         """
         Shutdown the connector. This is called when the worker process
         is shutting down to ensure that all the async operations are
         completed and the connector is cleaned up properly.
         """
-        return self._lmcache_engine.shutdown()
+        self._lmcache_engine.shutdown()
 
     # ==============================
     # Scheduler-side methods
     # ==============================
+    def prepare_request_lookup(
+        self,
+        request: "Request",
+        peer_sidecars: tuple[KVConnectorRequestSidecar, ...],
+    ) -> None:
+        """Forward composite request evidence to the LMCache adapter."""
+        self._lmcache_engine.prepare_request_lookup(request, peer_sidecars)
+
+    def bind_peer_connector_metadata(
+        self,
+        peer_connector_metadata: tuple[KVConnectorMetadata, ...],
+    ) -> None:
+        """Forward the complete composite worker-metadata tuple."""
+        self._lmcache_engine.bind_peer_connector_metadata(peer_connector_metadata)
+
+    def validate_peer_connector_metadata(
+        self,
+        peer_connector_metadata: tuple[KVConnectorMetadata, ...],
+    ) -> None:
+        """Validate composite metadata without changing adapter state."""
+        self._lmcache_engine.validate_peer_connector_metadata(peer_connector_metadata)
+
+    def begin_connector_metadata_transaction(self) -> None:
+        """Begin a retry-safe composite metadata transaction."""
+        self._lmcache_engine.begin_connector_metadata_transaction()
+
+    def commit_connector_metadata_transaction(self) -> None:
+        """Tentatively commit the pending composite metadata generation."""
+        self._lmcache_engine.commit_connector_metadata_transaction()
+
+    def finalize_connector_metadata_transaction(self) -> None:
+        """Finalize metadata after every composite child tentatively commits."""
+        self._lmcache_engine.finalize_connector_metadata_transaction()
+
+    def abort_connector_metadata_transaction(self) -> None:
+        """Restore pre-begin metadata state after any transaction failure."""
+        self._lmcache_engine.abort_connector_metadata_transaction()
+
+    def clear_peer_connector_metadata(self) -> None:
+        """Clear request-independent peer metadata after one worker step."""
+        self._lmcache_engine.clear_peer_connector_metadata()
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",

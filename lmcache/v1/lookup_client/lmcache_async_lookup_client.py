@@ -25,8 +25,12 @@ from lmcache.v1.rpc_utils import (
     get_zmq_rpc_path_lmcache,
     get_zmq_socket,
 )
+from lmcache.v1.token_span import ExplicitTokenSpans
 
 logger = init_logger(__name__)
+
+_ASYNC_LOOKUP_CLOSE_TIMEOUT_SECONDS = 1.0
+_ASYNC_LOOKUP_POLL_TIMEOUT_MS = 100
 
 
 # NOTE(Jiayi): Prefetch could load extra redundant cache if multiple
@@ -141,6 +145,8 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         self.aborted_lookups: set[str] = set()
 
         self.running = True
+        self._closed = False
+        self._close_lock = threading.Lock()
 
         self.thread = threading.Thread(
             target=self.process_responses_from_workers,
@@ -195,7 +201,12 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         token_ids: Union[torch.Tensor, list[int]],
         lookup_id: str,
         request_configs: Optional[dict] = None,
+        explicit_spans: Optional[ExplicitTokenSpans] = None,
     ) -> Optional[int]:
+        if explicit_spans is not None:
+            raise NotImplementedError(
+                "async lookup does not support explicit token spans"
+            )
         hashes: list[int] = []
         offsets = []
         for start, end, hash_val in self.token_database.process_tokens(
@@ -223,6 +234,10 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
     def process_responses_from_workers(self):
         while self.running:
             try:
+                # A bounded poll lets close() stop an idle receiver without
+                # closing a ZeroMQ socket from a different thread.
+                if not self.pull_socket.poll(timeout=_ASYNC_LOOKUP_POLL_TIMEOUT_MS):
+                    continue
                 msg_buf = self.pull_socket.recv(copy=False)
                 # Deserialize message using msgspec
                 msg = msgspec.msgpack.decode(msg_buf, type=LookupResponseMsg)
@@ -246,7 +261,8 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                         self.reqs_status[lookup_id] = min(all_res)
 
             except Exception as e:
-                logger.error("Error processing response from worker: %s", e)
+                if self.running:
+                    logger.error("Error processing response from worker: %s", e)
 
     def clear_lookup_status(self, lookup_id: str) -> None:
         with self.lock:
@@ -287,17 +303,25 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         """Return True as LMCacheLookupClient supports producer kvcache reuse"""
         return True
 
-    def close(self):
-        self.running = False
-        try:
+    def close(self) -> None:
+        with self._close_lock:
+            if self._closed:
+                return
+
+            self.running = False
             if self.thread.is_alive():
-                self.thread.join(timeout=1.0)
+                self.thread.join(timeout=_ASYNC_LOOKUP_CLOSE_TIMEOUT_SECONDS)
+            if self.thread.is_alive():
+                raise RuntimeError(
+                    "async lookup client thread did not terminate within "
+                    f"{_ASYNC_LOOKUP_CLOSE_TIMEOUT_SECONDS:.1f}s"
+                )
+
             for s in self.push_sockets:
                 s.close(linger=0)  # type: ignore[arg-type]
             self.pull_socket.close(linger=0)  # type: ignore[arg-type]
             self.ctx.term()
-        except Exception as e:
-            logger.warning("Failed to join thread during close: %s", e)
+            self._closed = True
 
 
 class LMCacheAsyncLookupServer:
@@ -338,6 +362,11 @@ class LMCacheAsyncLookupServer:
 
         self.lmcache_engine = lmcache_engine
         self.running = True
+        self._closed = False
+        self._close_lock = threading.Lock()
+        self._callback_condition = threading.Condition()
+        self._active_response_callbacks = 0
+        self._closing = False
 
         logger.info(
             "lmcache lookup server start with"
@@ -356,6 +385,11 @@ class LMCacheAsyncLookupServer:
     def process_requests_from_scheduler(self):
         while self.running:
             try:
+                # Polling is the transport-safe wakeup mechanism here. ZeroMQ
+                # sockets are thread-affine, so close() waits for this bounded
+                # poll rather than closing pull_socket underneath recv().
+                if not self.pull_socket.poll(timeout=_ASYNC_LOOKUP_POLL_TIMEOUT_MS):
+                    continue
                 msg_buf = self.pull_socket.recv(copy=False)
                 # rely on msgspec to automatically discriminate
                 # between LookupRequestMsg and LookupCleanupMsg
@@ -382,26 +416,70 @@ class LMCacheAsyncLookupServer:
                     logger.warning("Unknown message type: %s", type(msg))
 
             except Exception as e:
-                logger.error("Error processing request from scheduler: %s", e)
+                if self.running:
+                    logger.error("Error processing request from scheduler: %s", e)
 
     def send_response_to_scheduler(self, lookup_id: str, num_hit_tokens: int):
-        # Create structured response message
-        msg = LookupResponseMsg(
-            lookup_id=lookup_id,
-            num_hit_tokens=num_hit_tokens,
-        )
+        # StorageManager owns the asynchronous completion callback and can
+        # invoke this method from its event-loop thread. Fence socket teardown
+        # around the complete send, not merely around the receiver thread.
+        with self._callback_condition:
+            if self._closing or self._closed:
+                raise RuntimeError("async lookup server is closing or closed")
+            self._active_response_callbacks += 1
 
-        # Serialize message using msgspec
-        msg_buf = msgspec.msgpack.encode(msg)
-        self.push_socket.send(msg_buf, copy=False)
-
-    def close(self):
-        self.running = False
         try:
+            # Create structured response message
+            msg = LookupResponseMsg(
+                lookup_id=lookup_id,
+                num_hit_tokens=num_hit_tokens,
+            )
+
+            # Serialize message using msgspec
+            msg_buf = msgspec.msgpack.encode(msg)
+            self.push_socket.send(msg_buf, copy=False)
+        finally:
+            with self._callback_condition:
+                self._active_response_callbacks -= 1
+                if self._active_response_callbacks == 0:
+                    self._callback_condition.notify_all()
+
+    def close(self) -> None:
+        with self._close_lock:
+            if self._closed:
+                return
+
+            self.running = False
+            with self._callback_condition:
+                # Terminal once requested: late StorageManager callbacks must
+                # fail before touching a socket that is about to be closed.
+                self._closing = True
+
             if self.thread.is_alive():
-                self.thread.join(timeout=1.0)
+                self.thread.join(timeout=_ASYNC_LOOKUP_CLOSE_TIMEOUT_SECONDS)
+            if self.thread.is_alive():
+                # In particular, the receiver may be inside
+                # LMCacheEngine.async_lookup_and_prefetch(). Keep every socket
+                # and the context alive so a later terminal-shutdown retry can
+                # still prove quiescence before destroying the engine.
+                raise RuntimeError(
+                    "async lookup server thread did not terminate within "
+                    f"{_ASYNC_LOOKUP_CLOSE_TIMEOUT_SECONDS:.1f}s"
+                )
+
+            deadline = time.monotonic() + _ASYNC_LOOKUP_CLOSE_TIMEOUT_SECONDS
+            with self._callback_condition:
+                while self._active_response_callbacks:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RuntimeError(
+                            "async lookup server response callback did not "
+                            "terminate within "
+                            f"{_ASYNC_LOOKUP_CLOSE_TIMEOUT_SECONDS:.1f}s"
+                        )
+                    self._callback_condition.wait(timeout=remaining)
+
             self.push_socket.close(linger=0)  # type: ignore[arg-type]
             self.pull_socket.close(linger=0)  # type: ignore[arg-type]
             self.ctx.term()
-        except Exception as e:
-            logger.warning("Failed to join thread during close: %s", e)
+            self._closed = True

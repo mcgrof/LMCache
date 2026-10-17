@@ -279,6 +279,87 @@ def single_layer_kv_transfer(
     valid_token_indices = torch.nonzero(valid_mask_kv, as_tuple=True)[0]
     valid_slots = slots_kv[valid_mask_kv].to(paged_memory_device)
 
+    format_value = int(engine_kv_format)
+    is_fused_hnd = format_value == int(EngineKVFormat.NL_X_NB_NH_BS_CS)
+    is_fused_nhd = format_value == int(EngineKVFormat.NL_X_NB_BS_NH_CS)
+
+    if is_fused_hnd or is_fused_nhd:
+        direction_value = int(direction)
+        if direction_value not in (
+            int(TransferDirection.H2D),
+            int(TransferDirection.D2H),
+        ):
+            raise ValueError("direction must be exactly H2D or D2H")
+        if slot_mapping.ndim != 1:
+            raise ValueError("slot_mapping must be one-dimensional")
+        if vllm_key_value_cache.ndim != 4:
+            raise ValueError("unified vLLM KV cache must be four-dimensional")
+
+        if is_fused_hnd:
+            num_blocks, num_heads, block_size, content_size = vllm_key_value_cache.shape
+        else:
+            num_blocks, block_size, num_heads, content_size = vllm_key_value_cache.shape
+        if content_size <= 0 or content_size % 2:
+            raise ValueError("unified vLLM KV content size must be positive and even")
+        head_size = content_size // 2
+        hidden_size = num_heads * head_size
+
+        if lmc_key_value_cache.ndim != 3:
+            raise ValueError("non-MLA LMCache KV buffer must be three-dimensional")
+        if token_major:
+            valid_lmc_shape = (
+                lmc_key_value_cache.size(0) >= slot_mapping.numel()
+                and lmc_key_value_cache.size(1) == 2
+                and lmc_key_value_cache.size(2) == hidden_size
+            )
+        else:
+            valid_lmc_shape = (
+                lmc_key_value_cache.size(0) == 2
+                and lmc_key_value_cache.size(1) >= slot_mapping.numel()
+                and lmc_key_value_cache.size(2) == hidden_size
+            )
+        if not valid_lmc_shape:
+            raise ValueError("LMCache KV buffer does not match unified vLLM KV shape")
+        if int(valid_slots.max().item()) >= num_blocks * block_size:
+            raise ValueError("slot_mapping exceeds the unified vLLM KV cache")
+
+        block_indices = valid_slots // block_size
+        block_offsets = valid_slots % block_size
+        if format_value == int(EngineKVFormat.NL_X_NB_NH_BS_CS):
+            cache_tokens = vllm_key_value_cache[block_indices, :, block_offsets, :]
+        else:
+            cache_tokens = vllm_key_value_cache[block_indices, block_offsets, :, :]
+
+        if direction_value == int(TransferDirection.D2H):
+            key_tokens, value_tokens = cache_tokens.split(head_size, dim=-1)
+            key_tokens = key_tokens.reshape(-1, hidden_size).to(kv_device)
+            value_tokens = value_tokens.reshape(-1, hidden_size).to(kv_device)
+            if token_major:
+                lmc_key_value_cache[valid_token_indices, 0] = key_tokens
+                lmc_key_value_cache[valid_token_indices, 1] = value_tokens
+            else:
+                lmc_key_value_cache[0, valid_token_indices] = key_tokens
+                lmc_key_value_cache[1, valid_token_indices] = value_tokens
+        else:
+            if token_major:
+                key_tokens = lmc_key_value_cache[valid_token_indices, 0]
+                value_tokens = lmc_key_value_cache[valid_token_indices, 1]
+            else:
+                key_tokens = lmc_key_value_cache[0, valid_token_indices]
+                value_tokens = lmc_key_value_cache[1, valid_token_indices]
+            cache_tokens = torch.cat(
+                (
+                    key_tokens.reshape(-1, num_heads, head_size),
+                    value_tokens.reshape(-1, num_heads, head_size),
+                ),
+                dim=-1,
+            ).to(paged_memory_device)
+            if is_fused_hnd:
+                vllm_key_value_cache[block_indices, :, block_offsets, :] = cache_tokens
+            else:
+                vllm_key_value_cache[block_indices, block_offsets, :, :] = cache_tokens
+        return
+
     is_mla = _format_spec(engine_kv_format).is_mla
 
     if is_mla:

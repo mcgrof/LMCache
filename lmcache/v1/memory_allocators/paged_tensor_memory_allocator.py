@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
-from collections import deque
+from collections import OrderedDict
 from typing import List, Optional, Union
+import threading
 
 # Third Party
 import torch
@@ -38,6 +39,47 @@ class PagedAddressManager:
         return len(self._allocator.free_blocks) * self._allocator.align_bytes
 
 
+class _ExactFreeBlockQueue:
+    """Identity-keyed FIFO whose insertion is an idempotent free receipt."""
+
+    def __init__(self) -> None:
+        self._blocks: OrderedDict[int, TensorMemoryObj] = OrderedDict()
+        self._lock = threading.RLock()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._blocks)
+
+    def __iter__(self):
+        with self._lock:
+            return iter(tuple(self._blocks.values()))
+
+    def append(self, memory_obj: TensorMemoryObj) -> None:
+        self.add_if_absent(memory_obj)
+
+    def add_if_absent(self, memory_obj: TensorMemoryObj) -> bool:
+        """Atomically publish one free block and reject duplicate replay."""
+        with self._lock:
+            key = id(memory_obj)
+            if key in self._blocks:
+                return False
+            self._blocks[key] = memory_obj
+            return True
+
+    def discard(self, memory_obj: TensorMemoryObj) -> None:
+        """Remove a replayed free publication by exact object identity."""
+        with self._lock:
+            self._blocks.pop(id(memory_obj), None)
+
+    def popleft(self) -> TensorMemoryObj:
+        with self._lock:
+            try:
+                _, memory_obj = self._blocks.popitem(last=False)
+            except KeyError as error:
+                raise IndexError("pop from an empty free-block queue") from error
+            return memory_obj
+
+
 class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
     """
     Implements a paged memory allocator.
@@ -69,10 +111,9 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
 
         self.paged_buffers = torch.split(self.buffer, self.align_bytes, dim=0)
 
-        # NOTE: deque is used since thread-safety is not a concern here as
-        # is implemented in C under the hood (in CPython), and operations
-        # on deque are atomic.
-        self.free_blocks: deque[TensorMemoryObj] = deque()
+        # Identity-keyed insertion is also the durable free receipt. A retry
+        # after interruption cannot enqueue the same page twice.
+        self.free_blocks = _ExactFreeBlockQueue()
 
         for idx, buf in enumerate(self.paged_buffers):
             # NOTE: idx is the paged index
@@ -113,6 +154,16 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
             self.align_bytes,
         )
 
+    def _sync_debug_stats(self, update_monitor: bool = True) -> None:
+        """Derive accounting from the authoritative free-block queue."""
+        self.num_active_allocations = len(self.paged_buffers) - len(self.free_blocks)
+        self.total_allocated_size = self.num_active_allocations * self.align_bytes
+        if update_monitor:
+            self.stats_monitor.update_local_cache_usage(self.total_allocated_size)
+            self.stats_monitor.update_active_memory_objs_count(
+                self.num_active_allocations
+            )
+
     @_lmcache_nvtx_annotate
     def allocate(
         self,
@@ -149,16 +200,16 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
             )
             return None
 
-        free_block.rebind_layout(shapes, dtypes, fmt)
+        # A delayed release retry can re-add the page after popleft but before
+        # this lock. Discard that old-epoch publication and replace all reuse
+        # metadata while the same object lock excludes the retry.
+        with free_block.lock:
+            self.free_blocks.discard(free_block)
+            free_block.rebind_layout(shapes, dtypes, fmt)
+            free_block._reset_ref_count_for_reuse_locked()
+            free_block._used_size_override = None
 
-        # TODO (Jiayi): need a flag to drop these debug ops
-        # NOTE (Jiayi): the following code is not thread-safe but
-        # is tolerable as this is only used for debugging purposes.
-        # Update debug status
-        self.num_active_allocations += 1
-        self.total_allocated_size += self.align_bytes
-        self.stats_monitor.update_local_cache_usage(self.total_allocated_size)
-        self.stats_monitor.update_active_memory_objs_count(self.num_active_allocations)
+        self._sync_debug_stats()
 
         # Allocate the block
         return free_block
@@ -204,18 +255,15 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
                 self.batched_free(allocated_blocks, update_stats=False)
                 return None
 
-            free_block.rebind_layout(shapes, dtypes, fmt)
+            with free_block.lock:
+                self.free_blocks.discard(free_block)
+                free_block.rebind_layout(shapes, dtypes, fmt)
+                free_block._reset_ref_count_for_reuse_locked()
+                free_block._used_size_override = None
 
             allocated_blocks.append(free_block)
 
-        # TODO (Jiayi): need a flag to drop these debug ops
-        # NOTE (Jiayi): the following code is not thread-safe but
-        # is tolerable as this is only used for debugging purposes.
-        # Update debug status
-        self.num_active_allocations += batch_size
-        self.total_allocated_size = self.num_active_allocations * self.align_bytes
-        self.stats_monitor.update_local_cache_usage(self.total_allocated_size)
-        self.stats_monitor.update_active_memory_objs_count(self.num_active_allocations)
+        self._sync_debug_stats()
 
         # Allocate the block
         return allocated_blocks
@@ -236,18 +284,11 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
             page_idx = memory_obj.meta.address
             memory_obj.raw_data = self.paged_buffers[page_idx]
 
-        self.free_blocks.append(memory_obj)
+        self.free_blocks.add_if_absent(memory_obj)
 
         # memory_obj.invalidate()
 
-        # TODO (Jiayi): need a flag to drop these debug ops
-        # NOTE (Jiayi): the following code is not thread-safe but
-        # is tolerable as this is only used for debugging purposes.
-        # Update debug status
-        self.total_allocated_size -= self.align_bytes
-        self.num_active_allocations -= 1
-        self.stats_monitor.update_local_cache_usage(self.total_allocated_size)
-        self.stats_monitor.update_active_memory_objs_count(self.num_active_allocations)
+        self._sync_debug_stats()
 
     @_lmcache_nvtx_annotate
     def batched_free(
@@ -278,20 +319,12 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
                 page_idx = memory_obj.meta.address
                 memory_obj.raw_data = self.paged_buffers[page_idx]
 
-            self.free_blocks.append(memory_obj)
+            self.free_blocks.add_if_absent(memory_obj)
 
         if update_stats:
-            num_freed_blocks = len(memory_objs)
-            # TODO (Jiayi): need a flag to drop these debug ops
-            # NOTE (Jiayi): the following code is not thread-safe but
-            # is tolerable as this is only used for debugging purposes.
-            # Update debug status
-            self.total_allocated_size -= self.align_bytes * num_freed_blocks
-            self.num_active_allocations -= num_freed_blocks
-            self.stats_monitor.update_local_cache_usage(self.total_allocated_size)
-            self.stats_monitor.update_active_memory_objs_count(
-                self.num_active_allocations
-            )
+            self._sync_debug_stats()
+        else:
+            self._sync_debug_stats(update_monitor=False)
 
     def memcheck(self) -> bool:
         """Check allocator consistency for debugging.

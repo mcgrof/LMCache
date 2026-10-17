@@ -91,6 +91,9 @@ class LMCTritonSparseBackend(AttentionInterface):
             assert attn_metadata.block_indices is not None, (
                 "Sparse metadata not initialized. Call update_from_top_indices() first."
             )
+            assert attn_metadata.query_positions is not None, (
+                "Sparse metadata lost its original query positions."
+            )
             output, lse = block_sparse_attention(
                 query,
                 key,
@@ -104,6 +107,7 @@ class LMCTritonSparseBackend(AttentionInterface):
                 # Note: sparse_blk_row_size == sparse_blk_col_size (both 32)
                 # in the current implementation.
                 block_size=attn_metadata.sparse_blk_row_size,
+                query_positions=attn_metadata.query_positions,
             )
             # Store LSE for downstream blending if needed
             attn_metadata.lse = lse

@@ -12,6 +12,7 @@ from lmcache.logging import init_logger
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate
 from lmcache.v1.compute.blend.utils import LMCBlenderBuilder
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
+from lmcache.v1.gpu_connector.load_state import LayerwiseLoadState
 from lmcache.v1.gpu_connector.utils import (
     assert_is_vllm_flash_attn_or_flash_infer,
     get_block_size,
@@ -23,6 +24,7 @@ from lmcache.v1.gpu_connector.utils import (
 )
 from lmcache.v1.memory_allocators.gpu_memory_allocator import GPUMemoryAllocator
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
+from lmcache.v1.token_span import TokenSpan
 import lmcache.lmcache_native as lmcache_native
 
 if TYPE_CHECKING:
@@ -507,11 +509,6 @@ class VLLMBufferLayerwiseXPUConnector(GPUConnectorInterface):
         self.load_stream = torch.xpu.Stream()
         self.store_stream = torch.xpu.Stream()
 
-        self.buffer_mapping: dict[int, MemoryObj] = {}
-
-        # track gap positions between blended chunks
-        self.current_gap_positions = None
-
         self.use_gpu = use_gpu
         self.gpu_buffer_allocator = None
         self.element_size = torch.tensor([], dtype=self.dtype).element_size()
@@ -581,17 +578,33 @@ class VLLMBufferLayerwiseXPUConnector(GPUConnectorInterface):
                 gpu_buffer_size, device=self.device
             )
 
-    def get_kv(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_kv(
+        self, layer_id: int, load_state: LayerwiseLoadState
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Get the KV cache for the given layer ID.
         This function is used to get the KV cache from the GPU buffer.
+
+        Args:
+            layer_id: Layer whose contiguous KV buffer should be returned.
+            load_state: Request-owned state for the active layerwise load.
+
+        Returns:
+            The key and value tensors for ``layer_id``.
+
+        Raises:
+            ValueError: If the requested layer has not been published.
         """
-        if layer_id not in self.buffer_mapping:
+        if layer_id not in load_state.buffer_mapping:
             raise ValueError(f"Layer {layer_id} is not loaded into GPU buffer.")
 
-        gpu_buffer = self.buffer_mapping[layer_id].tensor
+        gpu_buffer = load_state.buffer_mapping[layer_id].tensor
         assert gpu_buffer is not None
         return gpu_buffer[0], gpu_buffer[1]
+
+    def supports_explicit_spans(self) -> bool:
+        """Return true for explicit CacheBlend recovery-window support."""
+        return True
 
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         """ """
@@ -604,7 +617,15 @@ class VLLMBufferLayerwiseXPUConnector(GPUConnectorInterface):
         raise NotImplementedError
 
     @_lmcache_nvtx_annotate
-    def batched_to_gpu(self, starts: List[int], ends: List[int], **kwargs):
+    def batched_to_gpu(
+        self,
+        starts: List[int],
+        ends: List[int],
+        *,
+        load_state: Optional[LayerwiseLoadState] = None,
+        buffer_span: Optional[TokenSpan] = None,
+        **kwargs,
+    ):
         """
         This function is a generator that moves the KV cache from the memory
         objects to buffer GPU memory. In each iteration i, it (1) loads the KV
@@ -620,143 +641,158 @@ class VLLMBufferLayerwiseXPUConnector(GPUConnectorInterface):
             token sequence.
         """
 
-        self.initialize_kvcaches_ptr(**kwargs)
-        assert self.kvcaches is not None, (
-            "kvcaches should be provided in kwargs or initialized beforehand."
-        )
-
-        if "slot_mapping" not in kwargs:
-            raise ValueError("'slot_mapping' should be provided in kwargs.")
-
-        if self.fused_rotary_emb is None and self.cache_positions:
-            # TODO(Jiayi): Make this more elegant
-            self.lmc_model = LMCBlenderBuilder.get(ENGINE_NAME).layerwise_model
-            self.fused_rotary_emb = self.lmc_model.fused_rotary_emb
-
-        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
-
-        self._lazy_initialize_buffer(self.kvcaches)
-
-        num_all_tokens = ends[-1] - starts[0]
-        slot_mapping_full = slot_mapping[starts[0] : ends[-1]]
-
-        # compute gap positions
-        gap_mask = torch.ones(
-            num_all_tokens, dtype=torch.bool, device=slot_mapping_full.device
-        )
-        buf_offset = starts[0]
-
-        for start, end in zip(starts, ends, strict=False):
-            gap_mask[start - buf_offset : end - buf_offset] = False
-
-        self.current_gap_positions = torch.where(gap_mask)[0]
-
-        buf_offset = starts[0]
-        if self.cache_positions:
-            new_positions_full = torch.arange(
-                starts[0], ends[-1], dtype=torch.int64, device=self.kvcaches[0].device
+        state = load_state if load_state is not None else LayerwiseLoadState()
+        state.begin()
+        try:
+            self.initialize_kvcaches_ptr(**kwargs)
+            assert self.kvcaches is not None, (
+                "kvcaches should be provided in kwargs or initialized beforehand."
             )
 
-        buffer_shape = self.get_shape(num_all_tokens)
-        assert self.gpu_buffer_allocator is not None
-        compute_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
-            buffer_shape, self.dtype, MemoryFormat.KV_2TD
-        )
-        load_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
-            buffer_shape, self.dtype, MemoryFormat.KV_2TD
-        )
-        assert compute_gpu_buffer_obj is not None, (
-            "Failed to allocate GPU buffer in GPUConnector"
-        )
-        assert load_gpu_buffer_obj is not None, (
-            "Failed to allocate GPU buffer in GPUConnector"
-        )
-        assert compute_gpu_buffer_obj.tensor is not None
-        assert load_gpu_buffer_obj.tensor is not None
+            if "slot_mapping" not in kwargs:
+                raise ValueError("'slot_mapping' should be provided in kwargs.")
 
-        # current_stream = torch.xpu.current_stream()
+            if self.fused_rotary_emb is None and self.cache_positions:
+                # TODO(Jiayi): Make this more elegant
+                self.lmc_model = LMCBlenderBuilder.get(ENGINE_NAME).layerwise_model
+                self.fused_rotary_emb = self.lmc_model.fused_rotary_emb
 
-        if self.cache_positions:
-            old_positions_full = torch.zeros(
-                (num_all_tokens,), dtype=torch.int64, device=self.kvcaches[0].device
+            slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+
+            self._lazy_initialize_buffer(self.kvcaches)
+
+            buffer_start = starts[0]
+            buffer_end = ends[-1]
+            if buffer_span is not None:
+                if not isinstance(buffer_span, TokenSpan):
+                    raise TypeError("buffer_span must be a TokenSpan")
+                if starts[0] < buffer_span.start or ends[-1] > buffer_span.end:
+                    raise ValueError("loaded spans must fit inside buffer_span")
+                buffer_start = buffer_span.start
+                buffer_end = buffer_span.end
+            if buffer_end > len(slot_mapping):
+                raise ValueError("buffer_span exceeds slot_mapping")
+
+            num_all_tokens = buffer_end - buffer_start
+            slot_mapping_full = slot_mapping[buffer_start:buffer_end]
+
+            # compute gap positions
+            gap_mask = torch.ones(
+                num_all_tokens, dtype=torch.bool, device=slot_mapping_full.device
             )
-        for layer_id in range(self.num_layers + 2):
-            if layer_id > 1:
-                device_ops.single_layer_kv_transfer(
-                    self.buffer_mapping[layer_id - 2].tensor,
-                    self.kvcaches[layer_id - 2],
-                    slot_mapping_full,
-                    lmcache_native.TransferDirection.H2D,
-                    self.engine_kv_format,
-                    token_major=False,  # shape is [2, num_tokens, hidden_dim]
-                )
-                del self.buffer_mapping[layer_id - 2]
+            buf_offset = buffer_start
 
-                logger.debug(
-                    "Finished loading layer %d into paged memory", layer_id - 2
-                )
+            for start, end in zip(starts, ends, strict=False):
+                gap_mask[start - buf_offset : end - buf_offset] = False
 
-            if layer_id > 0 and layer_id <= self.num_layers:
-                # NOTE: wait until both compute and load streams are done
-                torch.xpu.synchronize()
+            state.gap_positions = torch.where(gap_mask)[0]
 
-                # ping-pong the buffers
-                compute_gpu_buffer_obj, load_gpu_buffer_obj = (
-                    load_gpu_buffer_obj,
-                    compute_gpu_buffer_obj,
+            if self.cache_positions:
+                new_positions_full = torch.arange(
+                    buffer_start,
+                    buffer_end,
+                    dtype=torch.int64,
+                    device=self.kvcaches[0].device,
                 )
 
-                if self.cache_positions:
-                    assert compute_gpu_buffer_obj.tensor is not None
+            buffer_shape = self.get_shape(num_all_tokens)
+            assert self.gpu_buffer_allocator is not None
+            compute_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+                buffer_shape, self.dtype, MemoryFormat.KV_2TD
+            )
+            if compute_gpu_buffer_obj is None:
+                raise MemoryError("Failed to allocate compute XPU buffer")
+            state.own_buffer(compute_gpu_buffer_obj)
 
-                    compute_gpu_buffer_obj.tensor[0] = self.fused_rotary_emb(
-                        old_positions_full,
-                        new_positions_full,
-                        compute_gpu_buffer_obj.tensor[0],
+            load_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+                buffer_shape, self.dtype, MemoryFormat.KV_2TD
+            )
+            if load_gpu_buffer_obj is None:
+                raise MemoryError("Failed to allocate load XPU buffer")
+            state.own_buffer(load_gpu_buffer_obj)
+
+            assert compute_gpu_buffer_obj.tensor is not None
+            assert load_gpu_buffer_obj.tensor is not None
+
+            # current_stream = torch.xpu.current_stream()
+
+            if self.cache_positions:
+                old_positions_full = torch.zeros(
+                    (num_all_tokens,),
+                    dtype=torch.int64,
+                    device=self.kvcaches[0].device,
+                )
+            for layer_id in range(self.num_layers + 2):
+                if layer_id > 1:
+                    device_ops.single_layer_kv_transfer(
+                        state.buffer_mapping[layer_id - 2].tensor,
+                        self.kvcaches[layer_id - 2],
+                        slot_mapping_full,
+                        lmcache_native.TransferDirection.H2D,
+                        self.engine_kv_format,
+                        token_major=False,  # shape is [2, num_tokens, hidden_dim]
+                    )
+                    del state.buffer_mapping[layer_id - 2]
+
+                    logger.debug(
+                        "Finished loading layer %s into paged memory", layer_id - 2
                     )
 
-                # gap zeroing after RoPE
-                if self.current_gap_positions.numel():
-                    compute_gpu_buffer_obj.tensor[:, self.current_gap_positions] = 0.0
+                if layer_id > 0 and layer_id <= self.num_layers:
+                    # NOTE: wait until both compute and load streams are done
+                    torch.xpu.synchronize()
 
-                self.buffer_mapping[layer_id - 1] = compute_gpu_buffer_obj
+                    # ping-pong the buffers
+                    compute_gpu_buffer_obj, load_gpu_buffer_obj = (
+                        load_gpu_buffer_obj,
+                        compute_gpu_buffer_obj,
+                    )
 
-                logger.debug("Finished loading layer %d into buffer", layer_id - 1)
+                    if self.cache_positions:
+                        assert compute_gpu_buffer_obj.tensor is not None
 
-            if layer_id < self.num_layers:
-                memory_objs_layer = yield
+                        compute_gpu_buffer_obj.tensor[0] = self.fused_rotary_emb(
+                            old_positions_full,
+                            new_positions_full,
+                            compute_gpu_buffer_obj.tensor[0],
+                        )
 
-                # memobj -> gpu_buffer
-                with torch.xpu.stream(self.load_stream):
-                    for start, end, memory_obj in zip(
-                        starts, ends, memory_objs_layer, strict=False
-                    ):
-                        assert memory_obj.metadata.fmt == MemoryFormat.KV_2TD
-                        assert load_gpu_buffer_obj.tensor is not None
-                        load_gpu_buffer_obj.tensor[0][
-                            start - buf_offset : end - buf_offset
-                        ].copy_(memory_obj.tensor[0], non_blocking=True)
+                    # gap zeroing after RoPE
+                    assert state.gap_positions is not None
+                    if state.gap_positions.numel():
+                        compute_gpu_buffer_obj.tensor[:, state.gap_positions] = 0.0
 
-                        load_gpu_buffer_obj.tensor[1][
-                            start - buf_offset : end - buf_offset
-                        ].copy_(memory_obj.tensor[1], non_blocking=True)
+                    state.buffer_mapping[layer_id - 1] = compute_gpu_buffer_obj
 
-                        if self.cache_positions and layer_id == 0:
-                            old_positions_full[
+                    logger.debug("Finished loading layer %s into buffer", layer_id - 1)
+
+                if layer_id < self.num_layers:
+                    memory_objs_layer = yield
+
+                    # memobj -> gpu_buffer
+                    with torch.xpu.stream(self.load_stream):
+                        for start, end, memory_obj in zip(
+                            starts, ends, memory_objs_layer, strict=False
+                        ):
+                            assert memory_obj.metadata.fmt == MemoryFormat.KV_2TD
+                            assert load_gpu_buffer_obj.tensor is not None
+                            load_gpu_buffer_obj.tensor[0][
                                 start - buf_offset : end - buf_offset
-                            ] = memory_obj.metadata.cached_positions
+                            ].copy_(memory_obj.tensor[0], non_blocking=True)
 
-            elif layer_id == self.num_layers:
-                yield
+                            load_gpu_buffer_obj.tensor[1][
+                                start - buf_offset : end - buf_offset
+                            ].copy_(memory_obj.tensor[1], non_blocking=True)
 
-        # free the buffer memory
-        load_gpu_buffer_obj.ref_count_down()
-        compute_gpu_buffer_obj.ref_count_down()
+                            if self.cache_positions and layer_id == 0:
+                                old_positions_full[
+                                    start - buf_offset : end - buf_offset
+                                ] = memory_obj.metadata.cached_positions
 
-        assert len(self.buffer_mapping) == 0, (
-            "There are still layers in the buffer mapping after "
-            "releasing the GPU buffers."
-        )
+                elif layer_id == self.num_layers:
+                    yield
+        finally:
+            state.release()
 
         yield
 

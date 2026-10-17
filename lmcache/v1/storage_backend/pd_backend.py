@@ -26,6 +26,7 @@ from lmcache.v1.memory_allocators.paged_cpu_gpu_memory_allocator import (
     PagedCpuGpuMemoryAllocator,
 )
 from lmcache.v1.memory_management import (
+    AllocationReceipt,
     MemoryFormat,
     MemoryObj,
 )
@@ -367,7 +368,12 @@ class PDBackend(AllocatorBackendInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
+        allocation_receipt: Optional[AllocationReceipt] = None,
     ) -> Optional[MemoryObj]:
+        if allocation_receipt is not None:
+            raise NotImplementedError(
+                "exact allocation receipts are unsupported by this allocator"
+            )
         if fmt is None:
             fmt = MemoryFormat.KV_2LTD
         # NOTE: no eviction and busy_loop in PD
@@ -386,7 +392,12 @@ class PDBackend(AllocatorBackendInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
+        allocation_receipts: Optional[Sequence[AllocationReceipt]] = None,
     ):
+        if allocation_receipts is not None:
+            raise NotImplementedError(
+                "exact allocation receipts are unsupported by this allocator"
+            )
         if fmt is None:
             fmt = MemoryFormat.KV_2LTD
         alloc_type = "cpu" if self.corrected_device == "cpu" else "gpu"

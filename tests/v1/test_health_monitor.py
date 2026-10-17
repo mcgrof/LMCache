@@ -2,7 +2,7 @@
 """Unit tests for the health_monitor module."""
 
 # Standard
-from typing import List
+from typing import Iterator, List
 from unittest.mock import MagicMock
 import asyncio
 import threading
@@ -91,8 +91,12 @@ def mock_manager():
 
 
 @pytest.fixture
-def monitor(mock_manager):
-    return HealthMonitor(manager=mock_manager, ping_interval=0.1)
+def monitor(mock_manager) -> Iterator[HealthMonitor]:
+    health_monitor = HealthMonitor(manager=mock_manager, ping_interval=0.1)
+    try:
+        yield health_monitor
+    finally:
+        health_monitor.stop()
 
 
 @pytest.fixture
@@ -141,8 +145,11 @@ class TestHealthCheckBase:
 class TestHealthMonitor:
     def test_initialization(self, mock_manager):
         monitor = HealthMonitor(manager=mock_manager, ping_interval=10.0)
-        assert monitor.is_healthy() is True
-        assert monitor._ping_interval == 10.0
+        try:
+            assert monitor.is_healthy() is True
+            assert monitor.interval == 10.0
+        finally:
+            monitor.stop()
 
     @pytest.mark.parametrize(
         "checks,expected",

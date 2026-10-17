@@ -28,8 +28,16 @@ class _FakeParent:
 class _FakeEngine:
     def __init__(self):
         self.unpinned: list[str] = []
+        self.registered: list[str] = []
         self.store_steps: dict[str, int] = {}
         self.store_calls: list[str] = []
+        self.fail_on_step: dict[str, int] = {}
+
+    def register_lookup_cleanup(self, req_id: str) -> None:
+        self.registered.append(req_id)
+
+    def schedule_lookup_unpin(self, req_id: str) -> None:
+        self.lookup_unpin(req_id)
 
     def lookup_unpin(self, req_id: str) -> None:
         self.unpinned.append(req_id)
@@ -41,6 +49,8 @@ class _FakeEngine:
 
         def _storer():
             while True:
+                if self.fail_on_step.get(req_id) == self.store_steps[req_id] + 1:
+                    raise RuntimeError(f"injected storer failure for {req_id}")
                 self.store_steps[req_id] += 1
                 yield None
 
@@ -52,9 +62,14 @@ class _FakeManager:
         self.lmcache_engine = engine
 
 
-def _make_req(req_id: str, can_save: bool = True):
+def _make_req(
+    req_id: str,
+    can_save: bool = True,
+    lookup_id: str | None = None,
+):
     return SimpleNamespace(
         req_id=req_id,
+        lookup_id=lookup_id,
         token_ids=[1, 2, 3, 4],
         slot_mapping=torch.arange(4, dtype=torch.long),
         save_spec=SaveSpec(skip_leading_tokens=0, can_save=can_save),
@@ -73,6 +88,9 @@ def _make_connector(requests):
     connector._lmcache_chunk_size = 8
     connector.kv_caches = {"layer0": torch.zeros(1)}
     connector._layerwise_save_storers = {}
+    connector.layerwise_retrievers = []
+    connector.current_layer = 0
+    connector.num_layers = 1
     return connector, metadata, engine
 
 
@@ -148,3 +166,84 @@ def test_layerwise_save_kv_producer_ignores_can_save_flag() -> None:
     connector.wait_for_save()
     assert engine.store_steps["req-1"] == 2
     assert connector._layerwise_save_storers == {}
+
+
+def test_save_storer_failure_schedules_every_transferred_lookup() -> None:
+    connector, _, engine = _make_connector(
+        [
+            _make_req("req-1", lookup_id="lookup-1"),
+            _make_req("req-2", lookup_id="lookup-2"),
+        ]
+    )
+    engine.fail_on_step["req-1"] = 1
+
+    with pytest.raises(RuntimeError, match="req-1"):
+        connector.save_kv_layer("layer0", torch.zeros(1), None)
+
+    assert engine.registered[:2] == ["lookup-1", "lookup-2"]
+    assert engine.unpinned == ["lookup-1", "lookup-2"]
+
+
+def test_wait_for_save_isolates_storer_failure_and_cleans_later_id() -> None:
+    connector, _, engine = _make_connector(
+        [
+            _make_req("req-1", lookup_id="lookup-1"),
+            _make_req("req-2", lookup_id="lookup-2"),
+        ]
+    )
+    connector.save_kv_layer("layer0", torch.zeros(1), None)
+    engine.fail_on_step["req-1"] = 2
+
+    with pytest.raises(RuntimeError, match="req-1"):
+        connector.wait_for_save()
+
+    assert engine.unpinned == ["lookup-1", "lookup-2"]
+    assert engine.store_steps["req-1"] == 1
+    assert engine.store_steps["req-2"] == 2
+
+
+def test_wait_for_layer_load_failure_schedules_every_transferred_lookup() -> None:
+    connector, _, engine = _make_connector(
+        [
+            _make_req("req-1", lookup_id="lookup-1"),
+            _make_req("req-2", lookup_id="lookup-2"),
+        ]
+    )
+
+    def failing_retriever():
+        raise RuntimeError("injected layer retriever failure")
+        yield None
+
+    connector.layerwise_retrievers = [failing_retriever()]
+
+    with pytest.raises(RuntimeError, match="retriever failure"):
+        connector.wait_for_layer_load("layer0")
+
+    assert engine.unpinned == ["lookup-1", "lookup-2"]
+
+
+def test_no_forward_metadata_schedules_transferred_lookup_cleanup() -> None:
+    connector, _, engine = _make_connector([_make_req("req-1", lookup_id="lookup-1")])
+
+    connector.start_load_kv(SimpleNamespace(attn_metadata=None))
+
+    assert engine.registered == ["lookup-1"]
+    assert engine.unpinned == ["lookup-1"]
+
+
+def test_metadata_getter_failure_uses_raw_metadata_for_cleanup() -> None:
+    connector, metadata, engine = _make_connector(
+        [_make_req("req-1", lookup_id="lookup-1")]
+    )
+
+    class _FailingParent(_FakeParent):
+        def _get_connector_metadata(self):
+            raise RuntimeError("injected metadata getter failure")
+
+    connector._parent = _FailingParent(metadata)
+
+    with pytest.raises(RuntimeError, match="metadata getter failure"):
+        connector.start_load_kv(SimpleNamespace(attn_metadata=object()))
+
+    assert engine.registered == ["lookup-1"]
+    assert engine.unpinned == ["lookup-1"]

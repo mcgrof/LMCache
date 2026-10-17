@@ -48,7 +48,7 @@ def _create_backend(
     backend.current_cache_size = current_cache_size
     backend.max_cache_size = max_cache_size
     backend.dict = entries
-    backend.disk_lock = threading.Lock()
+    backend.disk_lock = threading.RLock()
     backend.cache_policy = MagicMock()
     backend.batched_remove = MagicMock()  # type: ignore[method-assign]
     backend.loop = MagicMock()

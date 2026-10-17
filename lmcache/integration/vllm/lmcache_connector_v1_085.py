@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 # Third Party
 from vllm.config import VllmConfig
@@ -14,6 +14,10 @@ from vllm.v1.core.sched.output import SchedulerOutput
 import torch
 
 # First Party
+from lmcache.integration.vllm.connector_construction import (
+    RetainedConnectorConstructionOwner,
+    cleanup_failed_connector_construction,
+)
 from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
 
 if TYPE_CHECKING:
@@ -28,11 +32,39 @@ logger = init_logger(__name__)
 class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
     def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
         super().__init__(vllm_config=vllm_config, role=role)
-        self._lmcache_engine = LMCacheConnectorV1Impl(vllm_config, role, self)
+        owner = RetainedConnectorConstructionOwner(
+            lambda publish: LMCacheConnectorV1Impl(
+                vllm_config,
+                role,
+                self,
+                publish,
+            ),
+            thread_name=("lmcache-vllm-wrapper-construction-" + role.name.lower()),
+        )
+        self._lmcache_engine_construction_owner: Optional[
+            RetainedConnectorConstructionOwner[LMCacheConnectorV1Impl]
+        ] = owner
+        try:
+            owner.invoke()
+            connector = owner.connector
+            self._lmcache_engine = connector
+            owner.release_provisional_manager()
+            self._lmcache_engine_construction_owner = None
+        except BaseException as init_error:
+            cleanup_failed_connector_construction(owner, init_error)
+            raise
 
     # ==============================
     # Worker-side methods
     # ==============================
+    def register_model(self, model: torch.nn.Module) -> None:
+        """Register the worker's loaded model for CacheBlend sessions.
+
+        Args:
+            model: Loaded vLLM model owned by this worker.
+        """
+        self._lmcache_engine.register_model(model)
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """
         Start loading the KV cache from the connector to vLLM's paged

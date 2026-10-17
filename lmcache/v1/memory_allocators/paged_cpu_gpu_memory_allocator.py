@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
-from typing import List, Optional, Union
+from typing import List, Optional, Sequence, Union
 
 # Third Party
 import torch
@@ -12,6 +12,7 @@ from lmcache.v1.memory_allocators.paged_tensor_memory_allocator import (
     PagedTensorMemoryAllocator,
 )
 from lmcache.v1.memory_management import (
+    AllocationReceipt,
     MemoryAllocatorInterface,
     MemoryFormat,
     MemoryObj,
@@ -95,6 +96,7 @@ class PagedCpuGpuMemoryAllocator(MemoryAllocatorInterface):
         dtypes: Union[torch.dtype, list[torch.dtype]],
         fmt: MemoryFormat = MemoryFormat.UNDEFINED,
         allocator_type: Optional[str] = "cpu",
+        allocation_receipt: Optional[AllocationReceipt] = None,
     ) -> Optional[MemoryObj]:
         """Allocate from the selected CPU or GPU paged allocator.
 
@@ -110,6 +112,10 @@ class PagedCpuGpuMemoryAllocator(MemoryAllocatorInterface):
         Raises:
             ValueError: If ``allocator_type`` is unsupported.
         """
+        if allocation_receipt is not None:
+            raise NotImplementedError(
+                "exact allocation receipts are unsupported by this allocator"
+            )
         if allocator_type == "gpu":
             return self.gpu_allocator.allocate(shapes, dtypes, fmt)
         elif allocator_type == "cpu":
@@ -124,6 +130,7 @@ class PagedCpuGpuMemoryAllocator(MemoryAllocatorInterface):
         batch_size: int,
         fmt: MemoryFormat = MemoryFormat.UNDEFINED,
         allocator_type: Optional[str] = "gpu",
+        allocation_receipts: Optional[Sequence[AllocationReceipt]] = None,
     ) -> Optional[List[MemoryObj]]:
         """Allocate a batch from the selected CPU or GPU paged allocator.
 
@@ -140,6 +147,10 @@ class PagedCpuGpuMemoryAllocator(MemoryAllocatorInterface):
         Raises:
             ValueError: If ``allocator_type`` is unsupported.
         """
+        if allocation_receipts is not None:
+            raise NotImplementedError(
+                "exact allocation receipts are unsupported by this allocator"
+            )
         if allocator_type == "gpu":
             return self.gpu_allocator.batched_allocate(shapes, dtypes, batch_size, fmt)
         elif allocator_type == "cpu":

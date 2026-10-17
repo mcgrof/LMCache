@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections import OrderedDict
-from typing import TYPE_CHECKING, AbstractSet, Optional
+from typing import TYPE_CHECKING, AbstractSet, Callable, Optional
 import asyncio
 import importlib  # Added for dynamic import
 
@@ -164,6 +164,7 @@ def _create_storage_backends(
     lmcache_worker: Optional["LMCacheWorker"] = None,
     skip_backends: Optional[AbstractSet[str]] = None,
     existing_backends: Optional[OrderedDict[str, StorageBackendInterface]] = None,
+    retain_backend: Optional[Callable[[str, StorageBackendInterface], None]] = None,
 ) -> OrderedDict[str, StorageBackendInterface]:
     """Populate caller-owned construction state for transactional cleanup."""
     if is_cuda_worker(metadata):
@@ -234,12 +235,28 @@ def _create_storage_backends(
         if "LocalCPUBackend" in _skip:
             pass  # Skipped — already exists
         elif config.max_local_cpu_size > 0:
-            local_cpu_backend = LocalCPUBackend(
-                config,
-                metadata,
-                dst_device,
-                lmcache_worker,
-            )
+            if retain_backend is None:
+                local_cpu_backend = LocalCPUBackend(
+                    config,
+                    metadata,
+                    dst_device,
+                    lmcache_worker,
+                )
+            else:
+                # The target LocalCPU backend owns a pinned arena. Publish its
+                # raw identity into StorageManager before __init__ can allocate
+                # that arena or construct a controller sender. Constructor-side
+                # BaseException then leaves a reachable partial backend.
+                local_cpu_backend = LocalCPUBackend.__new__(LocalCPUBackend)
+                LocalCPUBackend._prepare_partial_state(local_cpu_backend)
+                retain_backend("LocalCPUBackend", local_cpu_backend)
+                LocalCPUBackend.__init__(
+                    local_cpu_backend,
+                    config,
+                    metadata,
+                    dst_device,
+                    lmcache_worker,
+                )
             backend_name = str(local_cpu_backend)
             storage_backends[backend_name] = local_cpu_backend
         else:
@@ -403,6 +420,7 @@ def CreateStorageBackends(
     lmcache_worker: Optional["LMCacheWorker"] = None,
     skip_backends: Optional[AbstractSet[str]] = None,
     existing_backends: Optional[OrderedDict[str, StorageBackendInterface]] = None,
+    retain_backend: Optional[Callable[[str, StorageBackendInterface], None]] = None,
 ) -> OrderedDict[str, StorageBackendInterface]:
     """Create configured backends, rolling back newly owned backends on failure.
 
@@ -418,6 +436,8 @@ def CreateStorageBackends(
         lmcache_worker: Optional controller worker.
         skip_backends: Backend names already provided by the caller.
         existing_backends: Caller-owned backends reused by new dependents.
+        retain_backend: Optional owner accepting partial construction before
+            resources start; retains returned backends after a failed build.
 
     Returns:
         Newly constructed backends in tier order.
@@ -436,11 +456,15 @@ def CreateStorageBackends(
             lmcache_worker,
             skip_backends,
             existing_backends,
+            retain_backend,
         )
     except BaseException:
         # Dependents must stop using a staging allocator before it closes.
         # Reused backends belong to the caller and never enter this mapping.
-        for backend in reversed(storage_backends.values()):
+        for name, backend in reversed(storage_backends.items()):
+            if retain_backend is not None:
+                retain_backend(name, backend)
+                continue
             try:
                 backend.close()
             except Exception:

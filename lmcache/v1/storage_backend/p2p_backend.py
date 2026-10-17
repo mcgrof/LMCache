@@ -654,6 +654,10 @@ class P2PBackend(StorageBackendInterface):
             missed_mem_obj.ref_count_down()
         return hit_mem_objs
 
+    def batched_get_non_blocking_returns_pinned(self) -> bool:
+        # Successful transfers pin their returned CPU staging objects above.
+        return True
+
     def _get_unfull_chunk_shapes(self, num_tokens: int) -> list[torch.Size]:
         shapes = []
         for shape in self.full_size_shapes:

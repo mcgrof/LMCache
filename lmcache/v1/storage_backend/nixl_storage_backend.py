@@ -71,6 +71,7 @@ from lmcache.v1.memory_allocators.paged_tensor_memory_allocator import (
     PagedTensorMemoryAllocator,
 )
 from lmcache.v1.memory_management import (
+    AllocationReceipt,
     MemoryFormat,
     MemoryObj,
     MemoryObjMetadata,
@@ -947,7 +948,12 @@ class NixlStorageBackend(AllocatorBackendInterface, ABC):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
+        allocation_receipt: Optional[AllocationReceipt] = None,
     ) -> Optional[MemoryObj]:
+        if allocation_receipt is not None:
+            raise NotImplementedError(
+                "exact allocation receipts are unsupported by this allocator"
+            )
         if busy_loop:
             logger.warning("NixlStorageBackend does not support busy loop for now")
 
@@ -965,7 +971,12 @@ class NixlStorageBackend(AllocatorBackendInterface, ABC):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
+        allocation_receipts: Optional[Sequence[AllocationReceipt]] = None,
     ) -> Optional[list[MemoryObj]]:
+        if allocation_receipts is not None:
+            raise NotImplementedError(
+                "exact allocation receipts are unsupported by this allocator"
+            )
         if busy_loop:
             logger.warning("NixlStorageBackend does not support busy loop for now")
 

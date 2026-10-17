@@ -13,6 +13,7 @@ from lmcache import torch_device_type
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
+    AllocationReceipt,
     MemoryAllocatorInterface,
     MemoryFormat,
     MemoryObj,
@@ -58,6 +59,22 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
         :return: True if the key exists, False otherwise.
         """
         raise NotImplementedError
+
+    def supports_lookup_pin_progress(self) -> bool:
+        """Whether lookup pinning is exception-atomic one key at a time.
+
+        Backends must opt in only when ``pin_for_lookup`` either returns after
+        publishing exactly one pin or raises without changing pin ownership.
+        The explicit-span lookup path uses this contract to durably ledger
+        progress between keys.
+        """
+        return False
+
+    def pin_for_lookup(self, key: CacheEngineKey) -> bool:
+        """Atomically pin ``key`` for progress-safe lookup acquisition."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support progress-safe lookup pinning"
+        )
 
     @abc.abstractmethod
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
@@ -173,6 +190,15 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError
 
+    def batched_get_non_blocking_returns_pinned(self) -> bool:
+        """Whether batched get returns one caller-owned pin per object.
+
+        Most backends return unpinned objects. Backends that pin temporary
+        staging objects must override this so their caller can release exactly
+        that pin without consuming a pin owned by a separate lookup request.
+        """
+        return False
+
     # NOTE(Jiayi): Please re-implement this method if the storage backend
     # can benefit from batched get.
     def batched_get_blocking(
@@ -268,6 +294,16 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
         Close the storage backend.
         """
         raise NotImplementedError
+
+    def close_failure_is_retry_safe(self, error: BaseException) -> bool:
+        """Whether ``close`` may be invoked again after this exact failure.
+
+        The conservative default is false because a backend may raise after a
+        non-idempotent side effect. Backends with an exception-atomic or fully
+        idempotent close implementation can opt in explicitly.
+        """
+        del error
+        return False
 
     def batched_contains(
         self,
@@ -368,6 +404,7 @@ class AllocatorBackendInterface(StorageBackendInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
+        allocation_receipt: Optional[AllocationReceipt] = None,
     ) -> Optional[MemoryObj]:
         """
         Allocates memory in the backend to hold a tensor of the given shape.
@@ -398,6 +435,7 @@ class AllocatorBackendInterface(StorageBackendInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
+        allocation_receipts: Optional[Sequence[AllocationReceipt]] = None,
     ) -> Optional[list[MemoryObj]]:
         """
         Allocates memory in the backend to hold a tensor of the given shape

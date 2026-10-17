@@ -22,7 +22,11 @@ if TYPE_CHECKING:
     from lmcache.v1.manager import LMCacheManager
 
 # First Party
-from lmcache.integration.base_service_factory import BaseServiceFactory
+from lmcache.integration.base_service_factory import (
+    BaseServiceFactory,
+    ServiceResultPublisher,
+)
+from lmcache.integration.vllm.target_profile import SERIAL_PIC_V1
 from lmcache.logging import init_logger
 from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.config import LMCacheEngineConfig
@@ -51,14 +55,30 @@ class VllmServiceFactory(BaseServiceFactory):
         lmcache_config: LMCacheEngineConfig,
         vllm_config: "VllmConfig",
         role: str,
-    ):
+        target_profile: Optional[str] = None,
+    ) -> None:
+        """Initialize the role-local vLLM service factory.
+
+        Args:
+            lmcache_config: Fully resolved LMCache configuration.
+            vllm_config: Fully resolved vLLM configuration.
+            role: Role-local service topology, ``scheduler`` or ``worker``.
+            target_profile: Optional closed target profile already validated
+                by the adapter.
+        """
         self.lmcache_config = lmcache_config
         self.vllm_config = vllm_config
         self.role = role
+        self.target_profile = target_profile
         self.metadata: Optional[LMCacheMetadata] = None
         self.lmcache_engine: Optional[LMCacheEngine] = None
 
     def get_engine_instance_id(self) -> str:
+        """Return the stable vLLM engine registration identifier.
+
+        Returns:
+            The process-local engine name shared with ``LMCacheEngineBuilder``.
+        """
         # First Party
         from lmcache.integration.vllm.utils import ENGINE_NAME
 
@@ -159,7 +179,10 @@ class VllmServiceFactory(BaseServiceFactory):
         )
         return self.metadata
 
-    def get_or_create_lmcache_engine(self) -> Optional[LMCacheEngine]:
+    def get_or_create_lmcache_engine(
+        self,
+        result_publisher: Optional[ServiceResultPublisher] = None,
+    ) -> Optional[LMCacheEngine]:
         self._ensure_metadata()
         assert self.metadata is not None
 
@@ -176,6 +199,8 @@ class VllmServiceFactory(BaseServiceFactory):
                 self.metadata,
                 config=self.lmcache_config,
             )
+            if result_publisher is not None:
+                result_publisher.publish_final(None)
             return None
 
         # First Party
@@ -185,6 +210,8 @@ class VllmServiceFactory(BaseServiceFactory):
 
         if curr_engine := LMCacheEngineBuilder.get(ENGINE_NAME):
             self.lmcache_engine = curr_engine
+            if result_publisher is not None:
+                result_publisher.publish_final(curr_engine)
             return curr_engine
 
         if self.role == "scheduler":
@@ -216,6 +243,8 @@ class VllmServiceFactory(BaseServiceFactory):
             tpg.broadcast_object,
         )
         self.lmcache_engine = engine
+        if result_publisher is not None:
+            result_publisher.publish_final(engine)
 
         if (
             self.role == "scheduler"
@@ -245,9 +274,14 @@ class VllmServiceFactory(BaseServiceFactory):
         # (e.g., engine creation for scheduler, health monitor setup).
         return None
 
-    def maybe_create_lookup_client(self) -> Optional[LookupClientInterface]:
+    def maybe_create_lookup_client(
+        self,
+        result_publisher: Optional[ServiceResultPublisher] = None,
+    ) -> Optional[LookupClientInterface]:
         # Only scheduler needs lookup client
         if self.role != "scheduler":
+            if result_publisher is not None:
+                result_publisher.publish_final(None)
             return None
 
         # First Party
@@ -259,13 +293,17 @@ class VllmServiceFactory(BaseServiceFactory):
             self.lmcache_config,
             self.metadata,
             self.lmcache_engine,
+            result_publisher=result_publisher,
         )
 
     def maybe_create_lookup_server(
         self,
+        result_publisher: Optional[ServiceResultPublisher] = None,
     ) -> Optional[Union["LMCacheLookupServer", "LMCacheAsyncLookupServer"]]:
         # Only worker needs lookup server
         if self.role != "worker":
+            if result_publisher is not None:
+                result_publisher.publish_final(None)
             return None
 
         # First Party
@@ -278,9 +316,16 @@ class VllmServiceFactory(BaseServiceFactory):
         return LookupClientFactory.create_lookup_server(
             self.lmcache_engine,
             self.metadata,
+            result_publisher=result_publisher,
         )
 
     def maybe_create_offload_server(self) -> Optional[ZMQOffloadServer]:
+        # The bounded serial-PIC topology is one co-resident ``uni`` process.
+        # Its worker lookup server is the only admitted ZMQ data-plane service;
+        # the independent offload server is deliberately outside the profile.
+        if self.target_profile == SERIAL_PIC_V1:
+            return None
+
         # Only worker needs offload server
         if self.role != "worker":
             return None
@@ -300,6 +345,11 @@ class VllmServiceFactory(BaseServiceFactory):
     def maybe_create_runtime_plugin_launcher(
         self,
     ) -> Optional[RuntimePluginLauncher]:
+        # Even an empty launcher registers process-global cleanup state.  Do
+        # not construct it in the fixed-lifetime serial-PIC target profile.
+        if self.target_profile == SERIAL_PIC_V1:
+            return None
+
         # First Party
         from lmcache.integration.vllm.utils import is_dp_rank0
 
@@ -322,6 +372,11 @@ class VllmServiceFactory(BaseServiceFactory):
     def maybe_create_internal_api_server(
         self, lmcache_manager: "LMCacheManager"
     ) -> Optional[InternalAPIServer]:
+        # The internal API object is an excluded administrative surface even
+        # when its resolved config would leave the server thread disabled.
+        if self.target_profile == SERIAL_PIC_V1:
+            return None
+
         # First Party
         from lmcache.integration.vllm.utils import is_dp_rank0
 

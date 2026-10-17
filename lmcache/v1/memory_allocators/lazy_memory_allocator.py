@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import List, Optional, Union
+from typing import List, Optional, Sequence, Union
 import ctypes
 import threading
 
@@ -13,6 +13,7 @@ from lmcache.logging import init_logger
 from lmcache.v1.memory_allocators.tensor_memory_allocator import TensorMemoryAllocator
 from lmcache.v1.memory_management import (
     AddressManager,
+    AllocationReceipt,
     MemoryAllocatorInterface,
     MemoryFormat,
     MemoryObj,
@@ -172,6 +173,7 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
         dtypes: Union[torch.dtype, list[torch.dtype]],
         fmt: MemoryFormat = MemoryFormat.UNDEFINED,
         allocator_type: Optional[str] = None,
+        allocation_receipt: Optional[AllocationReceipt] = None,
     ) -> Optional[MemoryObj]:
         """Allocate one object from the lazily pinned memory pool.
 
@@ -184,6 +186,10 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
         Returns:
             A memory object, or ``None`` if the committed address space is full.
         """
+        if allocation_receipt is not None:
+            raise NotImplementedError(
+                "exact allocation receipts are unsupported by this allocator"
+            )
         obj = self._allocator.allocate(shapes, dtypes, fmt, allocator_type)
         # HACK(ApostaC): reset the parent allocator to this lazy allocator
         # There should be a cleaner way to decouple lazy allocator and
@@ -199,6 +205,7 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
         batch_size: int,
         fmt: MemoryFormat = MemoryFormat.UNDEFINED,
         allocator_type: Optional[str] = None,
+        allocation_receipts: Optional[Sequence[AllocationReceipt]] = None,
     ) -> Optional[List[MemoryObj]]:
         """Allocate a batch of objects from the lazily pinned memory pool.
 
@@ -212,6 +219,10 @@ class LazyMemoryAllocator(MemoryAllocatorInterface):
         Returns:
             Memory objects for the batch, or ``None`` if allocation fails.
         """
+        if allocation_receipts is not None:
+            raise NotImplementedError(
+                "exact allocation receipts are unsupported by this allocator"
+            )
         # HACK(ApostaC): reset the parent allocator to this lazy allocator
         # There should be a cleaner way to decouple lazy allocator and
         # tensor memory allocator

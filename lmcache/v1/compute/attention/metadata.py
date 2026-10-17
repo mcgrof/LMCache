@@ -129,6 +129,7 @@ class LMCTritonSparseMetadata(LMCAttnMetadata):
     # Sparse indices (populated by update_from_top_indices)
     block_indices: Optional[torch.Tensor] = None
     block_indptr: Optional[torch.Tensor] = None
+    query_positions: Optional[torch.Tensor] = None
 
     # Block column sizes for variable-size last block
     block_col_sizes: Optional[torch.Tensor] = None
@@ -144,9 +145,28 @@ class LMCTritonSparseMetadata(LMCAttnMetadata):
 
         Called by CacheBlend when it determines which tokens have cache hits.
         """
-        self.is_causal = False
+        if (
+            type(top_indices) is not torch.Tensor
+            or top_indices.ndim != 1
+            or top_indices.dtype != torch.int64
+            or not top_indices.is_contiguous()
+        ):
+            raise ValueError("top_indices must be a contiguous int64 vector")
         device = top_indices.device
         top_k_num = len(top_indices)
+        if top_k_num == 0:
+            raise ValueError("top_indices must not be empty")
+        query_positions = top_indices.clone()
+        if bool(
+            torch.any((query_positions < 0) | (query_positions >= self.seq_len)).item()
+        ):
+            raise ValueError("top_indices contain an out-of-range position")
+        if top_k_num > 1 and bool(
+            torch.any(query_positions[1:] <= query_positions[:-1]).item()
+        ):
+            raise ValueError("top_indices must be strictly increasing")
+        self.is_causal = False
+        self.query_positions = query_positions
 
         # Use ceiling division so all query positions are covered.
         # The last block row may be partial (fewer than sparse_blk_row_size
@@ -162,15 +182,20 @@ class LMCTritonSparseMetadata(LMCAttnMetadata):
             num_block_row, num_block_col, dtype=torch.bool, device=device
         )
 
-        top_indices_slice = top_indices[
-            self.sparse_blk_row_size - 1 :: self.sparse_blk_row_size
-        ]
-        top_indices_block = top_indices_slice // self.sparse_blk_col_size
+        row_end_indices = torch.arange(
+            num_block_row, dtype=torch.int64, device=device
+        ) * self.sparse_blk_row_size + (self.sparse_blk_row_size - 1)
+        row_end_indices.clamp_max_(top_k_num - 1)
+        row_max_positions = query_positions[row_end_indices]
+        row_max_blocks = row_max_positions // self.sparse_blk_col_size
 
         cols = torch.arange(num_block_col, device=device).expand(
-            len(top_indices_block), -1
+            len(row_max_blocks), -1
         )
-        mask = cols < top_indices_block.unsqueeze(1)
-        block_mask[: len(top_indices_block)] = mask
+        # Include the block containing each row's last original query. The
+        # Triton kernel applies the exact per-query causal mask inside that
+        # block using ``query_positions``.
+        mask = cols <= row_max_blocks.unsqueeze(1)
+        block_mask[: len(row_max_blocks)] = mask
 
         self.block_indices, self.block_indptr = _block_mask_to_csr(block_mask, device)

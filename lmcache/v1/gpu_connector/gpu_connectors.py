@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import List, Optional, Tuple, Union, cast
+from typing import Any, List, Optional, Tuple, Union, cast
 import abc
+import threading
+import weakref
 
 # Third Party
 import torch
@@ -14,6 +16,7 @@ from lmcache.v1.compute.blend.utils import LMCBlenderBuilder
 from lmcache.v1.gpu_connector.kv_format.contiguity import (
     attempt_permute_to_contiguous_view,
 )
+from lmcache.v1.gpu_connector.load_state import LayerwiseLoadState
 from lmcache.v1.gpu_connector.utils import (
     DiscoverableKVCache,
     LayoutHints,
@@ -34,9 +37,16 @@ from lmcache.v1.gpu_connector.utils import (
 )
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from lmcache.v1.memory_allocators.gpu_memory_allocator import GPUMemoryAllocator
-from lmcache.v1.memory_management import MemoryFormat, MemoryObj, retain_memory_owners
+from lmcache.v1.memory_management import (
+    AllocationReceipt,
+    MemoryFormat,
+    MemoryObj,
+    RefCountDownReceipt,
+    retain_memory_owners,
+)
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.platform.ops_types import PageBufferShapeDesc
+from lmcache.v1.token_span import TokenSpan
 import lmcache.lmcache_native as lmcache_native
 
 logger = init_logger(__name__)
@@ -85,7 +95,154 @@ def _synchronize_staging(
         raise
 
 
+class _GPUStoreOperationLease:
+    """Weakly observed proof that a GPU-store generator frame is live."""
+
+
+class _GPUStoreCleanupOwner:
+    """Retry state for one layerwise GPU-store temporary buffer."""
+
+    def __init__(
+        self,
+        stream: Any,
+        operation_lease: Optional[_GPUStoreOperationLease] = None,
+    ):
+        self._stream = stream
+        self._allocation_receipt = AllocationReceipt()
+        self._buffer: Optional[MemoryObj] = None
+        self._release_receipt: Optional[RefCountDownReceipt] = None
+        self._legacy_released = False
+        self._sync_required = False
+        self._pending = False
+        self._operation_lease_ref = (
+            weakref.ref(operation_lease) if operation_lease is not None else None
+        )
+        self._lock = threading.RLock()
+
+    @property
+    def pending(self) -> bool:
+        with self._lock:
+            return self._pending
+
+    @property
+    def complete(self) -> bool:
+        with self._lock:
+            if self._buffer is None:
+                buffer_released = self._allocation_receipt.release_complete()
+            else:
+                buffer_released = self._buffer_release_complete()
+            return self._pending and not self._sync_required and buffer_released
+
+    @property
+    def operation_alive(self) -> bool:
+        """Return whether the GPU-store frame still owns its strong lease."""
+        lease_ref = self._operation_lease_ref
+        return lease_ref is None or lease_ref() is not None
+
+    @property
+    def allocation_receipt(self) -> AllocationReceipt:
+        """Receipt retained before the connector enters its GPU allocator."""
+        return self._allocation_receipt
+
+    def attach_buffer(self, buffer: MemoryObj) -> None:
+        """Publish allocation ownership immediately after allocation."""
+        with self._lock:
+            if self._buffer is not None:
+                raise RuntimeError("GPU store cleanup owner already has a buffer")
+            if not self._allocation_receipt.adopted and isinstance(buffer, MemoryObj):
+                self._allocation_receipt.adopt(buffer)
+            self._buffer = buffer
+            if self._allocation_receipt.memory_obj is buffer:
+                self._release_receipt = self._allocation_receipt.ref_count_down_receipt
+
+    def _ensure_release_receipt(self) -> Optional[RefCountDownReceipt]:
+        if self._release_receipt is not None:
+            return self._release_receipt
+        assert self._buffer is not None
+        if self._allocation_receipt.memory_obj is self._buffer:
+            receipt = self._allocation_receipt.ref_count_down_receipt
+            if receipt is not None:
+                self._release_receipt = receipt
+                return receipt
+        try:
+            receipt = self._buffer.make_ref_count_down_receipt()
+        except (AttributeError, NotImplementedError):
+            if isinstance(self._buffer, MemoryObj):
+                raise RuntimeError(
+                    f"{type(self._buffer).__name__} lacks an exact release receipt"
+                ) from None
+            return None
+        self._release_receipt = receipt
+        return receipt
+
+    def _buffer_release_complete(self) -> bool:
+        if self._buffer is None:
+            return True
+        receipt = self._release_receipt
+        if receipt is None:
+            return self._legacy_released
+        return self._buffer.ref_count_down_receipt_complete(receipt)
+
+    def require_sync(self) -> None:
+        """Fence cleanup before any call that can enqueue device work."""
+        with self._lock:
+            self._sync_required = True
+
+    def mark_synchronized(self) -> None:
+        with self._lock:
+            self._sync_required = False
+
+    def mark_pending(self) -> None:
+        """Publish terminal cleanup with one non-fallible pointer assignment."""
+        self._pending = True
+
+    def drain(self) -> Optional[BaseException]:
+        """Synchronize before releasing the buffer, retaining failed state."""
+        with self._lock:
+            if not self._pending:
+                return None
+            if self._sync_required:
+                try:
+                    self._stream.synchronize()
+                except BaseException as error:
+                    return error
+                self._sync_required = False
+            if self._buffer is None and not self._allocation_receipt.release_complete():
+                try:
+                    self._allocation_receipt.release_once()
+                except BaseException as error:
+                    return error
+            if self._buffer is not None and not self._buffer_release_complete():
+                receipt = self._ensure_release_receipt()
+                try:
+                    if receipt is None:
+                        self._buffer.ref_count_down()
+                    else:
+                        self._buffer.ref_count_down_once(receipt)
+                except BaseException as error:
+                    return error
+                if receipt is None:
+                    self._legacy_released = True
+        return None
+
+
 class GPUConnectorInterface(metaclass=abc.ABCMeta):
+    def supports_explicit_spans(self) -> bool:
+        """Return whether this connector supports explicit recovery windows."""
+        return False
+
+    def drain_pending_gpu_cleanups(self) -> None:
+        """Retry pending GPU-store cleanup; connectors without state no-op."""
+        return None
+
+    def pending_gpu_cleanup_count(self) -> int:
+        """Return retry-owned GPU-store cleanup states for this connector."""
+        return 0
+
+    def gpu_cleanup_owner_count(self) -> int:
+        """Return all GPU cleanup owners, including active publication."""
+        return 0
+
     @abc.abstractmethod
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         # FIXME (Yihua): We shouldn't put start and end here since
@@ -982,14 +1139,86 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         self.load_stream = torch.cuda.Stream()
         self.store_stream = torch.cuda.Stream()
 
-        self.buffer_mapping: dict[int, MemoryObj] = {}
-
-        # track gap positions between blended chunks
-        self.current_gap_positions = None
-
         self.use_gpu = use_gpu
         self.gpu_buffer_allocator = None
         self.element_size = torch.tensor([], dtype=self.dtype).element_size()
+        self._gpu_store_cleanup_lock = threading.RLock()
+        self._gpu_store_cleanup_owners: dict[int, _GPUStoreCleanupOwner] = {}
+
+    def _ensure_gpu_store_cleanup_state(self) -> None:
+        """Initialize retry state for lightweight test connector objects."""
+        if not hasattr(self, "_gpu_store_cleanup_lock"):
+            self._gpu_store_cleanup_lock = threading.RLock()
+        if not hasattr(self, "_gpu_store_cleanup_owners"):
+            self._gpu_store_cleanup_owners = {}
+
+    def _register_gpu_store_cleanup(
+        self,
+        owner: _GPUStoreCleanupOwner,
+    ) -> None:
+        self._ensure_gpu_store_cleanup_state()
+        with self._gpu_store_cleanup_lock:
+            self._gpu_store_cleanup_owners[id(owner)] = owner
+
+    def _has_gpu_store_cleanup_owner(self, owner: _GPUStoreCleanupOwner) -> bool:
+        """Return whether the exact owner reached the connector ledger."""
+        self._ensure_gpu_store_cleanup_state()
+        with self._gpu_store_cleanup_lock:
+            return self._gpu_store_cleanup_owners.get(id(owner)) is owner
+
+    def finalize_gpu_store_cleanup(self, owner: _GPUStoreCleanupOwner) -> bool:
+        """Atomically move an exactly published GPU owner into cleanup."""
+        self._ensure_gpu_store_cleanup_state()
+        with self._gpu_store_cleanup_lock:
+            owner.mark_pending()
+            return self._gpu_store_cleanup_owners.get(id(owner)) is owner
+
+    def _drain_gpu_store_cleanup(
+        self,
+        owner: _GPUStoreCleanupOwner,
+    ) -> Optional[BaseException]:
+        error = owner.drain()
+        if owner.complete:
+            with self._gpu_store_cleanup_lock:
+                self._gpu_store_cleanup_owners.pop(id(owner), None)
+        return error
+
+    def drain_pending_gpu_cleanups(self) -> None:
+        """Retry all pending GPU-store cleanup owners.
+
+        Raises:
+            BaseException: The first cleanup failure after exhausting owners.
+        """
+        self._ensure_gpu_store_cleanup_state()
+        first_error: Optional[BaseException] = None
+        with self._gpu_store_cleanup_lock:
+            owners = tuple(self._gpu_store_cleanup_owners.values())
+        for owner in owners:
+            if not owner.pending:
+                if owner.operation_alive:
+                    continue
+                if not self.finalize_gpu_store_cleanup(owner):
+                    continue
+            error = self._drain_gpu_store_cleanup(owner)
+            if first_error is None and error is not None:
+                first_error = error
+        if first_error is not None:
+            raise first_error
+
+    def pending_gpu_cleanup_count(self) -> int:
+        """Return the number of retry-owned GPU-store cleanup states."""
+        self._ensure_gpu_store_cleanup_state()
+        with self._gpu_store_cleanup_lock:
+            return sum(
+                owner.pending or not owner.operation_alive
+                for owner in self._gpu_store_cleanup_owners.values()
+            )
+
+    def gpu_cleanup_owner_count(self) -> int:
+        """Return active and pending GPU-store cleanup owners."""
+        self._ensure_gpu_store_cleanup_state()
+        with self._gpu_store_cleanup_lock:
+            return len(self._gpu_store_cleanup_owners)
 
     @classmethod
     def from_metadata(
@@ -1061,17 +1290,33 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                 gpu_buffer_size, device=self.device
             )
 
-    def get_kv(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_kv(
+        self, layer_id: int, load_state: LayerwiseLoadState
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Get the KV cache for the given layer ID.
         This function is used to get the KV cache from the GPU buffer.
+
+        Args:
+            layer_id: Layer whose contiguous KV buffer should be returned.
+            load_state: Request-owned state for the active layerwise load.
+
+        Returns:
+            The key and value tensors for ``layer_id``.
+
+        Raises:
+            ValueError: If the requested layer has not been published.
         """
-        if layer_id not in self.buffer_mapping:
+        if layer_id not in load_state.buffer_mapping:
             raise ValueError(f"Layer {layer_id} is not loaded into GPU buffer.")
 
-        gpu_buffer = self.buffer_mapping[layer_id].tensor
+        gpu_buffer = load_state.buffer_mapping[layer_id].tensor
         assert gpu_buffer is not None
         return gpu_buffer[0], gpu_buffer[1]
+
+    def supports_explicit_spans(self) -> bool:
+        """Return true for explicit CacheBlend recovery-window support."""
+        return True
 
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         """ """
@@ -1084,7 +1329,15 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         raise NotImplementedError
 
     @_lmcache_nvtx_annotate
-    def batched_to_gpu(self, starts: List[int], ends: List[int], **kwargs):
+    def batched_to_gpu(
+        self,
+        starts: List[int],
+        ends: List[int],
+        *,
+        load_state: Optional[LayerwiseLoadState] = None,
+        buffer_span: Optional[TokenSpan] = None,
+        **kwargs,
+    ):
         """
         This function is a generator that moves the KV cache from the memory
         objects to buffer GPU memory. In each iteration i, it (1) loads the KV
@@ -1100,146 +1353,161 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             token sequence.
         """
 
-        self.initialize_kvcaches_ptr(**kwargs)
-        assert self.kvcaches is not None, (
-            "kvcaches should be provided in kwargs or initialized beforehand."
-        )
-
-        if "slot_mapping" not in kwargs:
-            raise ValueError("'slot_mapping' should be provided in kwargs.")
-
-        if self.fused_rotary_emb is None and self.cache_positions:
-            # TODO(Jiayi): Make this more elegant
-            # First Party
-            from lmcache.integration.vllm.utils import ENGINE_NAME
-
-            self.lmc_model = LMCBlenderBuilder.get(ENGINE_NAME).layerwise_model
-            self.fused_rotary_emb = self.lmc_model.fused_rotary_emb
-
-        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
-
-        self._lazy_initialize_buffer(self.kvcaches)
-
-        num_all_tokens = ends[-1] - starts[0]
-        slot_mapping_full = slot_mapping[starts[0] : ends[-1]]
-
-        # compute gap positions
-        gap_mask = torch.ones(
-            num_all_tokens, dtype=torch.bool, device=slot_mapping_full.device
-        )
-        buf_offset = starts[0]
-
-        for start, end in zip(starts, ends, strict=False):
-            gap_mask[start - buf_offset : end - buf_offset] = False
-
-        self.current_gap_positions = torch.where(gap_mask)[0]
-
-        buf_offset = starts[0]
-        if self.cache_positions:
-            new_positions_full = torch.arange(
-                starts[0], ends[-1], dtype=torch.int64, device=self.kvcaches[0].device
+        state = load_state if load_state is not None else LayerwiseLoadState()
+        state.begin()
+        try:
+            self.initialize_kvcaches_ptr(**kwargs)
+            assert self.kvcaches is not None, (
+                "kvcaches should be provided in kwargs or initialized beforehand."
             )
 
-        buffer_shape = self.get_shape(num_all_tokens)
-        assert self.gpu_buffer_allocator is not None
-        compute_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
-            buffer_shape, self.dtype, MemoryFormat.KV_2TD
-        )
-        load_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
-            buffer_shape, self.dtype, MemoryFormat.KV_2TD
-        )
-        assert compute_gpu_buffer_obj is not None, (
-            "Failed to allocate GPU buffer in GPUConnector"
-        )
-        assert load_gpu_buffer_obj is not None, (
-            "Failed to allocate GPU buffer in GPUConnector"
-        )
-        assert compute_gpu_buffer_obj.tensor is not None
-        assert load_gpu_buffer_obj.tensor is not None
+            if "slot_mapping" not in kwargs:
+                raise ValueError("'slot_mapping' should be provided in kwargs.")
 
-        # current_stream = torch.cuda.current_stream()
+            if self.fused_rotary_emb is None and self.cache_positions:
+                # TODO(Jiayi): Make this more elegant
+                # First Party
+                from lmcache.integration.vllm.utils import ENGINE_NAME
 
-        if self.cache_positions:
-            old_positions_full = torch.zeros(
-                (num_all_tokens,), dtype=torch.int64, device=self.kvcaches[0].device
+                self.lmc_model = LMCBlenderBuilder.get(ENGINE_NAME).layerwise_model
+                self.fused_rotary_emb = self.lmc_model.fused_rotary_emb
+
+            slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+
+            self._lazy_initialize_buffer(self.kvcaches)
+
+            buffer_start = starts[0]
+            buffer_end = ends[-1]
+            if buffer_span is not None:
+                if not isinstance(buffer_span, TokenSpan):
+                    raise TypeError("buffer_span must be a TokenSpan")
+                if starts[0] < buffer_span.start or ends[-1] > buffer_span.end:
+                    raise ValueError("loaded spans must fit inside buffer_span")
+                buffer_start = buffer_span.start
+                buffer_end = buffer_span.end
+            if buffer_end > len(slot_mapping):
+                raise ValueError("buffer_span exceeds slot_mapping")
+
+            num_all_tokens = buffer_end - buffer_start
+            slot_mapping_full = slot_mapping[buffer_start:buffer_end]
+
+            # compute gap positions
+            gap_mask = torch.ones(
+                num_all_tokens, dtype=torch.bool, device=slot_mapping_full.device
             )
-        for layer_id in range(self.num_layers + 2):
-            if layer_id > 1:
-                device_ops.single_layer_kv_transfer(
-                    self.buffer_mapping[layer_id - 2].tensor,
-                    self.kvcaches[layer_id - 2],
-                    slot_mapping_full,
-                    lmcache_native.TransferDirection.H2D,
-                    self.engine_kv_format,
-                    token_major=False,  # shape is [2, num_tokens, hidden_dim]
-                )
-                del self.buffer_mapping[layer_id - 2]
+            buf_offset = buffer_start
 
-                logger.debug(
-                    "Finished loading layer %s into paged memory", layer_id - 2
-                )
+            for start, end in zip(starts, ends, strict=False):
+                gap_mask[start - buf_offset : end - buf_offset] = False
 
-            if layer_id > 0 and layer_id <= self.num_layers:
-                # NOTE: wait until both compute and load streams are done
-                torch.cuda.synchronize()
+            state.gap_positions = torch.where(gap_mask)[0]
 
-                # ping-pong the buffers
-                compute_gpu_buffer_obj, load_gpu_buffer_obj = (
-                    load_gpu_buffer_obj,
-                    compute_gpu_buffer_obj,
+            if self.cache_positions:
+                new_positions_full = torch.arange(
+                    buffer_start,
+                    buffer_end,
+                    dtype=torch.int64,
+                    device=self.kvcaches[0].device,
                 )
 
-                if self.cache_positions:
-                    assert compute_gpu_buffer_obj.tensor is not None
+            buffer_shape = self.get_shape(num_all_tokens)
+            assert self.gpu_buffer_allocator is not None
+            compute_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+                buffer_shape, self.dtype, MemoryFormat.KV_2TD
+            )
+            if compute_gpu_buffer_obj is None:
+                raise MemoryError("Failed to allocate compute GPU buffer")
+            state.own_buffer(compute_gpu_buffer_obj)
 
-                    compute_gpu_buffer_obj.tensor[0] = self.fused_rotary_emb(
-                        old_positions_full,
-                        new_positions_full,
-                        compute_gpu_buffer_obj.tensor[0],
+            load_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+                buffer_shape, self.dtype, MemoryFormat.KV_2TD
+            )
+            if load_gpu_buffer_obj is None:
+                raise MemoryError("Failed to allocate load GPU buffer")
+            state.own_buffer(load_gpu_buffer_obj)
+
+            assert compute_gpu_buffer_obj.tensor is not None
+            assert load_gpu_buffer_obj.tensor is not None
+
+            # current_stream = torch.cuda.current_stream()
+
+            if self.cache_positions:
+                old_positions_full = torch.zeros(
+                    (num_all_tokens,),
+                    dtype=torch.int64,
+                    device=self.kvcaches[0].device,
+                )
+            for layer_id in range(self.num_layers + 2):
+                if layer_id > 1:
+                    device_ops.single_layer_kv_transfer(
+                        state.buffer_mapping[layer_id - 2].tensor,
+                        self.kvcaches[layer_id - 2],
+                        slot_mapping_full,
+                        lmcache_native.TransferDirection.H2D,
+                        self.engine_kv_format,
+                        token_major=False,  # shape is [2, num_tokens, hidden_dim]
+                    )
+                    del state.buffer_mapping[layer_id - 2]
+
+                    logger.debug(
+                        "Finished loading layer %s into paged memory", layer_id - 2
                     )
 
-                # gap zeroing after RoPE
-                if self.current_gap_positions.numel():
-                    compute_gpu_buffer_obj.tensor[:, self.current_gap_positions] = 0.0
+                if layer_id > 0 and layer_id <= self.num_layers:
+                    # NOTE: wait until both compute and load streams are done
+                    torch.cuda.synchronize()
 
-                self.buffer_mapping[layer_id - 1] = compute_gpu_buffer_obj
+                    # ping-pong the buffers
+                    compute_gpu_buffer_obj, load_gpu_buffer_obj = (
+                        load_gpu_buffer_obj,
+                        compute_gpu_buffer_obj,
+                    )
 
-                logger.debug("Finished loading layer %s into buffer", layer_id - 1)
+                    if self.cache_positions:
+                        assert compute_gpu_buffer_obj.tensor is not None
 
-            if layer_id < self.num_layers:
-                memory_objs_layer = yield
+                        compute_gpu_buffer_obj.tensor[0] = self.fused_rotary_emb(
+                            old_positions_full,
+                            new_positions_full,
+                            compute_gpu_buffer_obj.tensor[0],
+                        )
 
-                # memobj -> gpu_buffer
-                with torch.cuda.stream(self.load_stream):
-                    for start, end, memory_obj in zip(
-                        starts, ends, memory_objs_layer, strict=False
-                    ):
-                        assert memory_obj.metadata.fmt == MemoryFormat.KV_2TD
-                        assert load_gpu_buffer_obj.tensor is not None
-                        load_gpu_buffer_obj.tensor[0][
-                            start - buf_offset : end - buf_offset
-                        ].copy_(memory_obj.tensor[0], non_blocking=True)
+                    # gap zeroing after RoPE
+                    assert state.gap_positions is not None
+                    if state.gap_positions.numel():
+                        compute_gpu_buffer_obj.tensor[:, state.gap_positions] = 0.0
 
-                        load_gpu_buffer_obj.tensor[1][
-                            start - buf_offset : end - buf_offset
-                        ].copy_(memory_obj.tensor[1], non_blocking=True)
+                    state.buffer_mapping[layer_id - 1] = compute_gpu_buffer_obj
 
-                        if self.cache_positions and layer_id == 0:
-                            old_positions_full[
+                    logger.debug("Finished loading layer %s into buffer", layer_id - 1)
+
+                if layer_id < self.num_layers:
+                    memory_objs_layer = yield
+
+                    # memobj -> gpu_buffer
+                    with torch.cuda.stream(self.load_stream):
+                        for start, end, memory_obj in zip(
+                            starts, ends, memory_objs_layer, strict=False
+                        ):
+                            assert memory_obj.metadata.fmt == MemoryFormat.KV_2TD
+                            assert load_gpu_buffer_obj.tensor is not None
+                            load_gpu_buffer_obj.tensor[0][
                                 start - buf_offset : end - buf_offset
-                            ] = memory_obj.metadata.cached_positions
+                            ].copy_(memory_obj.tensor[0], non_blocking=True)
 
-            elif layer_id == self.num_layers:
-                yield
+                            load_gpu_buffer_obj.tensor[1][
+                                start - buf_offset : end - buf_offset
+                            ].copy_(memory_obj.tensor[1], non_blocking=True)
 
-        # free the buffer memory
-        load_gpu_buffer_obj.ref_count_down()
-        compute_gpu_buffer_obj.ref_count_down()
+                            if self.cache_positions and layer_id == 0:
+                                old_positions_full[
+                                    start - buf_offset : end - buf_offset
+                                ] = memory_obj.metadata.cached_positions
 
-        assert len(self.buffer_mapping) == 0, (
-            "There are still layers in the buffer mapping after "
-            "releasing the GPU buffers."
-        )
+                elif layer_id == self.num_layers:
+                    yield
+        finally:
+            state.release()
 
         yield
 
@@ -1279,6 +1547,10 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
 
+        # A prior failed synchronize owns its temporary buffer. Retry that
+        # cleanup before allocating another buffer for this connector.
+        self.drain_pending_gpu_cleanups()
+
         self.initialize_kvcaches_ptr(**kwargs)
         assert self.kvcaches is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
@@ -1312,53 +1584,105 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         num_tokens = len(slot_mapping_full)
         buffer_shape = self.get_shape(num_tokens)
         assert self.gpu_buffer_allocator is not None
-        tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
-            buffer_shape, self.dtype, MemoryFormat.KV_2TD
+        operation_lease: Optional[_GPUStoreOperationLease] = _GPUStoreOperationLease()
+        cleanup_owner = _GPUStoreCleanupOwner(
+            self.store_stream,
+            operation_lease,
         )
-        assert tmp_gpu_buffer_obj is not None, (
-            "Failed to allocate GPU buffer in GPUConnector"
-        )
-        assert tmp_gpu_buffer_obj.tensor is not None
-
-        current_stream = torch.cuda.current_stream()
-
-        for layer_id in range(self.num_layers):
-            memory_objs_layer = memory_objs[layer_id]
-            # kvcaches -> gpu_buffer -> memobj
-            with torch.cuda.stream(self.store_stream):
-                self.store_stream.wait_stream(current_stream)
-                device_ops.single_layer_kv_transfer(
-                    tmp_gpu_buffer_obj.tensor,
-                    self.kvcaches[layer_id],
-                    slot_mapping_full,
-                    lmcache_native.TransferDirection.D2H,
-                    self.engine_kv_format,
-                    token_major=False,  # shape is [2, num_tokens, hidden_dim]
+        operation_error: Optional[BaseException] = None
+        defer_sync_retry = False
+        try:
+            self._register_gpu_store_cleanup(cleanup_owner)
+            if getattr(
+                self.gpu_buffer_allocator,
+                "supports_allocation_receipts",
+                lambda: False,
+            )():
+                tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+                    buffer_shape,
+                    self.dtype,
+                    MemoryFormat.KV_2TD,
+                    allocation_receipt=cleanup_owner.allocation_receipt,
                 )
-                for (buf_start, buf_end), memory_obj, old_positions in zip(
-                    buf_starts_ends,
-                    memory_objs_layer,
-                    old_positions_chunks,
-                    strict=False,
-                ):
-                    assert memory_obj.tensor is not None
-                    memory_obj.tensor[0].copy_(
-                        tmp_gpu_buffer_obj.tensor[0][buf_start:buf_end],
-                        non_blocking=True,
-                    )
-                    memory_obj.tensor[1].copy_(
-                        tmp_gpu_buffer_obj.tensor[1][buf_start:buf_end],
-                        non_blocking=True,
-                    )
-                    if self.cache_positions:
-                        memory_obj.metadata.cached_positions = old_positions
+            else:
+                tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+                    buffer_shape, self.dtype, MemoryFormat.KV_2TD
+                )
+            if tmp_gpu_buffer_obj is None:
+                raise MemoryError("Failed to allocate GPU buffer in GPUConnector")
+            cleanup_owner.attach_buffer(tmp_gpu_buffer_obj)
+            assert tmp_gpu_buffer_obj.tensor is not None
 
-            yield
-            self.store_stream.synchronize()
-            logger.debug("Finished offloading layer %s", layer_id)
+            current_stream = torch.cuda.current_stream()
+            for layer_id in range(self.num_layers):
+                memory_objs_layer = memory_objs[layer_id]
+                # kvcaches -> gpu_buffer -> memobj
+                with torch.cuda.stream(self.store_stream):
+                    # wait_stream and every following operation may enqueue
+                    # device work. Publish the fence before the first call.
+                    cleanup_owner.require_sync()
+                    self.store_stream.wait_stream(current_stream)
+                    device_ops.single_layer_kv_transfer(
+                        tmp_gpu_buffer_obj.tensor,
+                        self.kvcaches[layer_id],
+                        slot_mapping_full,
+                        lmcache_native.TransferDirection.D2H,
+                        self.engine_kv_format,
+                        token_major=False,  # shape is [2, num_tokens, hidden_dim]
+                    )
+                    for (buf_start, buf_end), memory_obj, old_positions in zip(
+                        buf_starts_ends,
+                        memory_objs_layer,
+                        old_positions_chunks,
+                        strict=False,
+                    ):
+                        assert memory_obj.tensor is not None
+                        memory_obj.tensor[0].copy_(
+                            tmp_gpu_buffer_obj.tensor[0][buf_start:buf_end],
+                            non_blocking=True,
+                        )
+                        memory_obj.tensor[1].copy_(
+                            tmp_gpu_buffer_obj.tensor[1][buf_start:buf_end],
+                            non_blocking=True,
+                        )
+                        if self.cache_positions:
+                            memory_obj.metadata.cached_positions = old_positions
 
-        # free the buffer memory
-        tmp_gpu_buffer_obj.ref_count_down()
+                yield
+                try:
+                    self.store_stream.synchronize()
+                except BaseException:
+                    # Do not retry in this same failing generator turn. The
+                    # public cleanup ledger retains the buffer for its caller.
+                    defer_sync_retry = True
+                    raise
+                cleanup_owner.mark_synchronized()
+                logger.debug("Finished offloading layer %s", layer_id)
+        except BaseException as error:
+            operation_error = error
+            raise
+        finally:
+            # Kill the operation lease before the finalization helper so public
+            # drains can recover a one-shot interruption on its first line.
+            operation_lease = None
+            # Closing at a layer boundary must wait only for the transfer that
+            # was already submitted. Never advance into a missing future layer.
+            if self.finalize_gpu_store_cleanup(cleanup_owner):
+                cleanup_error = (
+                    None
+                    if defer_sync_retry
+                    else self._drain_gpu_store_cleanup(cleanup_owner)
+                )
+                if cleanup_error is not None:
+                    if operation_error is None or isinstance(
+                        operation_error, GeneratorExit
+                    ):
+                        raise cleanup_error
+                    logger.error(
+                        "GPU store cleanup also failed after %s: %s",
+                        operation_error,
+                        cleanup_error,
+                    )
         yield
 
     def get_shape(self, num_tokens: int) -> torch.Size:
