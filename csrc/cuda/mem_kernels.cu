@@ -6,6 +6,7 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <algorithm>
+#include <cstdint>
 #ifdef USE_ROCM
   #include <hip/hip_fp8.h>
 #else
@@ -155,7 +156,12 @@ __global__ void single_layer_kv_transfer_kernel(
     const TransferDirection direction) {
   constexpr bool USE_MLA = (format == EngineKVFormat::NL_X_NB_BS_HS);
   constexpr bool HND_LAYOUT = (format == EngineKVFormat::NL_X_TWO_NB_NH_BS_HS ||
-                               format == EngineKVFormat::NL_X_NB_TWO_NH_BS_HS);
+                               format == EngineKVFormat::NL_X_NB_TWO_NH_BS_HS ||
+                               format == EngineKVFormat::NL_X_NB_NH_BS_CS);
+  constexpr bool PACKED_KV = (format == EngineKVFormat::NL_X_NB_NH_BS_CS ||
+                              format == EngineKVFormat::NL_X_NB_BS_NH_CS);
+  // Packed K and V share the trailing dimension of each individual head.
+  constexpr int KV_STRIDE = PACKED_KV ? 2 : 1;
 
   const int64_t token_idx = blockIdx.x;
   const int64_t slot_idx = slot_mapping[token_idx];
@@ -178,14 +184,15 @@ __global__ void single_layer_kv_transfer_kernel(
     if constexpr (HND_LAYOUT) {
       // HND layout: [..., num_heads, block_size, head_size]
       vllm_key_idx = block_idx * vllm_block_key_stride_in_64bit +
-                     head_idx * block_size * head_size_in_64bit +
-                     block_offset * head_size_in_64bit + head_offset;
+                     head_idx * block_size * KV_STRIDE * head_size_in_64bit +
+                     block_offset * KV_STRIDE * head_size_in_64bit +
+                     head_offset;
     } else {
       // NHD layout: [..., block_size, num_heads, head_size]
       // (also correct for MLA where num_heads==1)
       vllm_key_idx = block_idx * vllm_block_key_stride_in_64bit +
-                     block_offset * num_heads * head_size_in_64bit +
-                     head_idx * head_size_in_64bit + head_offset;
+                     block_offset * num_heads * KV_STRIDE * head_size_in_64bit +
+                     head_idx * KV_STRIDE * head_size_in_64bit + head_offset;
     }
 
     if (direction == TransferDirection::D2H) {
@@ -1110,6 +1117,10 @@ void single_layer_kv_transfer(
                                //       head_size] for flash attention
                                //      [num_blocks, 2, num_heads, block_size,
                                //       head_size] for flash infer
+                               // Packed: [num_blocks, num_heads, block_size,
+                               //          2 * head_size] or
+                               //         [num_blocks, block_size, num_heads,
+                               //          2 * head_size]
                                // MLA: [num_blocks, block_size, head_size]
 
     torch::Tensor& slot_mapping,  // [num_tokens]
@@ -1141,9 +1152,57 @@ void single_layer_kv_transfer(
   int block_size;
 
   const bool use_mla = ::is_mla(engine_kv_format);
-  const bool hnd_layout = lmc::is_hnd(engine_kv_format);
+  const bool packed_hnd = engine_kv_format == EngineKVFormat::NL_X_NB_NH_BS_CS;
+  const bool packed_nhd = engine_kv_format == EngineKVFormat::NL_X_NB_BS_NH_CS;
+  const bool packed_kv = packed_hnd || packed_nhd;
+  const bool hnd_layout = lmc::is_hnd(engine_kv_format) || packed_hnd;
 
-  if (use_mla) {
+  if (packed_kv) {
+    TORCH_CHECK(elements_per_entry > 0,
+                "packed KV elements must fit in an eight-byte copy");
+    TORCH_CHECK(
+        reinterpret_cast<std::uintptr_t>(lmc_key_value_cache_ptr) % 8 == 0 &&
+            reinterpret_cast<std::uintptr_t>(vllm_key_value_cache_ptr) % 8 == 0,
+        "packed KV copy pointers must be eight-byte aligned");
+    TORCH_CHECK(vllm_key_value_cache.dim() == 4,
+                "packed KV cache must be four-dimensional");
+    const int64_t content_size = vllm_key_value_cache.size(3);
+    TORCH_CHECK(content_size > 0 && content_size % 2 == 0,
+                "packed KV content size must be positive and even");
+    TORCH_CHECK((content_size / 2) % elements_per_entry == 0,
+                "packed KV head size must align to an eight-byte copy");
+    TORCH_CHECK(
+        lmc_key_value_cache.scalar_type() == vllm_key_value_cache.scalar_type(),
+        "LMCache and packed KV dtypes must match");
+    TORCH_CHECK(vllm_key_value_cache.stride(3) == 1 &&
+                    vllm_key_value_cache.stride(2) == content_size &&
+                    vllm_key_value_cache.stride(1) ==
+                        vllm_key_value_cache.size(2) * content_size &&
+                    vllm_key_value_cache.stride(0) >=
+                        vllm_key_value_cache.size(1) *
+                            vllm_key_value_cache.size(2) * content_size &&
+                    vllm_key_value_cache.stride(0) % elements_per_entry == 0,
+                "packed KV requires tight inner dimensions and aligned blocks");
+    num_heads = vllm_key_value_cache.size(packed_hnd ? 1 : 2);
+    TORCH_CHECK(num_heads > 0, "packed KV head count must be positive");
+    block_size = vllm_key_value_cache.size(packed_hnd ? 2 : 1);
+    head_size_in_64bit = content_size / 2 / elements_per_entry;
+    TORCH_CHECK(
+        lmc_key_value_cache.dim() == 3 &&
+            lmc_key_value_cache.size(token_major ? 1 : 0) == 2 &&
+            lmc_key_value_cache.size(token_major ? 0 : 1) >= num_tokens &&
+            lmc_key_value_cache.size(2) == num_heads * content_size / 2 &&
+            lmc_key_value_cache.stride(2) == 1 &&
+            lmc_key_value_cache.stride(0) % elements_per_entry == 0 &&
+            lmc_key_value_cache.stride(1) % elements_per_entry == 0,
+        "LMCache buffer does not match packed KV geometry");
+    TORCH_CHECK(direction == TransferDirection::H2D ||
+                    direction == TransferDirection::D2H,
+                "packed KV direction must be H2D or D2H");
+    if (num_tokens == 0) {
+      return;
+    }
+  } else if (use_mla) {
     // MLA format: [num_blocks, block_size, head_size]
     num_heads = 1;
     block_size = vllm_key_value_cache.size(1);
@@ -1179,7 +1238,11 @@ void single_layer_kv_transfer(
 
   int vllm_block_key_stride_in_64bit;
   int vllm_value_offset;
-  if (use_mla) {
+  if (packed_kv) {
+    vllm_block_key_stride_in_64bit =
+        vllm_key_value_cache.stride(0) / elements_per_entry;
+    vllm_value_offset = head_size_in_64bit;
+  } else if (use_mla) {
     // MLA format: [num_blocks, block_size, head_size]
     vllm_block_key_stride_in_64bit =
         vllm_key_value_cache.stride(0) / elements_per_entry;
@@ -1225,6 +1288,10 @@ void single_layer_kv_transfer(
       LAUNCH_SINGLE_LAYER_KERNEL(EngineKVFormat::NL_X_TWO_NB_NH_BS_HS)
     case EngineKVFormat::NL_X_NB_TWO_NH_BS_HS:
       LAUNCH_SINGLE_LAYER_KERNEL(EngineKVFormat::NL_X_NB_TWO_NH_BS_HS)
+    case EngineKVFormat::NL_X_NB_NH_BS_CS:
+      LAUNCH_SINGLE_LAYER_KERNEL(EngineKVFormat::NL_X_NB_NH_BS_CS)
+    case EngineKVFormat::NL_X_NB_BS_NH_CS:
+      LAUNCH_SINGLE_LAYER_KERNEL(EngineKVFormat::NL_X_NB_BS_NH_CS)
     default:
       TORCH_CHECK(false,
                   "Unsupported EngineKVFormat for single_layer_kv_transfer: ",
