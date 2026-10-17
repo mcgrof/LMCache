@@ -53,11 +53,10 @@ def infer_attn_backend_from_vllm(
             )
             return LMCTritonSparseBackend(vllm_attn)
 
-        # On CUDA with flashinfer available, use flashinfer backend
-        # Local
-        from .flash_infer_sparse import LMCFlashInferSparseBackend
-
         if attn_name == "FlashInferImpl":
+            # Local
+            from .flash_infer_sparse import LMCFlashInferSparseBackend
+
             return LMCFlashInferSparseBackend(vllm_attn)
         else:
             # Fallback to Triton even on CUDA if flashinfer impl doesn't match
