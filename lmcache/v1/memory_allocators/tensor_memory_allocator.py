@@ -132,6 +132,17 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         self._sync_debug_stats()
         return memory_obj
 
+    def can_allocate_batch(
+        self,
+        shapes: Union[torch.Size, list[torch.Size]],
+        dtypes: Union[torch.dtype, list[torch.dtype]],
+        batch_size: int,
+    ) -> bool:
+        """Return whether an equal-shape batch fits without reserving it."""
+        shapes, dtypes = self._adapt_shapes_and_dtypes(shapes, dtypes)
+        raw_size = get_size_bytes(shapes, dtypes)
+        return self.address_manager.can_allocate_batch(raw_size, batch_size)
+
     def _get_buffer_slice(self, start: int, size: int) -> torch.Tensor:
         """Hook: Get buffer slice. Override for custom buffer access."""
         return self.buffer[start : start + size]

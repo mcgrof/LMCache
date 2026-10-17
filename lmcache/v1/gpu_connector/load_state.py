@@ -10,6 +10,52 @@ import torch
 from lmcache.v1.memory_management import MemoryObj
 
 
+@dataclass(frozen=True)
+class PendingPositionRecovery:
+    """One deferred cached-K position recovery for exactly one model layer.
+
+    A layerwise load normally re-rotates each layer's cached K to its target
+    positions inline.  A collective blend group instead defers that rotation
+    so one batched application can cover every group member.  The record
+    carries everything the group-level applier needs: the live device buffer
+    (``kv_buffer.tensor`` is ``[2, tokens, hidden]``; index 0 is K), the
+    per-token source and target positions, and the gap positions that must be
+    zeroed strictly after rotation.
+    """
+
+    layer_id: int
+    kv_buffer: MemoryObj
+    old_positions: torch.Tensor
+    new_positions: torch.Tensor
+    gap_positions: torch.Tensor
+
+    def __post_init__(self) -> None:
+        if type(self.layer_id) is not int or self.layer_id < 0:
+            raise ValueError("layer_id must be a nonnegative exact integer")
+        tensor = self.kv_buffer.tensor
+        if tensor is None or tensor.ndim != 3 or tensor.shape[0] != 2:
+            raise ValueError("kv_buffer must hold a [2, tokens, hidden] tensor")
+        token_count = tensor.shape[1]
+        for name in ("old_positions", "new_positions"):
+            positions = getattr(self, name)
+            if (
+                not isinstance(positions, torch.Tensor)
+                or positions.ndim != 1
+                or positions.dtype != torch.int64
+                or positions.numel() != token_count
+            ):
+                raise ValueError(
+                    f"{name} must be a one-dimensional int64 tensor matching "
+                    "the buffer token count"
+                )
+        if (
+            not isinstance(self.gap_positions, torch.Tensor)
+            or self.gap_positions.ndim != 1
+            or self.gap_positions.dtype != torch.int64
+        ):
+            raise ValueError("gap_positions must be a one-dimensional int64 tensor")
+
+
 @dataclass
 class LayerwiseLoadState:
     """Own mutable state for one layerwise device load.
@@ -26,6 +72,12 @@ class LayerwiseLoadState:
 
     buffer_mapping: dict[int, MemoryObj] = field(default_factory=dict)
     gap_positions: Optional[torch.Tensor] = None
+    defer_position_recovery: bool = False
+    pending_position_recovery: Optional[PendingPositionRecovery] = field(
+        default=None, init=False
+    )
+    position_recovery_serial_operations: int = field(default=0, init=False)
+    position_recovery_collective_operations: int = field(default=0, init=False)
     _owned_buffers: list[MemoryObj] = field(default_factory=list, repr=False)
     _released: bool = field(default=False, init=False, repr=False)
 
@@ -37,8 +89,62 @@ class LayerwiseLoadState:
         """
         if self.buffer_mapping or self._owned_buffers:
             raise RuntimeError("Layerwise load state still owns resources")
+        if self.pending_position_recovery is not None:
+            raise RuntimeError(
+                "Layerwise load state still holds a pending position recovery"
+            )
         self.gap_positions = None
         self._released = False
+
+    def publish_pending_position_recovery(
+        self, pending: PendingPositionRecovery
+    ) -> None:
+        """Record one deferred rotation that a group applier must consume.
+
+        Raises:
+            RuntimeError: If the state was released, deferral is not enabled,
+                or an earlier pending recovery was never applied.
+        """
+        if self._released:
+            raise RuntimeError("Cannot defer position recovery on released load state")
+        if not self.defer_position_recovery:
+            raise RuntimeError(
+                "Position recovery deferral is not enabled for this load"
+            )
+        if not isinstance(pending, PendingPositionRecovery):
+            raise TypeError("pending must be PendingPositionRecovery")
+        if self.pending_position_recovery is not None:
+            raise RuntimeError(
+                "A deferred position recovery was never applied before the "
+                "next layer advanced"
+            )
+        self.pending_position_recovery = pending
+
+    def consume_pending_position_recovery(self) -> PendingPositionRecovery:
+        """Return and clear the pending recovery after it has been applied.
+
+        Raises:
+            RuntimeError: If no recovery is pending.
+        """
+        pending = self.pending_position_recovery
+        if pending is None:
+            raise RuntimeError("No position recovery is pending")
+        self.pending_position_recovery = None
+        return pending
+
+    def record_position_recovery(self, *, serial: int = 0, collective: int = 0) -> None:
+        """Count completed cached-K position-recovery applications.
+
+        Raises:
+            TypeError: If either count is not an exact integer.
+            ValueError: If either count is negative.
+        """
+        if type(serial) is not int or type(collective) is not int:
+            raise TypeError("position recovery counts must be exact integers")
+        if serial < 0 or collective < 0:
+            raise ValueError("position recovery counts cannot be negative")
+        self.position_recovery_serial_operations += serial
+        self.position_recovery_collective_operations += collective
 
     def own_buffer(self, memory_obj: MemoryObj) -> None:
         """Record one temporary buffer that this load must release.
@@ -66,6 +172,7 @@ class LayerwiseLoadState:
         self._released = True
         self.buffer_mapping.clear()
         self.gap_positions = None
+        self.pending_position_recovery = None
         owned_buffers = self._owned_buffers
         self._owned_buffers = []
 

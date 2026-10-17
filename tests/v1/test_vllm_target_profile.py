@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Admission tests for the narrow KMesh serial-PIC target profile."""
+"""Admission tests for the narrow KMesh target profiles."""
 
 # Standard
 from collections import OrderedDict
@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Optional, cast
 from unittest.mock import MagicMock, patch
 import inspect
+import json
 import math
 import os
 import sys
@@ -20,6 +21,7 @@ import pytest
 # First Party
 from lmcache.integration.base_service_factory import BaseServiceFactory
 from lmcache.integration.vllm.target_profile import (
+    COLLECTIVE_LOCKSTEP_V1,
     SERIAL_PIC_V1,
     SERIAL_PIC_V1_CONTRACT,
     requested_target_profile,
@@ -397,6 +399,45 @@ def test_serial_pic_v1_accepts_exact_role_local_profile(role: str) -> None:
     )
 
 
+@pytest.mark.parametrize("role", ["scheduler", "worker"])
+def test_collective_lockstep_v1_accepts_serial_pic_v1_envelope(role: str) -> None:
+    validate_target_profile(
+        _valid_config(),
+        COLLECTIVE_LOCKSTEP_V1,
+        role=role,
+        vllm_config=_valid_vllm_config(profile=COLLECTIVE_LOCKSTEP_V1),
+    )
+
+
+@pytest.mark.parametrize(
+    ("surface", "field_name", "value"),
+    [
+        ("config", "enable_async_loading", True),
+        ("parallel", "data_parallel_size", 2),
+    ],
+)
+def test_collective_lockstep_v1_rejects_serial_envelope_mutations(
+    surface: str,
+    field_name: str,
+    value: Any,
+) -> None:
+    config = _valid_config()
+    vllm_config = _valid_vllm_config(profile=COLLECTIVE_LOCKSTEP_V1)
+    target = config if surface == "config" else vllm_config.parallel_config
+    setattr(target, field_name, value)
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{COLLECTIVE_LOCKSTEP_V1} profile rejected.*{field_name}",
+    ):
+        validate_target_profile(
+            config,
+            COLLECTIVE_LOCKSTEP_V1,
+            role="worker",
+            vllm_config=vllm_config,
+        )
+
+
 def test_serial_pic_v1_builds_nonpaged_receipt_allocator_without_gds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -663,9 +704,10 @@ def test_raw_target_profile_requires_nonempty_string(profile: Any) -> None:
         requested_target_profile(_valid_vllm_config(profile=profile))
 
 
-def test_unknown_target_profile_fails_closed() -> None:
+@pytest.mark.parametrize("profile", ["serial_pic_v2", [COLLECTIVE_LOCKSTEP_V1]])
+def test_unknown_target_profile_fails_closed(profile: Any) -> None:
     with pytest.raises(ValueError, match="unsupported LMCache target profile"):
-        validate_target_profile(_valid_config(), "serial_pic_v2")
+        validate_target_profile(_valid_config(), profile)
 
 
 def test_explicit_profile_must_match_raw_activation() -> None:
@@ -1060,7 +1102,11 @@ def test_serial_pic_v1_rejects_force_skip_save_environment(
 
 @pytest.mark.parametrize(
     ("profile", "expected_force_skip_save"),
-    [(SERIAL_PIC_V1, False), (None, True)],
+    [
+        (SERIAL_PIC_V1, False),
+        (COLLECTIVE_LOCKSTEP_V1, False),
+        (None, True),
+    ],
 )
 def test_adapter_freezes_force_skip_save_only_for_target_profile(
     monkeypatch: pytest.MonkeyPatch,
@@ -1074,6 +1120,9 @@ def test_adapter_freezes_force_skip_save_only_for_target_profile(
     import lmcache.integration.vllm.vllm_v1_adapter as adapter_module
 
     config = _valid_config()
+    factory_calls: list[tuple[str, Any]] = []
+    manager_events: list[str] = []
+    managers: list[Any] = []
 
     class ParentConnector:
         def register_kv_caches(self, kv_caches: dict[str, object]) -> None:
@@ -1096,18 +1145,22 @@ def test_adapter_freezes_force_skip_save_only_for_target_profile(
         services_stopped = False
 
         def __init__(self, *_args: object, **_kwargs: object) -> None:
+            managers.append(self)
             publisher = cast(Any, _kwargs.get("construction_result_publisher"))
             if publisher is not None:
                 publisher(self)
             return None
 
         def start_services(self) -> None:
+            manager_events.append("start")
             return None
 
         def raise_if_init_failed(self) -> None:
+            manager_events.append("ready")
             return None
 
         def is_healthy(self) -> bool:
+            manager_events.append("healthy")
             return True
 
         def retain_construction_cleanup(self) -> None:
@@ -1117,11 +1170,14 @@ def test_adapter_freezes_force_skip_save_only_for_target_profile(
             return None
 
         def stop_services(self) -> None:
+            manager_events.append("stop")
             self.services_stopped = True
 
     def inject_environment_after_validation(
-        *_args: object, **_kwargs: object
+        *_args: object,
+        **_kwargs: object,
     ) -> object:
+        factory_calls.append((cast(str, _args[2]), _kwargs.get("target_profile")))
         monkeypatch.setenv("LMCACHE_FORCE_SKIP_SAVE", "1")
         return object()
 
@@ -1152,7 +1208,144 @@ def test_adapter_freezes_force_skip_save_only_for_target_profile(
 
     assert os.environ["LMCACHE_FORCE_SKIP_SAVE"] == "1"
     assert connector.force_skip_save is expected_force_skip_save
+    assert factory_calls == [("worker", profile)]
+    assert len(managers) == 1
+    manager = managers[0]
+    assert connector.lmcache_engine is manager.lmcache_engine
+    assert connector.lookup_client is None
+    assert connector.lookup_server is manager.lookup_server
+    assert manager.offload_server is None
+    assert manager.api_server is None
+    assert manager.runtime_plugin_launcher is None
+    if profile is None:
+        assert manager_events == ["start"]
+        assert connector._kmesh_runtime_evidence is None
+    else:
+        assert manager_events == [
+            "ready",
+            "healthy",
+            "start",
+            "ready",
+            "healthy",
+        ]
+        assert connector._target_profile == profile
+        runtime_evidence = connector._kmesh_runtime_evidence
+        assert runtime_evidence is not None
+        assert json.loads(runtime_evidence.runtime_configuration)["profile"] == profile
     connector.shutdown()
+    assert manager_events[-1] == "stop"
+
+
+def test_collective_lockstep_v1_scheduler_adapter_constructs_exact_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real adapter admits only the exact scheduler service graph."""
+    vllm = pytest.importorskip("vllm.distributed.kv_transfer.kv_connector.v1.base")
+
+    # First Party
+    import lmcache.integration.vllm.vllm_v1_adapter as adapter_module
+
+    config = _valid_config()
+    lookup_client_sentinel = object()
+    factory_sentinel = object()
+    factory_calls: list[tuple[object, object, str, Any]] = []
+    manager_events: list[str] = []
+    managers: list[Any] = []
+
+    def build_factory(
+        actual_config: object,
+        vllm_config: object,
+        role: str,
+        *,
+        target_profile: Any = None,
+    ) -> object:
+        factory_calls.append((actual_config, vllm_config, role, target_profile))
+        return factory_sentinel
+
+    class ReadySchedulerManager(_ConstructionHandoffManagerDouble):
+        lmcache_engine = None
+        lmcache_engine_metadata = object()
+        lookup_client = lookup_client_sentinel
+        lookup_server = None
+        health_monitor = None
+        offload_server = None
+        api_server = None
+        runtime_plugin_launcher = None
+        services_stopped = False
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            managers.append(self)
+            publisher = cast(Any, _kwargs.get("construction_result_publisher"))
+            if publisher is not None:
+                publisher(self)
+
+        def start_services(self) -> None:
+            manager_events.append("start")
+
+        def raise_if_init_failed(self) -> None:
+            manager_events.append("ready")
+
+        def is_healthy(self) -> bool:
+            manager_events.append("healthy")
+            return True
+
+        def retain_construction_cleanup(self) -> None:
+            return None
+
+        def release_construction_cleanup(self) -> None:
+            return None
+
+        def stop_services(self) -> None:
+            manager_events.append("stop")
+            self.services_stopped = True
+
+    monkeypatch.setattr(adapter_module, "lmcache_get_or_create_config", lambda: config)
+    monkeypatch.setattr(adapter_module, "VllmServiceFactory", build_factory)
+    monkeypatch.setattr(adapter_module, "LMCacheManager", ReadySchedulerManager)
+    monkeypatch.setattr(
+        adapter_module.LMCStatsMonitor,
+        "GetOrCreate",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        adapter_module.PrometheusLogger,
+        "GetOrCreate",
+        lambda *_args, **_kwargs: MagicMock(),
+    )
+
+    vllm_config = _valid_vllm_config(profile=COLLECTIVE_LOCKSTEP_V1)
+    connector = adapter_module.LMCacheConnectorV1Impl(
+        cast(Any, vllm_config),
+        vllm.KVConnectorRole.SCHEDULER,
+        cast(Any, object()),
+    )
+
+    assert factory_calls == [(config, vllm_config, "scheduler", COLLECTIVE_LOCKSTEP_V1)]
+    assert len(managers) == 1
+    manager = managers[0]
+    assert manager_events == [
+        "ready",
+        "healthy",
+        "start",
+        "ready",
+        "healthy",
+    ]
+    assert connector.lmcache_engine is None
+    assert connector.lookup_client is lookup_client_sentinel
+    assert connector.lookup_server is None
+    assert manager.offload_server is None
+    assert manager.api_server is None
+    assert manager.runtime_plugin_launcher is None
+    assert connector._target_profile == COLLECTIVE_LOCKSTEP_V1
+    runtime_evidence = connector._kmesh_runtime_evidence
+    assert runtime_evidence is not None
+    assert (
+        json.loads(runtime_evidence.runtime_configuration)["profile"]
+        == COLLECTIVE_LOCKSTEP_V1
+    )
+
+    connector.shutdown()
+    assert manager_events[-1] == "stop"
 
 
 @pytest.mark.parametrize(
@@ -3196,17 +3389,19 @@ def test_serial_pic_v1_adapter_surfaces_incomplete_cleanup(
     assert "did not fully quiesce" in str(failure.value.__cause__)
 
 
-def test_serial_pic_v1_service_factory_suppresses_excluded_services(
+@pytest.mark.parametrize("profile", [SERIAL_PIC_V1, COLLECTIVE_LOCKSTEP_V1])
+def test_kmesh_pic_service_factory_suppresses_excluded_services(
     monkeypatch: pytest.MonkeyPatch,
+    profile: str,
 ) -> None:
     # First Party
     import lmcache.integration.vllm.vllm_service_factory as factory_module
 
     factory = factory_module.VllmServiceFactory(
         _valid_config(),
-        cast(Any, _valid_vllm_config()),
+        cast(Any, _valid_vllm_config(profile=profile)),
         "worker",
-        target_profile=SERIAL_PIC_V1,
+        target_profile=profile,
     )
 
     def forbidden_constructor(*_args: object, **_kwargs: object) -> object:
