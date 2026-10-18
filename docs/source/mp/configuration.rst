@@ -1029,3 +1029,28 @@ multimodal, prompt-embedding and LoRA requests keep the ordinary load path.
 This gate runs after LOOKUP, which already starts backend prefetch. It can
 suppress GPU loads without suppressing storage reads. Followers retry after
 leader cancellation or a 30-second timeout; cache reset clears deferrals.
+
+Family preload coordination
+---------------------------
+
+``lmcache.mp.family_prefetch: true`` enables caller-driven ancestor
+declarations on the scheduler connector. ``declare_family_prefetch`` records
+an exact, chunk-aligned base-model text prefix and an expected child count.
+The caller performs preloading through vLLM and calls
+``release_family_prefetch`` when the family completes or is pruned.
+With an internal warm request ID, matching children defer before LOOKUP
+until the warm request finishes, the ancestor is locally available or the
+30-second declaration expires. Completion and cancellation both release
+waiters. This avoids racing a warm prefetch's L1 write reservations. It
+requires ``lmcache.mp.eager_prefetch: false``, which is the default. The
+declaration itself submits no I/O and retains no GPU blocks.
+
+``get_family_prefetch_stats`` distinguishes subsequent local child hits from
+unused declarations. Local hits count after allocation admits the child,
+independently of external lookup results. Supply the internal warm request
+ID as ``prefetch_request_id`` to exclude it even if it finds local KV. The
+warm request does not count as its own child. Logical covered bytes are
+attribution, not measured storage savings.
+Declarations expire after 30 seconds; the registry admits at most 4096 at a
+time, returning no declaration at capacity. Reset and shutdown clear them.
+The option defaults to ``false`` and requires automatic prefix caching.

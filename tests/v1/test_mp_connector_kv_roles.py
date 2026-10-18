@@ -5,7 +5,7 @@
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 # Third Party
 import pytest
@@ -669,3 +669,156 @@ def test_singleflight_requires_prefix_cache(mock_io: SimpleNamespace) -> None:
     config.cache_config.enable_prefix_caching = False
     with pytest.raises(ValueError, match="requires vLLM prefix caching"):
         LMCacheMPConnector(config, KVConnectorRole.SCHEDULER)
+
+
+@pytest.mark.parametrize("consume", [False, True])
+def test_family_preload_only_credits_a_later_local_child(
+    mock_io: SimpleNamespace, consume: bool
+) -> None:
+    """The external warm request cannot consume its own family declaration."""
+    config = _config(
+        KVTransferConfig(
+            kv_connector="LMCacheMPConnector",
+            kv_role="kv_consumer",
+            kv_connector_extra_config={
+                "lmcache.mp.external_singleflight": True,
+                "lmcache.mp.family_prefetch": True,
+            },
+        )
+    )
+    connector = LMCacheMPConnector(config, KVConnectorRole.SCHEDULER)
+    warm = _request("warm")
+    warm.mm_features, warm.prompt_embeds, warm.lora_request = [], None, None
+    mock_io.scheduler.check_lookup_result.return_value = 8
+    try:
+        identity = connector.declare_family_prefetch(list(range(12)), 8, 2)
+        assert identity is not None
+        assert connector.get_num_new_matched_tokens(warm, 0) == (8, True)
+        assert connector.get_family_prefetch_stats()["family_prefetch_hit_total"] == 0
+        warm.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        connector.request_finished(warm, [])
+        if consume:
+            child = _request("child")
+            child.mm_features, child.prompt_embeds, child.lora_request = [], None, None
+            assert connector.get_num_new_matched_tokens(child, 8) == (0, False)
+            connector.update_state_after_alloc(
+                child, MagicMock(get_block_ids=lambda: ([1, 2, 3],)), 0
+            )
+            connector.request_finished(child, [])
+        connector.release_family_prefetch(identity)
+        stats = connector.get_family_prefetch_stats()
+        assert stats["family_prefetch_hit_total"] == int(consume)
+        assert stats["family_prefetch_wasted_total"] == int(not consume)
+        assert stats["pending"] == 0
+    finally:
+        connector.shutdown()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_family_child_waits_before_lookup_and_credits_local_hit_on_miss(
+    mock_io: SimpleNamespace, cancel: bool
+) -> None:
+    """An active preload parks child LOOKUP; its local hit needs no L2 hit."""
+    config = _config(
+        KVTransferConfig(
+            kv_connector="LMCacheMPConnector",
+            kv_role="kv_consumer",
+            kv_connector_extra_config={"lmcache.mp.family_prefetch": True},
+        )
+    )
+    connector = LMCacheMPConnector(config, KVConnectorRole.SCHEDULER)
+    warm, child = _request("warm"), _request("child")
+    for request in (warm, child):
+        request.mm_features, request.prompt_embeds, request.lora_request = (
+            [],
+            None,
+            None,
+        )
+    mock_io.scheduler.check_lookup_result.return_value = 8
+    try:
+        identity = connector.declare_family_prefetch(
+            list(range(12)), 8, 1, prefetch_request_id="warm"
+        )
+        assert identity is not None
+        assert connector.get_num_new_matched_tokens(warm, 0) == (8, True)
+        mock_io.scheduler.maybe_submit_lookup_request.reset_mock()
+        assert connector.get_num_new_matched_tokens(child, 0) == (None, True)
+        mock_io.scheduler.maybe_submit_lookup_request.assert_not_called()
+        warm.status = (
+            RequestStatus.FINISHED_ABORTED
+            if cancel
+            else RequestStatus.FINISHED_LENGTH_CAPPED
+        )
+        connector.request_finished(warm, [])
+        mock_io.scheduler.check_lookup_result.return_value = 8 if cancel else 0
+        assert connector.get_num_new_matched_tokens(child, 0 if cancel else 8) == (
+            (8, True) if cancel else (0, False)
+        )
+        assert connector.get_family_prefetch_stats()["family_prefetch_hit_total"] == 0
+        connector.update_state_after_alloc(
+            child, MagicMock(get_block_ids=lambda: ([1, 2, 3],)), 8 if cancel else 0
+        )
+        connector.request_finished(child, [])
+        connector.release_family_prefetch(identity)
+        stats = connector.get_family_prefetch_stats()
+        assert stats["family_prefetch_deferred_total"] == 1
+        assert stats["family_prefetch_hit_total"] == int(not cancel)
+        assert stats["family_prefetch_wasted_total"] == int(cancel)
+    finally:
+        connector.shutdown()
+
+
+def test_family_prefetch_rejects_eager_lookup(mock_io: SimpleNamespace) -> None:
+    """Child deferral must run before any lookup-triggered storage prefetch."""
+    config = _config(
+        KVTransferConfig(
+            kv_connector="LMCacheMPConnector",
+            kv_role="kv_consumer",
+            kv_connector_extra_config={
+                "lmcache.mp.family_prefetch": True,
+                "lmcache.mp.eager_prefetch": True,
+            },
+        )
+    )
+    with pytest.raises(ValueError, match="requires eager_prefetch=False"):
+        LMCacheMPConnector(config, KVConnectorRole.SCHEDULER)
+
+
+def test_family_wait_polls_reuse_identity_without_crossing_tenant_namespace(
+    mock_io: SimpleNamespace,
+) -> None:
+    """Repeated admission polls hash once per immutable request and coverage."""
+    config = _config(
+        KVTransferConfig(
+            kv_connector="LMCacheMPConnector",
+            kv_role="kv_consumer",
+            kv_connector_extra_config={"lmcache.mp.family_prefetch": True},
+        )
+    )
+    connector = LMCacheMPConnector(config, KVConnectorRole.SCHEDULER)
+    child, other = _request("child"), _request("other")
+    for request in (child, other):
+        request.mm_features, request.prompt_embeds, request.lora_request = (
+            [],
+            None,
+            None,
+        )
+    other.cache_salt = "other-tenant"
+    mock_io.scheduler.check_lookup_result.return_value = 8
+    try:
+        identity = connector.declare_family_prefetch(
+            list(range(12)), 8, 1, prefetch_request_id="warm"
+        )
+        assert identity is not None
+        with patch.object(
+            connector_mod, "build_identity", wraps=connector_mod.build_identity
+        ) as hashes:
+            for _ in range(100):
+                assert connector.get_num_new_matched_tokens(child, 0) == (None, True)
+            assert connector.get_num_new_matched_tokens(other, 0) == (8, True)
+            assert hashes.call_count == 2
+        connector.request_finished(child, [])
+        connector.request_finished(other, [])
+        connector.release_family_prefetch(identity)
+    finally:
+        connector.shutdown()

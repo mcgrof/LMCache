@@ -77,6 +77,8 @@ class LMCacheMPRequestTracker:
     request_configs: dict[str, Any] | None = None
     max_offload_tokens: int | None = None
     lookup_started_at: float | None = None
+    # Text prefixes are immutable; identities live only as long as this tracker.
+    family_prefix_identities: dict[int, str] = field(default_factory=dict)
 
     mm_adjusted_prompt_ids: list[int] = field(default_factory=list)
 
@@ -88,6 +90,7 @@ class LMCacheMPRequestTracker:
             "lmcache.max_offload_tokens"
         )
         self.lookup_started_at = None
+        self.family_prefix_identities = {}
         self.all_token_ids = request.all_token_ids
         self.num_prompt_tokens = request.num_prompt_tokens
         self.allocated_block_ids = {}

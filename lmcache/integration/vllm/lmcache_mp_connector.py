@@ -58,6 +58,7 @@ from lmcache.integration.vllm.external_singleflight import (
     ExternalSingleflightRegistry,
     build_identity,
 )
+from lmcache.integration.vllm.family_prefetch import FamilyPrefetchRegistry
 from lmcache.integration.vllm.kv_cache_group_edits import (
     apply_kv_cache_group_edits,
     validate_kv_cache_groups,
@@ -586,6 +587,15 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             raise ValueError("external_singleflight requires vLLM prefix caching")
         self._singleflight = ExternalSingleflightRegistry()
         self._singleflight_enabled = sf_enabled
+        fp_enabled = vllm_config.kv_transfer_config.get_from_extra_config(
+            "lmcache.mp.family_prefetch", False
+        )
+        if not isinstance(fp_enabled, bool):
+            raise ValueError("lmcache.mp.family_prefetch must be a boolean")
+        if fp_enabled and not vllm_config.cache_config.enable_prefix_caching:
+            raise ValueError("family_prefetch requires vLLM prefix caching")
+        self._family_prefetch_enabled = fp_enabled
+        self._family_prefetch = FamilyPrefetchRegistry()
 
         # Fail fast, before the server handshake below.
         kv_cache_config = getattr(self, "_kv_cache_config", None)
@@ -641,6 +651,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "lmcache.mp.eager_prefetch", False
             )
         )
+
+        if fp_enabled and self._eager_prefetch:
+            raise ValueError("family_prefetch requires eager_prefetch=False")
 
         # Multi-server: prefer lmcache.mp.server_urls (list or comma-separated
         # string) over the single-server lmcache.mp.host / lmcache.mp.port.
@@ -1190,6 +1203,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         so the drop rate is auditable from the log.
         """
         self._singleflight.clear()
+        self._family_prefetch.clear()
         if hasattr(self, "worker_adapter"):
             self.worker_adapter.shutdown()
         if hasattr(self, "scheduler_adapter"):
@@ -1223,7 +1237,76 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             return None
 
         self._singleflight.clear()
+        self._family_prefetch.clear()
         return self.scheduler_adapter.reset_cache()
+
+    def declare_family_prefetch(
+        self,
+        token_ids: list[int],
+        covered_tokens: int,
+        expected_children: int,
+        cache_salt: str | None = None,
+        bytes_per_token: int = 0,
+        prefetch_request_id: str | None = None,
+    ) -> str | None:
+        """Record a caller-preloaded ancestor for subsequent local-hit attribution.
+
+        This does not submit I/O or retain GPU blocks. With a warm request ID,
+        matching children defer before LOOKUP until that request finishes or
+        their ancestor is locally reusable. The caller preloads through the
+        engine and later releases the declaration. Only text/base-
+        model prefixes are supported, using the external singleflight identity.
+
+        Args:
+            token_ids: Ancestor tokens, including the covered prefix.
+            covered_tokens: Positive chunk-aligned ancestor length.
+            expected_children: Maximum distinct child hits to attribute.
+            cache_salt: Tenant cache namespace.
+            bytes_per_token: Logical KV bytes per token, not physical I/O.
+            prefetch_request_id: Internal engine warm request ID to exclude.
+
+        Returns:
+            Identity on admission, None when disabled, on workers or at capacity.
+
+        Raises:
+            ValueError: Invalid identity, coverage, child count or byte geometry.
+        """
+        if not self._family_prefetch_enabled or self.role != KVConnectorRole.SCHEDULER:
+            return None
+        if covered_tokens % self.scheduler_adapter.lmcache_tokens_per_chunk:
+            raise ValueError("family ancestor must be chunk aligned")
+        identity = build_identity(
+            self._sf_model_name,
+            self._sf_world_size,
+            cache_salt,
+            None,
+            token_ids,
+            covered_tokens,
+        )
+        admitted = self._family_prefetch.declare(
+            identity,
+            expected_children,
+            covered_tokens,
+            bytes_per_token,
+            prefetch_request_id=prefetch_request_id,
+        )
+        return identity if admitted else None
+
+    def release_family_prefetch(self, identity: str) -> None:
+        """Retire a completed or pruned family and account unused declarations.
+
+        Args:
+            identity: Identity returned by declare_family_prefetch.
+        """
+        self._family_prefetch.release(identity)
+
+    def get_family_prefetch_stats(self) -> dict[str, int]:
+        """Return logical declaration attribution and pending state.
+
+        Returns:
+            Detached counters; these do not represent storage bytes or savings.
+        """
+        return self._family_prefetch.snapshot()
 
     def get_singleflight_stats(self) -> dict[str, int | float]:
         """Return cumulative coalescing counters and live registry sizes.
@@ -1312,6 +1395,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             tracker.num_lmcache_hit_tokens = 0
             tracker.state = LMCacheMPRequestState.BYPASS_LMCACHE
             return 0, False
+
+        if self._defer_family_child(request, tracker, num_computed_tokens):
+            return None, True
 
         if tracker.lookup_started_at is None:
             tracker.lookup_started_at = time.monotonic()
@@ -1466,6 +1552,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             tracker.append_block_ids(
                 tuple(new_block_ids), self._mamba_relocation_window
             )
+
+        self._record_family_child(request, tracker)
 
         # Update the state of the tracker
         if tracker.state == LMCacheMPRequestState.BYPASS_LMCACHE:
@@ -1626,6 +1714,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 self._singleflight.mark_published(request.request_id)
             self._singleflight.on_request_finished(request.request_id)
 
+        self._family_prefetch.on_request_finished(request.request_id)
+
         # Clean up request tracker to prevent memory leak
         self._cleanup_request_tracker(request.request_id)
 
@@ -1738,6 +1828,55 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     ##############################
     # Helper functions
     ##############################
+    def _matching_family_prefixes(
+        self, request: "Request", tracker: LMCacheMPRequestTracker
+    ) -> Iterable[tuple[str, int]]:
+        """Derive candidate identities for this text request's declared lengths."""
+        if (
+            not self._family_prefetch_enabled
+            or request.mm_features
+            or request.prompt_embeds is not None
+            or request.lora_request is not None
+        ):
+            return
+        tokens: list[int] | None = None
+        for covered in self._family_prefetch.coverage_lengths():
+            if covered > len(tracker.all_token_ids):
+                continue
+            identity = tracker.family_prefix_identities.get(covered)
+            if identity is None:
+                if tokens is None:
+                    tokens = tracker.get_token_ids()
+                identity = build_identity(
+                    self._sf_model_name,
+                    self._sf_world_size,
+                    tracker.cache_salt,
+                    None,
+                    tokens,
+                    covered,
+                )
+                tracker.family_prefix_identities[covered] = identity
+            yield identity, covered
+
+    def _defer_family_child(
+        self, request: "Request", tracker: LMCacheMPRequestTracker, local_tokens: int
+    ) -> bool:
+        """Match declared text ancestors before lookup starts storage prefetch."""
+        return any(
+            self._family_prefetch.should_defer(
+                identity, request.request_id, local_tokens
+            )
+            for identity, _covered in self._matching_family_prefixes(request, tracker)
+        )
+
+    def _record_family_child(
+        self, request: "Request", tracker: LMCacheMPRequestTracker
+    ) -> None:
+        """Credit local ancestor reuse only after allocation commits admission."""
+        for identity, covered in self._matching_family_prefixes(request, tracker):
+            if tracker.num_vllm_hit_tokens >= covered:
+                self._family_prefetch.note_child_hit(identity, request.request_id)
+
     def _process_retrieve_requests(
         self,
         metadata: LMCacheMPConnectorMetadata,
