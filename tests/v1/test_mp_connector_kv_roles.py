@@ -601,3 +601,71 @@ def test_strict_prefix_rejects_configuration_that_can_recompute(
     )
     with pytest.raises(ValueError, match="strict_prefix requires"):
         LMCacheMPConnector(config, KVConnectorRole.SCHEDULER)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_external_singleflight_admission_and_abort(
+    mock_io: SimpleNamespace, enabled: bool
+) -> None:
+    """Only a leader allocates while followers retry APC or take over on abort."""
+    config = _config(
+        KVTransferConfig(
+            kv_connector="LMCacheMPConnector",
+            kv_role="kv_consumer",
+            kv_connector_extra_config={"lmcache.mp.external_singleflight": enabled},
+        )
+    )
+    connector = LMCacheMPConnector(config, KVConnectorRole.SCHEDULER)
+    leader, follower = _request("leader"), _request("follower")
+    for request in (leader, follower):
+        request.mm_features = []
+        request.prompt_embeds = None
+        request.lora_request = None
+    mock_io.scheduler.check_lookup_result.return_value = 8
+    try:
+        assert connector.get_num_new_matched_tokens(leader, 0) == (8, True)
+        assert connector.get_num_new_matched_tokens(follower, 0) == (
+            (None, True) if enabled else (8, True)
+        )
+        if enabled:
+            assert connector.get_singleflight_stats()["join_total"] == 1
+            leader.status = RequestStatus.FINISHED_ABORTED
+            connector.request_finished(leader, [])
+            assert connector.get_num_new_matched_tokens(follower, 0) == (8, True)
+            assert connector.get_singleflight_stats()["follower_retry_total"] == 1
+        assert connector.get_num_new_matched_tokens(follower, 8) == (0, False)
+        connector.request_finished(follower, [])
+        assert connector.get_singleflight_stats()["inflight"] == 0
+        assert connector.get_singleflight_stats()["joined"] == 0
+    finally:
+        connector.shutdown()
+
+
+@pytest.mark.parametrize("flag", ["true", 1, None])
+def test_singleflight_rejects_non_boolean_config(
+    mock_io: SimpleNamespace, flag: object
+) -> None:
+    """Validate the opt-in before constructing transport resources."""
+    config = _config(
+        KVTransferConfig(
+            kv_connector="LMCacheMPConnector",
+            kv_role="kv_consumer",
+            kv_connector_extra_config={"lmcache.mp.external_singleflight": flag},
+        )
+    )
+    with pytest.raises(ValueError, match="must be a boolean"):
+        LMCacheMPConnector(config, KVConnectorRole.SCHEDULER)
+
+
+def test_singleflight_requires_prefix_cache(mock_io: SimpleNamespace) -> None:
+    """Followers require APC to observe a leader's published blocks."""
+    config = _config(
+        KVTransferConfig(
+            kv_connector="LMCacheMPConnector",
+            kv_role="kv_consumer",
+            kv_connector_extra_config={"lmcache.mp.external_singleflight": True},
+        )
+    )
+    config.cache_config.enable_prefix_caching = False
+    with pytest.raises(ValueError, match="requires vLLM prefix caching"):
+        LMCacheMPConnector(config, KVConnectorRole.SCHEDULER)

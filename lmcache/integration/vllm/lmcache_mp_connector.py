@@ -53,6 +53,11 @@ import zmq
 # First Party
 from lmcache.banner import print_banner_once
 from lmcache.integration.vllm.experimental import dispatch
+from lmcache.integration.vllm.external_singleflight import (
+    JOIN,
+    ExternalSingleflightRegistry,
+    build_identity,
+)
 from lmcache.integration.vllm.kv_cache_group_edits import (
     apply_kv_cache_group_edits,
     validate_kv_cache_groups,
@@ -571,6 +576,16 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # while current vLLM's type declaration requires it.
         super().__init__(vllm_config, role, kv_cache_config)  # type: ignore[arg-type]
         self._connector_stats = LMCacheMPConnectorStats()
+        assert vllm_config.kv_transfer_config is not None
+        sf_enabled = vllm_config.kv_transfer_config.get_from_extra_config(
+            "lmcache.mp.external_singleflight", False
+        )
+        if not isinstance(sf_enabled, bool):
+            raise ValueError("lmcache.mp.external_singleflight must be a boolean")
+        if sf_enabled and not vllm_config.cache_config.enable_prefix_caching:
+            raise ValueError("external_singleflight requires vLLM prefix caching")
+        self._singleflight = ExternalSingleflightRegistry()
+        self._singleflight_enabled = sf_enabled
 
         # Fail fast, before the server handshake below.
         kv_cache_config = getattr(self, "_kv_cache_config", None)
@@ -593,6 +608,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             vllm_config, kv_cache_config
         )
         cache_model_name = get_dcp_decorated_model_name(vllm_config, kv_cache_config)
+        self._sf_model_name = cache_model_name
+        self._sf_world_size = vllm_config.parallel_config.world_size
 
         assert vllm_config.kv_transfer_config is not None
         self._can_store = vllm_config.kv_transfer_config.is_kv_producer
@@ -1172,6 +1189,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         On the scheduler side it also logs the lazy-offload counter ledger
         so the drop rate is auditable from the log.
         """
+        self._singleflight.clear()
         if hasattr(self, "worker_adapter"):
             self.worker_adapter.shutdown()
         if hasattr(self, "scheduler_adapter"):
@@ -1204,7 +1222,16 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if self.role != KVConnectorRole.SCHEDULER:
             return None
 
+        self._singleflight.clear()
         return self.scheduler_adapter.reset_cache()
+
+    def get_singleflight_stats(self) -> dict[str, int | float]:
+        """Return cumulative coalescing counters and live registry sizes.
+
+        Returns:
+            A detached snapshot; backend reads are measured separately.
+        """
+        return self._singleflight.snapshot()
 
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
         """Bind GPU block pool so that we can touch blocks during stores.
@@ -1243,7 +1270,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         Notes:
             The connector should only consider the largest prefix of prompt-
             tokens for which KV cache is actually available at the time of the
-            call. If the cache cannot be loaded for some tokens (e.g., due to
+            call. Opt-in exact-prefix singleflight defers duplicate text-only
+            loads until the ordinary local prefix lookup finds the leader's KV.
+            It does not suppress the LOOKUP-triggered backend prefetch.
+            If the cache cannot be loaded for some tokens (e.g., due to
             connectivity issues or eviction), those tokens must not be taken
             into account.
         """
@@ -1352,6 +1382,27 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         logger.debug(
             "vLLM hit is: %d, Need to load is %d", num_computed_tokens, need_to_load
         )
+        # Token identity cannot describe multimodal or embedded inputs. Keep
+        # those requests and adapter-specific KV on the ordinary load path.
+        if (
+            self._singleflight_enabled
+            and not request.mm_features
+            and request.prompt_embeds is None
+            and request.lora_request is None
+        ):
+            if need_to_load == 0:
+                self._singleflight.note_local_hit(request.request_id)
+            else:
+                identity = build_identity(
+                    self._sf_model_name,
+                    self._sf_world_size,
+                    tracker.cache_salt,
+                    None,
+                    tracker.get_token_ids(),
+                    ret,
+                )
+                if self._singleflight.acquire(identity, request.request_id) == JOIN:
+                    return None, True
         return need_to_load, need_to_load > 0
 
     def on_new_request(self, request: "Request") -> None:
@@ -1566,6 +1617,14 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "num_lmcache_cached_tokens": num_lmcache,
                 "num_lmcache_extra_cached_tokens": max(0, num_lmcache - num_vllm),
             }
+
+        if self._singleflight_enabled:
+            if request.status in (
+                RequestStatus.FINISHED_STOPPED,
+                RequestStatus.FINISHED_LENGTH_CAPPED,
+            ):
+                self._singleflight.mark_published(request.request_id)
+            self._singleflight.on_request_finished(request.request_id)
 
         # Clean up request tracker to prevent memory leak
         self._cleanup_request_tracker(request.request_id)

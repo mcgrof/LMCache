@@ -1016,3 +1016,16 @@ environment/configuration snapshot at startup and interval counters
 data, model names, or ``--instance-id`` are ever sent, and reporting can
 never affect serving. Opt out with ``LMCACHE_TRACK_USAGE=false`` or
 ``DO_NOT_TRACK=1``; see :ref:`usage-stats-collection` for details.
+
+External load coalescing
+------------------------
+
+Set ``lmcache.mp.external_singleflight`` to the boolean ``true`` in vLLM's
+connector extra configuration to defer simultaneous loads of an identical
+externally cached text prefix. Enable vLLM prefix caching so followers can
+reuse the leader's published GPU blocks. The option defaults to ``false``;
+multimodal, prompt-embedding and LoRA requests keep the ordinary load path.
+
+This gate runs after LOOKUP, which already starts backend prefetch. It can
+suppress GPU loads without suppressing storage reads. Followers retry after
+leader cancellation or a 30-second timeout; cache reset clears deferrals.
