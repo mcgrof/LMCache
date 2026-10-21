@@ -120,7 +120,7 @@ class LookupModule:
     def __init__(self, ctx: MPCacheServerContext) -> None:
         self._ctx = ctx
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
-        self._prefetch_job_lock = threading.Lock()
+        self._prefetch_job_lock = threading.RLock()
         self._setup_metrics()
 
     @property
@@ -139,8 +139,12 @@ class LookupModule:
         }
 
     def close(self) -> None:
-        """Release resources owned by this module (no-op)."""
-        pass
+        """Return unconsumed joined handles to their physical completion owner."""
+        if self._uses_joined_handles():
+            with self._prefetch_job_lock:
+                for job in self._prefetch_jobs.values():
+                    self._ctx.storage_manager.cancel_prefetch_task(job.handle)
+                self._prefetch_jobs.clear()
 
     # -----------------------------------------------------------------
     # Handlers
@@ -464,6 +468,10 @@ class LookupModule:
 
         Args:
             request_id: The request ID whose session should be removed.
+
+        Pending joined jobs return to their controller completion owner. Reader
+        refs already handed to the session still follow FREE_LOOKUP_LOCKS or
+        the stream-ordered retrieve completion contract.
         """
         self._ctx.event_bus.publish(
             Event(
@@ -471,7 +479,14 @@ class LookupModule:
                 metadata={"request_id": request_id},
             )
         )
-        session = self._ctx.session_manager.remove(request_id)
+        if self._uses_joined_handles():
+            with self._prefetch_job_lock:
+                job = self._prefetch_jobs.pop(request_id, None)
+                if job is not None:
+                    self._ctx.storage_manager.cancel_prefetch_task(job.handle)
+                session = self._ctx.session_manager.remove(request_id)
+        else:
+            session = self._ctx.session_manager.remove(request_id)
         self._ctx.event_bus.publish(
             Event(
                 event_type=EventType.MP_REQUEST_END,
@@ -526,9 +541,24 @@ class LookupModule:
 
     def _register_prefetch_job(self, job: _PrefetchJob) -> None:
         with self._prefetch_job_lock:
+            if (
+                self._uses_joined_handles()
+                and self._ctx.session_manager.get(job.request_id) is None
+            ):
+                self._ctx.storage_manager.cancel_prefetch_task(job.handle)
+                return
             self._prefetch_jobs[job.request_id] = job
 
     def _consume_prefetch_result(self, job: _PrefetchJob) -> int | None:
+        """Transfer a live job's result without racing joined-handle abandonment."""
+        if self._uses_joined_handles():
+            with self._prefetch_job_lock:
+                if self._prefetch_jobs.get(job.request_id) is not job:
+                    return 0
+                return self._record_prefetch_result(job)
+        return self._record_prefetch_result(job)
+
+    def _record_prefetch_result(self, job: _PrefetchJob) -> int | None:
         """Hand a finished prefetch result over to the request's session.
 
         Takes the result from the storage manager (each result is returned
@@ -600,6 +630,12 @@ class LookupModule:
         """Return the number of active prefetch jobs (thread-safe)."""
         with self._prefetch_job_lock:
             return len(self._prefetch_jobs)
+
+    def _uses_joined_handles(self) -> bool:
+        """Use joined cleanup only when the storage manager explicitly enables it."""
+        return (
+            getattr(self._ctx.storage_manager, "prefetch_join_overlaps", False) is True
+        )
 
     def _setup_metrics(self) -> None:
         """Register OTel observable gauges for lookup module metrics."""

@@ -273,6 +273,8 @@ class StorageManager:
                 adapter_descriptors=list(self._adapter_descriptors.values()),
                 policy=create_prefetch_policy(config.prefetch_policy),
                 max_in_flight=config.prefetch_max_in_flight,
+                join_overlaps=config.prefetch_join_overlaps,
+                max_pending=config.prefetch_max_pending,
             )
             self._prefetch_controller.start()
             cleanup.callback(self._prefetch_controller.stop)
@@ -707,6 +709,28 @@ class StorageManager:
             submit_time=time.monotonic(),
             sliding_windows=tuple(row.sliding_window_size for row in spec.key_groups),
         )
+
+    def cancel_prefetch_task(self, handle: PrefetchHandle) -> bool:
+        """Withdraw a joined lookup's reader interest without cancelling accepted I/O.
+
+        Args:
+            handle: Handle returned by :meth:`submit_prefetch_task`.
+
+        Returns:
+            True when the controller accepted ownership of the unwanted handle.
+            False if overlap joining is disabled or the result was consumed.
+            After True the caller must stop polling. An accepted backend fill
+            retains its destination and completion owner until it settles;
+            the controller drains its result and any reader refs automatically.
+        """
+        return self._prefetch_controller.cancel_prefetch_request(
+            handle.prefetch_request_id
+        )
+
+    @property
+    def prefetch_join_overlaps(self) -> bool:
+        """Whether accepted prefetch handles support overlap joins and cancellation."""
+        return self._prefetch_controller.join_overlaps
 
     def query_prefetch_status(self, handle: PrefetchHandle) -> PrefetchResult | None:
         """

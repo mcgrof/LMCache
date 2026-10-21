@@ -31,6 +31,7 @@ def _result(found):
 
 def _make_ctx(wait_result=True, found=None):
     storage_manager = mock.Mock()
+    storage_manager.prefetch_join_overlaps = False
     storage_manager.wait_prefetch_status.return_value = wait_result
     storage_manager.query_prefetch_status.return_value = _result(found)
     ctx = mock.Mock()
@@ -46,7 +47,7 @@ def _make_module(ctx):
     module = object.__new__(LookupModule)
     module._ctx = ctx
     module._prefetch_jobs = {}
-    module._prefetch_job_lock = threading.Lock()
+    module._prefetch_job_lock = threading.RLock()
     return module
 
 
@@ -103,3 +104,51 @@ def test_wait_prefetch_status_timeout_returns_none_and_keeps_job():
 def test_wait_prefetch_status_unknown_request_returns_zero():
     module = _make_module(_make_ctx())
     assert module.wait_prefetch_status("missing", timeout=1.0) == 0
+
+
+def test_joined_end_session_transfers_pending_handle_and_rejects_late_consume():
+    ctx = _make_ctx()
+    ctx.storage_manager.prefetch_join_overlaps = True
+    ctx.session_manager.remove.return_value = None
+    module = _make_module(ctx)
+    job = _PrefetchJob(
+        handle=mock.sentinel.handle,
+        row_windows=(-1,),
+        request_id="req",
+        requested_tokens=256,
+    )
+    module._prefetch_jobs["req"] = job
+
+    module.end_session("req")
+
+    ctx.storage_manager.cancel_prefetch_task.assert_called_once_with(job.handle)
+    assert "req" not in module._prefetch_jobs
+    assert module._consume_prefetch_result(job) == 0
+    ctx.storage_manager.query_prefetch_status.assert_not_called()
+    ctx.session_manager.get_or_create.assert_not_called()
+
+
+def test_joined_registration_after_session_end_transfers_late_handle():
+    ctx = _make_ctx()
+    ctx.storage_manager.prefetch_join_overlaps = True
+    ctx.session_manager.get.return_value = None
+    module = _make_module(ctx)
+    job = _PrefetchJob(
+        handle=mock.sentinel.handle,
+        row_windows=(-1,),
+        request_id="req",
+        requested_tokens=256,
+    )
+
+    module._register_prefetch_job(job)
+
+    assert "req" not in module._prefetch_jobs
+    ctx.storage_manager.cancel_prefetch_task.assert_called_once_with(job.handle)
+
+
+def test_default_end_session_does_not_claim_joined_cancellation():
+    ctx = _make_ctx()
+    ctx.session_manager.remove.return_value = None
+    module = _make_module(ctx)
+    module.end_session("req")
+    ctx.storage_manager.cancel_prefetch_task.assert_not_called()

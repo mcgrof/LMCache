@@ -750,7 +750,18 @@ class StorageManagerConfig:
     l1_manager_configs: list[L1ManagerConfig] = field(default_factory=list)
     """All peer L1 configurations. Empty accepts the legacy single-L1 input."""
 
+    prefetch_join_overlaps: bool = False
+    """Wait for compatible overlapping fills before starting another lookup."""
+
+    prefetch_max_pending: int = 1024
+    """Bound accepted, unconsumed handles when overlap joining is enabled."""
+
     def __post_init__(self) -> None:
+        if self.prefetch_join_overlaps:
+            if self.prefetch_policy != "retain":
+                raise ValueError("Overlapping prefetch joins require the retain policy")
+            if self.prefetch_max_in_flight <= 0 or self.prefetch_max_pending <= 0:
+                raise ValueError("Prefetch admission limits must be positive")
         if not self.l1_manager_configs:
             self.l1_manager_configs = [self.l1_manager_config]
         else:
@@ -1102,6 +1113,19 @@ def add_storage_manager_args(
         help="Maximum number of concurrent prefetch requests. Default is 8.",
     )
     policy_group.add_argument(
+        "--l2-prefetch-join-overlaps",
+        action="store_true",
+        help="Wait for compatible overlapping fills, then reuse retained L1 objects. "
+        "Requires --l2-prefetch-policy retain. Disjoint requests remain concurrent.",
+    )
+    policy_group.add_argument(
+        "--l2-prefetch-max-pending",
+        type=int,
+        default=1024,
+        help="Maximum accepted, unconsumed prefetch handles with overlap joining. "
+        "Reject new submissions at capacity. Default is 1024.",
+    )
+    policy_group.add_argument(
         "--periodic-notifier-interval-ms",
         type=int,
         default=5,
@@ -1203,6 +1227,8 @@ def parse_args_to_config(
             store_policy=args.l2_store_policy,
             prefetch_policy=args.l2_prefetch_policy,
             prefetch_max_in_flight=args.l2_prefetch_max_in_flight,
+            prefetch_join_overlaps=getattr(args, "l2_prefetch_join_overlaps", False),
+            prefetch_max_pending=getattr(args, "l2_prefetch_max_pending", 1024),
             periodic_notifier_interval_ms=args.periodic_notifier_interval_ms,
         )
     if args.l1_size_gb is None or defaults is None:
@@ -1283,6 +1309,8 @@ def parse_args_to_config(
         store_policy=args.l2_store_policy,
         prefetch_policy=args.l2_prefetch_policy,
         prefetch_max_in_flight=args.l2_prefetch_max_in_flight,
+        prefetch_join_overlaps=getattr(args, "l2_prefetch_join_overlaps", False),
+        prefetch_max_pending=getattr(args, "l2_prefetch_max_pending", 1024),
         periodic_notifier_interval_ms=args.periodic_notifier_interval_ms,
     )
     return config

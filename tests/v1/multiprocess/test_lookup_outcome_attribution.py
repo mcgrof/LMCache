@@ -96,6 +96,7 @@ def _end_metadata(
     l2_rows = l2_rows if l2_rows is not None else miss_rows
 
     ctx = MagicMock()
+    ctx.storage_manager.prefetch_join_overlaps = False
     ctx.chunk_size = CHUNK_SIZE
     ctx.event_bus.has_subscribers.return_value = False
     ctx.layout_desc_registry.find.return_value = MagicMock() if layout_found else None

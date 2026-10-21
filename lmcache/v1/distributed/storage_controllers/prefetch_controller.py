@@ -13,6 +13,11 @@ per key group marking the cells resident in L1 when the request finished.
 Every lock the controller holds on behalf of a request is recorded in the
 request's key states, and every phase leaves those states consistent, so
 releasing a request at any point is a walk over its maps.
+
+Optional overlap joining waits for compatible cold objects before starting
+another lookup. Each waiting request then resolves its own original key grid
+against retained L1 objects and owns independent reader refs. Completed shared
+objects hold temporary handoff refs until those lookups acquire their refs.
 """
 
 # Standard
@@ -53,6 +58,7 @@ from lmcache.v1.distributed.storage_controllers.adapter_lifecycle import (
 )
 from lmcache.v1.distributed.storage_controllers.prefetch_policy import (
     PrefetchPolicy,
+    RetainPrefetchPolicy,
 )
 from lmcache.v1.distributed.storage_controllers.utils import (
     Bitmap2D,
@@ -96,6 +102,21 @@ def _get_prefetch_write_tag(request_id: PrefetchRequestId) -> str:
         do not contend for its L1 reservation.
     """
     return f"prefetch:{request_id}"
+
+
+def _overlapping_keys(
+    left: list[GroupedObjectKeys], right: list[GroupedObjectKeys]
+) -> set[ObjectKey]:
+    """Find common objects with matching layouts and attention windows."""
+    return {
+        key
+        for first in left
+        for second in right
+        if first.object_group_id == second.object_group_id
+        and first.layout_desc == second.layout_desc
+        and first.sliding_window_size == second.sliding_window_size
+        for key in set(first.keys).intersection(second.keys)
+    }
 
 
 def _gather_keys(
@@ -435,6 +456,9 @@ class PrefetchController(StorageControllerInterface):
         adapter_descriptors: Descriptors for each L2 adapter (same order).
         policy: The prefetch policy for load plan and retention decisions.
         max_in_flight: Maximum number of concurrent prefetch requests.
+        join_overlaps: Wait for compatible overlapping fills before lookup.
+            Use a retain policy so later requests can reuse resident objects.
+        max_pending: Maximum accepted, unconsumed handles with overlap joining.
     """
 
     # Singleton dispatch for the in-flight load gauges: tests may construct
@@ -452,7 +476,13 @@ class PrefetchController(StorageControllerInterface):
         adapter_descriptors: list[L2AdapterDescriptor],
         policy: PrefetchPolicy,
         max_in_flight: int = 8,
+        join_overlaps: bool = False,
+        max_pending: int = 1024,
     ) -> None:
+        if join_overlaps and (max_in_flight <= 0 or max_pending <= 0):
+            raise ValueError("Prefetch admission limits must be positive")
+        if join_overlaps and not isinstance(policy, RetainPrefetchPolicy):
+            raise ValueError("Overlapping prefetch joins require the retain policy")
         self._l1_managers: dict[int, L1Manager] = {
             desc.index: mgr
             for desc, mgr in zip(l1_manager_descriptors, l1_managers, strict=True)
@@ -460,6 +490,7 @@ class PrefetchController(StorageControllerInterface):
         self._l1_manager_descriptors: dict[int, L1ManagerDescriptor] = {
             desc.index: desc for desc in l1_manager_descriptors
         }
+        self._l1_managers_by_id = {mgr.l1_manager_id: mgr for mgr in l1_managers}
 
         self._l2_adapters: dict[int, L2AdapterInterface] = {
             desc.index: adapter
@@ -476,6 +507,13 @@ class PrefetchController(StorageControllerInterface):
 
         # TODO: remove max_in_flight and make it dynamic
         self._max_in_flight = max_in_flight
+        self._join_overlaps = join_overlaps
+        self._max_pending = max_pending
+        self._accepted_specs: dict[PrefetchRequestId, PrefetchTaskSpec] = {}
+        self._cancelled_requests: set[PrefetchRequestId] = set()
+        self._dependency_waiters: set[PrefetchRequestId] = set()
+        self._handoff_locks: dict[PrefetchRequestId, dict[int, set[ObjectKey]]] = {}
+        self._joined_total = 0
 
         # Adapters being removed: adapter id -> event set once detached.
         self._draining: dict[int, threading.Event] = {}
@@ -491,7 +529,7 @@ class PrefetchController(StorageControllerInterface):
         self._pending_queue: deque[tuple[PrefetchRequestId, PrefetchTaskSpec]] = deque()
 
         # Thread-safe submission queue (external -> background)
-        self._submission_lock = threading.Lock()
+        self._submission_lock = threading.RLock()
         self._submission_queue: list[tuple[PrefetchRequestId, PrefetchTaskSpec]] = []
         self._next_request_id: PrefetchRequestId = 0
         self._submission_efd = create_event_notifier()
@@ -564,6 +602,11 @@ class PrefetchController(StorageControllerInterface):
     # External API (thread-safe)
     # =========================================================================
 
+    @property
+    def join_overlaps(self) -> bool:
+        """Whether overlapping fills share retained objects and bounded admission."""
+        return self._join_overlaps
+
     def submit_prefetch_request(
         self,
         spec: PrefetchTaskSpec,
@@ -582,6 +625,10 @@ class PrefetchController(StorageControllerInterface):
         Returns:
             A request ID for tracking via query_prefetch_result.
 
+        Raises:
+            RuntimeError: The controller is stopped, or overlap joining has
+                reached its accepted-handle limit. A rejected request owns no I/O.
+
         Note:
             When ``skip_l2`` is true, or no L2 adapter is attached, the
             request is served from L1 on the calling thread and its result
@@ -590,22 +637,74 @@ class PrefetchController(StorageControllerInterface):
         with self._submission_lock:
             if self._stop_flag.is_set():
                 raise RuntimeError("Prefetch controller is stopped")
+            if self._join_overlaps and len(self._accepted_specs) >= self._max_pending:
+                raise RuntimeError("Prefetch admission capacity reached")
             request_id = self._next_request_id
             self._next_request_id += 1
+            if self._join_overlaps:
+                self._accepted_specs[request_id] = spec
 
         if skip_l2 or not self._l2_adapters:
             request = _build_request(request_id, spec)
-            self._lock_l1_keys(request)
-            self._plan_load(request, {})
-            self._finish_request(request)
+            try:
+                self._lock_l1_keys(request)
+                self._plan_load(request, {})
+                self._finish_request(request)
+            except Exception:
+                self._release_all_locks(request)
+                with self._submission_lock:
+                    self._accepted_specs.pop(request_id, None)
+                raise
             return request_id
 
         with self._submission_lock:
             if self._stop_flag.is_set():
+                self._accepted_specs.pop(request_id, None)
                 raise RuntimeError("Prefetch controller is stopped")
             self._submission_queue.append((request_id, spec))
-            self._submission_efd.notify()
+            try:
+                self._submission_efd.notify()
+            except Exception:
+                self._submission_queue.pop()
+                self._accepted_specs.pop(request_id, None)
+                raise
         return request_id
+
+    def cancel_prefetch_request(self, request_id: PrefetchRequestId) -> bool:
+        """Transfer an unwanted joined handle back to the controller.
+
+        Args:
+            request_id: Handle whose logical reader no longer needs a result.
+
+        Returns:
+            True if the handle was still owned here, False if joining is disabled
+            or the caller already consumed it. After True, the caller must stop
+            polling. Accepted physical I/O continues under its existing owner;
+            completion releases reader refs and drains the handle automatically.
+        """
+        if not self._join_overlaps:
+            return False
+        with self._submission_lock:
+            spec = self._accepted_specs.get(request_id)
+            if spec is None:
+                return False
+            with self._prefetch_results_lock:
+                result = self._completed_results.pop(request_id, None)
+            if result is not None:
+                if spec.lock_mode == PrefetchLockMode.LOCK:
+                    by_owner: dict[int, list[ObjectKey]] = defaultdict(list)
+                    for key, owner in result.l1_owners.items():
+                        by_owner[owner].append(key)
+                    for owner, keys in by_owner.items():
+                        self._l1_managers_by_id[owner].finish_read(
+                            keys, read_locks=spec.num_kv_readers
+                        )
+                self._accepted_specs.pop(request_id)
+            else:
+                self._cancelled_requests.add(request_id)
+                if not self._stop_flag.is_set():
+                    self._submission_efd.notify()
+            return True
 
     def query_prefetch_result(
         self, request_id: PrefetchRequestId
@@ -625,6 +724,13 @@ class PrefetchController(StorageControllerInterface):
             served from L1 and loaded from L2. None if not yet complete or
             already retrieved.
         """
+        if self._join_overlaps:
+            with self._submission_lock:
+                with self._prefetch_results_lock:
+                    result = self._completed_results.pop(request_id, None)
+                if result is not None:
+                    self._accepted_specs.pop(request_id, None)
+                return result
         with self._prefetch_results_lock:
             return self._completed_results.pop(request_id, None)
 
@@ -673,6 +779,10 @@ class PrefetchController(StorageControllerInterface):
             "lookup_phase_count": lookup_phase_count,
             "load_phase_count": len(in_flight) - lookup_phase_count,
             "completed_results_count": completed_results_count,
+            "join_overlaps": self._join_overlaps,
+            "accepted_handle_count": len(self._accepted_specs),
+            "dependency_waiter_count": len(self._dependency_waiters),
+            "overlap_joined_total": self._joined_total,
             "num_l2_adapters": len(self._l2_adapters),
             "num_active_adapters": len(self._l2_adapters) - len(self._draining),
             "num_draining_adapters": len(self._draining),
@@ -1030,11 +1140,24 @@ class PrefetchController(StorageControllerInterface):
 
     def _start_pending_requests(self) -> None:
         """Start pending requests up to the max in-flight limit."""
-        # TODO: implement the dynamic in flight request admission
-        while (
-            self._pending_queue and len(self._in_flight_requests) < self._max_in_flight
-        ):
+        # Scan each queued item once so a blocked overlap cannot stall disjoint I/O.
+        for _ in range(len(self._pending_queue)):
+            if len(self._in_flight_requests) >= self._max_in_flight:
+                break
             request_id, spec = self._pending_queue.popleft()
+            if self._join_overlaps:
+                with self._submission_lock:
+                    cancelled = request_id in self._cancelled_requests
+                if cancelled:
+                    self._release_handoff_locks(request_id)
+                    self._abort_request(_build_request(request_id, spec))
+                    continue
+                if self._awaits_overlapping_fill(spec):
+                    if request_id not in self._dependency_waiters:
+                        self._dependency_waiters.add(request_id)
+                        self._joined_total += 1
+                    self._pending_queue.append((request_id, spec))
+                    continue
             try:
                 self._start_lookup_phase(request_id, spec)
             except Exception:
@@ -1042,6 +1165,24 @@ class PrefetchController(StorageControllerInterface):
                 request = self._in_flight_requests.get(request_id)
                 if request is not None:
                     self._abort_request(request)
+            finally:
+                self._dependency_waiters.discard(request_id)
+                self._release_handoff_locks(request_id)
+
+    def _awaits_overlapping_fill(self, spec: PrefetchTaskSpec) -> bool:
+        """Wait only for common objects that an active request has not locked in L1."""
+        for active in self._in_flight_requests.values():
+            shared = _overlapping_keys(spec.key_groups, active.key_groups)
+            if not shared:
+                continue
+            resident = {
+                key
+                for _owner, locked in active.key_states.l1_locked_keys.items()
+                for key in _gather_keys(active.key_groups, locked)
+            }
+            if shared - resident:
+                return True
+        return False
 
     # =========================================================================
     # Lookup phase
@@ -1546,6 +1687,14 @@ class PrefetchController(StorageControllerInterface):
     # =========================================================================
 
     def _finish_request(self, request: InFlightPrefetchRequest) -> None:
+        """Settle a request while serializing cancellation with result transfer."""
+        if self._join_overlaps:
+            with self._submission_lock:
+                self._settle_request(request)
+        else:
+            self._settle_request(request)
+
+    def _settle_request(self, request: InFlightPrefetchRequest) -> None:
         """Settle the request's L1 locks and publish its result.
 
         For `prefix` loading, it will do fold-unfold. It will also touch the
@@ -1555,9 +1704,6 @@ class PrefetchController(StorageControllerInterface):
             request: The request to finish. Its L2 locked map and reserved
                 map hold nothing at this point.
 
-        Note:
-            Reads and writes only ``request.key_states`` and the result
-            store.
         """
         states = request.key_states
         found = states.l1_locked_keys.merge()
@@ -1575,6 +1721,12 @@ class PrefetchController(StorageControllerInterface):
             hit_cells = Bitmap2D(all_grouped(found.to_list()))
         else:
             hit_cells = found
+
+        if self._join_overlaps and request.request_id in self._in_flight_requests:
+            self._hold_dependency_handoffs(request, hit_cells)
+        if self._join_overlaps:
+            if request.request_id in self._cancelled_requests:
+                hit_cells = hit_cells.zeros_like()
 
         for l1_idx, locked in states.l1_locked_keys.items():
             if request.lock_mode == PrefetchLockMode.NO_LOCK:
@@ -1633,9 +1785,24 @@ class PrefetchController(StorageControllerInterface):
         self, request: InFlightPrefetchRequest, result: PrefetchResult
     ) -> None:
         """Store the request's result and wake any waiter."""
-        with self._prefetch_results_lock:
-            self._completed_results[request.request_id] = result
-            # Wake any WAIT_PREFETCH_STATUS handler blocked on this result.
+        if self._join_overlaps:
+            with self._submission_lock:
+                if request.request_id in self._cancelled_requests:
+                    self._cancelled_requests.remove(request.request_id)
+                    self._accepted_specs.pop(request.request_id, None)
+                    with self._prefetch_results_cv:
+                        self._prefetch_results_cv.notify_all()
+                    return
+                self._store_result(request.request_id, result)
+        else:
+            self._store_result(request.request_id, result)
+
+    def _store_result(
+        self, request_id: PrefetchRequestId, result: PrefetchResult
+    ) -> None:
+        """Publish a result after its reader ownership has been settled."""
+        with self._prefetch_results_cv:
+            self._completed_results[request_id] = result
             self._prefetch_results_cv.notify_all()
 
     def _abort_request(self, request: InFlightPrefetchRequest) -> None:
@@ -1656,6 +1823,37 @@ class PrefetchController(StorageControllerInterface):
     def _retire_request(self, request: InFlightPrefetchRequest) -> None:
         """Remove a finished request from the in-flight table."""
         self._in_flight_requests.pop(request.request_id, None)
+        self._dependency_waiters.discard(request.request_id)
+
+    def _hold_dependency_handoffs(
+        self, request: InFlightPrefetchRequest, hit_cells: Bitmap2D
+    ) -> None:
+        """Pin shared completed objects until each waiting lookup reserves its refs."""
+        for waiter_id, spec in self._pending_queue:
+            shared = _overlapping_keys(request.key_groups, spec.key_groups)
+            if not shared:
+                continue
+            held = self._handoff_locks.setdefault(waiter_id, {})
+            for owner, locked in request.key_states.l1_locked_keys.items():
+                keys = shared.intersection(
+                    _gather_keys(request.key_groups, locked & hit_cells)
+                )
+                keys.difference_update(held.get(owner, set()))
+                if not keys:
+                    continue
+                reserved = self._l1_managers[owner].reserve_read(list(keys), 1)
+                pinned = {
+                    key
+                    for key, (error, _obj) in reserved.items()
+                    if error == L1Error.SUCCESS
+                }
+                held.setdefault(owner, set()).update(pinned)
+
+    def _release_handoff_locks(self, request_id: PrefetchRequestId) -> None:
+        """Return only the temporary handoff refs owned by one waiting handle."""
+        for owner, keys in self._handoff_locks.pop(request_id, {}).items():
+            if keys:
+                self._l1_managers[owner].finish_read(list(keys), read_locks=1)
 
     def _release_all_locks(
         self,
@@ -1724,4 +1922,25 @@ class PrefetchController(StorageControllerInterface):
                 len(request.get_flattened_keys()),
             )
             self._release_all_locks(request, outcomes)
+            if self._join_overlaps:
+                self._publish_empty_result(request)
             self._retire_request(request)
+        if self._join_overlaps:
+            self._drain_submission_queue()
+            while self._pending_queue:
+                request_id, spec = self._pending_queue.popleft()
+                self._release_handoff_locks(request_id)
+                self._publish_empty_result(_build_request(request_id, spec))
+                self._dependency_waiters.discard(request_id)
+
+    def _publish_empty_result(self, request: InFlightPrefetchRequest) -> None:
+        """Publish a terminal miss after resource ownership has been settled."""
+        empty = Bitmap2D.zeros(len(request.key_groups), len(request.key_groups[0].keys))
+        self._publish_result(
+            request,
+            PrefetchResult(
+                hit_cells=empty.to_list(),
+                l1_hit_cells=empty.zeros_like().to_list(),
+                l2_hit_cells=empty.zeros_like().to_list(),
+            ),
+        )

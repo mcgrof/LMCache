@@ -164,6 +164,8 @@ def make_controller(
     adapters: list,
     policy: PrefetchPolicy | None = None,
     max_in_flight: int = 8,
+    join_overlaps: bool = False,
+    max_pending: int = 1024,
 ) -> PrefetchController:
     """Build a controller over one L1 manager and the given adapters."""
     return PrefetchController(
@@ -173,6 +175,8 @@ def make_controller(
         adapter_descriptors=[make_descriptor(i) for i in range(len(adapters))],
         policy=policy or DefaultPrefetchPolicy(),
         max_in_flight=max_in_flight,
+        join_overlaps=join_overlaps,
+        max_pending=max_pending,
     )
 
 
