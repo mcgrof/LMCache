@@ -20,6 +20,14 @@ helper stream, whose failures would require an additional drain contract; do not
 introduce that consumer for this synchronous fingerprint copy. CPU snapshots use
 synchronous independent copies and need no device event.
 
+The manager also uploads completed CPU snapshots into new tensors on the
+registered device. Retain those host inputs and each new device destination
+through the same stream-completion contract. A provisional rotary generation
+owns preparation buffers without publishing a blend state; its context owner
+must be the actual receiving client. Upload completion alone does not publish
+that generation or enable runtime discovery. See the
+[ordered registration design](kmesh_rotary_snapshot.md) for the remaining path.
+
 If any device operation raises, attempt to drain the actual registered stream.
 A successful drain permits releasing the borrows but does not make the failed
 copy usable. A failed drain retains every buffer and both borrows in a

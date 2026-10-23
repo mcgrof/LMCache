@@ -27,7 +27,7 @@ from lmcache.v1.multiprocess.context_ownership import (
 )
 from lmcache.v1.multiprocess.kmesh_device_copy import RetainedTensorCopies
 from lmcache.v1.multiprocess.kmesh_domains import KMeshFenceError
-from lmcache.v1.multiprocess.modules.blend.rope import BorrowedRope
+from lmcache.v1.multiprocess.modules.blend.rope import BorrowedRope, provisional_rope
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
     BorrowedContext,
     ContextEntry,
@@ -51,7 +51,7 @@ class HostDestination:
         self.driver = driver
         self.values: torch.Tensor | None = None
 
-    def copy_(self, source: DeviceInput, non_blocking: bool) -> None:
+    def copy_(self, source: DeviceInput | torch.Tensor, non_blocking: bool) -> None:
         assert non_blocking
         self.driver.work.append((weakref.ref(self), weakref.ref(source)))
         self.driver.fail("copy")
@@ -83,7 +83,8 @@ class ControlledDriver:
         self.fail("wait")
 
     def allocate(self, tensor: object, **kwargs: Any) -> HostDestination:
-        assert kwargs["device"] == "cpu" and kwargs["pin_memory"] is True
+        device = torch.device(kwargs["device"])
+        assert kwargs["pin_memory"] == (device.type == "cpu")
         self.fail("allocate")
         target = HostDestination(self)
         self.destinations.append(weakref.ref(target))
@@ -102,12 +103,13 @@ class ControlledDriver:
         for target_ref, source_ref in self.work:
             target, source = target_ref(), source_ref()
             assert target is not None and source is not None
-            target.values = source.values.clone()
+            values = source if isinstance(source, torch.Tensor) else source.values
+            target.values = values.clone()
         self.work.clear()
 
 
 def controlled_borrows(
-    monkeypatch: pytest.MonkeyPatch, driver: ControlledDriver
+    monkeypatch: pytest.MonkeyPatch, driver: ControlledDriver, location: str = "device"
 ) -> tuple[BorrowedContext, BorrowedRope, ContextOwnership, ContextOwnership]:
     """Use real ownership holds with explicitly simulated device metadata."""
     monkeypatch.setattr(
@@ -137,7 +139,11 @@ def controlled_borrows(
         paged_hold,
     )
     state = SimpleNamespace(
-        cos_sin_caches=[DeviceInput(torch.arange(16).reshape(2, 8))],
+        cos_sin_caches=[
+            torch.arange(16).reshape(2, 8)
+            if location == "host"
+            else DeviceInput(torch.arange(16).reshape(2, 8))
+        ],
         context_identity=paged_owner.identity,
         ownership=rotary_owner,
     )
@@ -304,3 +310,86 @@ def test_interrupted_copy_keeps_both_holds_until_a_verified_drain(
     assert manager.drain_quarantined() == 0
     assert paged_owner.pending == rotary_owner.pending == 0
     manager.close()
+
+
+def test_completed_host_snapshot_prepares_without_replacing_registered_state() -> None:
+    with rotary_server() as (blend, transfer):
+        context, before = transfer.context_identity(99), blend.rope_identity(99)
+        assert context is not None and before is not None
+        values = torch.arange(16, dtype=torch.float32).reshape(2, 8)
+        with request_session("zmq", b"worker"):
+            paged = transfer.borrow_context(99, context, lambda: None)
+            owned = provisional_rope(context, [values], 8, True, [0], [], [], "")
+        assert owned.state.ownership.identity != before.rotary
+        manager = RetainedTensorCopies()
+        result = manager.copy_to_device(paged, owned)
+        assert torch.equal(result[0], values)
+        result[0].zero_()
+        assert values.count_nonzero().item() > 0
+        assert blend.rope_identity(99) == before
+        assert manager.pending == owned.state.ownership.pending == 0
+        manager.close()
+
+
+@pytest.mark.parametrize("owner", [None, b"foreign"])
+def test_provisional_generation_requires_the_actual_context_owner(
+    owner: bytes | None,
+) -> None:
+    with rotary_server() as (blend, transfer):
+        context, before = transfer.context_identity(99), blend.rope_identity(99)
+        assert context is not None
+        with request_session("zmq", owner) if owner is not None else nullcontext():
+            with pytest.raises(RuntimeError):
+                provisional_rope(context, [torch.ones(2, 8)], 8, True, [0], [], [], "")
+        assert blend.rope_identity(99) == before
+
+
+@pytest.mark.parametrize(
+    "failure,uncertain",
+    [
+        ("", False),
+        ("copy", False),
+        ("synchronize", False),
+        ("copy", True),
+        ("synchronize", True),
+    ],
+)
+def test_upload_retains_completed_host_sources_and_new_device_destinations(
+    monkeypatch: pytest.MonkeyPatch, failure: str, uncertain: bool
+) -> None:
+    driver = ControlledDriver(failure)
+    driver.drain_fails = uncertain
+    paged, rotary, paged_owner, rotary_owner = controlled_borrows(
+        monkeypatch, driver, "host"
+    )
+    manager = RetainedTensorCopies()
+    if failure:
+        with pytest.raises(KMeshFenceError, match="copy failed"):
+            manager.copy_to_device(paged, rotary)
+        assert (
+            manager.pending
+            == paged_owner.pending
+            == rotary_owner.pending
+            == int(uncertain)
+        )
+    else:
+        result = manager.copy_to_device(paged, rotary)
+        assert torch.equal(result[0].values, torch.arange(16).reshape(2, 8))
+        assert manager.pending == paged_owner.pending == rotary_owner.pending == 0
+    assert "import" not in driver.events and "wait" not in driver.events
+    driver.drain_fails = False
+    assert manager.drain_quarantined() == 0
+    assert paged_owner.pending == rotary_owner.pending == 0
+    manager.close()
+
+
+def test_upload_refuses_device_inputs_before_submitting_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = ControlledDriver()
+    paged, rotary, paged_owner, rotary_owner = controlled_borrows(monkeypatch, driver)
+    manager = RetainedTensorCopies()
+    with pytest.raises(KMeshFenceError, match="one registered device"):
+        manager.copy_to_device(paged, rotary)
+    assert not driver.events and manager.pending == 0
+    assert paged_owner.pending == rotary_owner.pending == 0

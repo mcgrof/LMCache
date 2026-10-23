@@ -36,9 +36,62 @@ _FP8_FLAVOR_TO_AT_SCALAR = {
 }
 
 
+def provisional_rope(
+    context: ContextIdentity,
+    caches: list[torch.Tensor],
+    head_size: int,
+    is_neox_style: bool,
+    group_to_cache: list[int],
+    group_rot: list[tuple[int, int] | None],
+    group_head_size: list[int],
+    kv_quant: str,
+) -> "BorrowedRope":
+    """Own unpublished rotary tensors for an exact receiving client's context.
+
+    Args:
+        context: Actual paged generation whose owner must match this request.
+        caches: Exact raw inputs or completed host snapshots to retain.
+        head_size: Rotary width from separately validated group geometry.
+        is_neox_style: Rotation style from that geometry.
+        group_to_cache: Validated engine-group to cache mapping.
+        group_rot: Validated rotation windows.
+        group_head_size: Validated per-group head widths.
+        kv_quant: Declared cache quantization format.
+
+    Returns:
+        An unpublished generation's first borrow, consumable by retained copies.
+        This does not install a blend state or authorize runtime discovery.
+
+    Raises:
+        ContextOwnershipError: The actual receiving client does not own context.
+        RuntimeError: No transport request identity is active.
+    """
+    session = get_request_session()
+    if context.owner_session != session:
+        raise ContextOwnershipError(
+            "provisional rotary context belongs to another client"
+        )
+    state = _CBRopeState(
+        head_size=head_size,
+        is_neox_style=is_neox_style,
+        cos_sin_caches=list(caches),
+        group_to_cache=list(group_to_cache),
+        group_rot=list(group_rot),
+        group_head_size=list(group_head_size),
+        kv_quant=kv_quant,
+        context_identity=context,
+    )
+    return BorrowedRope(
+        state, state.ownership.borrow(state.ownership.identity, session, lambda: None)
+    )
+
+
 @dataclass
 class _CBRopeState:
-    """Per-instance RoPE state IPC-shared from vLLM; dangles on reallocate.
+    """Own one registered or provisional rotary generation.
+
+    Worker-provided mappings require producer ordering and retained borrows.
+    Provisional host snapshots remain unpublished during device preparation.
 
     Models with per-layer-type RoPE (distinct local/global theta)
     register one cache per distinct rope and a per-layer index into

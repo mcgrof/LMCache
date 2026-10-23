@@ -1,13 +1,18 @@
 # Register a rotary snapshot before admitting device discovery
 
-Status: proposed. CPU runtime discovery and a retained-copy primitive exist.
-Device discovery and multiprocess KMesh engine admission remain disabled.
+Status: retained download/upload and unpublished rotary-ownership primitives
+are implemented. The ordered registration operation, canonical publication and
+exporter acknowledgement below are proposed. Device discovery and multiprocess
+KMesh engine admission remain disabled.
 
 A cache server must not normalize a worker's rotary cache before that worker
 has finished producing it. Waiting only when hashing the result is too late:
 the first normalization read may already have raced. For example, a worker
 initializing its cache on a non-default stream must supply an event recorded
 after that initialization, and the server must wait before reading any values.
+The worker must keep inputs unchanged until download completes. A producer
+event orders earlier writes; it does not exclude later writers or provide a
+kernel-enforced atomic snapshot.
 
 Use a dedicated ordered registration operation alongside the legacy blend
 registration API. Select and borrow the exact paged context for the receiving
