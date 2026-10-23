@@ -1,0 +1,145 @@
+// SPDX-License-Identifier: Apache-2.0
+syntax = "proto3";
+
+package lmcache.mp;
+
+message KmeshContextIdentity {
+  string generation = 1;
+  optional string owner_session = 2;
+}
+
+message KmeshRopeIdentity {
+  KmeshContextIdentity rotary = 1;
+  optional KmeshContextIdentity context = 2;
+}
+
+message KmeshRegisteredRuntime {
+  KmeshContextIdentity context = 1;
+  KmeshRopeIdentity rotary = 2;
+  string model_name = 3;
+  int64 world_size = 4;
+  string layout_digest = 5;
+  string rope_digest = 6;
+  string kv_dtype = 7;
+  int64 chunk_tokens = 8;
+  string hash_algorithm = 9;
+}
+
+message KmeshSemanticIdentity {
+  string weights_digest = 1;
+  string model_config_digest = 2;
+  string tokenizer_digest = 3;
+  string rope_digest = 4;
+  string layout_digest = 5;
+  string kv_dtype = 6;
+  int64 chunk_tokens = 7;
+  string hash_algorithm = 8;
+  int64 schema = 9;
+  string key_schema = 10;
+  string adapter_identity = 11;
+}
+
+message KmeshServerDescriptor {
+  string boot_id = 1;
+  int64 store_epoch = 2;
+  string capabilities_digest = 3;
+}
+
+message KmeshDomainDescriptor {
+  string domain_id = 1;
+  int64 domain_epoch = 2;
+  int64 store_epoch = 3;
+  string boot_id = 4;
+  KmeshSemanticIdentity semantics = 5;
+}
+
+message KmeshRegistrationLease {
+  string registration_id = 1;
+  int64 lease_epoch = 2;
+  string engine_run = 3;
+  int64 world_size = 4;
+  string execution_digest = 5;
+  KmeshServerDescriptor server = 6;
+  KmeshDomainDescriptor domain = 7;
+}
+
+message KmeshWorkerFence {
+  KmeshRegistrationLease lease = 1;
+  int64 rank = 2;
+  int64 instance_id = 3;
+  string session_id = 4;
+  string token = 5;
+}
+
+message KmeshRegistrationStatus {
+  string state = 1;
+  int64 pending = 2;
+}
+
+message KmeshGetServerRequest {}
+message KmeshGetServerResponse {
+  optional KmeshServerDescriptor value = 1;
+  string error = 2;
+}
+
+message KmeshGetRuntimeRequest { int64 instance_id = 1; }
+message KmeshGetRuntimeResponse {
+  optional KmeshRegisteredRuntime value = 1;
+  string error = 2;
+}
+
+message KmeshOpenRegistrationRequest {
+  KmeshSemanticIdentity semantics = 1;
+  string engine_run = 2;
+  int64 world_size = 3;
+  string execution_digest = 4;
+}
+message KmeshOpenRegistrationResponse {
+  optional KmeshRegistrationLease value = 1;
+  string error = 2;
+}
+
+message KmeshBindWorkerRequest {
+  KmeshRegistrationLease lease = 1;
+  int64 rank = 2;
+  int64 instance_id = 3;
+  KmeshRegisteredRuntime expected = 4;
+  KmeshSemanticIdentity semantics = 5;
+  string execution_digest = 6;
+}
+message KmeshBindWorkerResponse {
+  optional KmeshWorkerFence value = 1;
+  string error = 2;
+}
+
+message KmeshHeartbeatRequest { KmeshWorkerFence fence = 1; }
+message KmeshHeartbeatResponse {
+  optional bool value = 1;
+  string error = 2;
+}
+
+message KmeshRegistrationStateRequest { KmeshRegistrationLease lease = 1; }
+message KmeshRegistrationStateResponse {
+  optional KmeshRegistrationStatus value = 1;
+  string error = 2;
+}
+
+message KmeshRevokeRegistrationRequest { KmeshRegistrationLease lease = 1; }
+message KmeshRevokeRegistrationResponse {
+  // Accepted-work debt only; zero does not acknowledge exporter teardown.
+  optional int64 value = 1;
+  string error = 2;
+}
+
+service KmeshService {
+  rpc KmeshGetServer(KmeshGetServerRequest) returns (KmeshGetServerResponse);
+  rpc KmeshGetRuntime(KmeshGetRuntimeRequest) returns (KmeshGetRuntimeResponse);
+  rpc KmeshOpenRegistration(KmeshOpenRegistrationRequest)
+      returns (KmeshOpenRegistrationResponse);
+  rpc KmeshBindWorker(KmeshBindWorkerRequest) returns (KmeshBindWorkerResponse);
+  rpc KmeshHeartbeat(KmeshHeartbeatRequest) returns (KmeshHeartbeatResponse);
+  rpc KmeshRegistrationState(KmeshRegistrationStateRequest)
+      returns (KmeshRegistrationStateResponse);
+  rpc KmeshRevokeRegistration(KmeshRevokeRegistrationRequest)
+      returns (KmeshRevokeRegistrationResponse);
+}

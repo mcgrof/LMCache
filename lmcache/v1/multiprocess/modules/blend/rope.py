@@ -18,6 +18,7 @@ from lmcache.v1.multiprocess.context_ownership import (
     ContextOwnership,
     ContextOwnershipError,
 )
+from lmcache.v1.multiprocess.context_ownership import RopeIdentity as RopeIdentity
 from lmcache.v1.multiprocess.transport.request_context import get_request_session
 
 # torch dtype -> at::ScalarType (rope dispatch); missing -> Python fallback.
@@ -137,14 +138,6 @@ class _CBRopeState:
                 f"cache mapping (map covers {len(self.group_to_cache)} groups)."
             )
         return self.cos_sin_caches[self.group_to_cache[engine_group_idx]]
-
-
-@dataclass(frozen=True, slots=True)
-class RopeIdentity:
-    """Identify one rotary registration and its original paged-cache context."""
-
-    rotary: ContextIdentity
-    context: ContextIdentity | None
 
 
 @dataclass(frozen=True)

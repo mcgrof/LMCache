@@ -24,6 +24,14 @@ class ContextIdentity:
     owner_session: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class RopeIdentity:
+    """Identify one rotary registration and its original paged-cache context."""
+
+    rotary: ContextIdentity
+    context: ContextIdentity | None
+
+
 class ContextHold:
     """Own one physical-completion obligation for a registered context.
 

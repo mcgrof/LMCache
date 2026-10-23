@@ -22,6 +22,13 @@ from lmcache.v1.multiprocess.custom_types import (
 )
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.multiprocess.kmesh_domains import (
+    RegistrationLease,
+    SemanticIdentity,
+    ServerDescriptor,
+    WorkerFence,
+)
+from lmcache.v1.multiprocess.kmesh_types import RegisteredRuntime, RegistrationStatus
 from lmcache.v1.multiprocess.rpc import rpc_method
 
 
@@ -39,6 +46,57 @@ class RequestServer(Protocol):
 
 class RequestClient(Protocol):
     """Typed, transport-neutral contract for multiprocess RPC clients."""
+
+    @rpc_method
+    def kmesh_get_server(self) -> MessagingFuture[tuple[ServerDescriptor | None, str]]:
+        """Return the server descriptor, or a refusal string with no descriptor."""
+        ...
+
+    @rpc_method
+    def kmesh_get_runtime(
+        self,
+        instance_id: int,
+    ) -> MessagingFuture[tuple[RegisteredRuntime | None, str]]: ...
+
+    @rpc_method
+    def kmesh_open_registration(
+        self,
+        semantics: SemanticIdentity,
+        engine_run: str,
+        world_size: int,
+        execution_digest: str,
+    ) -> MessagingFuture[tuple[RegistrationLease | None, str]]: ...
+
+    @rpc_method
+    def kmesh_bind_worker(
+        self,
+        lease: RegistrationLease,
+        rank: int,
+        instance_id: int,
+        expected: RegisteredRuntime,
+        semantics: SemanticIdentity,
+        execution_digest: str,
+    ) -> MessagingFuture[tuple[WorkerFence | None, str]]: ...
+
+    @rpc_method
+    def kmesh_heartbeat(
+        self,
+        fence: WorkerFence,
+    ) -> MessagingFuture[tuple[bool | None, str]]: ...
+
+    @rpc_method
+    def kmesh_registration_state(
+        self,
+        lease: RegistrationLease,
+    ) -> MessagingFuture[tuple[RegistrationStatus | None, str]]: ...
+
+    @rpc_method
+    def kmesh_revoke_registration(
+        self,
+        lease: RegistrationLease,
+    ) -> MessagingFuture[tuple[int | None, str]]:
+        """Return pending work after revoke; zero is not exporter teardown."""
+        ...
 
     @rpc_method
     def register_kv_cache(

@@ -30,6 +30,7 @@ from lmcache.v1.multiprocess.kmesh_domains import (
     ServerDescriptor,
     WorkerFence,
 )
+from lmcache.v1.multiprocess.kmesh_types import RegisteredRuntime as RegisteredRuntime
 from lmcache.v1.multiprocess.modules.blend.rope import BorrowedRope, RopeIdentity
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import BorrowedContext
 from lmcache.v1.multiprocess.transport.request_context import get_request_session
@@ -46,21 +47,6 @@ def _digest(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-
-
-@dataclass(frozen=True, slots=True)
-class RegisteredRuntime:
-    """Describe exact registered tensors without authorizing any operation."""
-
-    context: ContextIdentity
-    rotary: RopeIdentity
-    model_name: str
-    world_size: int
-    layout_digest: str
-    rope_digest: str
-    kv_dtype: str
-    chunk_tokens: int
-    hash_algorithm: str
 
 
 def _runtime(
@@ -222,7 +208,9 @@ class RegisteredWorkerBindings:
         self._blend = blend
         self._lock = threading.RLock()
         self._workers: dict[str, _BoundWorker] = {}
+        self._leases: dict[str, RegistrationLease] = {}
         self._operations: dict[str, BoundOperation] = {}
+        self._closing = False
 
     @property
     def server(self) -> ServerDescriptor:
@@ -235,6 +223,8 @@ class RegisteredWorkerBindings:
         runtime: RegisteredRuntime | None,
         revoke: Callable[[], None],
     ) -> tuple[BorrowedContext, BorrowedRope, ContextIdentity, RopeIdentity]:
+        if self._closing:
+            raise KMeshFenceError("server bindings are closing")
         context = (
             runtime.context if runtime else self._transfer.context_identity(instance_id)
         )
@@ -289,11 +279,15 @@ class RegisteredWorkerBindings:
     ) -> RegistrationLease:
         """Create a rank barrier for independently supplied worker semantics."""
         with self._lock:
+            if self._closing:
+                raise KMeshFenceError("server bindings are closing")
             self._release_revoked()
             domain = self._registry.open_domain(semantics)
-            return self._registry.open_registration(
+            lease = self._registry.open_registration(
                 domain, engine_run, world_size, execution_digest
             )
+            self._leases[lease.registration_id] = lease
+            return lease
 
     def bind(
         self,
@@ -455,6 +449,47 @@ class RegisteredWorkerBindings:
         with self._lock:
             self._registry.update_capabilities(operations)
             self._release_revoked()
+
+    def heartbeat(self, fence: WorkerFence) -> None:
+        """Refresh a live bound worker using its actual receiving client."""
+        with self._lock:
+            self._release_revoked()
+            worker = self._workers.get(fence.token)
+            if worker is None or worker.fence != fence:
+                raise KMeshFenceError("worker resources are no longer bound")
+            self._registry.heartbeat(fence, get_request_session())
+
+    def reap_expired(self) -> None:
+        """Release expired registration holds while retaining physical debt."""
+        with self._lock:
+            self._release_revoked()
+
+    def clear_store(self, clear: Callable[[], None]) -> None:
+        """Serialize admission through clear, refusing any accepted work.
+
+        Advance the logical generation before attempting physical clear. Keep
+        admission serialized until the callback returns, including on failure,
+        so a new registration cannot publish while storage is still clearing.
+        """
+        with self._lock:
+            if self._closing:
+                raise KMeshFenceError("server bindings are closing")
+            self.invalidate_store()
+            if self._operations:
+                raise KMeshFenceError("accepted KMesh work must drain before clear")
+            clear()
+
+    def close(self) -> None:
+        """Revoke registrations and refuse shutdown while physical debt remains."""
+        with self._lock:
+            self._closing = True
+            for lease in self._leases.values():
+                self._registry.revoke(lease)
+            for worker in tuple(self._workers.values()):
+                self._registry.revoke(worker.fence.lease)
+            self._release_revoked()
+            if self._operations:
+                raise KMeshFenceError("accepted KMesh work must drain before shutdown")
 
     def _operation(self, operation: BoundOperation) -> None:
         if self._operations.get(operation.ticket.token) is not operation:

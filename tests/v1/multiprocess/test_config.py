@@ -160,6 +160,41 @@ def test_transport_flag_is_parsed_without_starting_grpc():
     assert _parse_mp(["--transport", "grpc"]).transport == "grpc"
 
 
+@pytest.mark.parametrize("mode", ["lmcache_driven", "auto"])
+def test_kmesh_controls_require_an_explicit_compatible_server(mode: str) -> None:
+    assert not _parse_mp([]).enable_kmesh_control
+    config = _parse_mp(
+        [
+            "--engine-type",
+            "blend",
+            "--supported-transfer-mode",
+            mode,
+            "--enable-kmesh-control",
+        ]
+    )
+    assert config.enable_kmesh_control
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--enable-kmesh-control"],
+        [
+            "--engine-type",
+            "blend",
+            "--supported-transfer-mode",
+            "engine_driven",
+            "--enable-kmesh-control",
+        ],
+    ],
+)
+def test_incompatible_kmesh_control_config_refuses_before_server_setup(
+    arguments: list[str],
+) -> None:
+    with pytest.raises(ValueError, match="blend LMCache-driven server"):
+        _parse_mp(arguments)
+
+
 def test_null_block_id_defaults_to_zero():
     assert _parse_mp([]).null_block_id == 0
     assert MPServerConfig().null_block_id == 0

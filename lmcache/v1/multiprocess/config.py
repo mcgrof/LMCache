@@ -54,6 +54,10 @@ class MPServerConfig:
     """Cache engine backend type: 'default' for standard prefix caching,
     'blend' to compose the blend module (non-prefix KV reuse)."""
 
+    enable_kmesh_control: bool = False
+    """Enable registered-state control RPCs on a blend server. This does not
+    enable device discovery, storage execution or engine recovery."""
+
     separate_object_groups: bool = False
     """When True, split kernel groups into one object group per
     sliding-window size at KV-cache registration (hybrid models). When False
@@ -137,13 +141,21 @@ class MPServerConfig:
     different sentinel, for example ``-1``."""
 
     def __post_init__(self) -> None:
-        """Validate the worker-reaping timeouts.
+        """Validate control prerequisites and worker-reaping timeouts.
 
         Raises:
-            ValueError: If a timeout is non-finite, the reap timeout is
+            ValueError: If KMesh controls lack a blend/LMCache-driven engine,
+                or a timeout is non-finite, the reap timeout is
                 negative or a non-zero value below the 30 s floor, or the
                 registration grace is below the reap timeout.
         """
+        if type(self.enable_kmesh_control) is not bool:
+            raise ValueError("enable_kmesh_control must be a boolean")
+        if self.enable_kmesh_control and (
+            self.engine_type != "blend"
+            or self.supported_transfer_mode == "engine_driven"
+        ):
+            raise ValueError("KMesh controls require a blend LMCache-driven server")
         reap = self.worker_reap_timeout_seconds
         grace = self.worker_registration_grace_seconds
         if self.grpc_server_workers < 1:
@@ -529,6 +541,12 @@ def add_mp_server_args(
         "behind different prefixes is indexed once. No effect otherwise.",
     )
     mp_group.add_argument(
+        "--enable-kmesh-control",
+        action="store_true",
+        help="Enable registered-state control RPCs on a blend server. "
+        "Does not enable device discovery, storage execution or engine recovery.",
+    )
+    mp_group.add_argument(
         "--enable",
         type=str,
         nargs="*",
@@ -575,6 +593,7 @@ def parse_args_to_mp_server_config(
         separate_object_groups=args.separate_object_groups,
         enable_segmented_prefix=args.enable_segmented_prefix,
         enable_dedup_content=args.enable_dedup_content,
+        enable_kmesh_control=args.enable_kmesh_control,
         supported_transfer_mode=args.supported_transfer_mode,
         isolated_ipc=args.isolated_ipc,
         runtime_plugin_config=RuntimePluginConfig(

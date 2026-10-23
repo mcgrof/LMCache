@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 # Standard
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
@@ -29,6 +30,14 @@ class EngineModule(Protocol):
 
     def close(self) -> None:
         """Release resources owned by this module."""
+        ...
+
+
+class StoreClearGuard(Protocol):
+    """Serialize admission with physical clear while retaining accepted debt."""
+
+    def clear_store(self, clear: Callable[[], None]) -> None:
+        """Disarm the old generation and run clear only when work is drained."""
         ...
 
 

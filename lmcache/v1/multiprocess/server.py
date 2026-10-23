@@ -58,6 +58,7 @@ from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
 from lmcache.v1.multiprocess.modules.lookup import LookupModule
 from lmcache.v1.multiprocess.modules.management import ManagementModule
 from lmcache.v1.multiprocess.modules.p2p_controller import P2PController
+from lmcache.v1.multiprocess.request_handler import iter_request_handlers
 from lmcache.v1.multiprocess.transport.base import RequestServer
 from lmcache.v1.multiprocess.transport.server_factory import create_request_server
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
@@ -271,26 +272,48 @@ def _build_modules(
         liveness_targets.append(module)
         experimental_transfer.append(enabled_module)
 
+    kmesh_control = None
+    if mp_config.enable_kmesh_control:
+        # First Party
+        from lmcache.v1.multiprocess.modules.blend import BlendModule
+        from lmcache.v1.multiprocess.modules.kmesh_control import KMeshControlModule
+
+        if not isinstance(blend_module, BlendModule):
+            raise ValueError("KMesh controls require an assembled blend module")
+        assert lmcache_driven_module is not None
+        kmesh_control = KMeshControlModule(ctx, lmcache_driven_module, blend_module)
+        liveness_targets.append(kmesh_control)
+
     management = ManagementModule(
         ctx,
         liveness_targets=liveness_targets,
         worker_reap_timeout_seconds=mp_config.worker_reap_timeout_seconds,
         worker_registration_grace_seconds=mp_config.worker_registration_grace_seconds,
         experimental_transfer=experimental_transfer,
+        store_clear_guard=kmesh_control,
     )
 
-    # ManagementModule precedes the transfer/blend modules so close() stops
-    # and joins the reaper before those modules clear their state and before
-    # storage_manager.close() runs.
+    # Stop the reaper before control/transfer teardown. Revoke KMesh holds
+    # before paged/rotary registrations and the storage manager close.
     blend_modules = [blend_module] if blend_module is not None else []
-    return [
+    modules: list[EngineModule] = [
         lookup_module,
         p2p_controller,
         management,
+        *([kmesh_control] if kmesh_control is not None else []),
         *transfer_modules,
         *experimental_modules,
         *blend_modules,
     ]
+    if kmesh_control is not None:
+        kmesh_control.set_handler_inventory(
+            [
+                handler.operation
+                for module in modules
+                for handler in iter_request_handlers(module)
+            ]
+        )
+    return modules
 
 
 def run_cache_server(

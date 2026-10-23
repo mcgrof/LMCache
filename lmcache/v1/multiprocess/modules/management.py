@@ -10,7 +10,10 @@ from lmcache.logging import init_logger
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.multiprocess.custom_types import BlockAllocationRecord
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
-from lmcache.v1.multiprocess.engine_module import InstanceLivenessTarget
+from lmcache.v1.multiprocess.engine_module import (
+    InstanceLivenessTarget,
+    StoreClearGuard,
+)
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
 from lmcache.v1.periodic_thread import (
     PeriodicThread,
@@ -42,6 +45,7 @@ class ManagementModule:
             registered but never pinged.
         experimental_transfer: Types of experimental intermediate tensor
             transfer built in the server.
+        store_clear_guard: Optional registered-state admission/drain boundary.
     """
 
     def __init__(
@@ -51,6 +55,7 @@ class ManagementModule:
         worker_reap_timeout_seconds: float = 0.0,
         worker_registration_grace_seconds: float = 0.0,
         experimental_transfer: Sequence[str] = (),
+        store_clear_guard: StoreClearGuard | None = None,
     ) -> None:
         self._ctx = ctx
         self._clear_lock = threading.Lock()
@@ -58,6 +63,7 @@ class ManagementModule:
         self._reap_timeout = worker_reap_timeout_seconds
         self._reap_grace = worker_registration_grace_seconds
         self._experimental_transfer = tuple(experimental_transfer)
+        self._store_clear_guard = store_clear_guard
 
         # Periodic reaper, started only when reaping is enabled and there is
         # something to scan. Scans every reap_timeout/4, so an instance is
@@ -162,9 +168,16 @@ class ManagementModule:
     def clear(self, force: bool = False) -> None:
         """Clear all stored KV cache data from the storage manager."""
         with self._clear_lock:
-            self._ctx.storage_manager.memcheck()
-            self._ctx.storage_manager.clear(force=force)
-            self._ctx.storage_manager.memcheck()
+
+            def clear() -> None:
+                self._ctx.storage_manager.memcheck()
+                self._ctx.storage_manager.clear(force=force)
+                self._ctx.storage_manager.memcheck()
+
+            if self._store_clear_guard is None:
+                clear()
+            else:
+                self._store_clear_guard.clear_store(clear)
 
     @request_handler(operation="noop")
     def debug(self) -> str:
