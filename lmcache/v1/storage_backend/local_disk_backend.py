@@ -16,6 +16,7 @@ from lmcache import torch_dev, torch_device_type
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import CacheEngineKey, DiskCacheMetadata, _lmcache_nvtx_annotate
+from lmcache.v1.buffered_file import read_file_range_into
 from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
@@ -752,8 +753,7 @@ class LocalDiskBackend(StorageBackendInterface):
 
         try:
             if not fblock_aligned or not self.use_odirect:
-                with open(path, "rb") as f:
-                    f.readinto(buffer)
+                read_file_range_into(path, memoryview(buffer))
             else:
                 fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
                 with os.fdopen(fd, "rb", buffering=0) as fdo:
