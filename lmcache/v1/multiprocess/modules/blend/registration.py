@@ -2,6 +2,7 @@
 """Blend registration: rope state attach/detach (STORE hook: store.py)."""
 
 # Standard
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -18,10 +19,16 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.multiprocess.context_ownership import ContextIdentity, ContextOwnership
 from lmcache.v1.multiprocess.custom_types import DeviceIPCWrapper
 from lmcache.v1.multiprocess.modules.blend.rope import (
     _FP8_FLAVOR_TO_AT_SCALAR,
+    BorrowedRope,
+    RopeIdentity,
     _CBRopeState,
+    borrow_rope,
+    replace_rope_state,
+    rope_identity,
 )
 from lmcache.v1.multiprocess.request_handler import request_handler
 
@@ -51,6 +58,26 @@ class RegistrationMixin:
             self, gpu_context: Any, rope_state: _CBRopeState, max_batch: int
         ) -> Any: ...
 
+    def rope_identity(self, instance_id: int) -> RopeIdentity | None:
+        """Read rotary/context generations without authorizing a restore."""
+        return rope_identity(self._cb_rope_state, instance_id)
+
+    def borrow_rope(
+        self,
+        instance_id: int,
+        expected: RopeIdentity,
+        context_identity: ContextIdentity,
+        revoke: Callable[[], None],
+    ) -> BorrowedRope:
+        """Retain exact rotary state beside the caller's paged-context borrow."""
+        return borrow_rope(
+            self._cb_rope_state, instance_id, expected, context_identity, revoke
+        )
+
+    def drop_rope_state(self, instance_id: int) -> bool:
+        """Disarm borrowers and prove rotary holds drained before dropping state."""
+        return replace_rope_state(self._cb_rope_state, instance_id, None)
+
     @request_handler()
     def cb_register_rope(
         self,
@@ -67,8 +94,9 @@ class RegistrationMixin:
     ) -> None:
         """Attach CB re-RoPE state to a registered KV-cache instance.
 
-        Idempotent; requires a prior ``REGISTER_KV_CACHE``. Strips any baked-in
-        YaRN/longrope mscale so re-RoPE stays a pure rotation.
+        Require a prior ``REGISTER_KV_CACHE`` and retire the previous rotary
+        generation before replacement. Strip baked-in YaRN/longrope mscale so
+        re-RoPE stays a pure rotation.
 
         Args:
             instance_id: KV-cache instance to attach rope state to.
@@ -94,6 +122,8 @@ class RegistrationMixin:
             ValueError: On a missing KV cache, bad ``group_to_cache``
                 coverage, a malformed ``group_rot`` entry, or an unknown
                 ``kv_quant`` flavor.
+            ContextOwnershipError: Prior rotary work or revocation did not
+                drain, or another registration replaced the selected state.
         """
         entry = self._transfer_module.get_and_touch_context_entry(instance_id)
         if entry is None:
@@ -101,6 +131,10 @@ class RegistrationMixin:
                 f"Instance {instance_id} has no paged KV cache registered; "
                 "send REGISTER_KV_CACHE before CB_REGISTER_ROPE."
             )
+        ownership = getattr(entry, "ownership", None)
+        context_identity = (
+            ownership.identity if type(ownership) is ContextOwnership else None
+        )
         # Zero caches is legal (NoPE): rope state still carries scatter
         # geometry; every re-RoPE consumer skips.
         if group_to_cache:
@@ -167,7 +201,7 @@ class RegistrationMixin:
                 cos_sin_cache = (_c32 / _m).to(cos_sin_cache.dtype)
             cos_sin_caches.append(cos_sin_cache)
 
-        self._cb_rope_state[instance_id] = _CBRopeState(
+        state = _CBRopeState(
             head_size=head_size,
             is_neox_style=is_neox_style,
             cos_sin_caches=cos_sin_caches,
@@ -175,7 +209,9 @@ class RegistrationMixin:
             group_rot=norm_rot,
             group_head_size=list(group_head_size),
             kv_quant=kv_quant,
+            context_identity=context_identity,
         )
+        replace_rope_state(self._cb_rope_state, instance_id, state)
 
         logger.info(
             "Registered CB rope state for instance %d "
@@ -220,7 +256,7 @@ class RegistrationMixin:
     @request_handler()
     def cb_unregister_rope(self, instance_id: int) -> None:
         """Drop the instance's CB rope state; the paged KV cache stays intact."""
-        self._cb_rope_state.pop(instance_id, None)
+        self.drop_rope_state(instance_id)
         if self._transfer_module.get_and_touch_context_entry(instance_id) is None:
             logger.warning(
                 "cb_unregister_rope: instance %d not registered", instance_id

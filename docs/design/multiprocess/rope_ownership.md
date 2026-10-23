@@ -1,6 +1,8 @@
 # Registered rotary-cache ownership
 
-Status: proposed. KMesh multiprocess admission remains closed.
+Status: registered rotary generations, borrows and retirement are implemented.
+CPU controls use actual shared-memory tensors and simulated receiving-client
+context. Device completion and KMesh multiprocess admission remain unqualified.
 
 The server registers rotary cos/sin tensors separately from the paged KV cache.
 An instance number alone cannot identify either registration: the same worker

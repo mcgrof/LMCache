@@ -201,10 +201,11 @@ class BlendModule(
         if self._coordinator is not None:
             # Joins the client's daemon thread and closes its httpx.Client.
             self._coordinator.close()
-        self._cb_rope_state.clear()
+        for instance_id in tuple(self._cb_rope_state):
+            self.drop_rope_state(instance_id)
 
     def drop_instance_state(self, instance_id: int) -> None:
         """Drop CB rope state for a reaped instance (InstanceLivenessTarget
         hook); the GPU cache context is owned by LMCacheDrivenTransferModule."""
-        if self._cb_rope_state.pop(instance_id, None) is not None:
+        if self.drop_rope_state(instance_id):
             logger.info("Dropped CB rope state for reaped instance %d", instance_id)

@@ -2,14 +2,23 @@
 """Blend re-RoPE state and geometry (pure: no server context or streams)."""
 
 # Standard
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
+import threading
 
 # Third Party
 import torch
 
 # First Party
 from lmcache.v1.gpu_connector.kv_format import get_spec_class
+from lmcache.v1.multiprocess.context_ownership import (
+    ContextHold,
+    ContextIdentity,
+    ContextOwnership,
+    ContextOwnershipError,
+)
+from lmcache.v1.multiprocess.transport.request_context import get_request_session
 
 # torch dtype -> at::ScalarType (rope dispatch); missing -> Python fallback.
 _TORCH_TO_AT_SCALAR = {
@@ -46,6 +55,8 @@ class _CBRopeState:
     group_head_size: list[int] = field(default_factory=list)
     # fp8 flavor of the paged KV ("fp8_e4m3"/"fp8_e5m2"); "" = unquantized.
     kv_quant: str = ""
+    context_identity: ContextIdentity | None = None
+    ownership: ContextOwnership = field(default_factory=ContextOwnership, repr=False)
 
     def head_size_for_group(self, engine_group_idx: int) -> int:
         """The scatter head size for one engine group.
@@ -126,6 +137,94 @@ class _CBRopeState:
                 f"cache mapping (map covers {len(self.group_to_cache)} groups)."
             )
         return self.cos_sin_caches[self.group_to_cache[engine_group_idx]]
+
+
+@dataclass(frozen=True, slots=True)
+class RopeIdentity:
+    """Identify one rotary registration and its original paged-cache context."""
+
+    rotary: ContextIdentity
+    context: ContextIdentity | None
+
+
+@dataclass(frozen=True)
+class BorrowedRope:
+    """Retain the exact rotary tensors until their device consumers complete."""
+
+    state: _CBRopeState
+    hold: ContextHold
+
+    def release(self) -> None:
+        """Report physical completion; keep the paged-context hold separately."""
+        self.hold.release()
+
+
+# Protect state selection and compare-and-replace, never callbacks or drain waits.
+_registration_lock = threading.Lock()
+
+
+def rope_identity(
+    states: dict[int, _CBRopeState], instance_id: int
+) -> RopeIdentity | None:
+    """Read a registration snapshot without granting reuse or refreshing liveness."""
+    with _registration_lock:
+        state = states.get(instance_id)
+        if state is None:
+            return None
+        return RopeIdentity(state.ownership.identity, state.context_identity)
+
+
+def borrow_rope(
+    states: dict[int, _CBRopeState],
+    instance_id: int,
+    expected: RopeIdentity,
+    context_identity: ContextIdentity,
+    revoke: Callable[[], None],
+) -> BorrowedRope:
+    """Borrow rotary state for the actual client and an already-borrowed context.
+
+    The caller must retain that separate paged-context hold throughout this
+    borrow. The returned state, rather than a new instance lookup, supplies the
+    exact rotary tensors. Retirement disarms users before waiting for holds.
+    """
+    session = get_request_session()
+    with _registration_lock:
+        state = states.get(instance_id)
+        if (
+            state is None
+            or expected.context is None
+            or expected.context != context_identity
+            or state.context_identity != context_identity
+        ):
+            raise ContextOwnershipError("rotary context registration changed")
+        hold = state.ownership.borrow(expected.rotary, session, revoke)
+        return BorrowedRope(state, hold)
+
+
+def replace_rope_state(
+    states: dict[int, _CBRopeState],
+    instance_id: int,
+    replacement: _CBRopeState | None,
+    timeout: float = 5.0,
+) -> bool:
+    """Retire the selected generation before installing or removing its state.
+
+    Failed drain retains the old state with admission closed. A concurrent
+    replacement cannot overwrite a generation installed since selection. No
+    dictionary lock is held while revocation callbacks or physical work drain.
+    """
+    with _registration_lock:
+        previous = states.get(instance_id)
+    if previous is not None:
+        previous.ownership.retire(timeout)
+    with _registration_lock:
+        if states.get(instance_id) is not previous:
+            raise ContextOwnershipError("concurrent rotary registration changed")
+        if replacement is None:
+            states.pop(instance_id, None)
+        else:
+            states[instance_id] = replacement
+    return previous is not None
 
 
 def _cb_group_rope_geometry(
