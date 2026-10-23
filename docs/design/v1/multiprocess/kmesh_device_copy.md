@@ -1,8 +1,9 @@
 # Retain registered tensors through device fingerprint copies
 
-Status: the CPU registration controls are implemented. The device-copy
-component described here is proposed. It does not enable device runtime
-discovery, storage recovery or multiprocess KMesh inference.
+Status: the copy component and controlled CPU failure tests are implemented.
+Real CUDA IPC tests are provided but require separate device qualification.
+The component is not connected to runtime discovery or engine admission.
+It does not enable storage recovery or multiprocess KMesh inference.
 
 A server deriving a rotary-cache fingerprint must copy actual registered
 tensors to host memory. For example, cancelling the request after the first
