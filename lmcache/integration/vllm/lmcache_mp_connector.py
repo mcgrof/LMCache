@@ -59,6 +59,10 @@ from lmcache.integration.vllm.external_singleflight import (
     build_identity,
 )
 from lmcache.integration.vllm.family_prefetch import FamilyPrefetchRegistry
+from lmcache.integration.vllm.kmesh_mp_handoff import (
+    KMESH_MP_HANDOFF_UNSUPPORTED,
+    reject_kmesh_mp_target_profile,
+)
 from lmcache.integration.vllm.kv_cache_group_edits import (
     apply_kv_cache_group_edits,
     validate_kv_cache_groups,
@@ -83,6 +87,7 @@ from lmcache.integration.vllm.lmcache_mp_metrics import (
 from lmcache.integration.vllm.mp_server_launcher import (
     is_mp_server_autostart_enabled,
 )
+from lmcache.integration.vllm.target_profile import KMESH_TARGET_PROFILE_KEY
 from lmcache.integration.vllm.utils import (
     mla_only,
     vllm_layout_hints,
@@ -572,7 +577,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             ValueError: If cache geometry or auto-start configuration is invalid,
                 including auto-start with multiple server endpoints.
             ConnectionError: If the configured MP server cannot be reached.
+            NotImplementedError: An unsupported KMesh target profile is set.
         """
+        transfer = vllm_config.kv_transfer_config
+        if transfer is not None:
+            reject_kmesh_mp_target_profile(
+                transfer.get_from_extra_config(KMESH_TARGET_PROFILE_KEY, None)
+            )
         # Older supported vLLM releases allow connectors to omit this value,
         # while current vLLM's type declaration requires it.
         super().__init__(vllm_config, role, kv_cache_config)  # type: ignore[arg-type]
@@ -869,6 +880,15 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             "lmcache.mp.transfer_intermediate_tensors", False
         )
         return vllm_transfer
+
+    def validate_kmesh_handoff_contract(self) -> None:
+        """Refuse KMesh proof even when this ordinary instance has no profile.
+
+        Raises:
+            NotImplementedError: MP KMesh metadata/span execution and its live
+                server/context/completion evidence are not qualified.
+        """
+        raise NotImplementedError(KMESH_MP_HANDOFF_UNSUPPORTED)
 
     # ==============================
     # Worker-side methods

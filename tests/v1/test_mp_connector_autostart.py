@@ -86,13 +86,33 @@ def test_connector_multiserver_autostart_fails_before_network(
         module.LMCacheMPWorkerAdapter.assert_not_called()
         module.validate_dcp_support.assert_not_called()
     else:
-        module.LMCacheMPConnector(config, role)
+        connector = module.LMCacheMPConnector(config, role)
         adapter = (
             module.LMCacheMPSchedulerAdapter
             if role_name == "SCHEDULER"
             else module.LMCacheMPWorkerAdapter
         )
         adapter.assert_called_once()
+        with pytest.raises(NotImplementedError, match="qualified KMesh handoff"):
+            connector.validate_kmesh_handoff_contract()
+
+
+@pytest.mark.parametrize("role_name", ["SCHEDULER", "WORKER"])
+@pytest.mark.parametrize("profile", ["serial_pic_v1", "collective_lockstep_v1", False])
+def test_kmesh_profile_refuses_before_adapter_or_base_construction(
+    connector_module: ModuleType, role_name: str, profile: object
+) -> None:
+    module = connector_module
+    role = getattr(module.KVConnectorRole, role_name)
+    extra = {"kmesh_target_profile": profile}
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(get_from_extra_config=extra.get)
+    )
+    with pytest.raises(NotImplementedError, match="qualified KMesh handoff"):
+        module.LMCacheMPConnector(config, role)
+    module.KVConnectorBase_V1.__init__.assert_not_called()
+    module.LMCacheMPSchedulerAdapter.assert_not_called()
+    module.LMCacheMPWorkerAdapter.assert_not_called()
 
 
 @pytest.mark.parametrize("role_name", ["SCHEDULER", "WORKER"])
