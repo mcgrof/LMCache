@@ -3,6 +3,7 @@
 
 # Standard
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Any, Callable, Generic, TypeVar, get_type_hints
 import enum
@@ -30,6 +31,7 @@ from lmcache.v1.multiprocess.futures import (
 from lmcache.v1.multiprocess.request_handler import HandlerType
 from lmcache.v1.multiprocess.rpc import RpcOperation, RpcSpec, get_rpc_spec
 from lmcache.v1.multiprocess.transport.base import RequestServer
+from lmcache.v1.multiprocess.transport.request_context import request_session
 from lmcache.v1.multiprocess.transport.zmq_impl.wire import (
     decode_operation,
     encode_operation,
@@ -489,11 +491,17 @@ class BlockingRequestHandler(RequestHandlerBase[ResponseType]):
             "Call add_normal_thread_pool or add_affinity_thread_pool first."
         )
         decoded_payloads = unwrap_request_payloads(payloads, self.payload_clss)
+        request_context = copy_context()
         if isinstance(self.executor, AffinityThreadPool):
             return self.executor.submit(
-                self.handler, *decoded_payloads, affinity_key=affinity_key
+                request_context.run,
+                self.handler,
+                *decoded_payloads,
+                affinity_key=affinity_key,
             )
-        return self.executor.submit(self.handler, *decoded_payloads)
+        return self.executor.submit(
+            request_context.run, self.handler, *decoded_payloads
+        )
 
     def get_response_class(self) -> ResponseType:
         return self.response_cls
@@ -650,11 +658,12 @@ class MessageQueueServer(RequestServer):
 
                 if handler_entry := self.handlers.get(operation):
                     try:
-                        self._call_handler(
-                            handler_entry=handler_entry,
-                            payloads=payloads,
-                            prefix_frames=[identity, b_request_uid, b_operation],
-                        )
+                        with request_session("zmq", identity):
+                            self._call_handler(
+                                handler_entry=handler_entry,
+                                payloads=payloads,
+                                prefix_frames=[identity, b_request_uid, b_operation],
+                            )
                     except Exception:
                         logger.exception("Error handling operation %s", operation)
                 else:

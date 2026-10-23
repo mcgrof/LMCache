@@ -4,6 +4,7 @@
 # Standard
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Any, Callable
 import threading
@@ -34,6 +35,7 @@ from lmcache.v1.multiprocess.transport.grpc_impl.proto_codec import (
     RequestDecoder,
     ResponseEncoder,
 )
+from lmcache.v1.multiprocess.transport.request_context import request_session
 
 logger = init_logger(__name__)
 
@@ -78,7 +80,8 @@ class _GeneratedServicer:
             raise AttributeError(method_name)
 
         def invoke(request: Any, context: grpc.ServicerContext) -> Any:
-            return self._dispatch(handler, request, context)
+            with request_session("grpc", self._client_identity(context)):
+                return self._dispatch(handler, request, context)
 
         return invoke
 
@@ -105,6 +108,7 @@ class _GeneratedServicer:
                 affinity_key = self._affinity_key(context)
                 with self._affinity_submit_lock:
                     future = self._affinity_pool.submit(
+                        copy_context().run,
                         registered.handler,
                         *payloads,
                         affinity_key=affinity_key,
@@ -112,7 +116,7 @@ class _GeneratedServicer:
                 result = future.result()
             elif registered.handler_type is HandlerType.BLOCKING:
                 result = self._normal_pool.submit(
-                    registered.handler, *payloads
+                    copy_context().run, registered.handler, *payloads
                 ).result()
             else:
                 raise NotImplementedError(
@@ -122,6 +126,20 @@ class _GeneratedServicer:
         except NotImplementedError as exc:
             context.abort(grpc.StatusCode.UNIMPLEMENTED, str(exc))
             raise RuntimeError("gRPC context abort unexpectedly returned") from exc
+
+    @staticmethod
+    def _client_identity(context: grpc.ServicerContext) -> bytes | None:
+        identities = [
+            value
+            for key, value in context.invocation_metadata()
+            if key == _CLIENT_ID_METADATA_KEY
+        ]
+        if len(identities) != 1:
+            return None
+        identity = identities[0]
+        if type(identity) is not bytes or not 0 < len(identity) <= 1024:
+            return None
+        return identity
 
     @staticmethod
     def _affinity_key(context: grpc.ServicerContext) -> int:
