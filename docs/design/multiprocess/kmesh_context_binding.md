@@ -1,6 +1,8 @@
 # KMesh registered worker binding
 
-Status: proposed server-side binding. Engine admission remains closed.
+Status: CPU runtime discovery and registration/transaction binding are
+implemented. Device discovery, storage execution and engine admission remain
+closed pending their separate completion and namespace qualification.
 
 A worker restoring the same update at a different token position needs its
 actual paged and rotary registrations. A scheduler's model label or digest echo
@@ -14,6 +16,9 @@ world size. Exclude addresses, device placement and allocated block capacity
 from semantic compatibility. Retain those exact contexts separately for use.
 The first binding accepts uncompressed BF16 full-attention KV without adapters,
 recurrent state, quantization or sliding windows. Unsupported cases must refuse.
+Initial discovery uses CPU-mapped tensors. Device discovery must retain both
+borrows through verified copy completion and quarantine uncertain copy failures;
+refuse device tensors before hashing until that completion backend is qualified.
 
 Compare server-derived layout and rotary digests with the independently supplied
 worker semantics before binding its rank in the domain registry. Persistent

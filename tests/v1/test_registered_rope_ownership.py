@@ -41,6 +41,10 @@ from lmcache.v1.platform.devices.cpu.shm import migrate_to_shm_and_wrap
 @contextmanager
 def rotary_server(
     owner: bytes | None = b"worker",
+    *,
+    hash_algorithm: str = "sha256_cbor",
+    world_size: int = 1,
+    num_blocks: int = 16,
 ) -> Iterator[tuple[BlendModule, LMCacheDrivenTransferModule]]:
     # Eight MiB bounds a synthetic DRAM store; registration performs no storage IO.
     context = MPCacheServerContext(
@@ -49,11 +53,11 @@ def rotary_server(
             EvictionConfig("LRU"),
         ),
         chunk_size=8,
-        hash_algorithm="sha256_cbor",
+        hash_algorithm=hash_algorithm,
     )
     transfer = LMCacheDrivenTransferModule(context)
     blend = BlendModule(context, transfer)
-    kv = torch.zeros((2, 16, 4, 2, 8), dtype=torch.bfloat16)
+    kv = torch.zeros((2, num_blocks, 4, 2, 8), dtype=torch.bfloat16)
     rotary = torch.zeros((64, 8), dtype=torch.float32)
     rotary[:, :4] = 1
     wrappers = [migrate_to_shm_and_wrap(tensor) for tensor in (kv, rotary)]
@@ -63,7 +67,7 @@ def rotary_server(
                 99,
                 [wrappers[0]],
                 "synthetic-model",
-                1,
+                world_size,
                 EngineType.VLLM,
                 {"kv_layout": "NHD"},
                 [],
