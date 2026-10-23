@@ -1,7 +1,9 @@
 # Registered context ownership
 
-Status: proposed. KMesh MP admission remains closed. These rules extend the
-domain registry's accepted-work debt to the actual registered cache context.
+Status: registration identity, context holds and retirement are implemented and
+tested with actual CPU cache registrations through both request transports.
+KMesh MP admission remains closed. Binding these holds to KMesh transactions
+and actual device completion remains required.
 
 A worker instance number can survive deregistration and be reused for different
 tensors. The actual context registration therefore needs a fresh opaque
@@ -34,8 +36,18 @@ Normal transfers that never borrow add no accepted-work holds. Their existing
 stream-completion shutdown remains in force. This increment must not change
 store/prefetch retention, failure chains or metadata lookup ownership.
 
-CPU tests must cover ownerless and mismatched-session refusal, fresh generation
-after replacement, close/borrow races, multiple accepted holds, repeated close,
-and failed revocation. Real registration tests must use actual cache contexts
-and request dispatch. These are prerequisites for serial position-recovery
-execution, not evidence of model equivalence or device-I/O correctness.
+A legacy unregister response is not a KMesh drain acknowledgement. Before an
+exporter releases its tensors, the KMesh adapter must establish transaction
+completion and receive its own positive teardown acknowledgement. Retaining a
+server-side context after failure does not prove an exporter can safely exit.
+Arbitrary exporter death with outstanding device work remains unqualified.
+
+`tests/v1/test_context_ownership.py` covers ownerless and mismatched-session
+refusal, fresh generation, multiple holds, repeated close, failed revocation
+and concurrent retirement while a callback is incomplete.
+`tests/v1/test_registered_context_ownership.py` uses actual shared CPU tensors,
+an eight-MiB DRAM store and both request transports. It checks foreign-client
+refusal, no-op refresh ownership, deregistration/reaping with pending holds and
+replacement with distinct tensor contents. Completion is controlled by the CPU
+test; it does not attest a device event. These are prerequisites for serial
+position-recovery, not evidence of model equivalence or device-I/O correctness.

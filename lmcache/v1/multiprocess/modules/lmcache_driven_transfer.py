@@ -2,7 +2,8 @@
 """LMCache-driven KV cache transfer operations for the MPCacheServer."""
 
 # Standard
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any, Sequence
 import threading
 import time
@@ -23,6 +24,12 @@ from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.kv_layer_groups import ObjectGroupInfo
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType, next_transfer_key
+from lmcache.v1.multiprocess.context_ownership import (
+    ContextHold,
+    ContextIdentity,
+    ContextOwnership,
+    ContextOwnershipError,
+)
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheServerKey,
     KVCache,
@@ -40,6 +47,7 @@ from lmcache.v1.multiprocess.object_group_transfer import (
     transfer_kv_per_object_group,
 )
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
+from lmcache.v1.multiprocess.transport.request_context import get_request_session
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
 from lmcache.v1.platform.base.event_ipc import (
     EventIPCBackend,
@@ -151,6 +159,8 @@ class ContextEntry:
             PING. Selects the reap window (timeout vs registration grace).
             Latched only by PING, never by traffic.
         event_backend: Cached event backend selected for this context's device.
+        ownership: Registration identity and opt-in completion holds. Ordinary
+            transfers add no holds; all retirements close borrow admission.
     """
 
     cache_context: BaseCacheContext
@@ -159,6 +169,19 @@ class ContextEntry:
     last_seen: float = 0.0
     has_liveness_signal: bool = False
     event_backend: EventIPCBackend | None = None
+    ownership: ContextOwnership = field(default_factory=ContextOwnership)
+
+
+@dataclass(frozen=True)
+class BorrowedContext:
+    """An exact context entry retained until server work physically completes."""
+
+    entry: ContextEntry
+    hold: ContextHold
+
+    def release(self) -> None:
+        """Report that all work using this context has physically completed."""
+        self.hold.release()
 
 
 class LMCacheDrivenTransferModule(InstanceLivenessTarget):
@@ -322,6 +345,56 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         with self._lock:
             return dict(self._cache_contexts)
 
+    def context_identity(self, instance_id: int) -> ContextIdentity | None:
+        """Read a context's generation and owner without refreshing liveness.
+
+        A snapshot alone cannot authorize work;
+        borrow_context() checks the actual request session and retains the exact
+        context through retirement. A no-op registration refresh keeps identity.
+
+        Args:
+            instance_id: Worker instance whose registration to inspect.
+
+        Returns:
+            Immutable generation/owner snapshot, or None when unregistered.
+        """
+        with self._lock:
+            entry = self._cache_contexts.get(instance_id)
+        return entry.ownership.identity if entry is not None else None
+
+    def borrow_context(
+        self,
+        instance_id: int,
+        expected: ContextIdentity,
+        revoke: Callable[[], None],
+    ) -> BorrowedContext:
+        """Borrow the exact current registration for the receiving client.
+
+        The caller must execute against the returned entry rather than look up
+        instance_id again, and retain its hold until physical completion.
+        Retirement invokes revoke outside the registry lock before closing the
+        context. Stale, ownerless, retiring or foreign-session entries refuse.
+
+        Args:
+            instance_id: Registered worker instance to borrow.
+            expected: Snapshot from context_identity().
+            revoke: Disarm the borrower's lease before context retirement.
+
+        Returns:
+            Exact context entry and its physical-completion hold.
+
+        Raises:
+            ContextOwnershipError: Missing, stale, foreign or retiring context.
+            RuntimeError: Called without an actual request-client session.
+        """
+        session = get_request_session()
+        with self._lock:
+            entry = self._cache_contexts.get(instance_id)
+        if entry is None:
+            raise ContextOwnershipError("context is not registered")
+        hold = entry.ownership.borrow(expected, session, revoke)
+        return BorrowedContext(entry, hold)
+
     def touch_instance(self, instance_id: int) -> None:
         """Refresh the worker's last-seen time and mark it ping-proven.
 
@@ -400,9 +473,13 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             return
         for entry in entries:
             try:
+                entry.ownership.retire()
                 entry.cache_context.close()
             except RuntimeError:
-                logger.exception("GPU context shutdown did not prove stream completion")
+                logger.exception(
+                    "Cache context shutdown did not prove ownership "
+                    "and stream completion"
+                )
                 _RETAINED_TRANSFER_CONTEXTS.append(entry)
                 continue
             self._ctx.layout_desc_registry.unregister(
