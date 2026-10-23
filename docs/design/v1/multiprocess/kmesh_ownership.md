@@ -2,8 +2,9 @@
 
 ## Scope of this increment
 
-This design proposes CPU ownership rules for an opt-in KMesh multi-process
-data plane. Status: design only; the registry and request adapters are proposed.
+`kmesh_domains.py` implements CPU ownership rules for an opt-in KMesh
+multi-process data plane. Status: the registry and its CPU tests are implemented;
+the request adapters are proposed. No connector or request handler is enabled.
 Ordinary MP store, lookup, retained reads and completion handling are unchanged.
 The public KMesh target admission remains closed for MP execution.
 
@@ -105,16 +106,15 @@ Upgrade by draining, disarming, replacing processes and explicitly rearming.
 
 ## CPU validation
 
-The proposed `tests/v1/test_kmesh_domains.py` must test public APIs without native
-extensions. It must cover atomic opens, unsupported schemas/adapters, exact
-rank/session binding,
+`tests/v1/test_kmesh_domains.py` tests public APIs without native extensions.
+It covers atomic opens, unsupported schemas/adapters, exact rank/session binding,
 the generation rollback regression, startup/heartbeat expiry, failed drain debt,
 stale writer refusal, namespace drift across index/store/reboot boundaries,
 unrelated registrations and publication serialized against revocation. These
-tests will establish the ownership rules only; they will not attest an RPC
+tests establish the ownership rules only; they do not attest an RPC
 session, model, device, storage backend, or kernel transport.
 
-Once implemented, run the CPU suite in an environment with pytest installed:
+Run the CPU suite in an environment with pytest installed:
 
 ```sh
 uv run --no-project --with pytest python -m pytest -q -ra \
