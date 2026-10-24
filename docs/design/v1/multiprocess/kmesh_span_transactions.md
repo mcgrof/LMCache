@@ -149,3 +149,43 @@ slots before restore. Inject an exception after real slot-map gather and refuse
 its first drain; retirement must wait, and later physical drain must settle the
 operation without another gather. This storage extension still supplies no
 model-repair consumer or DMA-BUF performance result.
+
+## A source segment with a partial final chunk
+
+A model consumer can request 416 tokens from a 512-token cached segment. Saving
+or restoring only complete 256-token chunks changes that baseline. Admit the
+exact positive token count and allocate its ceiling number of complete storage
+objects. Keep the token count in the immutable handle; padding is storage, not
+additional valid model state.
+
+The existing native slot-map gather derives its token stride from the output
+tensor shape. Passing a shorter slot map beside a full-size tensor would read
+past that map. For a partial final object, gather only valid slots into a packed
+prefix view of that same registered host buffer, shaped by the exact valid token
+count. Keep the packed view, object and physical I/O lease until server-observed
+device-context drain. After that drain, copy the packed prefix into a temporary
+CPU tensor, zero the canonical full object, then repack the valid K/V rows into
+its full-chunk strides. Checksum and admit only this canonical representation.
+There is no additional GPU-to-host staging copy and no source-slot padding read.
+
+Block transfer remains available for complete chunks at aligned source starts.
+A partial final chunk uses slot gathering in the qualified two-plane NHD/HND
+formats. Refuse unsupported formats or objects crossing a host-registration
+range before launching that gather. Native submission errors retain their actual
+packed views through exception ownership and unresolved physical cleanup.
+
+Restore builds full-object matches except for the final valid token extent. The
+native positional planner stages and rotates full canonical chunks, including
+zero padding, but scatters only the handle's valid coordinates. Shifted matches
+must have rotary-table capacity for that padded chunk at both positions; refuse
+a short table before native launch. Padding must never become a worker
+cache hit or overwrite the destination's following token. Extend the registered
+planner's coordinate validation to equal positive lengths at most one chunk;
+its accepted-resource and physical-completion contracts remain unchanged.
+
+Qualify tails shorter than a block, tails spanning blocks, a one-token segment,
+multilayer NHD/HND rotation, both source and destination interior positions, exact
+unchanged values, poisoned neighboring slots and a second canonical-source
+restore. Fail after real partial gathering and refuse drain to verify no source
+publication and no early host-buffer release. These storage gates still do not
+establish the model consumer's deeper-layer repair or DMA-BUF performance.
