@@ -81,3 +81,16 @@ Keep all worker allocations and producer events until validating that receipt,
 or until observing importing-process exit. Missing status, a disconnect, a zero
 copy count or a legacy reply is not release evidence. These transport identities
 coordinate cooperative clients; they do not authenticate a hostile peer.
+
+Storage admission result prerequisite
+-------------------------------------
+
+``StorageManager.finish_write_with_status`` returns each captured key's actual
+L1 admission result. A batch can contain successes and failures; callers must
+check every requested key before publishing a logical source span. Existing
+``finish_write_by_owner`` retains its void interface and event reporting.
+
+Both interfaces require device completion first. Their owner/key groups do not
+identify reservation generations. A delayed completion therefore needs unique,
+immutable physical keys to avoid admitting a replacement reservation. This
+status API alone does not enable managed span execution or model recovery.

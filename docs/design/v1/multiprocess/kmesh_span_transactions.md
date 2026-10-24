@@ -1,8 +1,10 @@
 # Publish and restore immutable spans under an accepted KMesh operation
 
-Status: design only. Managed raw registration, ordered rotary preparation and
-checked release are separately qualified. Storage execution and the actual
-multiprocess model consumer remain disabled.
+Status: the owner-routed per-key write-status API is implemented and passes
+actual CPU L1 admission/readback controls. Native registered-resource planning
+and span execution remain design only. Managed raw registration, ordered rotary
+preparation and checked release are separately qualified. The multiprocess
+model consumer remains disabled.
 
 Registration ownership does not establish storage publication. The ordinary
 transfer handler records an event and queues a host callback that admits its

@@ -420,6 +420,28 @@ class StorageManager:
         retain their existing lifetime rules; an owner tag is not a write epoch.
         Single-L1 tracing retains the replayable finish_write(keys) record.
         """
+        self.finish_write_with_status(completion)
+
+    def finish_write_with_status(
+        self, completion: L1WriteCompletion
+    ) -> dict[ObjectKey, L1Error]:
+        """Admit captured owner/key groups and return every actual L1 result.
+
+        Args:
+            completion: Groups captured from the original reserved objects.
+
+        Returns:
+            Per-key admission outcomes, including failed or absent reservations.
+            A successful call can contain both successful and failed keys.
+
+        Raises:
+            ValueError: A captured owner is no longer registered.
+
+        The caller must first prove device completion. Owner/key groups are not
+        reservation epochs: use immutable unique physical keys when a delayed
+        completion could otherwise address a replacement reservation. Existing
+        resident keys can report success while discarding the staging copy.
+        """
         if any(owner not in self._l1_managers_by_id for owner, _ in completion):
             raise ValueError("write completion requires a registered L1 owner")
         if is_tracing_enabled() and len(self._l1_managers_by_id) == 1:
@@ -447,6 +469,7 @@ class StorageManager:
         )
 
         # TODO: global key states update
+        return finish_result
 
     def acquire_write_transfer_leases(
         self, objects: dict[ObjectKey, MemoryObj]
