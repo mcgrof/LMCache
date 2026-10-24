@@ -115,3 +115,35 @@ same-context physical restoration. ``loaded-needs-repair`` proves only I/O for
 changed positions or preceding context. None of these receipts implements the
 worker's model repair or marks vLLM tokens computed. Model and tokenizer artifact
 digests remain cooperative worker declarations, not server weight attestation.
+
+## Source positions inside a chunk
+
+The first native storage profile admits chunk-aligned source positions. That
+restriction cannot represent a shared segment beginning after a private prompt
+prefix, for example at source token five with a 256-token storage chunk. Chunk
+length is relative to the saved segment; it need not align the segment's first
+position to the original prompt. Destination rotation alone cannot fix a gather
+that selected the wrong source tokens.
+
+Keep the existing block transfer for aligned sources. For an unaligned source,
+build its exact slot map from the retained block table and original positions:
+``slot[p] = blocks[p // block_size] * block_size + p % block_size``. Use the
+existing native ``multi_layer_kv_transfer`` gather into each complete pinned CPU
+object. Its slot-map path supports the two-plane head-major and token-major
+layouts needed by the bounded full-attention worker. Refuse other unaligned
+formats until qualified, while preserving their existing aligned path.
+
+The accepting operation owns every slot-map tensor, pointer table and actual
+host-buffer I/O lease until the importing device context drains. A launch error
+can occur before the helper returns its new tensors; retain its exception frames
+as well as the accepted operation. Failed drain must withhold buffers and prevent
+admission. A later cleanup retries physical drain only, not the gather itself.
+No source handle may be published from partial or uncertain bytes.
+
+Qualify a nonzero unaligned source with multiple layers in both supported
+layouts, reversed noncontiguous blocks, positive and negative positional shifts,
+raw value equality and an independent key rotation. Poison the original source
+slots before restore. Inject an exception after real slot-map gather and refuse
+its first drain; retirement must wait, and later physical drain must settle the
+operation without another gather. This storage extension still supplies no
+model-repair consumer or DMA-BUF performance result.
