@@ -13,7 +13,10 @@ import torch
 from lmcache import torch_device_type
 from lmcache.logging import init_logger
 from lmcache.v1.compute.attention.metadata import LMCAttnMetadata
-from lmcache.v1.compute.blend.layer_source import BlendLayerSource
+from lmcache.v1.compute.blend.layer_source import (
+    BlendLayerSource,
+    UnsettledLayerSourceError,
+)
 from lmcache.v1.compute.blend.metadata import LMCBlendCommonMetadata, LMCBlendMetadata
 from lmcache.v1.compute.models.utils import infer_model_from_vllm
 from lmcache.v1.config import LMCacheEngineConfig
@@ -237,6 +240,8 @@ class LMCBlendSession:
         else:
             try:
                 self.close()
+            except UnsettledLayerSourceError:
+                raise
             except Exception:
                 logger.exception("CacheBlend cleanup failed after an exception")
         return False
@@ -523,6 +528,9 @@ class LMCBlendSession:
 
         self.metadata.clean()
         if errors:
+            for cleanup_error in errors:
+                if isinstance(cleanup_error, UnsettledLayerSourceError):
+                    raise cleanup_error
             raise RuntimeError("Failed to close CacheBlend session") from errors[0]
 
     @property
@@ -602,6 +610,8 @@ class LMCBlendSession:
     def _abort(self) -> None:
         try:
             self.close()
+        except UnsettledLayerSourceError:
+            raise
         except Exception:
             logger.exception("CacheBlend session cleanup failed during abort")
 
@@ -932,6 +942,13 @@ class LMCBlender:
                 "structure"
             )
         prepared = self._prepare_group_requests(requests)
+        if any(
+            request.retrieve_kwargs.get("layer_source") is not None
+            for request in prepared
+        ):
+            raise NotImplementedError(
+                "request-owned layer sources support serial sessions only"
+            )
         states = [_LMCBlendGroupMemberState(request=request) for request in prepared]
         collective_passes: list[LMCBlendCollectivePass] = []
 

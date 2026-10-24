@@ -80,6 +80,7 @@ from lmcache.v1.compute.blend import (
     LMCBlendGroupResult,
     LMCBlendOperationCounts,
 )
+from lmcache.v1.compute.blend.layer_source import UnsettledLayerSourceError
 from lmcache.v1.compute.models.utils import VLLMModelTracker
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
@@ -2673,6 +2674,10 @@ class LMCacheConnectorV1Impl:
                     "explicit lookup/retrieve race produced an all-false mask",
                 )
         except Exception as error:
+            if isinstance(error, UnsettledLayerSourceError):
+                # A failed retry must escape before scheduler blocks are made
+                # eligible for request-local recomputation.
+                error.drain()
             if contract.request_id not in self._kmesh_failed_worker_requests:
                 self._record_kmesh_load_failure(
                     contract,

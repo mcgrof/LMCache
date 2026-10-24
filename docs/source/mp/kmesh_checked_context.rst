@@ -160,3 +160,14 @@ completion. Its close operation must settle device work or retain unresolved
 physical ownership and report failure. This interface does not itself establish
 completed placement, engine block lifetime or model numerical qualification.
 The ordinary multiprocess connector's KMesh guard remains closed.
+
+Request-owned layer sources currently support serial sessions. Group execution
+refuses these sources before creating sessions. ``UnsettledLayerSourceError``
+retains the actual owner's physical cleanup operation. Session abort and close
+preserve this failure instead of hiding it behind an ordinary model error.
+The serial worker retries that operation before reporting blocks for request
+recomputation. If physical cleanup still fails, the error escapes the load step;
+the worker must retain its reservations and stop normal request continuation.
+
+Serializing this error carries failure text only. The physical cleanup callback
+and its live device resources remain in the owning worker.

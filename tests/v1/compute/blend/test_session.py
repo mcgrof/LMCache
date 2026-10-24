@@ -4,6 +4,7 @@ from collections.abc import Generator
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Optional, cast
+import pickle
 
 # Third Party
 import pytest
@@ -21,6 +22,7 @@ from lmcache.v1.compute.blend.blender import (
     LMCBlendOutcome,
     LMCBlendSession,
 )
+from lmcache.v1.compute.blend.layer_source import UnsettledLayerSourceError
 from lmcache.v1.compute.models.utils import VLLMModelTracker
 from lmcache.v1.gpu_connector.gpu_connectors import (
     VLLMBufferLayerwiseGPUConnector,
@@ -288,6 +290,76 @@ def test_bound_source_failure_closes_its_request_owned_buffers() -> None:
     assert source.engine.generators_closed == {"1"}
     assert all(buffer.release_count == 1 for buffer in source.engine.buffers["1"])
     assert not blender.cache_engine.retrieve_kwargs
+
+
+@dataclass
+class _UnsettledLayerSource(_ExplicitLayerSource):
+    def retrieve_layer(
+        self,
+        tokens: torch.Tensor,
+        mask: torch.Tensor | None,
+        *,
+        load_state: LayerwiseLoadState,
+    ) -> Generator[torch.Tensor | None, None, None]:
+        try:
+            yield from self.engine.retrieve_layer(tokens, mask, load_state=load_state)
+        finally:
+            raise UnsettledLayerSourceError("synthetic unresolved drain", self.drain)
+
+    def drain(self) -> None:
+        raise RuntimeError("synthetic cleanup still pending")
+
+
+@pytest.mark.parametrize("failure", ["retrieval", "caller", "close"])
+def test_unsettled_cleanup_escapes_session_error_containment(failure: str) -> None:
+    blender = _FakeBlender()
+    spans = ExplicitTokenSpans(3, TokenSpan(0, 3), (TokenSpan(0, 3),))
+    source = _UnsettledLayerSource(
+        spans, _FakeCacheEngine(3, failure=("1", 1) if failure == "retrieval" else None)
+    )
+    with pytest.raises(UnsettledLayerSourceError) as raised:
+        with blender.create_session(
+            torch.tensor([1, 2, 3]),
+            request_id="1",
+            layer_source=source,
+            explicit_spans=spans,
+        ) as session:
+            if failure == "caller":
+                session.prime()
+                raise ValueError("synthetic caller failure")
+            session.run()
+    with pytest.raises(RuntimeError, match="still pending"):
+        raised.value.drain()
+
+
+def test_unqualified_group_source_refuses_before_any_session() -> None:
+    blender = _FakeBlender()
+    spans = ExplicitTokenSpans(3, TokenSpan(0, 3), (TokenSpan(0, 3),))
+    source = _ExplicitLayerSource(spans, _FakeCacheEngine(3))
+    request = LMCBlendGroupRequest(
+        request_id="1",
+        tokens=torch.tensor([1, 2, 3]),
+        retrieve_kwargs={"layer_source": source, "explicit_spans": spans},
+    )
+    with pytest.raises(NotImplementedError, match="serial sessions"):
+        blender.blend_group((request,))
+    assert not blender.sessions and not source.engine.retrieve_kwargs
+
+
+def test_serialized_cleanup_error_keeps_the_actual_owner_local() -> None:
+    attempts = 0
+
+    def drain() -> None:
+        nonlocal attempts
+        attempts += 1
+
+    original = UnsettledLayerSourceError("synthetic unresolved device work", drain)
+    transported = pickle.loads(pickle.dumps(original))
+    assert type(transported) is RuntimeError
+    assert str(transported) == str(original)
+    assert attempts == 0
+    original.drain()
+    assert attempts == 1
 
 
 def test_session_marks_only_explicit_spans_for_gap_recompute() -> None:

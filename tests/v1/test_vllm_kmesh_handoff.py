@@ -92,6 +92,7 @@ from lmcache.v1.compute.blend import (
     LMCBlendGroupResult,
     LMCBlendOperationCounts,
 )
+from lmcache.v1.compute.blend.layer_source import UnsettledLayerSourceError
 from lmcache.v1.lifecycle import RetainedCall
 from tests.v1.instruction_monitoring import (
     InstructionInterruption,
@@ -3071,6 +3072,34 @@ def test_worker_gap_recompute_failure_rolls_back_prompt_and_suppresses_store(
     assert state._invalid_block_ids == {3, 5}
     assert state._test_worker_engine.store_calls == []
     assert state._test_worker_engine.scheduled == [metadata.requests[0].lookup_id]
+
+
+@pytest.mark.parametrize("allow_drain", [True, False])
+def test_worker_requires_physical_source_drain_before_fallback(
+    runtime: KMeshRuntimeEvidence, allow_drain: bool
+) -> None:
+    _, _, metadata = _build_new_request_metadata(runtime, lookup_result=3)
+    worker = _bind_worker(runtime, metadata)
+    blender = cast(_Blender, worker.blender)
+    attempts = 0
+
+    def drain() -> None:
+        nonlocal attempts
+        attempts += 1
+        if not allow_drain:
+            raise RuntimeError("synthetic device work has not drained")
+
+    blender.masks["request-a"] = UnsettledLayerSourceError(
+        "synthetic unresolved layer input", drain
+    )
+    if allow_drain:
+        worker.start_load_kv(cast(Any, _forward_context()))
+        assert worker.get_block_ids_with_load_errors() == {3, 5}
+    else:
+        with pytest.raises(RuntimeError, match="has not drained"):
+            worker.start_load_kv(cast(Any, _forward_context()))
+        assert worker.get_block_ids_with_load_errors() == set()
+    assert attempts == 1
 
 
 def test_worker_store_observes_exact_layer_order_and_flushes_once(
