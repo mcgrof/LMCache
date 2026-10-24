@@ -1,7 +1,8 @@
 # Acknowledge imported-memory retirement only after verified release
 
 Status: checked raw-wrapper reference release, import retirement and scoped
-mapping inspection are implemented; their hardware qualification is pending.
+mapping inspection pass three scoped CUDA cases on an RTX 4090. The full CUDA
+IPC regression module separately passes fourteen cases.
 Ordered rotary snapshots have separate copy-completion controls. The integrated
 retirement ledger and positive exporter-teardown acknowledgement below remain
 proposed. Multiprocess KMesh engine admission remains closed.
