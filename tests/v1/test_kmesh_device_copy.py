@@ -108,6 +108,55 @@ class ControlledDriver:
         self.work.clear()
 
 
+class ControlledRaw:
+    """Model import/close debt without creating a CUDA allocation or mapping."""
+
+    def __init__(self, driver: ControlledDriver) -> None:
+        self.driver = driver
+        self.tensor = DeviceInput(torch.arange(16).reshape(2, 8))
+        self.mapped = False
+        self.fail_import = False
+        self.fail_close = False
+        self.interrupt_close = False
+
+    def to_tensor(self) -> DeviceInput:
+        self.mapped = True
+        if self.fail_import:
+            raise RuntimeError("injected partial raw import")
+        return self.tensor
+
+    def close_checked(self) -> None:
+        self.driver.events.append("raw-close")
+        assert not self.driver.work, "mapping close before pending device reads drain"
+        if self.interrupt_close:
+            self.interrupt_close = False
+            raise KeyboardInterrupt("injected raw close interruption")
+        if self.fail_close:
+            raise RuntimeError("injected checked raw close refusal")
+        self.mapped = False
+
+
+def controlled_raw_borrows(
+    monkeypatch: pytest.MonkeyPatch, driver: ControlledDriver, count: int = 1
+) -> tuple[
+    BorrowedContext,
+    BorrowedRope,
+    ContextOwnership,
+    ContextOwnership,
+    list[ControlledRaw],
+]:
+    # First Party
+    from lmcache.v1.platform.devices.cuda import ipc_wrapper
+
+    paged, rotary, paged_owner, rotary_owner = controlled_borrows(monkeypatch, driver)
+    owners = [ControlledRaw(driver) for _ in range(count)]
+    rotary.state.cos_sin_caches.clear()
+    rotary.state.backing_handles = tuple(owners)
+    monkeypatch.setattr(ipc_wrapper, "RawCudaIPCWrapper", ControlledRaw)
+    monkeypatch.setattr(copy_module, "torch_device_type", "cuda")
+    return paged, rotary, paged_owner, rotary_owner, owners
+
+
 def controlled_borrows(
     monkeypatch: pytest.MonkeyPatch, driver: ControlledDriver, location: str = "device"
 ) -> tuple[BorrowedContext, BorrowedRope, ContextOwnership, ContextOwnership]:
@@ -165,6 +214,113 @@ def test_cpu_snapshot_uses_real_registration_and_independent_host_storage() -> N
         assert original.count_nonzero().item() > 0
         assert manager.pending == 0
         assert paged.entry.ownership.pending == rotary.state.ownership.pending == 0
+        manager.close()
+
+
+def test_raw_imports_are_owned_before_mapping_and_closed_after_copy_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = ControlledDriver()
+    paged, rotary, paged_owner, rotary_owner, owners = controlled_raw_borrows(
+        monkeypatch, driver
+    )
+    manager = RetainedTensorCopies()
+
+    def validate(actual_paged: BorrowedContext, actual_rotary: BorrowedRope) -> None:
+        assert actual_paged is paged and actual_rotary is rotary
+        assert manager.pending == paged_owner.pending == rotary_owner.pending == 1
+        assert owners[0].mapped
+
+    snapshots = manager.copy_raw_to_cpu(paged, rotary, b"producer-ready", validate)
+    assert torch.equal(snapshots[0].values, owners[0].tensor.values)
+    assert not owners[0].mapped
+    assert manager.pending == paged_owner.pending == rotary_owner.pending == 0
+    manager.close()
+
+
+def test_partial_raw_import_failure_releases_every_opened_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = ControlledDriver()
+    paged, rotary, paged_owner, rotary_owner, owners = controlled_raw_borrows(
+        monkeypatch, driver, 2
+    )
+    owners[1].fail_import = True
+    manager = RetainedTensorCopies()
+    with pytest.raises(KMeshFenceError, match="copy failed"):
+        manager.copy_raw_to_cpu(paged, rotary, b"producer-ready", lambda *_: None)
+    assert not any(owner.mapped for owner in owners)
+    assert manager.pending == paged_owner.pending == rotary_owner.pending == 0
+    manager.close()
+
+
+@pytest.mark.parametrize("failure", ["close", "interruption", "copy-undrained"])
+def test_raw_cleanup_debt_retains_borrows_until_later_actual_drain(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    driver = ControlledDriver("copy" if failure == "copy-undrained" else "")
+    paged, rotary, paged_owner, rotary_owner, owners = controlled_raw_borrows(
+        monkeypatch, driver
+    )
+    owners[0].fail_close = failure == "close"
+    owners[0].interrupt_close = failure == "interruption"
+    driver.drain_fails = failure == "copy-undrained"
+    manager = RetainedTensorCopies()
+    error = KeyboardInterrupt if failure == "interruption" else KMeshFenceError
+    with pytest.raises(error):
+        manager.copy_raw_to_cpu(paged, rotary, b"producer-ready", lambda *_: None)
+    assert manager.pending == paged_owner.pending == rotary_owner.pending == 1
+    assert owners[0].mapped
+    if failure == "copy-undrained":
+        assert "raw-close" not in driver.events
+    if failure == "close":
+        with pytest.raises(KMeshFenceError, match="must drain"):
+            manager.close()
+        assert manager.pending == paged_owner.pending == rotary_owner.pending == 1
+    owners[0].fail_close = driver.drain_fails = False
+    assert manager.drain_quarantined(paged_owner.identity) == 0
+    assert not owners[0].mapped
+    assert paged_owner.pending == rotary_owner.pending == 0
+    manager.close()
+
+
+def test_raw_metadata_refusal_does_not_return_or_publish_copied_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = ControlledDriver()
+    paged, rotary, paged_owner, rotary_owner, owners = controlled_raw_borrows(
+        monkeypatch, driver
+    )
+    manager = RetainedTensorCopies()
+
+    def refuse(*_: object) -> None:
+        raise ValueError("unsupported registered layout")
+
+    with pytest.raises(KMeshFenceError, match="copy failed"):
+        manager.copy_raw_to_cpu(paged, rotary, b"producer-ready", refuse)
+    assert not driver.destinations
+    assert not owners[0].mapped
+    assert manager.pending == paged_owner.pending == rotary_owner.pending == 0
+    manager.close()
+
+
+def test_raw_copy_refuses_cpu_context_and_releases_only_consumed_borrows() -> None:
+    with rotary_server() as (blend, transfer):
+        context, identity = transfer.context_identity(99), blend.rope_identity(99)
+        assert context is not None and identity is not None
+        with request_session("zmq", b"worker"):
+            paged = transfer.borrow_context(99, context, lambda: None)
+            rotary = blend.borrow_rope(99, identity, context, lambda: None)
+        manager = RetainedTensorCopies()
+        with pytest.raises(KMeshFenceError, match="unpublished CUDA inputs"):
+            manager.copy_raw_to_cpu(paged, rotary, b"", lambda *_: None)
+        assert (
+            manager.pending
+            == paged.entry.ownership.pending
+            == rotary.state.ownership.pending
+            == 0
+        )
         manager.close()
 
 

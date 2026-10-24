@@ -10,7 +10,9 @@ worker producer, and must retain the exporter until teardown is acknowledged.
 from __future__ import annotations
 
 # Standard
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, cast
 import threading
 import uuid
 
@@ -18,7 +20,7 @@ import uuid
 import torch
 
 # First Party
-from lmcache import torch_dev
+from lmcache import torch_dev, torch_device_type
 from lmcache.logging import init_logger
 from lmcache.v1.multiprocess.context_ownership import ContextIdentity
 from lmcache.v1.multiprocess.kmesh_domains import KMeshFenceError
@@ -26,6 +28,10 @@ from lmcache.v1.multiprocess.modules.blend.rope import BorrowedRope
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import BorrowedContext
 from lmcache.v1.platform.base.event_ipc import EventIPCBackend
 from lmcache.v1.platform.stream import synchronize_stream
+
+if TYPE_CHECKING:
+    # First Party
+    from lmcache.v1.platform.devices.cuda.ipc_wrapper import RawCudaIPCWrapper
 
 logger = init_logger(__name__)
 
@@ -42,6 +48,7 @@ class _Copy:
     stream: object
     backend: EventIPCBackend | None
     inputs: tuple[torch.Tensor, ...]
+    raw_owners: tuple[RawCudaIPCWrapper, ...] = ()
     targets: list[torch.Tensor] = field(default_factory=list)
     imported: object | None = None
     uncertain: bool = False
@@ -53,7 +60,9 @@ class RetainedTensorCopies:
 
     Successful copies return independent destination tensors. Failed copies never
     return partially populated snapshots. Uncertain driver failures retain
-    their borrows, inputs, destinations and events until a server-side drain.
+    their borrows, inputs, destinations and events until verified cleanup.
+    An ambiguous raw native outcome requires importer teardown rather than
+    another pointer-level close attempt.
     """
 
     def __init__(self) -> None:
@@ -101,6 +110,43 @@ class RetainedTensorCopies:
                 for copy in self._copies.values()
             )
 
+    def copy_raw_to_cpu(
+        self,
+        paged: BorrowedContext,
+        rotary: BorrowedRope,
+        producer_event: bytes,
+        validate_metadata: Callable[[BorrowedContext, BorrowedRope], None],
+    ) -> list[torch.Tensor]:
+        """Own raw imports before mapping and release them after physical drain.
+
+        Args:
+            paged: Exact CUDA context borrow, consumed on entry.
+            rotary: Unpublished generation with empty tensors and fresh receiving
+                raw wrappers in ``backing_handles``. Retain every import created
+                here, including partial imports if a later mapping fails.
+            producer_event: Worker event recorded after its last input write.
+            validate_metadata: Trusted server validator called with mapped
+                tensors before copying. It must inspect metadata only.
+
+        Returns:
+            Independent host snapshots after stream drain and checked release
+            of all owned raw references. This does not retire their allocations.
+
+        Raises:
+            KMeshFenceError: Unsupported state, failed import/validation/copy,
+                uncertain stream drain or checked mapping release. Physical
+                debt retains both borrows and all owners until verified cleanup.
+                Unknown native effects require importer teardown.
+        """
+        return self._copy_to(
+            paged,
+            rotary,
+            torch.device("cpu"),
+            producer_event,
+            raw_inputs=True,
+            validate_metadata=validate_metadata,
+        )
+
     def copy_to_device(
         self, paged: BorrowedContext, rotary: BorrowedRope
     ) -> list[torch.Tensor]:
@@ -142,10 +188,11 @@ class RetainedTensorCopies:
                     continue
                 try:
                     synchronize_stream(copy.device, copy.stream)
-                except RuntimeError:
-                    logger.exception("Registered tensor copy still has uncertain drain")
-                else:
                     self._release(token, copy)
+                except RuntimeError:
+                    logger.exception(
+                        "Registered copy drain or import cleanup is uncertain"
+                    )
             finally:
                 copy.lock.release()
         return self.pending if context is None else self.pending_for(context)
@@ -167,14 +214,40 @@ class RetainedTensorCopies:
         rotary: BorrowedRope,
         destination: torch.device,
         producer_event: bytes,
+        *,
+        raw_inputs: bool = False,
+        validate_metadata: Callable[[BorrowedContext, BorrowedRope], None]
+        | None = None,
     ) -> list[torch.Tensor]:
         cache = paged.entry.cache_context
         inputs = tuple(rotary.state.cos_sin_caches)
+        raw_owners: tuple[RawCudaIPCWrapper, ...] = ()
         try:
             source_device = (
                 cache.device if destination.type == "cpu" else torch.device("cpu")
             )
-            if not inputs or any(t.device != source_device for t in inputs):
+            if raw_inputs:
+                if (
+                    cache.device.type != "cuda"
+                    or torch_device_type != "cuda"
+                    or destination.type != "cpu"
+                    or inputs
+                ):
+                    raise KMeshFenceError("raw copy requires unpublished CUDA inputs")
+                # First Party
+                from lmcache.v1.platform.devices.cuda.ipc_wrapper import (
+                    RawCudaIPCWrapper,
+                )
+
+                if not rotary.state.backing_handles or any(
+                    type(owner) is not RawCudaIPCWrapper
+                    for owner in rotary.state.backing_handles
+                ):
+                    raise KMeshFenceError("raw copy requires owned raw CUDA wrappers")
+                raw_owners = cast(
+                    tuple[RawCudaIPCWrapper, ...], rotary.state.backing_handles
+                )
+            elif not inputs or any(t.device != source_device for t in inputs):
                 raise KMeshFenceError("copy requires one registered device")
             if rotary.state.context_identity != paged.entry.ownership.identity:
                 raise KMeshFenceError("rotary state belongs to another registration")
@@ -186,7 +259,15 @@ class RetainedTensorCopies:
             backend = paged.entry.event_backend
             if not cpu and backend is None:
                 raise KMeshFenceError("registered context has no event backend")
-            copy = _Copy(paged, rotary, cache.device, cache.stream, backend, inputs)
+            copy = _Copy(
+                paged,
+                rotary,
+                cache.device,
+                cache.stream,
+                backend,
+                inputs,
+                raw_owners=raw_owners,
+            )
         except BaseException:
             rotary.release()
             paged.release()
@@ -215,11 +296,23 @@ class RetainedTensorCopies:
             try:
                 with torch_dev.device(copy.device), torch_dev.stream(copy.stream):
                     backend.check_event_support(copy.device)
+                    if raw_inputs:
+                        copy.inputs = tuple(
+                            owner.to_tensor() for owner in copy.raw_owners
+                        )
+                        rotary.state.cos_sin_caches = list(copy.inputs)
+                        if any(t.device != source_device for t in copy.inputs):
+                            raise KMeshFenceError(
+                                "raw input device differs from context"
+                            )
                     if source_device.type != "cpu":
                         copy.imported = backend.import_event(
                             producer_event, copy.device
                         )
                         backend.wait_event(copy.imported, copy.stream)
+                    if raw_inputs:
+                        assert validate_metadata is not None
+                        validate_metadata(paged, rotary)
                     for tensor in copy.inputs:
                         target = torch.empty_like(
                             tensor,
@@ -252,6 +345,19 @@ class RetainedTensorCopies:
         with self._lock:
             if self._copies.get(token) is not copy:
                 return
+        if copy.raw_owners:
+            try:
+                for owner in copy.raw_owners:
+                    owner.close_checked()
+            except BaseException as error:
+                copy.uncertain = True
+                logger.exception("Retain raw copy after checked mapping release failed")
+                if isinstance(error, RuntimeError):
+                    raise KMeshFenceError(
+                        "raw import cleanup requires checked close"
+                    ) from error
+                raise
+        with self._lock:
             del self._copies[token]
             if not self._copies:
                 with _quarantine_lock:

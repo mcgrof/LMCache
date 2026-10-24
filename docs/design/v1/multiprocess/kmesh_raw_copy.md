@@ -1,8 +1,9 @@
 # Retain raw rotary imports before their first mapping attempt
 
-Status: proposed. Checked raw-wrapper reference release passes its separate
-three-case CUDA prerequisite. Raw rotary input preparation and integrated
-server retirement remain unimplemented; multiprocess engine admission is closed.
+Status: owned raw rotary import/copy/cleanup primitives are implemented and their
+CUDA qualification is pending. The native-outcome prerequisite passes six scoped
+CUDA cases. Typed raw registration and integrated server retirement remain
+unimplemented; multiprocess engine admission is closed.
 
 Ordered registration accepts PyTorch CUDA IPC inputs today. Extending it to raw
 imports needs ownership before calling ``to_tensor``. If importing a later table
