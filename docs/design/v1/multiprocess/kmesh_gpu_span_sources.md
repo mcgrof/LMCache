@@ -1,8 +1,10 @@
 # GPU-backed canonical span sources
 
-Status: design. The registered serial model replay must qualify before the
-storage-route comparison. The current native span executor accepts CPU-L1
-objects, and its default behavior remains the reference for this extension.
+Status: prototype. Eager pinned-host and GPU canonical objects, bounded working
+slots, retained repacking scratch and explicit raw-block storage configuration
+are implemented. Their GPU controls and actual model/storage comparison still
+need execution. The registered serial model replay must qualify before that
+comparison. Lazy CPU-L1 allocation remains the default reference.
 
 ## Use the existing raw-block ownership path
 
@@ -60,6 +62,12 @@ and scatter. The current model replay restores one canonical object per span
 operation, so this bound does not require a new multiwave scheduling algorithm.
 Rotate the working copies, never the immutable canonical source. Keep the
 partial valid extent and padded rotary-capacity rules unchanged.
+
+The eager pinned-host arm uses the same bounded preparation and empty native
+host-staging tables, with asynchronous host-to-device copies on the registered
+stream. Validate its actual pinned arena and registration-window boundary.
+This keeps the working-copy interface matched to the GPU arm without changing
+the existing lazy-host planner used by ordinary serving.
 
 ## Prove the storage route and consuming model
 

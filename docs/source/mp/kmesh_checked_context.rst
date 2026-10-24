@@ -22,9 +22,10 @@ An ambiguous native import or close outcome requires importing-process teardown;
 stream completion cannot make its old pointer safe to submit again.
 
 This check does not cover PyTorch storage, VMM or external driver imports.
-The constructor and close also refuse active GDS because the existing staging
-buffer deregistration interface logs backend errors. GPU-L1 storage therefore
-requires a separately qualified checked lifecycle before admission. A service
+The constructor and close also refuse an active GDSContext slab because its
+staging-buffer deregistration interface logs backend errors. The raw-block
+adapter's optional GPU L1 has separate arena ownership and close outcomes; it
+does not activate that slab or remove this guard. A service
 release receipt, storage namespace fencing and a model consumer are additional
 gates; this primitive does not grant any of them.
 
@@ -95,8 +96,8 @@ identify reservation generations. A delayed completion therefore needs unique,
 immutable physical keys to avoid admitting a replacement reservation. This
 status API alone does not enable managed span execution or model recovery.
 
-Native CPU-L1 span transactions
--------------------------------
+Native span transactions
+------------------------
 
 The dedicated service can additionally enable bounded native span transfers:
 
@@ -110,7 +111,8 @@ This selects lazy pinned CPU allocation, whose registration granule is 64 MiB.
 Use a semantic identity with ``key_schema="kmesh-span-v1"`` when opening and
 binding the worker registration. The executor admits CUDA BF16 full attention,
 one worker and one object/kernel group, with exact valid source extents. It does
-not accept GPU-L1/GDS or enable the vLLM multiprocess model consumer.
+not enable the ordinary vLLM multiprocess model consumer. Explicit eager
+arenas use the separate factory option described below.
 
 ``kmesh_store_span`` takes the bound fence, request ID/generation, source token
 IDs, original source position, preceding-context SHA-256, full block table
@@ -153,6 +155,45 @@ requires request-local model repair before those tokens become computed state.
 On failure, recompute only after ``failed-drained`` or observed importer exit;
 ``failed-undrained`` still owns the destination blocks. These controls do not
 establish model quality, GPU-direct storage latency or collective recovery.
+
+Eager canonical arenas and raw-block storage
+--------------------------------------------
+
+The Python ``create_managed_raw_server`` factory accepts an explicit
+``storage_config`` with span execution enabled. It admits one DRAM or GPU L1
+and at most one raw-block L2 adapter. Omit this argument to retain lazy pinned
+CPU allocation. Peer L1s, Device-DAX, a GDSContext slab and other L2 adapters
+are outside this bounded service. The GPU arena's existing explicit
+``buffer_provider="vulkan_rm"`` option is required where native device export
+is unsupported; provider failure must not switch to host memory.
+
+Eager objects must occupy their actual nonpaged allocator arena, with the
+registered device, complete BF16 payload and exact bounds. Pinned host objects
+must fit one registration window. The slot-map gather accepts either arena,
+including interior starts, separate or fused K/V and partial tails. Scratch
+exists before native gathering can queue work. Repack a drained partial tail
+on the registered stream and physically drain again before admission. Failed
+completion retains the canonical objects, scratch and context borrows.
+
+The positional planner copies eager sources into distinct private working
+slots on that stream. It supplies no host-staging rows to the native executor;
+device pointers must never enter its host-copy interface. Rotate and scatter
+working copies while preserving the canonical sources. Plans that would reuse
+a slot are refused until a separate multiwave device algorithm is qualified.
+Ordinary serving retains its existing lazy-host planner.
+
+Restoration can prefetch actual missing objects from configured raw-block L2.
+L1 admission does not prove storage admission: a cold-read experiment must
+confirm successful L2 lookup of every exact key, unlock those lookups, and
+only then evict its L1 copies. The raw-block adapter owns and retains its I/O
+arena independently of the engine's raw imports. Its close outcome remains
+authoritative even when an engine-device drain succeeds.
+
+``checksum_span_object`` checks every canonical payload byte. GPU objects
+currently copy their full payload to the CPU for SHA-256, including on restore.
+Include that transfer and hashing cost in any latency comparison. This is an
+experimental route with pending GPU/model qualification; it establishes no
+elimination of all host copies, storage capacity saving or serving speedup.
 
 Request-owned model layer sources
 ---------------------------------
