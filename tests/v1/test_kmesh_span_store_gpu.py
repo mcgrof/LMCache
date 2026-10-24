@@ -24,6 +24,7 @@ from lmcache.v1.multiprocess import kmesh_span_store as span_module
 from lmcache.v1.multiprocess.custom_types import DeviceIPCWrapper
 from lmcache.v1.multiprocess.kmesh_bindings import RegisteredWorkerBindings
 from lmcache.v1.multiprocess.kmesh_domains import RegistrationState
+from lmcache.v1.multiprocess.kmesh_native_store import RegisteredSpanGather
 from lmcache.v1.multiprocess.kmesh_raw_server import create_managed_raw_server
 from lmcache.v1.multiprocess.modules.blend.retrieve import RegisteredRetrievePlan
 from lmcache.v1.multiprocess.transport.factory import RequestClientFactory
@@ -56,7 +57,7 @@ def span_service(
     publish = RegisteredWorkerBindings.publish
 
     @wraps(gather)
-    def actual_gather(*args: Any, **kwargs: Any) -> list[torch.Tensor]:
+    def actual_gather(*args: Any, **kwargs: Any) -> RegisteredSpanGather:
         observed["gathers"] += 1
         result = gather(*args, **kwargs)
         if armed["enabled"] and mode == "source-undrained":
@@ -213,9 +214,9 @@ def read_window(
 
 @pytest.mark.parametrize("transport", ["zmq", "grpc"])
 @pytest.mark.parametrize(
-    "mode,source_start,destination_start,layout,layers",
+    "mode,source_start,destination_start,layout,layers,token_count",
     [
-        (mode, 0, 3, "NHD", 1)
+        (mode, 0, 3, "NHD", 1, 16)
         for mode in (
             "success",
             "corrupt",
@@ -227,11 +228,20 @@ def read_window(
         )
     ]
     + [
-        ("success", 5, destination, layout, 24)
+        ("success", 5, destination, layout, 24, 16)
         for layout in ("NHD", "HND")
         for destination in (3, 9)
     ]
-    + [("source-undrained", 5, 3, layout, 24) for layout in ("NHD", "HND")],
+    + [("source-undrained", 5, 3, layout, 24, 16) for layout in ("NHD", "HND")]
+    + [
+        ("success", 5, destination, layout, 24, count)
+        for count in (1, 9, 15)
+        for layout in ("NHD", "HND")
+        for destination in (3, 9)
+    ]
+    + [("success", 0, 3, layout, 24, 13) for layout in ("NHD", "HND")]
+    + [("source-undrained", 5, 3, layout, 24, 9) for layout in ("NHD", "HND")]
+    + [("rope-capacity", 5, 23, layout, 24, 1) for layout in ("NHD", "HND")],
 )
 def test_managed_span_native_store_and_restore(
     transport: Literal["zmq", "grpc"],
@@ -240,6 +250,7 @@ def test_managed_span_native_store_and_restore(
     destination_start: int,
     layout: str,
     layers: int,
+    token_count: int,
 ) -> None:
     device = torch.device("cuda", 0)
     # Synthetic two-plane geometry includes the model's 24-layer count.
@@ -251,9 +262,9 @@ def test_managed_span_native_store_and_restore(
     kv.fill_(-9)
     source = (
         (
-            torch.arange(layers * 2 * 16 * 2 * 16, dtype=torch.float32).reshape(
-                layers, 2, 16, 2, 16
-            )
+            torch.arange(
+                layers * 2 * token_count * 2 * 16, dtype=torch.float32
+            ).reshape(layers, 2, token_count, 2, 16)
             % 53
             / 17
         )
@@ -263,8 +274,13 @@ def test_managed_span_native_store_and_restore(
     source_gpu = source.to(device)
     source_blocks = [2, 4, 6, 8, 10, 12]
     rotary_pool = torch.empty((64 << 20) // 4, dtype=torch.float32, device=device)
-    rope = rotary_pool[: 64 * 16].reshape(64, 16)
-    phases = torch.arange(64, dtype=torch.float32)[:, None] * torch.arange(1, 9) * 0.013
+    rotary_tokens = 24 if mode == "rope-capacity" else 64
+    rope = rotary_pool[: rotary_tokens * 16].reshape(rotary_tokens, 16)
+    phases = (
+        torch.arange(rotary_tokens, dtype=torch.float32)[:, None]
+        * torch.arange(1, 9)
+        * 0.013
+    )
     rope.copy_(torch.cat((phases.cos(), phases.sin()), dim=1))
     backend = get_event_ipc_backend(device)
     ready = backend.create_event(device)
@@ -348,7 +364,7 @@ def test_managed_span_native_store_and_restore(
             fence,
             "source",
             1,
-            list(range(16)),
+            list(range(token_count)),
             source_start,
             context_digest,
             [source_blocks],
@@ -397,12 +413,12 @@ def test_managed_span_native_store_and_restore(
         else:
             assert stored.state == "stored" and stored.span is not None
             span = stored.span
-            assert span.source_start == source_start
+            assert span.source_start == source_start and span.token_count == token_count
             changed = client.kmesh_store_span(
                 fence,
                 "source",
                 1,
-                [1] * 16,
+                [1] * token_count,
                 source_start,
                 context_digest,
                 [source_blocks],
@@ -445,7 +461,9 @@ def test_managed_span_native_store_and_restore(
             if mode == "success":
                 assert restored.state == "loaded-needs-repair" and restored.span == span
                 torch_dev.synchronize(device)
-                actual = read_window(kv, destination[0], destination_start, 16, layout)
+                actual = read_window(
+                    kv, destination[0], destination_start, token_count, layout
+                )
                 expected = rotate_reference(source, destination_start - source_start)
                 torch.testing.assert_close(
                     actual[:, 0], expected[:, 0], rtol=0.012, atol=0.025
@@ -457,7 +475,7 @@ def test_managed_span_native_store_and_restore(
                 untouched = [
                     p
                     for p in range(28)
-                    if not destination_start <= p < destination_start + 16
+                    if not destination_start <= p < destination_start + token_count
                 ]
                 assert torch.all(all_rows[:, :, untouched] == -9).item()
                 assert (
@@ -483,7 +501,9 @@ def test_managed_span_native_store_and_restore(
                 )
                 assert same.state == "loaded"
                 torch_dev.synchronize(device)
-                actual = read_window(kv, source_blocks, source_start, 16, layout)
+                actual = read_window(
+                    kv, source_blocks, source_start, token_count, layout
+                )
                 torch.testing.assert_close(
                     actual[:, 0], source[:, 0], rtol=0.012, atol=0.025
                 )
@@ -495,8 +515,12 @@ def test_managed_span_native_store_and_restore(
                 assert restored.state == (
                     "failed-undrained" if mode == "drain-refusal" else "failed-drained"
                 )
-                if mode in ("corrupt", "evict"):
-                    expected_error = "checksum" if mode == "corrupt" else "evicted"
+                if mode in ("corrupt", "evict", "rope-capacity"):
+                    expected_error = {
+                        "corrupt": "checksum",
+                        "evict": "evicted",
+                        "rope-capacity": "rotary capacity",
+                    }[mode]
                     assert expected_error in restored.error
                     parent.send("observe")
                     assert read_snapshot(parent)["enqueues"] == 0

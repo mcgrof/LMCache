@@ -109,7 +109,7 @@ The dedicated service can additionally enable bounded native span transfers:
 This selects lazy pinned CPU allocation, whose registration granule is 64 MiB.
 Use a semantic identity with ``key_schema="kmesh-span-v1"`` when opening and
 binding the worker registration. The executor admits CUDA BF16 full attention,
-one worker and one object/kernel group, with complete source chunks. It does
+one worker and one object/kernel group, with exact valid source extents. It does
 not accept GPU-L1/GDS or enable the vLLM multiprocess model consumer.
 
 ``kmesh_store_span`` takes the bound fence, request ID/generation, source token
@@ -121,6 +121,15 @@ object must fit within one host-registration range. The service waits for source
 writes, gathers exact source slots, drains actual device work and checks every key's L1
 admission before publishing an immutable ``SpanHandle``. Each physical key is
 unique to that accepted operation; the source is never overwritten.
+
+A final source chunk may be partial. Gather only its valid slots into packed
+host strides. After checked device completion, repack them into a complete
+canonical object with zero padding before checksum and admission. The immutable
+handle records valid tokens only. Restore scatters only that valid extent.
+Native key rotation visits a full padded chunk, so a shifted match additionally
+requires rotary-table capacity for both padded position ranges. Refuse short
+tables before native launch. Partial gathering uses the qualified two-plane
+NHD/HND formats and never reads following source slots as padding.
 
 ``kmesh_restore_span`` takes that exact handle, a destination position and its
 preceding-context digest, reserved block table and destination-ready event.

@@ -19,7 +19,7 @@ operation, all memory objects, block-ID tables, event imports, native plans and
 storage leases until the server proves physical completion.
 
 The first execution profile remains serialized, single-worker, contiguous BF16
-full attention with one object/kernel group, full source chunks and CPU DRAM L1.
+full attention with one object/kernel group, complete storage objects with exact valid source extents and CPU DRAM L1.
 Use the existing native object-group transfer and positional-retrieve executor;
 do not substitute a numerical reference implementation for the measured path.
 ``BlendModule.prepare_registered_retrieve`` plans against accepted resource

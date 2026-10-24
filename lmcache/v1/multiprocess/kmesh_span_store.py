@@ -132,13 +132,13 @@ class KMeshSpanStore:
         block_ids: list[list[int]],
         producer_event: bytes,
     ) -> SpanOperationStatus:
-        """Gather complete source chunks, admit each key, then publish a handle.
+        """Gather exact source tokens, admit canonical chunks and publish a handle.
 
         Args:
             fence: Exact bound worker and receiving transport session.
             request_id: Logical request whose generation is consumed once.
             generation: Strictly increasing positive request generation.
-            token_ids: Nonnegative source token IDs in complete chunk order.
+            token_ids: Nonnegative source token IDs, including any partial tail.
             source_start: First position in the original sequence.
             context_digest: SHA-256 identity of the source preceding context.
             block_ids: Full source sequence's private engine block table.
@@ -156,10 +156,9 @@ class KMeshSpanStore:
             type(source_start) is not int
             or source_start < 0
             or not token_ids
-            or len(token_ids) % chunk
             or any(type(t) is not int or not 0 <= t < 2**63 for t in token_ids)
         ):
-            raise KMeshFenceError("span store requires complete token chunks")
+            raise KMeshFenceError("span store requires nonempty valid source tokens")
         signature = _digest(
             (
                 "store",
@@ -183,7 +182,7 @@ class KMeshSpanStore:
                     f"kmesh-{namespace}",
                     0,
                 )
-                for i in range(len(token_ids) // chunk)
+                for i in range((len(token_ids) + chunk - 1) // chunk)
             ]
             layout = get_layout_desc(cache, chunk, 0)
             work.objects = self._storage.reserve_write(keys, layout)
@@ -194,14 +193,17 @@ class KMeshSpanStore:
                 work.objects, all_buffers=True
             )
             self._wait_producer(work, producer_event)
-            work.staged_blocks = gather_registered_span(
+            gathered = gather_registered_span(
                 work.operation,
                 [work.objects[k] for k in keys],
                 source_start,
                 block_ids,
+                token_count=len(token_ids),
                 transfer_key=work.status.operation_id,
             )
+            work.staged_blocks = gathered.index_buffers
             self._drain_device(work)
+            gathered.canonicalize()
             handle = SpanHandle(
                 namespace,
                 work.status.operation_id,
@@ -328,9 +330,9 @@ class KMeshSpanStore:
             matches = [
                 CBMatchResult(
                     span.source_start + i * chunk,
-                    span.source_start + (i + 1) * chunk,
+                    span.source_start + min((i + 1) * chunk, span.token_count),
                     destination_start + i * chunk,
-                    destination_start + (i + 1) * chunk,
+                    destination_start + min((i + 1) * chunk, span.token_count),
                     key.chunk_hash,
                 )
                 for i, key in enumerate(keys)
@@ -446,7 +448,6 @@ class KMeshSpanStore:
         block_size = manager.kernel_groups[0].tokens_per_block
         if (
             chunk % block_size
-            or count % chunk
             or any(b >= cache.num_blocks for b in blocks[0])
             or start + count > len(blocks[0]) * block_size
             or any(start + count > t.shape[0] for t in rope.cos_sin_caches)

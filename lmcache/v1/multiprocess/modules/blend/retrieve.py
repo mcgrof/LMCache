@@ -191,7 +191,8 @@ class RetrieveMixin:
                 before dropping any resources, including on failure.
 
         The first profile is serialized CUDA BF16, one full-attention group and
-        full source chunks. The worker must retain its actual destination block
+        full storage objects with at most one chunk of valid tokens per match.
+        The worker must retain its actual destination block
         reservations; a CUDA allocation borrow cannot prevent slot recycling.
         """
         cache, rope = paged.entry.cache_context, rotary.state
@@ -235,13 +236,20 @@ class RetrieveMixin:
             if (
                 match.old_st < 0
                 or match.cur_st < 0
-                or match.old_ed - match.old_st != chunk
-                or match.cur_ed - match.cur_st != chunk
+                or not 0 < match.old_ed - match.old_st <= chunk
+                or match.cur_ed - match.cur_st != match.old_ed - match.old_st
                 or match.cur_st < previous_end
                 or match.cur_ed > limit
                 or any(match.old_ed > int(t.shape[0]) for t in rope.cos_sin_caches)
             ):
                 raise ValueError("invalid registered retrieve coordinates")
+            # Native re-RoPE visits the whole canonical chunk, including zero
+            # padding, even though scatter uses only this match's valid extent.
+            if match.old_st != match.cur_st and any(
+                max(match.old_st, match.cur_st) + chunk > int(t.shape[0])
+                for t in rope.cos_sin_caches
+            ):
+                raise ValueError("registered rotation exceeds padded rotary capacity")
             previous_end = match.cur_ed
         runs: list[list[tuple[CBMatchResult, tuple[MemoryObj]]]] = []
         for match, obj in zip(matches, objects, strict=True):
