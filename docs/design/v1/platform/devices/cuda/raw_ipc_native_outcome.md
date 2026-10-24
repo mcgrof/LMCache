@@ -1,7 +1,8 @@
 # Quarantine ambiguous native IPC outcomes
 
 Status: native-outcome quarantine and process-local reference serialization are
-implemented; hardware qualification is pending. Earlier checked-release controls
+implemented. Six scoped CUDA cases pass on an RTX 4090, including conservative
+refusal after controlled native errors and safe preflight retry. Earlier controls
 inject failure before native effects and do not establish recovery after an
 actual driver error or interruption at an unknown native side-effect boundary.
 
