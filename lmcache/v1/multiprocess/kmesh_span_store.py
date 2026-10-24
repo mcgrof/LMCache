@@ -14,6 +14,7 @@ import blake3
 import torch
 
 # First Party
+from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import (
     GroupedObjectKeys,
@@ -38,7 +39,10 @@ from lmcache.v1.multiprocess.kmesh_domains import (
     KMeshFenceError,
     WorkerFence,
 )
-from lmcache.v1.multiprocess.kmesh_native_store import gather_registered_span
+from lmcache.v1.multiprocess.kmesh_native_store import (
+    RegisteredSpanGather,
+    gather_registered_span,
+)
 from lmcache.v1.multiprocess.kmesh_types import SpanHandle, SpanOperationStatus
 from lmcache.v1.multiprocess.modules.blend import BlendModule
 from lmcache.v1.multiprocess.modules.blend.retrieve import RegisteredRetrievePlan
@@ -55,11 +59,27 @@ def _digest(value: object) -> str:
     ).hexdigest()
 
 
-def _checksum(obj: MemoryObj) -> str:
+def checksum_span_object(obj: MemoryObj) -> str:
+    """Hash the complete canonical payload, including any GPU-to-host copy.
+
+    Args:
+        obj: Complete canonical source with an actual physical transfer lease.
+
+    Returns:
+        Hexadecimal SHA-256 over every payload byte, including zero padding.
+
+    Raises:
+        KMeshFenceError: The source has no CPU or CUDA tensor.
+        RuntimeError: Tensor access or device-to-host transfer failed.
+
+    The caller must first complete source writes. Retain the object and its
+    owner through actual device drain if hashing fails. Hashing is not a
+    registration, storage admission or physical lease operation.
+    """
     tensor = obj.get_tensor(0)
-    if tensor is None or tensor.device.type != "cpu":
-        raise KMeshFenceError("span requires actual CPU source bytes")
-    return hashlib.sha256(tensor.view(torch.uint8).numpy().tobytes()).hexdigest()
+    if tensor is None or tensor.device.type not in ("cpu", "cuda"):
+        raise KMeshFenceError("span requires actual canonical source bytes")
+    return hashlib.sha256(tensor.view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -82,6 +102,7 @@ class _Work:
     read_keys: list[ObjectKey] = field(default_factory=list)
     read_owners: dict[ObjectKey, int] = field(default_factory=dict)
     staged_blocks: list[torch.Tensor] = field(default_factory=list)
+    gather: RegisteredSpanGather | None = None
     producer: object | None = None
     plan: RegisteredRetrievePlan | None = None
     device_touched: bool = False
@@ -96,17 +117,18 @@ _RETAINED_LOCK = threading.Lock()
 
 
 class KMeshSpanStore:
-    """Serialize native CPU-L1 span transfers for one managed CUDA context.
+    """Serialize native span transfers for one managed CUDA context.
 
     Args:
         bindings: Actual server's registration and accepted-resource owner.
-        storage: CPU L1 manager using lazy pinned allocation and no L2 adapters.
+        storage: L1 manager with lazy pinned host or nonpaged device objects.
         blend: Native positional planner retaining its private staging buffers.
 
     Operation results are immutable receipts scoped to the receiving session,
     request generation and block-table digest. Callers must reserve those actual
     engine blocks until a drained result arrives. Loaded-needs-repair does not
-    authorize model admission. This service does not supply model repair or GDS.
+    authorize model admission. This service does not supply model repair. GPU
+    objects keep the full integrity check, including its host payload copy.
     """
 
     def __init__(
@@ -201,9 +223,17 @@ class KMeshSpanStore:
                 token_count=len(token_ids),
                 transfer_key=work.status.operation_id,
             )
+            work.gather = gathered
             work.staged_blocks = gathered.index_buffers
             self._drain_device(work)
-            gathered.canonicalize()
+            work.device_touched = True
+            with torch_dev.device(cache.device), torch_dev.stream(cache.stream):
+                gathered.canonicalize()
+            self._drain_device(work)
+            work.device_touched = any(
+                obj.raw_tensor is not None and obj.raw_tensor.device.type == "cuda"
+                for obj in work.objects.values()
+            )
             handle = SpanHandle(
                 namespace,
                 work.status.operation_id,
@@ -217,8 +247,11 @@ class KMeshSpanStore:
                 fence.lease.domain.semantics.rope_digest,
             )
             source = _Source(
-                handle, tuple(keys), tuple(_checksum(work.objects[k]) for k in keys)
+                handle,
+                tuple(keys),
+                tuple(checksum_span_object(work.objects[k]) for k in keys),
             )
+            self._drain_device(work)
 
             def publish(accepted: str) -> None:
                 if accepted != namespace:
@@ -312,19 +345,26 @@ class KMeshSpanStore:
                     ]
                 ),
                 work.status.operation_id,
-                skip_l2=True,
+                skip_l2=not self._storage.l2_adapters(),
             )
             self._collect_prefetch(work)
             if work.read_keys != work.requested:
                 raise KMeshFenceError("span source was evicted or is incomplete")
             keys, objects = self._storage.unsafe_read(work.read_keys, work.read_owners)
             work.objects = dict(zip(keys, objects, strict=True))
+            work.device_touched = any(
+                obj.raw_tensor is not None and obj.raw_tensor.device.type == "cuda"
+                for obj in objects
+            )
             if keys != work.requested:
                 raise KMeshFenceError("span source lost its retained objects")
             work.leases = self._storage.acquire_read_transfer_leases(
                 work.objects, all_buffers=True
             )
-            if tuple(_checksum(work.objects[k]) for k in keys) != source.checksums:
+            if (
+                tuple(checksum_span_object(work.objects[k]) for k in keys)
+                != source.checksums
+            ):
                 raise KMeshFenceError("span source checksum mismatch")
             self._wait_producer(work, producer_event)
             matches = [
@@ -576,6 +616,7 @@ class KMeshSpanStore:
             work.completion = []
         work.objects.clear()
         work.plan = None
+        work.gather = None
         work.staged_blocks.clear()
         work.producer = None
 

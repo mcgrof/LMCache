@@ -68,7 +68,7 @@ class KMeshManagedRawModule(KMeshControlModule):
     The standalone compositor serves only this module: no integer registration,
     generic transfer, lookup, peer, HTTP or reaper can touch its context. One
     registration and one rotary preparation are admitted per server lifetime.
-    Native CPU-L1 span execution is an explicit opt-in; model admission remains
+    Native span execution is an explicit opt-in; model admission remains
     disabled. A loaded span may still require deeper-layer model repair.
     """
 

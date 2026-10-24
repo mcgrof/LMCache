@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Gather exact accepted source positions into canonical pinned host chunks."""
+"""Gather exact accepted source positions into canonical host or device chunks."""
 
 # Standard
 from dataclasses import dataclass, field
@@ -12,6 +12,7 @@ from lmcache import device_ops, torch_dev
 from lmcache.v1.memory_allocators.lazy_memory_allocator import LazyMemoryAllocator
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.multiprocess.kmesh_bindings import BoundOperation
+from lmcache.v1.multiprocess.kmesh_source_memory import require_registered_span_tensor
 from lmcache.v1.multiprocess.object_group_transfer import (
     downsample_and_stage_block_ids,
     transfer_kv_per_object_group,
@@ -25,7 +26,8 @@ class RegisteredSpanGather:
 
     Args:
         index_buffers: Device indexing tensors retained through actual drain.
-        partials: Packed and canonical views of each partial host reservation.
+        partials: Packed and canonical views of each partial reservation.
+        scratch: Preallocated repacking tensors, retained through device drain.
 
     The importing server must establish physical device completion before
     canonicalization. This object supplies neither completion nor admission.
@@ -33,22 +35,30 @@ class RegisteredSpanGather:
 
     index_buffers: list[torch.Tensor]
     partials: tuple[tuple[torch.Tensor, torch.Tensor], ...] = ()
+    scratch: tuple[torch.Tensor, ...] = ()
     _canonicalized: bool = field(default=False, init=False)
 
     def canonicalize(self) -> None:
-        """Repack completed host bytes once, with deterministic zero padding.
+        """Repack completed bytes once, with deterministic zero padding.
 
         Raises:
             RuntimeError: This gather has already consumed its packed bytes.
 
         The caller must have drained the actual importing device context.
-        Moving bytes on the CPU before that boundary would race native writes.
+        Repacking before that boundary would race native writes. Device copies
+        use the caller's current registered stream and require a second drain.
         """
         if self._canonicalized:
             raise RuntimeError("gather bytes have already been canonicalized")
         self._canonicalized = True
-        for packed, canonical in self.partials:
-            completed = packed.clone()
+        if not self.scratch:
+            if any(packed.device.type != "cpu" for packed, _ in self.partials):
+                raise RuntimeError("device repacking requires retained scratch")
+            self.scratch = tuple(torch.empty_like(p) for p, _ in self.partials)
+        for (packed, canonical), completed in zip(
+            self.partials, self.scratch, strict=True
+        ):
+            completed.copy_(packed)
             canonical.zero_()
             canonical[:, :, : packed.shape[2]].copy_(completed)
 
@@ -66,7 +76,7 @@ def gather_registered_span(
 
     Args:
         operation: Exact accepted paged/rotary borrows retained by the caller.
-        objects: Complete CPU chunk reservations with physical I/O leases held.
+        objects: Complete host or device chunks with physical I/O leases held.
         source_start: First source position in the original sequence.
         block_ids: Its full private block table, for one full-attention group.
         token_count: Exact positive valid extent, including a partial final chunk.
@@ -80,10 +90,11 @@ def gather_registered_span(
         RuntimeError: Native preparation or submission failed. Retain the
             exception frames, all borrows and objects until device-context drain.
 
-    Complete block-aligned spans keep the object-group path. Interior starts
-    and partial tails use the native slot-map kernel for separate or fused NHD/HND.
-    A tail gathers into packed host strides, then needs CPU canonicalization
-    after actual drain. Returning never establishes completion or admission.
+    Complete block-aligned lazy-host spans keep the object-group path. Interior
+    starts and partial tails use the native slot-map kernel for separate or
+    fused NHD/HND. Eager sources always use it. A tail gathers into packed strides,
+    then needs canonicalization after actual drain. Device canonicalization
+    needs another physical drain before admission. Returning establishes neither.
     """
     cache = operation.paged.entry.cache_context
     manager = cache.kv_layer_groups_manager
@@ -118,7 +129,11 @@ def gather_registered_span(
     ):
         raise ValueError("invalid registered source gather coordinates")
     with torch_dev.device(cache.device), torch_dev.stream(cache.stream):
-        if source_start % block_size == 0 and count % chunk == 0:
+        if (
+            all(isinstance(obj.parent(), LazyMemoryAllocator) for obj in objects)
+            and source_start % block_size == 0
+            and count % chunk == 0
+        ):
             selected = [
                 block_ids[0][
                     source_start // block_size : (source_start + count) // block_size
@@ -148,26 +163,27 @@ def gather_registered_span(
         tensors: list[torch.Tensor] = []
         expected = (shape.kv_size, shape.nl, chunk, shape.nh * shape.hs)
         for obj in objects:
-            # The native slot kernel maps one registered host pointer and then
-            # indexes it linearly; separate pin ranges need separate mappings.
-            offset, size = obj.meta.address, obj.get_size()
-            pin = LazyMemoryAllocator.PIN_CHUNK_SIZE
-            if (
-                not isinstance(obj.parent(), LazyMemoryAllocator)
-                or offset < 0
-                or size < 1
-                or offset // pin != (offset + size - 1) // pin
-            ):
-                raise ValueError("slot gather object crosses a host registration")
             tensor = obj.get_tensor(0)
             if (
                 tensor is None
                 or tuple(tensor.shape) != expected
-                or tensor.device.type != "cpu"
                 or tensor.dtype != torch.bfloat16
                 or not tensor.is_contiguous()
             ):
-                raise ValueError("unaligned gather requires complete host chunks")
+                raise ValueError("slot gather requires complete contiguous chunks")
+            if isinstance(obj.parent(), LazyMemoryAllocator):
+                # One host pointer cannot span separate pin registrations.
+                offset, size = obj.meta.address, obj.get_size()
+                pin = LazyMemoryAllocator.PIN_CHUNK_SIZE
+                if (
+                    tensor.device.type != "cpu"
+                    or offset < 0
+                    or size < 1
+                    or offset // pin != (offset + size - 1) // pin
+                ):
+                    raise ValueError("slot gather object crosses a host registration")
+            else:
+                require_registered_span_tensor(obj, cache.device, tensor.nbytes)
             tensors.append(tensor)
         positions = range(source_start, source_start + count)
         slots = torch.tensor(
@@ -180,6 +196,7 @@ def gather_registered_span(
         )
         pointers = cache.get_kernel_group_kv_pointers(0)
         partials: list[tuple[torch.Tensor, torch.Tensor]] = []
+        targets: list[torch.Tensor] = []
         for index, tensor in enumerate(tensors):
             valid = min(chunk, count - index * chunk)
             target = tensor
@@ -189,6 +206,14 @@ def gather_registered_span(
                     shape.kv_size, shape.nl, valid, shape.nh * shape.hs
                 )
                 partials.append((target, tensor))
+            targets.append(target)
+        gathered = RegisteredSpanGather(
+            [slots],
+            tuple(partials),
+            tuple(torch.empty_like(packed) for packed, _ in partials),
+        )
+        for index, target in enumerate(targets):
+            valid = target.shape[2]
             device_ops.multi_layer_kv_transfer(
                 target,
                 pointers,
@@ -203,4 +228,4 @@ def gather_registered_span(
                 ),
                 block_stride_elems=shape.block_stride_elems,
             )
-        return RegisteredSpanGather([slots], tuple(partials))
+        return gathered

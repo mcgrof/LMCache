@@ -12,8 +12,12 @@ from lmcache import torch_device_type
 from lmcache.v1.distributed.config import (
     DRAML1ManagerConfig,
     EvictionConfig,
+    GPUL1ManagerConfig,
     L1MemoryManagerConfig,
     StorageManagerConfig,
+)
+from lmcache.v1.distributed.l2_adapters.raw_block_l2_adapter import (
+    RawBlockL2AdapterConfig,
 )
 from lmcache.v1.gpu_connector.gds_context import require_inactive_gds
 from lmcache.v1.multiprocess.config import MPServerConfig
@@ -33,6 +37,8 @@ def create_managed_raw_server(
     chunk_tokens: int = 256,
     dram_bytes: int = 64 << 20,
     enable_span_execution: bool = False,
+    *,
+    storage_config: StorageManagerConfig | None = None,
 ) -> tuple[RequestServer, MPCacheServer]:
     """Construct the bounded raw service; the caller starts its transport.
 
@@ -41,8 +47,11 @@ def create_managed_raw_server(
         port: Request port, or zero for a test-selected free port.
         transport: Same-host ZeroMQ or gRPC request transport.
         chunk_tokens: Positive attention chunk size used for registration.
-        dram_bytes: Positive CPU L1 capacity; GPU-L1/GDS is not admitted.
-        enable_span_execution: Opt into native CPU-L1 span transactions.
+        dram_bytes: Positive CPU L1 capacity when storage_config is absent.
+        enable_span_execution: Opt into native span transactions.
+        storage_config: Optional single pinned-host or GPU L1, with at most
+            one raw-block L2. This takes precedence over dram_bytes and needs
+            span execution enabled. No GDSContext slab or peer L1 is admitted.
 
     Returns:
         Unstarted request transport and its resource-owning cache server.
@@ -55,8 +64,8 @@ def create_managed_raw_server(
     if chunk_tokens < 1 or dram_bytes < 1 or transport not in ("zmq", "grpc"):
         raise ValueError("invalid managed raw service configuration")
     require_inactive_gds()
-    context = MPCacheServerContext(
-        StorageManagerConfig(
+    if storage_config is None:
+        storage_config = StorageManagerConfig(
             DRAML1ManagerConfig(
                 L1MemoryManagerConfig(
                     dram_bytes,
@@ -66,7 +75,24 @@ def create_managed_raw_server(
                 )
             ),
             EvictionConfig("LRU"),
-        ),
+        )
+    elif (
+        not enable_span_execution
+        or len(storage_config.l1_manager_configs) != 1
+        or not isinstance(
+            storage_config.l1_manager_config, (DRAML1ManagerConfig, GPUL1ManagerConfig)
+        )
+        or storage_config.l1_manager_config.gds_l1_config is not None
+        or storage_config.l1_manager_config.memory_config.devdax_path
+        or len(storage_config.l2_adapter_config.adapters) > 1
+        or any(
+            not isinstance(adapter, RawBlockL2AdapterConfig)
+            for adapter in storage_config.l2_adapter_config.adapters
+        )
+    ):
+        raise ValueError("managed spans require one host or GPU L1 and raw-block L2")
+    context = MPCacheServerContext(
+        storage_config,
         chunk_size=chunk_tokens,
         hash_algorithm="blake3",
     )

@@ -35,6 +35,7 @@ from lmcache.v1.multiprocess.custom_types import (
     CBMatchResult,
     IPCCacheServerKey,
 )
+from lmcache.v1.multiprocess.kmesh_source_memory import require_registered_span_tensor
 from lmcache.v1.multiprocess.modules.blend.read_set import (
     _BlendReadGroups,
     _cb_chunk_major_object_keys,
@@ -263,6 +264,7 @@ class RetrieveMixin:
                 [(np.asarray(blocks, dtype=np.int64), block_size)],
                 runs,
                 cache.max_batch_size,
+                source_device=cache.device,
             )
             if prepared is None:
                 raise ValueError("native registered retrieve plan is unavailable")
@@ -486,6 +488,8 @@ class RetrieveMixin:
         cpu_block_tables: "list[tuple[np.ndarray, int]]",
         runs: "list[list[tuple[CBMatchResult, Any]]]",
         max_batch: int,
+        *,
+        source_device: torch.device | None = None,
     ) -> "tuple[list[Any], tuple[Any, Any, Any, Any], list[torch.Tensor]] | None":
         """Build the native retrieve plan for ``execute_cb_retrieve_plan_flat``
         (table layouts in the pybind docstring).
@@ -494,19 +498,33 @@ class RetrieveMixin:
             ``(group_specs, (staging, ropes, scatters, step_offsets),
             keepalive)``, or ``None`` when the native plan cannot serve this
             request (old cuda_ops, non-lazy host objects, ``max_batch < 2``,
-            unsupported geometry) — the caller then fails the retrieve and
-            the client degrades to full recompute.
+            unsupported geometry). Only the registered caller supplies
+            ``source_device`` to admit eager pinned or device objects. Those
+            objects use distinct private slots and queued device copies;
+            their pointers never enter native host-staging rows. The caller
+            must drain preparation before dropping resources on any failure.
         """
         if not _HAS_NATIVE_RETRIEVE_PLAN or max_batch < 2:
             return None
         pairs = [pair for run in runs for pair in run]
         if not pairs:
             return None
-        # Native staging requires the lazy-allocator (pin-chunked) host path.
-        for _, chunk_objs in pairs:
-            for memory_obj in chunk_objs:
-                if not isinstance(memory_obj.parent(), LazyMemoryAllocator):
-                    return None
+        lazy_sources = all(
+            isinstance(obj.parent(), LazyMemoryAllocator)
+            for _, objs in pairs
+            for obj in objs
+        )
+        source_tensors: list[list[torch.Tensor]] = []
+        if not lazy_sources:
+            if source_device is None:
+                return None
+            source_tensors = [
+                [
+                    require_registered_span_tensor(obj, source_device, obj.get_size())
+                    for obj in objs
+                ]
+                for _, objs in pairs
+            ]
 
         # Specs are invariant per registration except the slot-mapping fields:
         # cache per context, re-stamp per request. The cached rope_state
@@ -627,9 +645,14 @@ class RetrieveMixin:
             dtype=np.int64,
         )
         dest = obj_buf_ptrs[slot_of]  # (n, n_read)
-        staging = np.stack(
-            [dest.ravel(), src.ravel(), nbytes.ravel(), host_off.ravel()], axis=1
-        )
+        if lazy_sources:
+            staging = np.stack(
+                [dest.ravel(), src.ravel(), nbytes.ravel(), host_off.ravel()], axis=1
+            )
+        else:
+            if len(np.unique(slot_of)) != n:
+                raise ValueError("span plan would reuse a private working slot")
+            staging = np.empty((0, 4), dtype=np.int64)
 
         groups_arr = np.arange(num_groups, dtype=np.int64)
         shifted = old_st != cur_st
@@ -669,6 +692,16 @@ class RetrieveMixin:
             ],
             axis=1,
         )
+        if not lazy_sources:
+            step_offsets[:, 0] = 0
+            copies = [
+                (slot_group_buffers[int(slot)][g], tensor.view(torch.uint8).view(-1))
+                for slot, tensors in zip(slot_of, source_tensors, strict=True)
+                for g, tensor in enumerate(tensors)
+            ]
+            keepalive.extend(t for pair in copies for t in pair)
+            for target, source in copies:
+                target.copy_(source, non_blocking=True)
         return (
             group_specs,
             (staging, ropes, scatters, step_offsets),

@@ -19,6 +19,13 @@ import zmq
 
 # First Party
 from lmcache import torch_dev, torch_device_type
+from lmcache.v1.distributed.config import (
+    DRAML1ManagerConfig,
+    EvictionConfig,
+    GPUL1ManagerConfig,
+    L1MemoryManagerConfig,
+    StorageManagerConfig,
+)
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.multiprocess import kmesh_span_store as span_module
@@ -59,7 +66,10 @@ class SpanConsumerCase:
 
 
 def span_service(
-    channel: Connection, transport: Literal["zmq", "grpc"], mode: str
+    channel: Connection,
+    transport: Literal["zmq", "grpc"],
+    mode: str,
+    source_memory: Literal["lazy-host", "eager-host", "vulkan_rm"] = "lazy-host",
 ) -> None:
     """Observe real calls; inject refusals without manufacturing device faults."""
     armed = {"enabled": False}
@@ -138,12 +148,29 @@ def span_service(
             patch.setattr(StorageManager, "submit_prefetch_task", actual_prefetch)
             patch.setattr(StorageManager, "finish_write_with_status", actual_admit)
             patch.setattr(RegisteredWorkerBindings, "publish", actual_publish)
+            storage = None
+            if source_memory != "lazy-host":
+                memory = L1MemoryManagerConfig(
+                    64 << 20,
+                    False,
+                    shm_name="",
+                    buffer_registration="fixed"
+                    if source_memory == "eager-host"
+                    else "dmabuf",
+                )
+                l1 = (
+                    DRAML1ManagerConfig(memory)
+                    if source_memory == "eager-host"
+                    else GPUL1ManagerConfig(memory, buffer_provider="vulkan_rm")
+                )
+                storage = StorageManagerConfig(l1, EvictionConfig("LRU"))
             server, engine = create_managed_raw_server(
                 port=0,
                 transport=transport,
                 chunk_tokens=8,
                 dram_bytes=64 << 20,
                 enable_span_execution=True,
+                storage_config=storage,
             )
             server.start()
             if isinstance(server, GrpcMultiprocessServer):
@@ -286,6 +313,7 @@ def test_managed_span_native_store_and_restore(
     token_count: int,
     consume: Callable[[SpanConsumerCase], None] | None = None,
     packed: bool = False,
+    source_memory: Literal["lazy-host", "eager-host", "vulkan_rm"] = "lazy-host",
 ) -> None:
     device = torch.device("cuda", 0)
     # Synthetic two-plane geometry includes the model's 24-layer count.
@@ -310,6 +338,8 @@ def test_managed_span_native_store_and_restore(
     )
     source_gpu = source.to(device)
     source_blocks = [2, 4, 6, 8, 10, 12]
+    if mode == "slot-reuse":
+        source_blocks = list(range(12))
     rotary_pool = torch.empty((64 << 20) // 4, dtype=torch.float32, device=device)
     rotary_tokens = 24 if mode == "rope-capacity" else 64
     rope = rotary_pool[: rotary_tokens * 16].reshape(rotary_tokens, 16)
@@ -330,7 +360,7 @@ def test_managed_span_native_store_and_restore(
     assert wrappers[-1].allocation_identity not in kv_allocations
     parent, child = mp.get_context("spawn").Pipe()
     process = mp.get_context("spawn").Process(
-        target=span_service, args=(child, transport, mode)
+        target=span_service, args=(child, transport, mode, source_memory)
     )
     process.start()
     child.close()
@@ -466,6 +496,8 @@ def test_managed_span_native_store_and_restore(
             backend.record_event(ready, torch_dev.current_stream(device))
             event = backend.export_event(ready, device)
             destination = [[13, 11, 9, 7, 5, 3, 1]]
+            if mode == "slot-reuse":
+                destination = [list(range(12))]
             altered = client.kmesh_restore_span(
                 fence,
                 "bad-handle",
@@ -565,11 +597,12 @@ def test_managed_span_native_store_and_restore(
                 assert restored.state == (
                     "failed-undrained" if mode == "drain-refusal" else "failed-drained"
                 )
-                if mode in ("corrupt", "evict", "rope-capacity"):
+                if mode in ("corrupt", "evict", "rope-capacity", "slot-reuse"):
                     expected_error = {
                         "corrupt": "checksum",
                         "evict": "evicted",
                         "rope-capacity": "rotary capacity",
+                        "slot-reuse": "working slot",
                     }[mode]
                     assert expected_error in restored.error
                     parent.send("observe")

@@ -10,6 +10,13 @@ import torch
 
 # First Party
 from lmcache.utils import EngineType
+from lmcache.v1.distributed.config import (
+    DRAML1ManagerConfig,
+    EvictionConfig,
+    L1ManagerConfig,
+    L1MemoryManagerConfig,
+    StorageManagerConfig,
+)
 from lmcache.v1.multiprocess import kmesh_raw_server
 from lmcache.v1.multiprocess.context_ownership import (
     ContextOwnership,
@@ -33,6 +40,26 @@ def test_managed_server_factory_refuses_cpu_before_resource_creation(
     monkeypatch.setattr(kmesh_raw_server, "torch_device_type", "cpu")
     with pytest.raises(ValueError, match="requires CUDA"):
         kmesh_raw_server.create_managed_raw_server()
+
+
+@pytest.mark.parametrize("case", ["disabled", "legacy-tier", "peer-tier"])
+def test_managed_storage_refuses_unbounded_profiles_before_allocation(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    monkeypatch.setattr(kmesh_raw_server, "torch_device_type", "cuda")
+    monkeypatch.setattr(kmesh_raw_server, "is_isolated_ipc", lambda: False)
+    memory = L1MemoryManagerConfig(64 << 20, True, shm_name="")
+    l1 = (
+        L1ManagerConfig(memory)
+        if case == "legacy-tier"
+        else DRAML1ManagerConfig(memory)
+    )
+    peers = [l1, DRAML1ManagerConfig(memory, tag="peer")] if case == "peer-tier" else []
+    storage = StorageManagerConfig(l1, EvictionConfig("LRU"), l1_manager_configs=peers)
+    with pytest.raises(ValueError, match="one host or GPU L1"):
+        kmesh_raw_server.create_managed_raw_server(
+            enable_span_execution=case != "disabled", storage_config=storage
+        )
 
 
 def test_managed_control_inventory_excludes_legacy_context_consumers() -> None:
