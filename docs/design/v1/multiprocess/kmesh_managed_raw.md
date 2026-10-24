@@ -4,8 +4,9 @@ Status: the managed GPU context resource primitive is implemented and passes
 CPU admission and separate-process CUDA controls. A dedicated raw-only service
 implements typed managed registration, raw rotary preparation and cached release
 receipts. Separate-process CUDA controls pass on both transports, including
-actual exporter frees while the importing service stays alive. Pinned strict
-reproduction is a separate qualification.
+actual exporter frees while the importing service stays alive. Strict pinned
+reproduction passes 331 CPU cases and ten CUDA cases with source, loaded-schema,
+native binary and complete process-exit-log verification.
 Raw rotary copy primitives have separate CPU/CUDA qualification. Multiprocess
 KMesh engine admission remains closed.
 
