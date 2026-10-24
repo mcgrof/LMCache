@@ -2,7 +2,8 @@
 """Exercise actual native span I/O through separate CUDA service processes."""
 
 # Standard
-from dataclasses import replace
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from functools import wraps
 from multiprocessing.connection import Connection
 from typing import Any, Literal
@@ -23,9 +24,10 @@ from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.multiprocess import kmesh_span_store as span_module
 from lmcache.v1.multiprocess.custom_types import DeviceIPCWrapper
 from lmcache.v1.multiprocess.kmesh_bindings import RegisteredWorkerBindings
-from lmcache.v1.multiprocess.kmesh_domains import RegistrationState
+from lmcache.v1.multiprocess.kmesh_domains import RegistrationState, WorkerFence
 from lmcache.v1.multiprocess.kmesh_native_store import RegisteredSpanGather
 from lmcache.v1.multiprocess.kmesh_raw_server import create_managed_raw_server
+from lmcache.v1.multiprocess.kmesh_types import RegisteredRuntime, SpanOperationStatus
 from lmcache.v1.multiprocess.modules.blend.retrieve import RegisteredRetrievePlan
 from lmcache.v1.multiprocess.transport.factory import RequestClientFactory
 from lmcache.v1.multiprocess.transport.grpc_impl.server import GrpcMultiprocessServer
@@ -40,6 +42,20 @@ pytestmark = pytest.mark.skipif(
     not (torch_dev.is_available() and torch_device_type == "cuda"),
     reason="requires actual native CUDA span transfers and raw IPC",
 )
+
+
+@dataclass(frozen=True)
+class SpanConsumerCase:
+    """Expose real completed placement to a separately selected consumer test."""
+
+    fence: WorkerFence
+    runtime: RegisteredRuntime
+    receipt: SpanOperationStatus
+    kv: torch.Tensor
+    blocks: tuple[int, ...]
+    destination_start: int
+    token_count: int
+    layout: Literal["NHD", "HND"]
 
 
 def span_service(
@@ -248,9 +264,10 @@ def test_managed_span_native_store_and_restore(
     mode: str,
     source_start: int,
     destination_start: int,
-    layout: str,
+    layout: Literal["NHD", "HND"],
     layers: int,
     token_count: int,
+    consume: Callable[[SpanConsumerCase], None] | None = None,
 ) -> None:
     device = torch.device("cuda", 0)
     # Synthetic two-plane geometry includes the model's 24-layer count.
@@ -484,6 +501,19 @@ def test_managed_span_native_store_and_restore(
                 )
                 parent.send("observe")
                 assert read_snapshot(parent)["enqueues"] == 1
+                if consume is not None:
+                    consume(
+                        SpanConsumerCase(
+                            fence,
+                            runtime,
+                            restored,
+                            kv,
+                            tuple(destination[0]),
+                            destination_start,
+                            token_count,
+                            layout,
+                        )
+                    )
                 kv.fill_(-9)
                 backend.record_event(ready, torch_dev.current_stream(device))
                 event = backend.export_event(ready, device)

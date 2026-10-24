@@ -180,3 +180,27 @@ the worker must retain its reservations and stop normal request continuation.
 
 Serializing this error carries failure text only. The physical cleanup callback
 and its live device resources remain in the owning worker.
+
+Experimental registered paged-layer input
+-----------------------------------------
+
+``lmcache.integration.vllm.kmesh_span_layers`` binds completed native restore
+receipts to actual model tokens and a private engine block table.
+``RestoredSpanBatch`` checks the accepting fence, context, request generation,
+operation kind, block digest, semantic namespace and exact source content.
+Only its completed valid spans become hits. Other declared spans remain gaps.
+These cooperative checks do not acquire scheduler blocks or attest model weights.
+
+``RestoredPagedLayerSource`` supplies those actual paged inputs through the
+session interface. It reads valid restored slots with the native transfer kernel,
+zeroes gaps, and publishes a request-owned GPU buffer through ``LayerwiseLoadState``.
+The existing model performs selection and deeper-layer repair. Advancing the
+source after each model layer scatters the repaired buffer into the worker's
+still-reserved blocks. Cached keys are not rotated a second time.
+
+Close drains actual worker-device work before releasing buffers. Unresolved
+cleanup retains the source, raw tensors and cache views, and raises the typed
+cleanup failure. ``drain_failed()`` retries a closed source's cleanup without
+another transfer. Keep real engine reservations until that operation succeeds.
+The primitive remains experimental; model outputs and end-to-end registered
+serving have not been qualified by its synthetic layer-input controls.
