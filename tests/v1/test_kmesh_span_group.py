@@ -3,6 +3,7 @@
 
 # Standard
 from dataclasses import replace
+from typing import Any
 import hashlib
 import json
 
@@ -15,6 +16,8 @@ from lmcache.integration.vllm.kmesh_span_group import (
     RestoredSpanGroupMember,
 )
 from lmcache.integration.vllm.kmesh_span_layers import RestoredSpanBatch
+from lmcache.v1.compute.blend.layer_source import BlendLayerSourceRequest
+from lmcache.v1.token_span import ExplicitTokenSpans, TokenSpan
 from tests.v1.test_kmesh_span_layers import completed_batch
 
 
@@ -109,3 +112,55 @@ def test_group_member_requires_an_exact_model_identity(case: str) -> None:
             else 0,
             batch,
         )
+
+
+@pytest.mark.parametrize(
+    "case", ["match", "request", "generation", "tokens", "spans", "order", "missing"]
+)
+def test_bind_checks_every_actual_model_input_before_consumption(case: str) -> None:
+    with completed_batch() as batch:
+        group = RestoredSpanGroup((sibling(batch, 0), sibling(batch, 1)))
+        requests = tuple(
+            BlendLayerSourceRequest(
+                m.request_id, m.generation, m.batch.token_ids, m.batch.explicit_spans
+            )
+            for m in group.members
+        )
+        if case == "match":
+            group.validate_requests(requests)
+            return
+        if case == "order":
+            requests = requests[::-1]
+        elif case == "missing":
+            requests = requests[:1]
+        else:
+            changes: dict[str, dict[str, Any]] = {
+                "request": {"request_id": "other-model"},
+                "generation": {"generation": 2},
+                "tokens": {"token_ids": (321,) * 14},
+                "spans": {
+                    "explicit_spans": ExplicitTokenSpans(
+                        14, TokenSpan(0, 14), (TokenSpan(4, 12),)
+                    )
+                },
+            }
+            changed = changes[case]
+            requests = (requests[0], replace(requests[1], **changed))
+        with pytest.raises(ValueError, match="complete registered group"):
+            group.validate_requests(requests)
+
+
+@pytest.mark.parametrize(
+    "case", ["bool-generation", "mutable-tokens", "bool-token", "bounds"]
+)
+def test_group_model_input_rejects_mutable_or_ambiguous_values(case: str) -> None:
+    spans = ExplicitTokenSpans(3, TokenSpan(0, 3), (TokenSpan(0, 3),))
+    values = {
+        "bool-generation": (True, (1, 2, 3)),
+        "mutable-tokens": (1, [1, 2, 3]),
+        "bool-token": (1, (1, True, 3)),
+        "bounds": (1, (1, 2)),
+    }
+    generation, tokens = values[case]
+    with pytest.raises(ValueError):
+        BlendLayerSourceRequest("model", generation, tokens, spans)  # type: ignore[arg-type]

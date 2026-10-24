@@ -15,6 +15,10 @@ import torch
 
 # First Party
 from lmcache import torch_dev
+from lmcache.integration.vllm.kmesh_span_group import (
+    RestoredPagedLayerGroup,
+    RestoredSpanGroup,
+)
 from lmcache.integration.vllm.kmesh_span_layers import (
     CompletedSpanPlacement,
     RestoredPagedLayerSource,
@@ -165,7 +169,7 @@ class RegisteredSpanWorker:
         self._exports = exports
         self.registration, self.runtime, self.fence = registration, runtime, fence
         self._pending: _Operation | None = None
-        self._sources: list[RestoredPagedLayerSource] = []
+        self._sources: list[RestoredPagedLayerSource | RestoredPagedLayerGroup] = []
         self._closing = False
         self._release: ManagedRawRelease | None = None
 
@@ -404,6 +408,33 @@ class RegisteredSpanWorker:
         self._sources.append(source)
         return source
 
+    def layer_source_group(self, group: RestoredSpanGroup) -> RestoredPagedLayerGroup:
+        """Admit a complete group with private blocks under this worker owner.
+
+        Args:
+            group: Validated ordered requests, exact placements and block tables.
+
+        Returns:
+            One aggregate model-input owner, retained through checked cleanup.
+
+        Raises:
+            ValueError: A receiving fence, context or cache bound differs.
+            RuntimeError: The worker is retiring or still owns earlier work.
+        """
+        if self._closing or self.pending or any(not s.is_closed for s in self._sources):
+            raise RuntimeError("earlier registered model work still owns its blocks")
+        if any(
+            member.batch.fence != self.fence
+            or member.batch.context != self.runtime.context
+            for member in group.members
+        ):
+            raise ValueError("registered group belongs to another worker or context")
+        source = RestoredPagedLayerGroup(
+            group, self._exports.caches, self._exports.layout
+        )
+        self._sources.append(source)
+        return source
+
     def store(
         self,
         token_ids: tuple[int, ...],
@@ -495,9 +526,19 @@ class RegisteredSpanWorker:
         """
         op = self._pending
         if op is None:
+            errors: list[Exception] = []
             for source in self._sources:
                 if source.pending:
-                    source.drain_failed()
+                    try:
+                        source.drain_failed()
+                    except Exception as error:
+                        logger.exception("registered source drain remains unresolved")
+                        errors.append(error)
+            if errors:
+                raise UnsettledLayerSourceError(
+                    "registered sources still owe physical completion",
+                    self.drain_pending,
+                ) from errors[0]
             return
         if not op.issued:
             synchronize_device(self._exports.device)
@@ -539,8 +580,7 @@ class RegisteredSpanWorker:
         if self._release is not None:
             return self._release
         self._closing = True
-        for source in self._sources:
-            source.close()
+        self._close_sources()
         self.drain_pending()
         receipt = _value(
             self._exports.client.kmesh_retire_raw_context(
@@ -565,6 +605,23 @@ class RegisteredSpanWorker:
         self._sources.clear()
         _RETAINED_EXPORTS.pop(self._exports.nonce)
         return receipt
+
+    def _close_sources(self) -> None:
+        errors: list[Exception] = []
+        for source in self._sources:
+            try:
+                source.close()
+            except Exception as error:
+                logger.exception("registered source close remains unresolved")
+                errors.append(error)
+        if errors:
+            if any(isinstance(error, UnsettledLayerSourceError) for error in errors):
+                raise UnsettledLayerSourceError(
+                    "registered sources still owe physical cleanup", self._close_sources
+                ) from errors[0]
+            raise RuntimeError(
+                "a live model source still owns its worker blocks"
+            ) from errors[0]
 
     def _execute(self, op: _Operation) -> SpanOperationStatus:
         """Retain submitted arguments until the exact operation proves drain."""

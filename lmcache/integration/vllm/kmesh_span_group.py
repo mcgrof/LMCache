@@ -3,9 +3,25 @@
 
 # Standard
 from dataclasses import dataclass
+from typing import Literal
+
+# Third Party
+import torch
 
 # First Party
-from lmcache.integration.vllm.kmesh_span_layers import RestoredSpanBatch
+from lmcache.integration.vllm.kmesh_span_layers import (
+    RestoredPagedLayerSource,
+    RestoredSpanBatch,
+)
+from lmcache.integration.vllm.kmesh_span_layout import resolve_registered_paged_shape
+from lmcache.logging import init_logger
+from lmcache.v1.compute.blend.layer_source import (
+    BlendLayerSource,
+    BlendLayerSourceRequest,
+    UnsettledLayerSourceError,
+)
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -86,3 +102,123 @@ class RestoredSpanGroup:
             names.add(member.request_id)
             blocks.update(batch.block_ids)
             operations.update(p.receipt.operation_id for p in batch.placements)
+
+    def validate_requests(self, requests: tuple[BlendLayerSourceRequest, ...]) -> None:
+        """Check the complete model membership without opening any layer source.
+
+        Args:
+            requests: Actual ordered model identities, tokens and declared spans.
+
+        Raises:
+            ValueError: Any identity, order or model input differs from the group.
+        """
+        expected = tuple(
+            BlendLayerSourceRequest(
+                member.request_id,
+                member.generation,
+                member.batch.token_ids,
+                member.batch.explicit_spans,
+            )
+            for member in self.members
+        )
+        if type(requests) is not tuple or requests != expected:
+            raise ValueError("model requests differ from the complete registered group")
+
+
+class RestoredPagedLayerGroup:
+    """Own private layer sources for an atomically validated registered group.
+
+    Args:
+        group: Complete validated model members and destination reservations.
+        kv_caches: The worker's actual registered engine cache views.
+        layout: Their physical NHD/HND ordering.
+
+    Construction validates every member's cache bounds before creating any
+    source. It does not enqueue device work. The owning worker retains this
+    group until every source closes and physical work is settled.
+    """
+
+    def __init__(
+        self,
+        group: RestoredSpanGroup,
+        kv_caches: tuple[torch.Tensor, ...],
+        layout: Literal["NHD", "HND"],
+    ) -> None:
+        if not kv_caches:
+            raise ValueError("registered model group requires actual cache views")
+        geometry = resolve_registered_paged_shape(tuple(kv_caches[0].shape), layout)
+        if any(
+            max(m.batch.block_ids) >= geometry.blocks
+            or len(m.batch.token_ids) > len(m.batch.block_ids) * geometry.block_size
+            for m in group.members
+        ):
+            raise ValueError("registered model group exceeds its reserved cache blocks")
+        self._group = group
+        self._sources = tuple(
+            RestoredPagedLayerSource(member.batch, kv_caches, layout)
+            for member in group.members
+        )
+        self._bound = False
+
+    @property
+    def pending(self) -> bool:
+        """Report any member still owing checked physical completion."""
+        return any(source.pending for source in self._sources)
+
+    @property
+    def is_closed(self) -> bool:
+        """Report logical retirement of every member, separately from drain."""
+        return all(source.is_closed for source in self._sources)
+
+    def bind(
+        self, requests: tuple[BlendLayerSourceRequest, ...]
+    ) -> tuple[BlendLayerSource, ...]:
+        """Match the entire ordered model input before exposing any source.
+
+        Args:
+            requests: Actual model request identities, tokens and declared spans.
+
+        Returns:
+            Private, single-use model inputs in that exact member order.
+
+        Raises:
+            ValueError: Any model input differs from its completed span batch.
+            RuntimeError: This group was already bound or closed.
+        """
+        if self._bound or self.is_closed:
+            raise RuntimeError("registered model group is already bound or closed")
+        self._group.validate_requests(requests)
+        self._bound = True
+        return self._sources
+
+    def close(self) -> None:
+        """Attempt all member cleanups while retaining unresolved ownership.
+
+        Raises:
+            UnsettledLayerSourceError: At least one actual device drain failed.
+            RuntimeError: A live generator still owns a consuming model step.
+        """
+        errors: list[Exception] = []
+        for source in self._sources:
+            try:
+                source.close()
+            except Exception as error:
+                logger.exception("registered group member cleanup remains unresolved")
+                errors.append(error)
+        if errors:
+            if any(isinstance(error, UnsettledLayerSourceError) for error in errors):
+                raise UnsettledLayerSourceError(
+                    "registered group still owes physical cleanup", self.close
+                ) from errors[0]
+            raise RuntimeError(
+                "registered group still owns a live model source"
+            ) from errors[0]
+
+    def drain_failed(self) -> None:
+        """Retry every source cleanup after its consuming generator closes.
+
+        Raises:
+            UnsettledLayerSourceError: Actual device drain remains unresolved.
+            RuntimeError: A consuming generator is still live.
+        """
+        self.close()
