@@ -14,7 +14,6 @@ import blake3
 import torch
 
 # First Party
-from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import (
     GroupedObjectKeys,
@@ -39,17 +38,13 @@ from lmcache.v1.multiprocess.kmesh_domains import (
     KMeshFenceError,
     WorkerFence,
 )
+from lmcache.v1.multiprocess.kmesh_native_store import gather_registered_span
 from lmcache.v1.multiprocess.kmesh_types import SpanHandle, SpanOperationStatus
 from lmcache.v1.multiprocess.modules.blend import BlendModule
 from lmcache.v1.multiprocess.modules.blend.retrieve import RegisteredRetrievePlan
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import get_layout_desc
-from lmcache.v1.multiprocess.object_group_transfer import (
-    downsample_and_stage_block_ids,
-    transfer_kv_per_object_group,
-)
 from lmcache.v1.multiprocess.transport.request_context import get_request_session
 from lmcache.v1.platform.stream import synchronize_device
-import lmcache.lmcache_native as lmcache_native
 
 logger = init_logger(__name__)
 
@@ -144,7 +139,7 @@ class KMeshSpanStore:
             request_id: Logical request whose generation is consumed once.
             generation: Strictly increasing positive request generation.
             token_ids: Nonnegative source token IDs in complete chunk order.
-            source_start: Chunk-aligned position in the original sequence.
+            source_start: First position in the original sequence.
             context_digest: SHA-256 identity of the source preceding context.
             block_ids: Full source sequence's private engine block table.
             producer_event: Recorded CUDA IPC event after its last source write.
@@ -160,12 +155,11 @@ class KMeshSpanStore:
         if (
             type(source_start) is not int
             or source_start < 0
-            or source_start % chunk
             or not token_ids
             or len(token_ids) % chunk
             or any(type(t) is not int or not 0 <= t < 2**63 for t in token_ids)
         ):
-            raise KMeshFenceError("span store requires aligned complete token chunks")
+            raise KMeshFenceError("span store requires complete token chunks")
         signature = _digest(
             (
                 "store",
@@ -200,26 +194,13 @@ class KMeshSpanStore:
                 work.objects, all_buffers=True
             )
             self._wait_producer(work, producer_event)
-            block_size = cache.kv_layer_groups_manager.kernel_groups[0].tokens_per_block
-            selected = [
-                block_ids[0][
-                    source_start // block_size : (source_start + len(token_ids))
-                    // block_size
-                ]
-            ]
-            with torch_dev.device(cache.device), torch_dev.stream(cache.stream):
-                work.staged_blocks = downsample_and_stage_block_ids(cache, selected)
-                transfer_kv_per_object_group(
-                    cache,
-                    work.staged_blocks,
-                    [work.objects[k] for k in keys],
-                    0,
-                    1,
-                    0,
-                    lmcache_native.TransferDirection.D2H,
-                    transfer_key=work.status.operation_id,
-                    block_ids_host=selected,
-                )
+            work.staged_blocks = gather_registered_span(
+                work.operation,
+                [work.objects[k] for k in keys],
+                source_start,
+                block_ids,
+                transfer_key=work.status.operation_id,
+            )
             self._drain_device(work)
             handle = SpanHandle(
                 namespace,

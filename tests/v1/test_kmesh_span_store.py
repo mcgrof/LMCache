@@ -44,9 +44,9 @@ def test_span_refusal_preserves_exact_completion_boundary(case: str) -> None:
                     "request",
                     1,
                     list(range(8)),
-                    0,
+                    5 if case == "cpu-runtime" else 0,
                     "5" * 64,
-                    [[1, 2]],
+                    [[1, 2, 3, 4]],
                     b"" if case == "empty-event" else b"not-a-device-event",
                 )
                 if case == "cpu-runtime":

@@ -118,8 +118,8 @@ digests remain cooperative worker declarations, not server weight attestation.
 
 ## Source positions inside a chunk
 
-The first native storage profile admits chunk-aligned source positions. That
-restriction cannot represent a shared segment beginning after a private prompt
+The native storage profile accepts source positions inside a chunk. A
+chunk-alignment restriction cannot represent a shared segment beginning after a private prompt
 prefix, for example at source token five with a 256-token storage chunk. Chunk
 length is relative to the saved segment; it need not align the segment's first
 position to the original prompt. Destination rotation alone cannot fix a gather
@@ -129,7 +129,9 @@ Keep the existing block transfer for aligned sources. For an unaligned source,
 build its exact slot map from the retained block table and original positions:
 ``slot[p] = blocks[p // block_size] * block_size + p % block_size``. Use the
 existing native ``multi_layer_kv_transfer`` gather into each complete pinned CPU
-object. Its slot-map path supports the two-plane head-major and token-major
+object. Each object must fit within one lazy allocator host-registration range;
+the slot kernel maps one pointer and cannot assume aliases of independently
+registered ranges are adjacent. Its slot-map path supports the two-plane head-major and token-major
 layouts needed by the bounded full-attention worker. Refuse other unaligned
 formats until qualified, while preserving their existing aligned path.
 

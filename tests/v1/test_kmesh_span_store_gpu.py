@@ -6,6 +6,7 @@ from dataclasses import replace
 from functools import wraps
 from multiprocessing.connection import Connection
 from typing import Any, Literal
+import math
 import multiprocessing as mp
 import traceback
 import uuid
@@ -20,6 +21,7 @@ from lmcache import torch_dev, torch_device_type
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.multiprocess import kmesh_span_store as span_module
+from lmcache.v1.multiprocess.custom_types import DeviceIPCWrapper
 from lmcache.v1.multiprocess.kmesh_bindings import RegisteredWorkerBindings
 from lmcache.v1.multiprocess.kmesh_domains import RegistrationState
 from lmcache.v1.multiprocess.kmesh_raw_server import create_managed_raw_server
@@ -45,7 +47,7 @@ def span_service(
     """Observe real calls; inject refusals without manufacturing device faults."""
     armed = {"enabled": False}
     observed = {"enqueues": 0, "gathers": 0, "drains": 0}
-    gather = span_module.transfer_kv_per_object_group
+    gather = span_module.gather_registered_span
     enqueue = RegisteredRetrievePlan.enqueue
     drain = span_module.synchronize_device
     read = StorageManager.unsafe_read
@@ -54,9 +56,12 @@ def span_service(
     publish = RegisteredWorkerBindings.publish
 
     @wraps(gather)
-    def actual_gather(*args: Any, **kwargs: Any) -> None:
+    def actual_gather(*args: Any, **kwargs: Any) -> list[torch.Tensor]:
         observed["gathers"] += 1
-        gather(*args, **kwargs)
+        result = gather(*args, **kwargs)
+        if armed["enabled"] and mode == "source-undrained":
+            raise RuntimeError("injected after actual native source gather")
+        return result
 
     @wraps(enqueue)
     def actual_enqueue(plan: RegisteredRetrievePlan) -> None:
@@ -67,7 +72,7 @@ def span_service(
 
     @wraps(drain)
     def actual_drain(device: object) -> None:
-        if armed["enabled"] and mode == "drain-refusal":
+        if armed["enabled"] and mode in ("drain-refusal", "source-undrained"):
             raise RuntimeError("injected before span device drain")
         drain(device)
         observed["drains"] += 1
@@ -109,7 +114,7 @@ def span_service(
     server = engine = None
     try:
         with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(span_module, "transfer_kv_per_object_group", actual_gather)
+            patch.setattr(span_module, "gather_registered_span", actual_gather)
             patch.setattr(RegisteredRetrievePlan, "enqueue", actual_enqueue)
             patch.setattr(span_module, "synchronize_device", actual_drain)
             patch.setattr(StorageManager, "unsafe_read", actual_read)
@@ -163,55 +168,113 @@ def span_service(
 def rotate_reference(source: torch.Tensor, delta: int) -> torch.Tensor:
     """Rotate post-RoPE keys independently and preserve values byte for byte."""
     result = source.clone()
-    keys = source[0].float()
+    keys = source[:, 0].float()
     frequencies = torch.arange(1, 9, dtype=torch.float32) * 0.013
     cosine, sine = (delta * frequencies).cos(), (delta * frequencies).sin()
     first, second = keys[..., :8], keys[..., 8:]
-    result[0, ..., :8] = first * cosine - second * sine
-    result[0, ..., 8:] = first * sine + second * cosine
+    result[:, 0, ..., :8] = first * cosine - second * sine
+    result[:, 0, ..., 8:] = first * sine + second * cosine
     return result
+
+
+def place_source(
+    kv: torch.Tensor,
+    source: torch.Tensor,
+    blocks: list[int],
+    start: int,
+    layout: str,
+) -> None:
+    """Write actual token slots on the caller's current CUDA stream."""
+    for index in range(source.shape[2]):
+        position = start + index
+        block, offset = blocks[position // 4], position % 4
+        target = (
+            kv[:, :, block, offset] if layout == "NHD" else kv[:, :, block, :, offset]
+        )
+        target.copy_(source[:, :, index], non_blocking=True)
+
+
+def read_window(
+    kv: torch.Tensor,
+    blocks: list[int],
+    start: int,
+    count: int,
+    layout: str,
+) -> torch.Tensor:
+    """Read real paged token slots after the server's completed receipt."""
+    rows: list[torch.Tensor] = []
+    for position in range(start, start + count):
+        block, offset = blocks[position // 4], position % 4
+        rows.append(
+            kv[:, :, block, offset] if layout == "NHD" else kv[:, :, block, :, offset]
+        )
+    return torch.stack(rows, dim=2).cpu()
 
 
 @pytest.mark.parametrize("transport", ["zmq", "grpc"])
 @pytest.mark.parametrize(
-    "mode",
+    "mode,source_start,destination_start,layout,layers",
     [
-        "success",
-        "corrupt",
-        "evict",
-        "enqueue-failure",
-        "drain-refusal",
-        "admission-refusal",
-        "stale-publication",
-    ],
+        (mode, 0, 3, "NHD", 1)
+        for mode in (
+            "success",
+            "corrupt",
+            "evict",
+            "enqueue-failure",
+            "drain-refusal",
+            "admission-refusal",
+            "stale-publication",
+        )
+    ]
+    + [
+        ("success", 5, destination, layout, 24)
+        for layout in ("NHD", "HND")
+        for destination in (3, 9)
+    ]
+    + [("source-undrained", 5, 3, layout, 24) for layout in ("NHD", "HND")],
 )
 def test_managed_span_native_store_and_restore(
     transport: Literal["zmq", "grpc"],
     mode: str,
+    source_start: int,
+    destination_start: int,
+    layout: str,
+    layers: int,
 ) -> None:
     device = torch.device("cuda", 0)
-    # Synthetic geometry: K/V planes, 16 blocks, 4 tokens/block, two heads,
-    # 16 elements/head. Distinct 64 MiB raw allocations avoid interior sharing.
+    # Synthetic two-plane geometry includes the model's 24-layer count.
+    # Each layer has 16 blocks, 4 tokens/block, two heads, 16 elements/head.
+    # Separate 64 MiB exporter allocations avoid sharing small CUDA segments.
     pool = torch.empty((64 << 20) // 2, dtype=torch.bfloat16, device=device)
-    kv = pool[:4096].reshape(2, 16, 4, 2, 16)
+    shape = (2, 16, 4, 2, 16) if layout == "NHD" else (2, 16, 2, 4, 16)
+    kv = pool[: layers * math.prod(shape)].reshape(layers, *shape)
     kv.fill_(-9)
     source = (
-        (torch.arange(1024, dtype=torch.float32).reshape(2, 16, 2, 16) % 53 / 17)
+        (
+            torch.arange(layers * 2 * 16 * 2 * 16, dtype=torch.float32).reshape(
+                layers, 2, 16, 2, 16
+            )
+            % 53
+            / 17
+        )
         .to(torch.bfloat16)
         .pin_memory()
     )
-    source_blocks = [2, 4, 6, 8]
-    for i, block in enumerate(source_blocks):
-        kv[:, block].copy_(source[:, i * 4 : (i + 1) * 4])
+    source_gpu = source.to(device)
+    source_blocks = [2, 4, 6, 8, 10, 12]
     rotary_pool = torch.empty((64 << 20) // 4, dtype=torch.float32, device=device)
-    rope = rotary_pool[:1024].reshape(64, 16)
+    rope = rotary_pool[: 64 * 16].reshape(64, 16)
     phases = torch.arange(64, dtype=torch.float32)[:, None] * torch.arange(1, 9) * 0.013
     rope.copy_(torch.cat((phases.cos(), phases.sin()), dim=1))
     backend = get_event_ipc_backend(device)
     ready = backend.create_event(device)
     backend.record_event(ready, torch_dev.current_stream(device))
     event = backend.export_event(ready, device)
-    wrappers = [RawCudaIPCWrapper.wrap(t) for t in (kv, rope)]
+    wrappers = [RawCudaIPCWrapper.wrap(t) for t in (*kv.unbind(0), rope)]
+    cache_wrappers: list[DeviceIPCWrapper] = list(wrappers[:-1])
+    kv_allocations = {w.allocation_identity for w in wrappers[:-1]}
+    assert len(kv_allocations) == 1
+    assert wrappers[-1].allocation_identity not in kv_allocations
     parent, child = mp.get_context("spawn").Pipe()
     process = mp.get_context("spawn").Process(
         target=span_service, args=(child, transport, mode)
@@ -232,16 +295,16 @@ def test_managed_span_native_store_and_restore(
                 server.boot_id,
                 nonce,
                 99,
-                [wrappers[0]],
+                cache_wrappers,
                 "synthetic-span",
-                "NHD",
+                layout,
             ).result(timeout=30)
         )
         runtime = value(
             client.kmesh_register_rotary(
                 99,
                 registration.context,
-                [wrappers[1]],
+                [wrappers[-1]],
                 16,
                 True,
                 [0],
@@ -268,12 +331,15 @@ def test_managed_span_native_store_and_restore(
         stream = torch_dev.Stream(device=device)
         matrix = torch.full((2048, 2048), 1 / 2048, device=device)
         workspace = torch.empty_like(matrix)
+        # Load this exact strided copy before the pending-work challenge; first
+        # CUDA module initialization can otherwise drain the queued producer.
+        place_source(kv, source_gpu, source_blocks, source_start, layout)
+        kv.fill_(-9)
         torch_dev.synchronize(device)
         with torch_dev.stream(stream):
             for _ in range(512):
                 torch.mm(matrix, matrix, out=workspace)
-            for i, block in enumerate(source_blocks):
-                kv[:, block].copy_(source[:, i * 4 : (i + 1) * 4], non_blocking=True)
+            place_source(kv, source_gpu, source_blocks, source_start, layout)
             backend.record_event(ready, stream)
         assert not backend.query_event(ready)
         event = backend.export_event(ready, device)
@@ -283,14 +349,14 @@ def test_managed_span_native_store_and_restore(
             "source",
             1,
             list(range(16)),
-            0,
+            source_start,
             context_digest,
             [source_blocks],
             event,
         )
         refused = foreign.kmesh_store_span(*store_args).result(timeout=30)
         assert refused[0] is None and refused[1]
-        if mode == "admission-refusal":
+        if mode in ("admission-refusal", "source-undrained"):
             parent.send("arm")
             read_snapshot(parent)
         stored = value(client.kmesh_store_span(*store_args).result(timeout=30))
@@ -299,26 +365,60 @@ def test_managed_span_native_store_and_restore(
             == stored
         )
         assert value(client.kmesh_store_span(*store_args).result(timeout=30)) == stored
-        if mode == "admission-refusal":
-            assert stored.state == "failed-drained" and stored.span is None
-            assert "admission" in stored.error
+        if mode in ("admission-refusal", "source-undrained"):
+            assert stored.span is None
+            if mode == "admission-refusal":
+                assert stored.state == "failed-drained" and "admission" in stored.error
+            else:
+                assert (
+                    stored.state == "failed-undrained"
+                    and "source gather" in stored.error
+                )
+                assert (
+                    value(
+                        client.kmesh_registration_state(lease).result(timeout=30)
+                    ).pending
+                    == 1
+                )
+                blocked = client.kmesh_retire_raw_context(
+                    server.boot_id, nonce, registration.context
+                ).result(timeout=30)
+                assert blocked[0] is None and blocked[1]
+                parent.send("cleanup")
+                before = read_snapshot(parent)
+                drained = value(
+                    client.kmesh_drain_span(fence, "source", 1).result(timeout=30)
+                )
+                assert drained.state == "failed-drained" and drained.span is None
+                parent.send("observe")
+                after = read_snapshot(parent)
+                assert after["gathers"] == before["gathers"] == 1
+                assert after["drains"] == before["drains"] + 1
         else:
             assert stored.state == "stored" and stored.span is not None
             span = stored.span
+            assert span.source_start == source_start
             changed = client.kmesh_store_span(
-                fence, "source", 1, [1] * 16, 0, context_digest, [source_blocks], event
+                fence,
+                "source",
+                1,
+                [1] * 16,
+                source_start,
+                context_digest,
+                [source_blocks],
+                event,
             ).result(timeout=30)
             assert changed[0] is None and "changed" in changed[1]
             kv.fill_(-9)
             backend.record_event(ready, torch_dev.current_stream(device))
             event = backend.export_event(ready, device)
-            destination = [[13, 11, 9, 7, 5]]
+            destination = [[13, 11, 9, 7, 5, 3, 1]]
             altered = client.kmesh_restore_span(
                 fence,
                 "bad-handle",
                 1,
                 replace(span, token_digest="0" * 64),
-                4,
+                destination_start,
                 context_digest,
                 destination,
                 event,
@@ -334,7 +434,7 @@ def test_managed_span_native_store_and_restore(
                 "destination",
                 1,
                 span,
-                3,
+                destination_start,
                 "6" * 64,
                 destination,
                 event,
@@ -345,19 +445,21 @@ def test_managed_span_native_store_and_restore(
             if mode == "success":
                 assert restored.state == "loaded-needs-repair" and restored.span == span
                 torch_dev.synchronize(device)
-                actual = torch.stack(
-                    [kv[:, destination[0][p // 4], p % 4].cpu() for p in range(3, 19)],
-                    dim=1,
-                )
-                expected = rotate_reference(source, 3)
+                actual = read_window(kv, destination[0], destination_start, 16, layout)
+                expected = rotate_reference(source, destination_start - source_start)
                 torch.testing.assert_close(
-                    actual[0], expected[0], rtol=0.012, atol=0.025
+                    actual[:, 0], expected[:, 0], rtol=0.012, atol=0.025
                 )
                 assert torch.equal(
-                    actual[1].view(torch.uint16), source[1].view(torch.uint16)
+                    actual[:, 1].view(torch.uint16), source[:, 1].view(torch.uint16)
                 )
-                assert torch.all(kv[:, destination[0][0], :3] == -9).item()
-                assert torch.all(kv[:, destination[0][-1], 3:] == -9).item()
+                all_rows = read_window(kv, destination[0], 0, 28, layout)
+                untouched = [
+                    p
+                    for p in range(28)
+                    if not destination_start <= p < destination_start + 16
+                ]
+                assert torch.all(all_rows[:, :, untouched] == -9).item()
                 assert (
                     value(client.kmesh_restore_span(*restore_args).result(timeout=30))
                     == restored
@@ -373,7 +475,7 @@ def test_managed_span_native_store_and_restore(
                         "same-position",
                         1,
                         span,
-                        0,
+                        source_start,
                         context_digest,
                         [source_blocks],
                         event,
@@ -381,10 +483,12 @@ def test_managed_span_native_store_and_restore(
                 )
                 assert same.state == "loaded"
                 torch_dev.synchronize(device)
-                actual = torch.cat([kv[:, b].cpu() for b in source_blocks], dim=1)
-                torch.testing.assert_close(actual[0], source[0], rtol=0.012, atol=0.025)
+                actual = read_window(kv, source_blocks, source_start, 16, layout)
+                torch.testing.assert_close(
+                    actual[:, 0], source[:, 0], rtol=0.012, atol=0.025
+                )
                 assert torch.equal(
-                    actual[1].view(torch.uint16), source[1].view(torch.uint16)
+                    actual[:, 1].view(torch.uint16), source[:, 1].view(torch.uint16)
                 )
             else:
                 assert restored.span is None

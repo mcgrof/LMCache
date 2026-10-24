@@ -113,9 +113,12 @@ one worker and one object/kernel group, with complete source chunks. It does
 not accept GPU-L1/GDS or enable the vLLM multiprocess model consumer.
 
 ``kmesh_store_span`` takes the bound fence, request ID/generation, source token
-IDs, chunk-aligned source position, preceding-context SHA-256, full block table
-and recorded producer event. It waits for source writes, gathers through the
-native object-group path, drains actual device work and checks every key's L1
+IDs, original source position, preceding-context SHA-256, full block table
+and recorded producer event. Source positions may begin inside a block.
+Block-aligned sources use native object-group transfer; interior positions use
+the native slot-map gather for two-plane NHD/HND layouts. Each slot-map target
+object must fit within one host-registration range. The service waits for source
+writes, gathers exact source slots, drains actual device work and checks every key's L1
 admission before publishing an immutable ``SpanHandle``. Each physical key is
 unique to that accepted operation; the source is never overwritten.
 
