@@ -138,6 +138,22 @@ def _registered_layout_digest(paged: BorrowedContext, rotary: BorrowedRope) -> s
     )
 
 
+def _validate_raw_snapshot_metadata(
+    paged: BorrowedContext, rotary: BorrowedRope
+) -> None:
+    """Validate actual imported metadata without reading unordered device values."""
+    if any(
+        tensor.device != paged.entry.cache_context.device
+        or tensor.ndim != 2
+        or not tensor.shape[0]
+        or tensor.dtype not in (torch.float32, torch.float16, torch.bfloat16)
+        or not tensor.is_contiguous()
+        for tensor in rotary.state.cos_sin_caches
+    ):
+        raise KMeshFenceError("invalid raw rotary input tensor metadata")
+    _registered_layout_digest(paged, rotary)
+
+
 def _runtime(
     paged: BorrowedContext,
     rotary: BorrowedRope,
@@ -238,6 +254,7 @@ class RegisteredWorkerBindings:
         blend: "BlendModule",
         *,
         allow_device_snapshots: bool = False,
+        raw_snapshot_inputs: bool = False,
     ) -> None:
         self._registry = registry
         self._transfer = transfer
@@ -249,6 +266,7 @@ class RegisteredWorkerBindings:
         self._copies = RetainedTensorCopies()
         self._preparations: set[ContextIdentity] = set()
         self._allow_device_snapshots = allow_device_snapshots
+        self._raw_snapshot_inputs = raw_snapshot_inputs
         self._closing = False
 
     @property
@@ -346,7 +364,7 @@ class RegisteredWorkerBindings:
             instance_id: Actual client's registered worker instance.
             context: Expected exact paged generation from context discovery.
             caches_ipc: Raw worker rotary mappings; CUDA currently requires
-                PyTorch IPC rather than raw-driver or virtual-memory wrappers.
+                PyTorch IPC by default; the managed server selects raw inputs.
             head_size: Model-wide rotary width, positive and even.
             is_neox_style: Must be true for contiguous cosine/sine halves.
             group_to_cache: Engine-group to rotary-cache indices.
@@ -386,17 +404,28 @@ class RegisteredWorkerBindings:
                 )
             if cache.device.type != "cpu":
                 # First Party
-                from lmcache.v1.platform.devices.cuda.ipc_wrapper import CudaIPCWrapper
+                from lmcache.v1.platform.devices.cuda.ipc_wrapper import (
+                    CudaIPCWrapper,
+                    RawCudaIPCWrapper,
+                )
 
+                expected_wrapper = (
+                    RawCudaIPCWrapper if self._raw_snapshot_inputs else CudaIPCWrapper
+                )
                 if (
                     cache.device.type != "cuda"
                     or torch_device_type != "cuda"
                     or any(
-                        type(wrapper) is not CudaIPCWrapper for wrapper in caches_ipc
+                        type(wrapper) is not expected_wrapper for wrapper in caches_ipc
                     )
                 ):
                     raise KMeshFenceError(
-                        "ordered device snapshots currently require PyTorch CUDA IPC"
+                        "managed device snapshots require raw CUDA IPC"
+                        if self._raw_snapshot_inputs
+                        else (
+                            "ordered device snapshots currently require "
+                            "PyTorch CUDA IPC"
+                        )
                     )
             if (
                 type(head_size) is not int
@@ -409,7 +438,13 @@ class RegisteredWorkerBindings:
                 raise KMeshFenceError(
                     "ordered snapshots require full unquantized NeoX state"
                 )
-            raw = [wrapper.to_tensor() for wrapper in caches_ipc]
+            if self._raw_snapshot_inputs and cache.device.type != "cuda":
+                raise KMeshFenceError("raw snapshots require CUDA")
+            raw = (
+                []
+                if self._raw_snapshot_inputs
+                else [wrapper.to_tensor() for wrapper in caches_ipc]
+            )
             if any(
                 t.device != cache.device
                 or t.ndim != 2
@@ -420,7 +455,7 @@ class RegisteredWorkerBindings:
             ):
                 raise KMeshFenceError("invalid rotary input tensor metadata")
             if group_to_cache and (
-                min(group_to_cache) < -1 or max(group_to_cache) >= len(raw)
+                min(group_to_cache) < -1 or max(group_to_cache) >= len(caches_ipc)
             ):
                 raise KMeshFenceError("rotary cache mapping is out of range")
             rotations: list[tuple[int, int] | None] = []
@@ -442,12 +477,21 @@ class RegisteredWorkerBindings:
                 kv_quant,
                 tuple(caches_ipc),
             )
-            _registered_layout_digest(paged, provisional)
+            if not self._raw_snapshot_inputs:
+                _registered_layout_digest(paged, provisional)
             copy_context = self._transfer.borrow_context(
                 instance_id, context, revoked.set
             )
             consumed, provisional = provisional, None
-            host = self._copies.copy_to_cpu(copy_context, consumed, producer_event)
+            if self._raw_snapshot_inputs:
+                host = self._copies.copy_raw_to_cpu(
+                    copy_context,
+                    consumed,
+                    producer_event,
+                    _validate_raw_snapshot_metadata,
+                )
+            else:
+                host = self._copies.copy_to_cpu(copy_context, consumed, producer_event)
             normalized = [normalize_rope_snapshot(t) for t in host]
             with self._lock:
                 if self._closing or revoked.is_set():

@@ -645,6 +645,61 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         self._release_entries(popped)
         logger.info("Unregistered KV cache for GPU ID %d", instance_id)
 
+    def adopt_context_entry(self, instance_id: int, entry: ContextEntry) -> None:
+        """Publish a trusted server's already constructed exact context entry.
+
+        The caller must retain construction before import and serialize this
+        operation against all registration writers. This method is not an RPC.
+        Its supplied ownership must belong to the actual receiving client.
+
+        Raises:
+            ContextOwnershipError: Foreign or already registered ownership.
+        """
+        if entry.ownership.identity.owner_session != get_request_session():
+            raise ContextOwnershipError("context entry belongs to another client")
+        with self._lock:
+            if instance_id in self._cache_contexts:
+                raise ContextOwnershipError("context entry is already registered")
+        cache = entry.cache_context
+        manager = cache.kv_layer_groups_manager
+        layouts = {
+            group: get_layout_desc(cache, self._ctx.chunk_size, object_group_id=group)
+            for group in range(manager.num_object_groups)
+        }
+        self._ctx.layout_desc_registry.register(
+            entry.model_name,
+            entry.world_size,
+            layouts[0],
+            manager.get_attn_desc(),
+            group_layout_descs=layouts,
+        )
+        with self._lock:
+            if instance_id in self._cache_contexts:
+                raise ContextOwnershipError("concurrent context registration changed")
+            self._cache_contexts[instance_id] = entry
+
+    def detach_context_entry(self, instance_id: int, entry: ContextEntry) -> None:
+        """Detach exactly the server's selected entry after checked physical close.
+
+        This host bookkeeping operation is not release evidence. The caller
+        must first complete its checked device close and serialize writers.
+        Unknown bookkeeping failure must not produce a release receipt.
+
+        Raises:
+            ContextOwnershipError: Foreign, stale, missing or undrained entry.
+        """
+        if entry.ownership.identity.owner_session != get_request_session():
+            raise ContextOwnershipError("context entry belongs to another client")
+        with self._lock:
+            if self._cache_contexts.get(instance_id) is not entry:
+                raise ContextOwnershipError("context entry generation changed")
+        entry.ownership.retire(0)
+        with self._lock:
+            if self._cache_contexts.get(instance_id) is not entry:
+                raise ContextOwnershipError("context entry generation changed")
+            del self._cache_contexts[instance_id]
+        self._ctx.layout_desc_registry.unregister(entry.model_name, entry.world_size)
+
     @request_handler(
         HandlerType.BLOCKING,
         requires_client_affinity=True,

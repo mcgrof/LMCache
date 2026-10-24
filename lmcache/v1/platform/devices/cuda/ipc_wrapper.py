@@ -28,6 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, ClassVar
 import hashlib
+import json
 import os
 import threading
 import uuid
@@ -474,6 +475,24 @@ class RawCudaIPCWrapper(DeviceIPCWrapper):
         return hashlib.sha256(self._ipc_handle_reserved).hexdigest()
 
     @property
+    def view_identity(self) -> str:
+        """Identify exact raw view metadata, including its allocation and offset."""
+        return hashlib.sha256(
+            json.dumps(
+                (
+                    self.allocation_identity,
+                    self._alloc_offset,
+                    self._nbytes,
+                    str(self.dtype),
+                    self.shape,
+                    self.stride,
+                    self.device_uuid,
+                ),
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+
+    @property
     def raw_mapping_released(self) -> bool:
         """Inspect raw-wrapper references; this is not an exporter release receipt.
 
@@ -502,6 +521,26 @@ class RawCudaIPCWrapper(DeviceIPCWrapper):
         with _MAPPINGS_LOCK:
             if self._opens <= 0 or self._ipc_handle_reserved not in _MAPPED_ALLOCATIONS:
                 raise RuntimeError("cannot retire an unowned raw IPC allocation")
+            _RETIRED_RAW_ALLOCATIONS.add(self._ipc_handle_reserved)
+
+    def retire_released_raw_imports(self) -> None:
+        """Ban new imports of an allocation whose raw references have all released.
+
+        A server ledger must separately establish prior ownership and stop every
+        input consumer. Absence of raw mappings alone is not a release receipt.
+        This covers temporary rotary inputs after their checked copy cleanup;
+        it neither closes a native pointer nor counts other IPC implementations.
+
+        Raises:
+            RuntimeError: Any raw mapping or uncertain native outcome remains.
+        """
+        with _MAPPINGS_LOCK:
+            if (
+                self._ipc_handle_reserved in _MAPPED_ALLOCATIONS
+                or self._ipc_handle_reserved in _UNCERTAIN_RAW_ALLOCATIONS
+                or self._ipc_handle_reserved in _UNCERTAIN_RAW_IMPORTS
+            ):
+                raise RuntimeError("raw allocation has unresolved import obligations")
             _RETIRED_RAW_ALLOCATIONS.add(self._ipc_handle_reserved)
 
     def close_checked(self) -> None:

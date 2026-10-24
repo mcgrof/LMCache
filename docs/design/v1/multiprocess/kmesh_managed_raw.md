@@ -1,8 +1,11 @@
 # Managed raw context registration and release
 
 Status: the managed GPU context resource primitive is implemented and passes
-CPU admission and separate-process CUDA controls. Typed managed registration,
-raw rotary RPC integration and service retirement receipts remain design only.
+CPU admission and separate-process CUDA controls. A dedicated raw-only service
+implements typed managed registration, raw rotary preparation and cached release
+receipts. Separate-process CUDA controls pass on both transports, including
+actual exporter frees while the importing service stays alive. Pinned strict
+reproduction is a separate qualification.
 Raw rotary copy primitives have separate CPU/CUDA qualification. Multiprocess
 KMesh engine admission remains closed.
 

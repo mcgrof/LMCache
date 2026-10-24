@@ -79,6 +79,52 @@ message KmeshRegistrationStatus {
   int64 pending = 2;
 }
 
+message KmeshManagedRawRegistration {
+  string boot_id = 1;
+  string nonce = 2;
+  int64 instance_id = 3;
+  KmeshContextIdentity context = 4;
+  string state = 5;
+  repeated string allocation_ids = 6;
+}
+message KmeshManagedRawRelease {
+  string boot_id = 1;
+  string nonce = 2;
+  int64 instance_id = 3;
+  KmeshContextIdentity context = 4;
+  optional KmeshRopeIdentity rotary = 5;
+  repeated string allocation_ids = 6;
+}
+message KmeshRegisterRawContextRequest {
+  string boot_id = 1;
+  string nonce = 2;
+  int64 instance_id = 3;
+  repeated DeviceIpcWrapper caches_ipc = 4;
+  string model_name = 5;
+  string layout = 6;
+}
+message KmeshRegisterRawContextResponse {
+  optional KmeshManagedRawRegistration value = 1;
+  string error = 2;
+}
+message KmeshRawContextStatusRequest {
+  string boot_id = 1;
+  string nonce = 2;
+}
+message KmeshRawContextStatusResponse {
+  optional KmeshManagedRawRegistration value = 1;
+  string error = 2;
+}
+message KmeshRetireRawContextRequest {
+  string boot_id = 1;
+  string nonce = 2;
+  KmeshContextIdentity context = 3;
+}
+message KmeshRetireRawContextResponse {
+  optional KmeshManagedRawRelease value = 1;
+  string error = 2;
+}
+
 message KmeshGetServerRequest {}
 message KmeshGetServerResponse {
   optional KmeshServerDescriptor value = 1;
@@ -165,6 +211,12 @@ message KmeshRevokeRegistrationResponse {
 }
 
 service KmeshService {
+  rpc KmeshRegisterRawContext(KmeshRegisterRawContextRequest)
+      returns (KmeshRegisterRawContextResponse);
+  rpc KmeshRawContextStatus(KmeshRawContextStatusRequest)
+      returns (KmeshRawContextStatusResponse);
+  rpc KmeshRetireRawContext(KmeshRetireRawContextRequest)
+      returns (KmeshRetireRawContextResponse);
   rpc KmeshGetContext(KmeshGetContextRequest) returns (KmeshGetContextResponse);
   rpc KmeshRegisterRotary(KmeshRegisterRotaryRequest)
       returns (KmeshRegisterRotaryResponse);

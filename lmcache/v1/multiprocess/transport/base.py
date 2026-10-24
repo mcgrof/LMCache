@@ -29,7 +29,12 @@ from lmcache.v1.multiprocess.kmesh_domains import (
     ServerDescriptor,
     WorkerFence,
 )
-from lmcache.v1.multiprocess.kmesh_types import RegisteredRuntime, RegistrationStatus
+from lmcache.v1.multiprocess.kmesh_types import (
+    ManagedRawRegistration,
+    ManagedRawRelease,
+    RegisteredRuntime,
+    RegistrationStatus,
+)
 from lmcache.v1.multiprocess.rpc import rpc_method
 
 
@@ -47,6 +52,33 @@ class RequestServer(Protocol):
 
 class RequestClient(Protocol):
     """Typed, transport-neutral contract for multiprocess RPC clients."""
+
+    @rpc_method
+    def kmesh_register_raw_context(
+        self,
+        boot_id: str,
+        nonce: str,
+        instance_id: int,
+        caches_ipc: list[DeviceIPCWrapper],
+        model_name: str,
+        layout: str,
+    ) -> MessagingFuture[tuple[ManagedRawRegistration | None, str]]:
+        """Register once or recover a lost reply without repeating raw imports."""
+        ...
+
+    @rpc_method
+    def kmesh_raw_context_status(
+        self, boot_id: str, nonce: str
+    ) -> MessagingFuture[tuple[ManagedRawRegistration | None, str]]:
+        """Inspect actual owner state; this is not exporter release evidence."""
+        ...
+
+    @rpc_method
+    def kmesh_retire_raw_context(
+        self, boot_id: str, nonce: str, context: ContextIdentity
+    ) -> MessagingFuture[tuple[ManagedRawRelease | None, str]]:
+        """Retire exact owned resources or return their cached release receipt."""
+        ...
 
     @rpc_method
     def kmesh_get_server(self) -> MessagingFuture[tuple[ServerDescriptor | None, str]]:

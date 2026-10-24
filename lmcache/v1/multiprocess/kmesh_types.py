@@ -30,3 +30,36 @@ class RegistrationStatus:
 
     state: RegistrationState
     pending: int
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedRawRegistration:
+    """Report one actual receiving client's bounded raw context registration.
+
+    Status lookup resolves a lost reply; only a separate release receipt permits
+    exporter teardown. Poisoned construction requires importing-process exit.
+    """
+
+    boot_id: str
+    nonce: str
+    instance_id: int
+    context: ContextIdentity
+    state: str
+    allocation_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedRawRelease:
+    """Acknowledge server-observed retirement of one exact raw registration.
+
+    The server has closed admission, drained physical work and retired all raw
+    input mappings before caching this idempotent value. This covers only its
+    bounded managed profile, not other IPC or service implementations.
+    """
+
+    boot_id: str
+    nonce: str
+    instance_id: int
+    context: ContextIdentity
+    rotary: RopeIdentity | None
+    allocation_ids: tuple[str, ...]

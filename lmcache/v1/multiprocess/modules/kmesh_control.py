@@ -31,11 +31,18 @@ from lmcache.v1.multiprocess.transport.request_context import get_request_sessio
 T = TypeVar("T")
 
 
-def _reply(action: Callable[[], T]) -> tuple[T | None, str]:
+def control_reply(action: Callable[[], T]) -> tuple[T | None, str]:
     """Return an explicit refusal on both transports without inventing evidence.
 
     ZeroMQ does not send a response when an ordinary handler raises. Expected
     ownership refusals therefore travel as typed absent-value/error replies.
+
+    Args:
+        action: Trusted server operation requiring an actual request session.
+
+    Returns:
+        The operation result with an empty error, or no value and a bounded
+        expected-refusal message. This wrapper does not create completion proof.
     """
     try:
         get_request_session()
@@ -54,6 +61,7 @@ class KMeshControlModule(InstanceLivenessTarget):
         lease_seconds: Worker-silence budget, separate from ordinary PING.
         clock: Monotonic lease clock; injectable for deterministic CPU tests.
         allow_device_snapshots: Explicit experimental ordered-device opt-in.
+        raw_snapshot_inputs: Select managed raw-only inputs for the dedicated server.
     """
 
     def __init__(
@@ -65,6 +73,7 @@ class KMeshControlModule(InstanceLivenessTarget):
         clock: Callable[[], float] = time.monotonic,
         *,
         allow_device_snapshots: bool = False,
+        raw_snapshot_inputs: bool = False,
     ) -> None:
         self._ctx = ctx
         self._bindings = RegisteredWorkerBindings(
@@ -72,6 +81,7 @@ class KMeshControlModule(InstanceLivenessTarget):
             transfer,
             blend,
             allow_device_snapshots=allow_device_snapshots,
+            raw_snapshot_inputs=raw_snapshot_inputs,
         )
 
     @property
@@ -109,17 +119,17 @@ class KMeshControlModule(InstanceLivenessTarget):
 
     @request_handler()
     def kmesh_get_server(self) -> tuple[ServerDescriptor | None, str]:
-        return _reply(lambda: self._bindings.server)
+        return control_reply(lambda: self._bindings.server)
 
     @request_handler(HandlerType.BLOCKING, requires_client_affinity=True)
     def kmesh_get_runtime(
         self, instance_id: int
     ) -> tuple[RegisteredRuntime | None, str]:
-        return _reply(lambda: self._bindings.describe(instance_id))
+        return control_reply(lambda: self._bindings.describe(instance_id))
 
     @request_handler(HandlerType.BLOCKING, requires_client_affinity=True)
     def kmesh_get_context(self, instance_id: int) -> tuple[ContextIdentity | None, str]:
-        return _reply(lambda: self._bindings.context_identity(instance_id))
+        return control_reply(lambda: self._bindings.context_identity(instance_id))
 
     @request_handler(HandlerType.BLOCKING, requires_client_affinity=True)
     def kmesh_register_rotary(
@@ -135,7 +145,7 @@ class KMeshControlModule(InstanceLivenessTarget):
         kv_quant: str,
         producer_event: bytes,
     ) -> tuple[RegisteredRuntime | None, str]:
-        return _reply(
+        return control_reply(
             lambda: self._bindings.register_rotary_snapshot(
                 instance_id,
                 context,
@@ -155,7 +165,7 @@ class KMeshControlModule(InstanceLivenessTarget):
         self, context: ContextIdentity
     ) -> tuple[int | None, str]:
         """Report actual copy drain; zero does not acknowledge exporter teardown."""
-        return _reply(lambda: self._bindings.retry_rotary_drain(context))
+        return control_reply(lambda: self._bindings.retry_rotary_drain(context))
 
     @request_handler()
     def kmesh_open_registration(
@@ -165,7 +175,7 @@ class KMeshControlModule(InstanceLivenessTarget):
         world_size: int,
         execution_digest: str,
     ) -> tuple[RegistrationLease | None, str]:
-        return _reply(
+        return control_reply(
             lambda: self._bindings.open_registration(
                 replace(semantics), engine_run, world_size, execution_digest
             )
@@ -181,7 +191,7 @@ class KMeshControlModule(InstanceLivenessTarget):
         semantics: SemanticIdentity,
         execution_digest: str,
     ) -> tuple[WorkerFence | None, str]:
-        return _reply(
+        return control_reply(
             lambda: self._bindings.bind(
                 lease, rank, instance_id, expected, replace(semantics), execution_digest
             )
@@ -193,13 +203,13 @@ class KMeshControlModule(InstanceLivenessTarget):
             self._bindings.heartbeat(fence)
             return True
 
-        return _reply(heartbeat)
+        return control_reply(heartbeat)
 
     @request_handler()
     def kmesh_registration_state(
         self, lease: RegistrationLease
     ) -> tuple[RegistrationStatus | None, str]:
-        return _reply(
+        return control_reply(
             lambda: RegistrationStatus(
                 self._bindings.state(lease), self._bindings.pending(lease)
             )
@@ -215,4 +225,4 @@ class KMeshControlModule(InstanceLivenessTarget):
             self._bindings.revoke(lease)
             return self._bindings.pending(lease)
 
-        return _reply(revoke)
+        return control_reply(revoke)

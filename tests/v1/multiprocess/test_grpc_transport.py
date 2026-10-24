@@ -34,6 +34,7 @@ from lmcache.v1.multiprocess.modules.engine_driven_transfer import (
 )
 from lmcache.v1.multiprocess.modules.experimental.qstore import QStoreModule
 from lmcache.v1.multiprocess.modules.kmesh_control import KMeshControlModule
+from lmcache.v1.multiprocess.modules.kmesh_managed_raw import KMeshManagedRawModule
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
     LMCacheDrivenTransferModule,
 )
@@ -306,6 +307,7 @@ def test_module_annotations_cover_and_match_generated_grpc_methods() -> None:
         QStoreModule,
         BlendModule,
         KMeshControlModule,
+        KMeshManagedRawModule,
     )
     handlers = {
         registered.operation: registered.handler
