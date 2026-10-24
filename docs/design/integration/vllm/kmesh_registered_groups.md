@@ -1,8 +1,10 @@
 # Consume registered spans in a bounded model group
 
-Status: design. The registered serial consumer and matched storage comparison
-still require their real GPU/model gates. This document describes the next
-consumer; it does not enable ordinary multiprocess KMesh serving.
+Status: prototype. Complete-group metadata, worker ownership and an explicit
+layer-major CacheBlend consumer are implemented. CPU consistency and synthetic
+session checks pass. Native group inputs, the registered serial consumer and
+the matched storage comparison still require their real GPU/model gates.
+Ordinary multiprocess KMesh serving remains disabled.
 
 The serial worker permits one live model input because that input owns engine
 blocks through layer repair and checked physical cleanup. A collective model

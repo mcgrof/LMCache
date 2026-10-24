@@ -212,8 +212,9 @@ physical ownership and report failure. This interface does not itself establish
 completed placement, engine block lifetime or model numerical qualification.
 The ordinary multiprocess connector's KMesh guard remains closed.
 
-Request-owned layer sources currently support serial sessions. Group execution
-refuses these sources before creating sessions. ``UnsettledLayerSourceError``
+Individual source injection supports serial sessions. Group execution requires
+an explicit owner for the complete ordered input set and refuses individual
+source injection before creating sessions. ``UnsettledLayerSourceError``
 retains the actual owner's physical cleanup operation. Session abort and close
 preserve this failure instead of hiding it behind an ordinary model error.
 The serial worker retries that operation before reporting blocks for request
@@ -275,3 +276,33 @@ matching boot, nonce, context, rotary generation and every allocation identity
 before dropping export references. Repeated close returns the same receipt.
 Uncertain raw import or retirement still requires retained exports until the
 actual importing process or the owning worker process exits.
+
+Experimental registered model groups
+------------------------------------
+
+``RestoredSpanGroup`` in ``lmcache.integration.vllm.kmesh_span_group`` validates
+the entire ordered member set before any source opens. Each member names its
+actual model request and generation, completed span batch and still-reserved
+engine block table. Require one receiving fence/context, unique restore
+operations and pairwise disjoint full destination tables. Immutable canonical
+sources may be shared; mutable destination slots remain private.
+
+``RegisteredSpanWorker.layer_source_group`` checks that group against the
+worker's actual context and cache bounds, then retains its aggregate input
+owner. Pass the owner as ``layer_source_group`` to ``LMCBlender.blend_group``.
+The complete model identity, token and span set must match before any session
+is created. The owner is single-use and closes every member after the sessions
+close. Store, restore and retirement remain fenced while any member is live
+or still owes physical completion.
+
+This prototype advances request-local model operations in layer-major order.
+Native restoration already rotates cached keys, so this route refuses another
+cached-key position recovery or batched model-side tensor operation. Physical
+cleanup attempts every member even if an earlier member fails. Its aggregate
+``UnsettledLayerSourceError`` retains the retry owner and prevents a failed
+member result from authorizing block reuse before an actual drain.
+
+CPU metadata and synthetic session checks do not establish registered group
+model equivalence or a speed benefit. Native simultaneous inputs, actual model
+repair and storage-route performance still require separate qualification.
+The ordinary multiprocess serving guard remains closed.
