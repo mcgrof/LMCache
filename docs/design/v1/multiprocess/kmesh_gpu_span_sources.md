@@ -1,10 +1,14 @@
 # GPU-backed canonical span sources
 
-Status: prototype. Eager pinned-host and GPU canonical objects, bounded working
-slots, retained repacking scratch and explicit raw-block storage configuration
-are implemented. Their GPU controls and actual model/storage comparison still
-need execution. The registered serial model replay must qualify before that
-comparison. Lazy CPU-L1 allocation remains the default reference.
+Status: experimental, qualified in a bounded RTX 4090 model replay. Native
+arena controls and the registered serial consumer pass their separate gates.
+Matched NVMe restores into pinned-host and GPU DMA-BUF arenas preserve the
+serial reference's K/V, logits, masks, selections and generated tokens. Seven
+alternating pairs show lower read-call medians but mixed complete-restore time.
+GPU integrity checking still copies the full canonical payload to the host.
+See the [replay and measured limits](https://knlp.io/kmesh-recovery.html#registered-storage).
+Lazy CPU-L1 allocation remains the default reference; ordinary multiprocess
+KMesh serving stays disabled.
 
 ## Use the existing raw-block ownership path
 

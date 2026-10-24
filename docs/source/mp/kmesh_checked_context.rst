@@ -192,8 +192,13 @@ authoritative even when an engine-device drain succeeds.
 ``checksum_span_object`` checks every canonical payload byte. GPU objects
 currently copy their full payload to the CPU for SHA-256, including on restore.
 Include that transfer and hashing cost in any latency comparison. This is an
-experimental route with pending GPU/model qualification; it establishes no
-elimination of all host copies, storage capacity saving or serving speedup.
+experimental route qualified in the bounded RTX 4090 registered serial replay.
+Both NVMe routes pass separate poisoned-arena data-arrival and model checks.
+Seven alternating pairs improve read-call medians but show mixed full-restore
+time. These results establish no elimination of all host copies, storage
+capacity saving or production serving speedup. See the
+`registered storage study <https://knlp.io/kmesh-recovery.html#registered-storage>`_
+for its exact workload, component pins and reproduction instructions.
 
 Request-owned model layer sources
 ---------------------------------

@@ -2,8 +2,9 @@
 
 Status: prototype. Complete-group metadata, worker ownership and an explicit
 layer-major CacheBlend consumer are implemented. CPU consistency and synthetic
-session checks pass. Native group inputs, the registered serial consumer and
-the matched storage comparison still require their real GPU/model gates.
+session checks pass. The registered serial consumer and matched storage
+comparison pass their separate bounded GPU/model gates. Native group inputs
+and the registered group model comparison still require qualification.
 Ordinary multiprocess KMesh serving remains disabled.
 
 The serial worker permits one live model input because that input owns engine
