@@ -204,3 +204,29 @@ cleanup failure. ``drain_failed()`` retries a closed source's cleanup without
 another transfer. Keep real engine reservations until that operation succeeds.
 The primitive remains experimental; model outputs and end-to-end registered
 serving have not been qualified by its synthetic layer-input controls.
+
+Experimental worker operation owner
+------------------------------------
+
+``RegisteredSpanWorker.connect`` in
+``lmcache.integration.vllm.kmesh_span_client`` registers the actual contiguous
+worker views and recorded model rotary producer with one same-host service.
+Its artifact identities must come from the caller's verified model and resolved
+configuration. The service derives tensor and rotary facts but does not load
+or attest model weights.
+
+The owner enters retention before the first raw registration can import memory.
+Unknown bootstrap outcomes retain all exporter views and preparation frames.
+``store`` and ``restore`` keep immutable coordinates and actual events until
+an exact operation status establishes physical completion. Missing or mismatched
+status cannot release blocks. ``drain_pending`` resolves the original operation
+and retries physical cleanup without submitting another copy.
+
+``block_table`` validates the actual prompt-origin engine slot map.
+``layer_source`` binds completed placements to this owner's registered views;
+the worker still retains scheduler reservations through the consuming model
+step. ``close`` refuses live model sources, drains failed sources and requires
+matching boot, nonce, context, rotary generation and every allocation identity
+before dropping export references. Repeated close returns the same receipt.
+Uncertain raw import or retirement still requires retained exports until the
+actual importing process or the owning worker process exits.
