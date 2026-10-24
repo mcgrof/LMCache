@@ -1,8 +1,9 @@
 # Quarantine ambiguous native IPC outcomes
 
-Status: proposed. The existing checked-release controls inject failure before
-the native close takes effect. They do not establish recovery after an actual
-driver error or interruption at an unknown native side-effect boundary.
+Status: native-outcome quarantine and process-local reference serialization are
+implemented; hardware qualification is pending. Earlier checked-release controls
+inject failure before native effects and do not establish recovery after an
+actual driver error or interruption at an unknown native side-effect boundary.
 
 The [CUDA Runtime API](https://docs.nvidia.com/cuda/cuda-runtime-api/cuda_runtime_api/group__CUDART__DEVICE.html)
 permits device-address reuse and gives a new exported allocation a distinct IPC

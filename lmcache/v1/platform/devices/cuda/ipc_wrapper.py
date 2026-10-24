@@ -26,7 +26,7 @@ from __future__ import annotations
 
 # Standard
 from dataclasses import dataclass
-from typing import Callable, ClassVar
+from typing import Any, Callable, ClassVar
 import hashlib
 import os
 import threading
@@ -85,6 +85,7 @@ _VMM_MULTI_CHUNK_HINT = (
 # allocation is only ever imported on the wrapper's own device.
 _MAPPED_ALLOCATIONS: dict[bytes, list[int]] = {}
 _UNCERTAIN_RAW_ALLOCATIONS: set[bytes] = set()
+_UNCERTAIN_RAW_IMPORTS: set[bytes] = set()
 _RETIRED_RAW_ALLOCATIONS: set[bytes] = set()
 _MAPPINGS_LOCK = threading.Lock()
 
@@ -401,25 +402,35 @@ class RawCudaIPCWrapper(DeviceIPCWrapper):
         with _MAPPINGS_LOCK:
             if (
                 self._ipc_handle_reserved in _UNCERTAIN_RAW_ALLOCATIONS
+                or self._ipc_handle_reserved in _UNCERTAIN_RAW_IMPORTS
                 or self._ipc_handle_reserved in _RETIRED_RAW_ALLOCATIONS
             ):
                 raise RuntimeError(
-                    "raw IPC allocation is retired or has uncertain close"
+                    "raw IPC allocation is retired or has an uncertain native outcome"
                 )
-            entry = _MAPPED_ALLOCATIONS.get(self._ipc_handle_reserved)
-            if entry is None:
-                handle = cuda_ipc_handle_from_bytes(self._ipc_handle_reserved)
-                with torch.cuda.device(device_index):
-                    err, ptr = _cuda.runtime.cudaIpcOpenMemHandle(
-                        handle, _cuda.runtime.cudaIpcMemLazyEnablePeerAccess
-                    )
-                if err != _cuda.runtime.cudaError_t.cudaSuccess:
-                    raise RuntimeError(f"cudaIpcOpenMemHandle failed: {err}")
-                entry = [int(ptr), 0]
-                _MAPPED_ALLOCATIONS[self._ipc_handle_reserved] = entry
-            entry[1] += 1
-            self._opens += 1
-            base_ptr = entry[0]
+            # Keep unknown native effects visible even if no pointer/owner record
+            # can be completed after interruption. Never infer absence from that gap.
+            _UNCERTAIN_RAW_IMPORTS.add(self._ipc_handle_reserved)
+            try:
+                entry = _MAPPED_ALLOCATIONS.get(self._ipc_handle_reserved)
+                if entry is None:
+                    handle = cuda_ipc_handle_from_bytes(self._ipc_handle_reserved)
+                    with torch.cuda.device(device_index):
+                        err, ptr = _cuda.runtime.cudaIpcOpenMemHandle(
+                            handle, _cuda.runtime.cudaIpcMemLazyEnablePeerAccess
+                        )
+                    if err != _cuda.runtime.cudaError_t.cudaSuccess:
+                        raise RuntimeError(f"cudaIpcOpenMemHandle failed: {err}")
+                    entry = [int(ptr), 0]
+                    _MAPPED_ALLOCATIONS[self._ipc_handle_reserved] = entry
+                entry[1] += 1
+                self._opens += 1
+                base_ptr = entry[0]
+                _UNCERTAIN_RAW_IMPORTS.remove(self._ipc_handle_reserved)
+            except BaseException:
+                _UNCERTAIN_RAW_IMPORTS.add(self._ipc_handle_reserved)
+                logger.exception("Raw IPC import outcome requires importer teardown")
+                raise
 
         # Wrap as a flat ``uint8`` CuPy array at the allocation offset,
         # DLPack to torch, then view as the original dtype/shape.
@@ -471,7 +482,11 @@ class RawCudaIPCWrapper(DeviceIPCWrapper):
         PyTorch storage, VMM and external driver imports are not counted here.
         """
         with _MAPPINGS_LOCK:
-            return self._ipc_handle_reserved not in _MAPPED_ALLOCATIONS
+            return (
+                self._ipc_handle_reserved not in _MAPPED_ALLOCATIONS
+                and self._ipc_handle_reserved not in _UNCERTAIN_RAW_ALLOCATIONS
+                and self._ipc_handle_reserved not in _UNCERTAIN_RAW_IMPORTS
+            )
 
     def retire_raw_imports(self) -> None:
         """Close new raw-wrapper imports while preserving existing alias references.
@@ -494,14 +509,22 @@ class RawCudaIPCWrapper(DeviceIPCWrapper):
 
         The caller must first drain every device use of these references. Other
         aliases remain mapped until they release their own references. Driver
-        failure retains this wrapper's obligations and blocks new imports; retry
-        requires actual success, never an inference from a missing mapping.
+        failure retains obligations and blocks new imports. A known preflight
+        refusal can be retried. Unknown native outcomes require importer teardown;
+        never retry their old pointer or infer success from a missing record.
 
         Raises:
             RuntimeError: Reference accounting is inconsistent or native close
                 did not report success. Keep the wrapper alive for later retry.
         """
         with _MAPPINGS_LOCK:
+            if (
+                self._ipc_handle_reserved in _UNCERTAIN_RAW_ALLOCATIONS
+                or self._ipc_handle_reserved in _UNCERTAIN_RAW_IMPORTS
+            ):
+                raise RuntimeError(
+                    "raw IPC outcome is uncertain; importer teardown required"
+                )
             opens = self._opens
             if opens <= 0:
                 return
@@ -511,22 +534,43 @@ class RawCudaIPCWrapper(DeviceIPCWrapper):
                     "raw IPC mapping reference accounting is inconsistent"
                 )
             if entry[1] > opens:
-                entry[1] -= opens
-                self._opens = 0
+                _UNCERTAIN_RAW_ALLOCATIONS.add(self._ipc_handle_reserved)
+                try:
+                    entry[1] -= opens
+                    self._opens = 0
+                    _UNCERTAIN_RAW_ALLOCATIONS.remove(self._ipc_handle_reserved)
+                except BaseException:
+                    _UNCERTAIN_RAW_ALLOCATIONS.add(self._ipc_handle_reserved)
+                    logger.exception(
+                        "Raw IPC reference accounting requires importer teardown"
+                    )
+                    raise
                 return
             device_index = self._get_device_index_from_uuid(self.device_uuid)
-            try:
-                with torch.cuda.device(device_index):
+            # Context-entry failure precedes native close and leaves a retryable
+            # known mapping. Quarantine starts before the native call itself.
+            with torch.cuda.device(device_index):
+                _UNCERTAIN_RAW_ALLOCATIONS.add(self._ipc_handle_reserved)
+                try:
                     (err,) = _cuda.runtime.cudaIpcCloseMemHandle(entry[0])
-            except BaseException:
-                _UNCERTAIN_RAW_ALLOCATIONS.add(self._ipc_handle_reserved)
-                raise
-            if err != _cuda.runtime.cudaError_t.cudaSuccess:
-                _UNCERTAIN_RAW_ALLOCATIONS.add(self._ipc_handle_reserved)
-                raise RuntimeError(f"cudaIpcCloseMemHandle failed: {err}")
-            del _MAPPED_ALLOCATIONS[self._ipc_handle_reserved]
-            _UNCERTAIN_RAW_ALLOCATIONS.discard(self._ipc_handle_reserved)
-            self._opens = 0
+                    if err != _cuda.runtime.cudaError_t.cudaSuccess:
+                        raise RuntimeError(f"cudaIpcCloseMemHandle failed: {err}")
+                    self._opens = 0
+                    del _MAPPED_ALLOCATIONS[self._ipc_handle_reserved]
+                    _UNCERTAIN_RAW_ALLOCATIONS.remove(self._ipc_handle_reserved)
+                except BaseException:
+                    _UNCERTAIN_RAW_ALLOCATIONS.add(self._ipc_handle_reserved)
+                    logger.exception("Raw IPC close outcome requires importer teardown")
+                    raise
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state["_opens"] = 0
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._opens = 0
 
 
 class VmmCudaIPCWrapper(DeviceIPCWrapper):

@@ -28,8 +28,9 @@ A driver error is not positive evidence that release completed.
 Add an explicit checked-reference release to the raw wrapper. Preserve the
 mapping record, owning wrapper and reference obligation when driver close fails.
 Do not decrement the final reference or mark a wrapper closed before success.
-Retries require an actual successful driver result; an absent record or an
-invalid-handle error must not be reinterpreted as successful close. Keep legacy
+Only a failure known to precede the native call is retryable. An ambiguous native
+outcome requires importer teardown; an absent record or invalid-handle error
+must not be reinterpreted as successful close. Keep legacy
 best-effort cleanup from silently erasing the checked path's retained debt.
 
 The raw wrapper exposes ``close_checked``, ``retire_raw_imports`` and
@@ -37,6 +38,8 @@ The raw wrapper exposes ``close_checked``, ``retire_raw_imports`` and
 PyTorch storage, virtual-memory and external driver imports are not counted.
 Retired raw handles remain tombstoned for the process lifetime. This bounded
 prototype has no tombstone reclamation policy or integrated server receipt.
+The later [native-outcome contract](raw_ipc_native_outcome.md) fences import,
+close and bookkeeping uncertainty, including an absent completed mapping record.
 
 Reference release and allocation retirement are distinct operations. A completed
 rotary download may release its temporary raw import while a paged-cache alias

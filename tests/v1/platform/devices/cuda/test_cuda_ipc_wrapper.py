@@ -172,6 +172,89 @@ def _pool_exporter(conn: Connection, pool_mib: int, exit_after_send: bool) -> No
         conn.recv()  # hold the pool until the parent finishes
 
 
+def check_unknown_import(owner: RawCudaIPCWrapper) -> None:
+    """Unknown open effects cannot be erased by an absent mapping record."""
+    calls = 0
+
+    def refuse_open(handle: object, flags: object) -> tuple[object, int]:
+        nonlocal calls
+        calls += 1
+        return _cuda.runtime.cudaError_t.cudaErrorNotSupported, 0
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(_cuda.runtime, "cudaIpcOpenMemHandle", refuse_open)
+        with pytest.raises(RuntimeError, match="cudaIpcOpenMemHandle failed"):
+            owner.to_tensor()
+        assert not owner.raw_mapping_released
+        with pytest.raises(RuntimeError, match="importer teardown"):
+            owner.close_checked()
+        with pytest.raises(RuntimeError, match="uncertain native outcome"):
+            owner.to_tensor()
+        assert calls == 1
+
+
+def check_known_imports(
+    first: RawCudaIPCWrapper, second: RawCudaIPCWrapper, scenario: str
+) -> None:
+    first.to_tensor()
+    existing = second.to_tensor()
+    assert first.allocation_identity == second.allocation_identity
+    if scenario == "retire":
+        first.retire_raw_imports()
+    first.close_checked()
+    assert not first.raw_mapping_released
+    assert existing[4095].item() == 4095.0
+    if scenario == "refusal":
+
+        def refuse_context(device: object) -> None:
+            raise RuntimeError("injected before device-context entry")
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(torch.cuda, "device", refuse_context)
+            with pytest.raises(RuntimeError, match="before device-context"):
+                second.close_checked()
+            assert not second.raw_mapping_released
+    elif scenario == "native-unknown":
+        calls = 0
+
+        def refuse_close(pointer: int) -> tuple[object]:
+            nonlocal calls
+            calls += 1
+            return (_cuda.runtime.cudaError_t.cudaErrorNotSupported,)
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(_cuda.runtime, "cudaIpcCloseMemHandle", refuse_close)
+            with pytest.raises(RuntimeError, match="cudaIpcCloseMemHandle failed"):
+                second.close_checked()
+            assert not second.raw_mapping_released
+            with pytest.raises(RuntimeError, match="importer teardown"):
+                second.close_checked()
+            with pytest.raises(RuntimeError, match="uncertain native outcome"):
+                second.to_tensor()
+            assert calls == 1
+        # No pointer retry: the importing child exits while its exporter waits.
+        return
+    elif scenario == "forward":
+        forwarded = DeviceIPCWrapper.Deserialize(DeviceIPCWrapper.Serialize(second))
+        assert isinstance(forwarded, RawCudaIPCWrapper)
+        forwarded.to_tensor()
+        forwarded.close_checked()
+        assert existing[4095].item() == 4095.0
+        assert not second.raw_mapping_released
+    else:
+        with pytest.raises(RuntimeError, match="retired"):
+            first.to_tensor()
+    second.close_checked()
+    assert first.raw_mapping_released and second.raw_mapping_released
+    if scenario == "refusal":
+        reopened = second.to_tensor()
+        assert reopened[4095].item() == 4095.0
+        second.close_checked()
+    elif scenario == "retire":
+        with pytest.raises(RuntimeError, match="retired"):
+            second.to_tensor()
+
+
 def checked_close_importer(channel: Connection, scenario: str) -> None:
     """Keep all test imports in a child that exits before exporter release."""
     try:
@@ -181,41 +264,10 @@ def checked_close_importer(channel: Connection, scenario: str) -> None:
         ]
         assert isinstance(first, RawCudaIPCWrapper)
         assert isinstance(second, RawCudaIPCWrapper)
-        first.to_tensor()
-        existing = second.to_tensor()
-        assert first.allocation_identity == second.allocation_identity
-        if scenario == "retire":
-            first.retire_raw_imports()
-        first.close_checked()
-        assert not first.raw_mapping_released
-        assert existing[4095].item() == 4095.0
-        if scenario == "refusal":
-            # The injected error occurs before native close, so this controlled
-            # alias remains readable. An actual device error proves no such fact.
-            with pytest.MonkeyPatch.context() as patch:
-                patch.setattr(
-                    _cuda.runtime,
-                    "cudaIpcCloseMemHandle",
-                    lambda _: (_cuda.runtime.cudaError_t.cudaErrorNotSupported,),
-                )
-                with pytest.raises(RuntimeError, match="cudaIpcCloseMemHandle failed"):
-                    second.close_checked()
-                assert not second.raw_mapping_released
-                assert existing[4095].item() == 4095.0
-                with pytest.raises(RuntimeError, match="uncertain close"):
-                    second.to_tensor()
+        if scenario == "import-unknown":
+            check_unknown_import(first)
         else:
-            with pytest.raises(RuntimeError, match="retired"):
-                first.to_tensor()
-        second.close_checked()
-        assert first.raw_mapping_released and second.raw_mapping_released
-        if scenario == "refusal":
-            reopened = second.to_tensor()
-            assert reopened[4095].item() == 4095.0
-            second.close_checked()
-        else:
-            with pytest.raises(RuntimeError, match="retired"):
-                second.to_tensor()
+            check_known_imports(first, second, scenario)
     except BaseException:
         channel.send(("error", traceback.format_exc()))
         raise
@@ -225,7 +277,9 @@ def checked_close_importer(channel: Connection, scenario: str) -> None:
         channel.close()
 
 
-@pytest.mark.parametrize("scenario", ["refusal", "retire"])
+@pytest.mark.parametrize(
+    "scenario", ["refusal", "retire", "native-unknown", "import-unknown", "forward"]
+)
 def test_checked_raw_mapping_release_and_alias_retirement(scenario: str) -> None:
     pool = torch.zeros(64 * (1 << 20) // 4, device=DEVICE, dtype=torch.float32)
     first, second = pool[1024:2048], pool[4096:8192]

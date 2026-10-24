@@ -35,6 +35,10 @@ copying while import cleanup remains uncertain. Interruption preserves the same
 obligations. Remove the ledger entry only after physical work and all owned raw
 reference releases succeed.
 
+An ambiguous native import/close outcome is not a retryable preflight refusal.
+The raw wrapper quarantines it until importer teardown. A later copy-stream
+drain must not turn that unresolved mapping outcome into a successful release.
+
 CPU snapshots and existing registered-state copy operations keep their current
 contracts. An experimental raw-input entry point must require raw wrapper types
 and a trusted server metadata validator. It does not grant runtime discovery,
