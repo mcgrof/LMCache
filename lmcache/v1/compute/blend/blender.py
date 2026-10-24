@@ -13,6 +13,7 @@ import torch
 from lmcache import torch_device_type
 from lmcache.logging import init_logger
 from lmcache.v1.compute.attention.metadata import LMCAttnMetadata
+from lmcache.v1.compute.blend.layer_source import BlendLayerSource
 from lmcache.v1.compute.blend.metadata import LMCBlendCommonMetadata, LMCBlendMetadata
 from lmcache.v1.compute.models.utils import infer_model_from_vllm
 from lmcache.v1.config import LMCacheEngineConfig
@@ -162,6 +163,7 @@ class LMCBlendSession:
         retrieve_kwargs: dict[str, Any],
         defer_position_recovery: bool = False,
         collective_qkv: bool = False,
+        layer_source: BlendLayerSource | None = None,
     ) -> None:
         # First Party
         # Defer package initialization until the blend module is complete;
@@ -172,6 +174,10 @@ class LMCBlendSession:
             raise TypeError("defer_position_recovery must be a boolean")
         if type(collective_qkv) is not bool:
             raise TypeError("collective_qkv must be a boolean")
+        if layer_source is not None and (
+            retrieve_kwargs.get("explicit_spans") != layer_source.explicit_spans
+        ):
+            raise ValueError("layer source spans differ from the model recovery window")
         self.collective_qkv = collective_qkv
         self.request_id = request_id
         self.generation = generation
@@ -184,17 +190,22 @@ class LMCBlendSession:
             retrieve_kwargs.get("explicit_spans") is not None
         )
 
+        self._layer_source = layer_source
         self._layerwise_model = blender.layerwise_model
         self._tokens = tokens
         self._model_generator: Optional[Generator[object, object, None]] = None
-        self._retrieve_generator: Generator[Optional[torch.Tensor], None, None] = (
-            blender.cache_engine.retrieve_layer(
+        self._retrieve_generator: Generator[Optional[torch.Tensor], None, None]
+        if layer_source is None:
+            self._retrieve_generator = blender.cache_engine.retrieve_layer(
                 tokens,
                 mask,
                 load_state=self.load_state,
                 **retrieve_kwargs,
             )
-        )
+        else:
+            self._retrieve_generator = layer_source.retrieve_layer(
+                tokens, mask, load_state=self.load_state
+            )
         self._primed = False
         self._completed_layers = 0
         self._retrieval_stepped = False
@@ -804,6 +815,7 @@ class LMCBlender:
         generation: int = 0,
         defer_position_recovery: bool = False,
         collective_qkv: bool = False,
+        layer_source: BlendLayerSource | None = None,
         **kwargs: Any,
     ) -> LMCBlendSession:
         """Create one request-owned CacheBlend session.
@@ -817,13 +829,16 @@ class LMCBlender:
                 group applier can batch it; only ``blend_group`` may apply
                 deferred rotations, so plain serial callers must leave this
                 false.
-            **kwargs: Arguments forwarded to ``retrieve_layer``.
+            layer_source: Optional request-owned input source, with the same
+                explicit spans as the model. The cache engine remains default.
+            **kwargs: Arguments forwarded to the default cache-engine source.
 
         Returns:
             A closeable session that can run serially or advance layerwise.
 
         Raises:
-            ValueError: If a caller attempts to inject a shared load state.
+            ValueError: A shared load state is supplied or source spans differ
+                from the explicit model recovery window.
         """
         if "load_state" in kwargs:
             raise ValueError("CacheBlend sessions always own their load state")
@@ -846,6 +861,7 @@ class LMCBlender:
             retrieve_kwargs=retrieve_kwargs,
             defer_position_recovery=defer_position_recovery,
             collective_qkv=collective_qkv,
+            layer_source=layer_source,
         )
 
     def blend(

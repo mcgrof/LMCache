@@ -27,6 +27,7 @@ from lmcache.v1.gpu_connector.gpu_connectors import (
 )
 from lmcache.v1.gpu_connector.load_state import LayerwiseLoadState
 from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.token_span import ExplicitTokenSpans, TokenSpan
 import lmcache.v1.cache_engine as cache_engine_module
 
 
@@ -218,6 +219,75 @@ class _FakeBlender(LMCBlender):
         cast(Any, session).close = counted_close
         self.sessions.append(session)
         return session
+
+
+@dataclass
+class _ExplicitLayerSource:
+    explicit_spans: ExplicitTokenSpans
+    engine: _FakeCacheEngine
+
+    def retrieve_layer(
+        self,
+        tokens: torch.Tensor,
+        mask: torch.Tensor | None,
+        *,
+        load_state: LayerwiseLoadState,
+    ) -> Generator[torch.Tensor | None, None, None]:
+        return self.engine.retrieve_layer(tokens, mask, load_state=load_state)
+
+
+def test_session_consumes_bound_source_without_legacy_retrieval() -> None:
+    blender = _FakeBlender()
+    spans = ExplicitTokenSpans(3, TokenSpan(0, 3), (TokenSpan(0, 3),))
+    source = _ExplicitLayerSource(spans, _FakeCacheEngine(3))
+    with blender.create_session(
+        torch.tensor([1, 2, 3]),
+        request_id="1",
+        layer_source=source,
+        explicit_spans=spans,
+    ) as session:
+        result = session.run()
+        assert torch.all(result)
+        assert session.requires_explicit_gap_recompute
+        assert len(blender.layerwise_model.outputs["1"]) == 3
+    assert not blender.cache_engine.retrieve_kwargs
+    assert source.engine.generators_closed == {"1"}
+    assert all(buffer.release_count == 1 for buffer in source.engine.buffers["1"])
+
+
+@pytest.mark.parametrize("mismatch", ["absent", "different-window"])
+def test_session_refuses_mismatched_source_before_retrieval(mismatch: str) -> None:
+    blender = _FakeBlender()
+    spans = ExplicitTokenSpans(3, TokenSpan(0, 3), (TokenSpan(0, 3),))
+    source = _ExplicitLayerSource(spans, _FakeCacheEngine(3))
+    supplied = (
+        None
+        if mismatch == "absent"
+        else ExplicitTokenSpans(3, TokenSpan(0, 2), (TokenSpan(0, 2),))
+    )
+    with pytest.raises(ValueError, match="source spans"):
+        blender.create_session(
+            torch.tensor([1, 2, 3]), layer_source=source, explicit_spans=supplied
+        )
+    assert not source.engine.retrieve_kwargs
+    assert not blender.cache_engine.retrieve_kwargs
+
+
+def test_bound_source_failure_closes_its_request_owned_buffers() -> None:
+    blender = _FakeBlender()
+    spans = ExplicitTokenSpans(3, TokenSpan(0, 3), (TokenSpan(0, 3),))
+    source = _ExplicitLayerSource(spans, _FakeCacheEngine(3, failure=("1", 1)))
+    with pytest.raises(InjectedLayerFailure):
+        with blender.create_session(
+            torch.tensor([1, 2, 3]),
+            request_id="1",
+            layer_source=source,
+            explicit_spans=spans,
+        ) as session:
+            session.run()
+    assert source.engine.generators_closed == {"1"}
+    assert all(buffer.release_count == 1 for buffer in source.engine.buffers["1"])
+    assert not blender.cache_engine.retrieve_kwargs
 
 
 def test_session_marks_only_explicit_spans_for_gap_recompute() -> None:

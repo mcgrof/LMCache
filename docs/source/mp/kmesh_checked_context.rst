@@ -143,3 +143,20 @@ requires request-local model repair before those tokens become computed state.
 On failure, recompute only after ``failed-drained`` or observed importer exit;
 ``failed-undrained`` still owns the destination blocks. These controls do not
 establish model quality, GPU-direct storage latency or collective recovery.
+
+Request-owned model layer sources
+---------------------------------
+
+``LMCBlender.create_session(..., layer_source=source)`` can consume an explicit
+request-owned layer source through the existing model repair and selection
+logic. The default remains the cache engine's layerwise retrieval. A custom
+source must expose the exact ``ExplicitTokenSpans`` also supplied to the model;
+a mismatched recovery window refuses before retrieval begins.
+
+The source yields a hit count, one input boundary per model layer and a final
+hit mask. It publishes actual buffers and mandatory gap positions through the
+session's private ``LayerwiseLoadState`` and writes repaired state back before
+completion. Its close operation must settle device work or retain unresolved
+physical ownership and report failure. This interface does not itself establish
+completed placement, engine block lifetime or model numerical qualification.
+The ordinary multiprocess connector's KMesh guard remains closed.
