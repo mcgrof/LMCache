@@ -46,6 +46,13 @@ Restore resolves only a published handle in the accepting operation's namespace.
 Use the retained immutable source coordinates and content/layout/rotary facts;
 the client supplies destination coordinates and its actual block reservation.
 Acquire actual read locks and retain the returned objects through completion.
+Use ``acquire_write_transfer_leases`` or ``acquire_read_transfer_leases`` with
+``all_buffers=True`` before enqueueing native work against host objects. These
+physical leases prevent allocator reuse when logical read/write locks expire.
+Ordinary eviction refuses a resident object while its physical lease remains
+active; discarded write reservations also withhold their memory until release.
+Release these leases only after checked completion. The default GPU-only lease
+selection remains available to existing callers.
 An absent or evicted source fails safely and lets the worker recompute. No
 foreign namespace, stale generation or rejected request may trigger device I/O.
 Never rotate shared stored bytes in place; positional transformation uses private

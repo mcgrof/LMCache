@@ -472,42 +472,47 @@ class StorageManager:
         return finish_result
 
     def acquire_write_transfer_leases(
-        self, objects: dict[ObjectKey, MemoryObj]
+        self, objects: dict[ObjectKey, MemoryObj], *, all_buffers: bool = False
     ) -> L1TransferLeases:
-        """Pin exact GPU write reservations before enqueueing gather copies.
+        """Pin exact write reservations before enqueueing external copies.
 
         Args:
             objects: Objects returned by reserve_write, keyed by their keys.
+            all_buffers: Also pin host and opaque L1 objects against TTL-driven
+                buffer reuse while an external transfer can still access them.
 
         Returns:
-            Owner/lease IDs for stream-ordered release. Host objects need no
-            additional transfer lease. No device pointers cross the callback.
+            Owner/lease IDs for stream-ordered release. Host objects are omitted
+            unless all_buffers is requested. No pointers cross the callback.
 
         Raises:
             ValueError: An object no longer belongs to its captured reservation.
             RuntimeError: Its arena is closed or retained.
         """
-        return self._acquire_transfer_leases(objects, _L1_WRITE_TAG)
+        return self._acquire_transfer_leases(objects, _L1_WRITE_TAG, all_buffers)
 
     def acquire_read_transfer_leases(
-        self, objects: dict[ObjectKey, MemoryObj]
+        self, objects: dict[ObjectKey, MemoryObj], *, all_buffers: bool = False
     ) -> L1TransferLeases:
-        """Pin exact GPU resident objects before enqueueing scatter copies.
+        """Pin exact resident objects before enqueueing external copies.
 
         Args:
             objects: Already read-locked objects returned by unsafe_read.
+            all_buffers: Also pin host and opaque L1 objects against TTL-driven
+                buffer reuse while an external transfer can still access them.
 
         Returns:
-            Owner/lease IDs for stream-ordered release; host objects are omitted.
+            Owner/lease IDs for stream-ordered release; host objects are omitted
+            unless all_buffers is requested.
 
         Raises:
             ValueError: An object no longer belongs to its captured resident key.
             RuntimeError: Its arena is closed or retained.
         """
-        return self._acquire_transfer_leases(objects, None)
+        return self._acquire_transfer_leases(objects, None, all_buffers)
 
     def release_transfer_leases(self, leases: L1TransferLeases) -> None:
-        """Release transfer leases after their GPU stream callback executes.
+        """Release leases after a completion callback or checked device drain.
 
         Args:
             leases: Owner/lease IDs from an acquire_*_transfer_leases call.
@@ -1597,16 +1602,19 @@ class StorageManager:
         return results
 
     def _acquire_transfer_leases(
-        self, objects: dict[ObjectKey, MemoryObj], tag: str | None
+        self,
+        objects: dict[ObjectKey, MemoryObj],
+        tag: str | None,
+        all_buffers: bool = False,
     ) -> L1TransferLeases:
         groups: dict[int, dict[ObjectKey, MemoryObj]] = {}
         for key, obj in objects.items():
             tensor = obj.physical_tensor
-            if tensor is None or tensor.device.type == "cpu":
+            if not all_buffers and (tensor is None or tensor.device.type == "cpu"):
                 continue
             owner = obj.get_l1_manager()
             if owner is None or owner not in self._l1_managers_by_id:
-                raise ValueError("GPU transfer requires a registered L1 owner")
+                raise ValueError("transfer requires a registered L1 owner")
             groups.setdefault(owner, {})[key] = obj
         leases: L1TransferLeases = []
         try:

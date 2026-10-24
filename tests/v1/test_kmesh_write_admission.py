@@ -109,3 +109,63 @@ def test_legacy_owner_completion_keeps_void_result(storage: StorageManager) -> N
     assert storage.finish_write_with_status(completion) == dict.fromkeys(
         keys, L1Error.KEY_NOT_EXIST
     )
+
+
+def large_inputs() -> tuple[ObjectKey, ObjectKey, MemoryLayoutDesc]:
+    """Only one 6 MiB object fits in this fixture's 8 MiB CPU arena."""
+    return (
+        ObjectKey(b"a" * 32, "synthetic-lease", 0),
+        ObjectKey(b"b" * 32, "synthetic-lease", 0),
+        MemoryLayoutDesc([torch.Size((6 << 20,))], [torch.uint8]),
+    )
+
+
+def test_host_write_lease_prevents_reuse_after_reservation_discard(
+    storage: StorageManager,
+) -> None:
+    first, second, layout = large_inputs()
+    objects = storage.reserve_write([first], layout)
+    assert set(objects) == {first}
+    assert storage.acquire_write_transfer_leases(objects) == []
+    leases = storage.acquire_write_transfer_leases(objects, all_buffers=True)
+    assert len(leases) == 1
+    try:
+        storage.discard_write_by_owner(storage.prepare_write_completion(objects))
+        assert storage.reserve_write([second], layout) == {}
+    finally:
+        storage.release_transfer_leases(leases)
+    replacement = storage.reserve_write([second], layout)
+    assert set(replacement) == {second}
+    storage.discard_write_by_owner(storage.prepare_write_completion(replacement))
+
+
+def test_host_read_lease_prevents_reuse_after_reader_release_and_eviction(
+    storage: StorageManager,
+) -> None:
+    first, second, layout = large_inputs()
+    objects = storage.reserve_write([first], layout)
+    storage.finish_write_by_owner(storage.prepare_write_completion(objects))
+    handle = storage.submit_prefetch_task(
+        PrefetchTaskSpec([GroupedObjectKeys([first], 0, layout)]),
+        "lease-readback",
+        skip_l2=True,
+    )
+    assert storage.wait_prefetch_status(handle, timeout=10)
+    result = storage.query_prefetch_status(handle)
+    assert result is not None and result.hit_cells[0].test(0)
+    keys, read = storage.unsafe_read([first], result.l1_owners)
+    assert keys == [first] and len(read) == 1
+    retained = dict(zip(keys, read, strict=True))
+    assert storage.acquire_read_transfer_leases(retained) == []
+    leases = storage.acquire_read_transfer_leases(retained, all_buffers=True)
+    assert len(leases) == 1
+    try:
+        storage.finish_read_prefetched([first], l1_owners=result.l1_owners)
+        assert storage.delete_l1_keys([first]) == (0, 1)
+        assert storage.reserve_write([second], layout) == {}
+    finally:
+        storage.release_transfer_leases(leases)
+    assert storage.delete_l1_keys([first]) == (1, 0)
+    replacement = storage.reserve_write([second], layout)
+    assert set(replacement) == {second}
+    storage.discard_write_by_owner(storage.prepare_write_completion(replacement))
