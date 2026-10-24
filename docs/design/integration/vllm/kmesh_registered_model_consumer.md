@@ -13,6 +13,15 @@ rotary producer event with the managed service. Bind the returned server boot,
 context generation, rotary generation and runtime facts to separately verified
 model/config/tokenizer artifacts and the exact execution profile.
 
+Physical layout must describe the actual engine allocation. Separate K/V
+planes use five-dimensional NHD/HND views. TRITON_ATTN can instead expose
+four-dimensional views whose trailing content packs each head's K and V.
+Normalize only through storage-sharing views, retain that fused native format,
+and derive the actual rotary head size as half the content width. Store fused
+canonical objects in their native one-plane representation, while the existing
+transfer kernel unpacks request-owned model inputs into separate K/V planes.
+Never allocate a replacement engine cache to satisfy a registration shape.
+
 Retain the owner before the first remote import can happen. Initialization
 failure, transport uncertainty or a missing retirement reply must not drop
 exporter allocations. Resolve known operations by their exact request generation;

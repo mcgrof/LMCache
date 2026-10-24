@@ -14,6 +14,7 @@ import torch
 
 # First Party
 from lmcache import device_ops
+from lmcache.integration.vllm.kmesh_span_layout import resolve_registered_paged_shape
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType
 from lmcache.v1.compute.blend.layer_source import UnsettledLayerSourceError
@@ -170,7 +171,7 @@ class RestoredPagedLayerSource:
         batch: Validated receipts and immutable model input/reservation metadata.
         kv_caches: This registered worker's actual cache tensor views, retained
             with its engine block reservation for the complete consuming step.
-        layout: Physical two-plane NHD or HND layout registered with the service.
+        layout: Physical NHD/HND ordering, with separate or fused per-head K/V.
 
     This serialized CUDA BF16 source does not apply RoPE again. Native service
     restoration already rotates cached keys. It supplies real layer inputs to
@@ -186,18 +187,15 @@ class RestoredPagedLayerSource:
         fmt, normalized = normalize_kv_and_discover_format(
             list(kv_caches), EngineType.VLLM, layout_hints={"kv_layout": layout}
         )
-        expected = {
-            "NHD": "NL_X_TWO_NB_BS_NH_HS",
-            "HND": "NL_X_TWO_NB_NH_BS_HS",
-        }
         if (
-            layout not in expected
-            or fmt.name != expected[layout]
-            or not isinstance(normalized, list)
+            not isinstance(normalized, list)
             or not normalized
             or any(not isinstance(t, torch.Tensor) for t in normalized)
         ):
-            raise ValueError("registered layer source requires two-plane NHD/HND")
+            raise ValueError("registered layer source requires actual paged views")
+        geometry = resolve_registered_paged_shape(tuple(normalized[0].shape), layout)
+        if fmt.name != geometry.format_name:
+            raise ValueError("registered physical layout differs from native format")
         first = normalized[0]
         if any(
             t.device.type != "cuda"
@@ -210,10 +208,10 @@ class RestoredPagedLayerSource:
             raise ValueError("registered layer views must be contiguous CUDA BF16")
         self._batch, self._caches, self._format = batch, tuple(normalized), fmt
         self._device = first.device
-        self._block_size = int(first.shape[2 if layout == "NHD" else 3])
-        self._blocks = int(first.shape[1])
-        self._head_size = int(first.shape[-1])
-        self._hidden = int(first.shape[3 if layout == "NHD" else 2]) * self._head_size
+        self._block_size = geometry.block_size
+        self._blocks = geometry.blocks
+        self._head_size = geometry.head_size
+        self._hidden = geometry.kv_heads * geometry.head_size
         if (
             max(batch.block_ids) >= self._blocks
             or len(batch.token_ids) > len(batch.block_ids) * self._block_size

@@ -205,10 +205,20 @@ def place_source(
     for index in range(source.shape[2]):
         position = start + index
         block, offset = blocks[position // 4], position % 4
-        target = (
-            kv[:, :, block, offset] if layout == "NHD" else kv[:, :, block, :, offset]
-        )
-        target.copy_(source[:, :, index], non_blocking=True)
+        if kv.ndim == 5:
+            target = (
+                kv[:, block, offset] if layout == "NHD" else kv[:, block, :, offset]
+            )
+            half = target.shape[-1] // 2
+            target[..., :half].copy_(source[:, 0, index], non_blocking=True)
+            target[..., half:].copy_(source[:, 1, index], non_blocking=True)
+        else:
+            target = (
+                kv[:, :, block, offset]
+                if layout == "NHD"
+                else kv[:, :, block, :, offset]
+            )
+            target.copy_(source[:, :, index], non_blocking=True)
 
 
 def read_window(
@@ -222,9 +232,16 @@ def read_window(
     rows: list[torch.Tensor] = []
     for position in range(start, start + count):
         block, offset = blocks[position // 4], position % 4
-        rows.append(
-            kv[:, :, block, offset] if layout == "NHD" else kv[:, :, block, :, offset]
-        )
+        if kv.ndim == 5:
+            row = kv[:, block, offset] if layout == "NHD" else kv[:, block, :, offset]
+            half = row.shape[-1] // 2
+            rows.append(torch.stack((row[..., :half], row[..., half:]), dim=1))
+        else:
+            rows.append(
+                kv[:, :, block, offset]
+                if layout == "NHD"
+                else kv[:, :, block, :, offset]
+            )
     return torch.stack(rows, dim=2).cpu()
 
 
@@ -268,13 +285,16 @@ def test_managed_span_native_store_and_restore(
     layers: int,
     token_count: int,
     consume: Callable[[SpanConsumerCase], None] | None = None,
+    packed: bool = False,
 ) -> None:
     device = torch.device("cuda", 0)
     # Synthetic two-plane geometry includes the model's 24-layer count.
     # Each layer has 16 blocks, 4 tokens/block, two heads, 16 elements/head.
     # Separate 64 MiB exporter allocations avoid sharing small CUDA segments.
     pool = torch.empty((64 << 20) // 2, dtype=torch.bfloat16, device=device)
-    shape = (2, 16, 4, 2, 16) if layout == "NHD" else (2, 16, 2, 4, 16)
+    shape: tuple[int, ...] = (2, 16, 4, 2, 16) if layout == "NHD" else (2, 16, 2, 4, 16)
+    if packed:
+        shape = (16, 4, 2, 32) if layout == "NHD" else (16, 2, 4, 32)
     kv = pool[: layers * math.prod(shape)].reshape(layers, *shape)
     kv.fill_(-9)
     source = (

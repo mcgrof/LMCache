@@ -20,6 +20,7 @@ from lmcache.integration.vllm.kmesh_span_layers import (
     RestoredPagedLayerSource,
     RestoredSpanBatch,
 )
+from lmcache.integration.vllm.kmesh_span_layout import resolve_registered_paged_shape
 from lmcache.logging import init_logger
 from lmcache.v1.compute.blend.layer_source import UnsettledLayerSourceError
 from lmcache.v1.multiprocess.custom_types import DeviceIPCWrapper
@@ -186,7 +187,7 @@ class RegisteredSpanWorker:
             client: Actual same-host transport, retained by the caller.
             kv_caches: Contiguous physical engine cache views, with no data copy.
             rotary_cache: Actual contiguous model rotary table, retained unchanged.
-            layout: Engine-provided physical NHD/HND layout.
+            layout: Engine-provided NHD/HND ordering for separate or fused K/V.
             model_name: Actual serving model identifier.
             is_neox_style: Actual model rotary style.
             artifacts: Separately validated model and execution identities.
@@ -203,10 +204,9 @@ class RegisteredSpanWorker:
         if type(kv_caches) is not tuple or not kv_caches:
             raise ValueError("registered worker requires actual engine cache views")
         first = kv_caches[0]
+        geometry = resolve_registered_paged_shape(tuple(first.shape), layout)
         if (
-            first.ndim != 5
-            or first.shape[0] != 2
-            or type(is_neox_style) is not bool
+            type(is_neox_style) is not bool
             or layout not in ("NHD", "HND")
             or any(
                 t.device.type != "cuda"
@@ -257,7 +257,7 @@ class RegisteredSpanWorker:
             event = backend.create_event(first.device)
             exports.events.append(event)
             backend.record_event(event, torch_dev.current_stream(first.device))
-            head_size = int(first.shape[-1])
+            head_size = geometry.head_size
             runtime = _value(
                 client.kmesh_register_rotary(
                     1,
@@ -339,7 +339,10 @@ class RegisteredSpanWorker:
         if self._closing:
             raise RuntimeError("registered worker is retiring")
         cache = self._exports.caches[0]
-        block_size = int(cache.shape[2 if self._exports.layout == "NHD" else 3])
+        geometry = resolve_registered_paged_shape(
+            tuple(cache.shape), self._exports.layout
+        )
+        block_size = geometry.block_size
         if (
             type(slot_mapping) is not tuple
             or not slot_mapping
@@ -352,7 +355,7 @@ class RegisteredSpanWorker:
         )
         if (
             len(set(blocks)) != len(blocks)
-            or max(blocks) >= cache.shape[1]
+            or max(blocks) >= geometry.blocks
             or any(
                 slot != blocks[p // block_size] * block_size + p % block_size
                 for p, slot in enumerate(slot_mapping)

@@ -81,7 +81,7 @@ def gather_registered_span(
             exception frames, all borrows and objects until device-context drain.
 
     Complete block-aligned spans keep the object-group path. Interior starts
-    and partial tails use the native slot-map kernel for two-plane NHD/HND.
+    and partial tails use the native slot-map kernel for separate or fused NHD/HND.
     A tail gathers into packed host strides, then needs CPU canonicalization
     after actual drain. Returning never establishes completion or admission.
     """
@@ -138,10 +138,15 @@ def gather_registered_span(
             )
             return RegisteredSpanGather(staged)
         fmt = cache.get_engine_kv_format(0)
-        if fmt.name not in ("NL_X_TWO_NB_BS_NH_HS", "NL_X_TWO_NB_NH_BS_HS"):
-            raise ValueError("unaligned gather requires two-plane NHD or HND")
+        if fmt.name not in (
+            "NL_X_TWO_NB_BS_NH_HS",
+            "NL_X_TWO_NB_NH_BS_HS",
+            "NL_X_NB_BS_NH_CS",
+            "NL_X_NB_NH_BS_CS",
+        ):
+            raise ValueError("unaligned gather requires separate or fused NHD/HND")
         tensors: list[torch.Tensor] = []
-        expected = (2, shape.nl, chunk, shape.nh * shape.hs)
+        expected = (shape.kv_size, shape.nl, chunk, shape.nh * shape.hs)
         for obj in objects:
             # The native slot kernel maps one registered host pointer and then
             # indexes it linearly; separate pin ranges need separate mappings.
@@ -179,9 +184,9 @@ def gather_registered_span(
             valid = min(chunk, count - index * chunk)
             target = tensor
             if valid < chunk:
-                elements = 2 * shape.nl * valid * shape.nh * shape.hs
+                elements = shape.kv_size * shape.nl * valid * shape.nh * shape.hs
                 target = tensor.view(-1)[:elements].view(
-                    2, shape.nl, valid, shape.nh * shape.hs
+                    shape.kv_size, shape.nl, valid, shape.nh * shape.hs
                 )
                 partials.append((target, tensor))
             device_ops.multi_layer_kv_transfer(

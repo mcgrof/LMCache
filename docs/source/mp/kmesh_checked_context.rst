@@ -116,7 +116,8 @@ not accept GPU-L1/GDS or enable the vLLM multiprocess model consumer.
 IDs, original source position, preceding-context SHA-256, full block table
 and recorded producer event. Source positions may begin inside a block.
 Block-aligned sources use native object-group transfer; interior positions use
-the native slot-map gather for two-plane NHD/HND layouts. Each slot-map target
+the native slot-map gather for separate or per-head fused K/V in NHD/HND.
+Each slot-map target
 object must fit within one host-registration range. The service waits for source
 writes, gathers exact source slots, drains actual device work and checks every key's L1
 admission before publishing an immutable ``SpanHandle``. Each physical key is
@@ -128,8 +129,8 @@ canonical object with zero padding before checksum and admission. The immutable
 handle records valid tokens only. Restore scatters only that valid extent.
 Native key rotation visits a full padded chunk, so a shifted match additionally
 requires rotary-table capacity for both padded position ranges. Refuse short
-tables before native launch. Partial gathering uses the qualified two-plane
-NHD/HND formats and never reads following source slots as padding.
+tables before native launch. Partial gathering preserves each physical format
+and never reads following source slots as padding.
 
 ``kmesh_restore_span`` takes that exact handle, a destination position and its
 preceding-context digest, reserved block table and destination-ready event.
@@ -211,6 +212,9 @@ Experimental worker operation owner
 ``RegisteredSpanWorker.connect`` in
 ``lmcache.integration.vllm.kmesh_span_client`` registers the actual contiguous
 worker views and recorded model rotary producer with one same-host service.
+Five-dimensional views contain separate K/V planes. Four-dimensional views
+pack K and V into each head's trailing content axis. The actual rotary head
+size is half that fused width; registration never replaces engine storage.
 Its artifact identities must come from the caller's verified model and resolved
 configuration. The service derives tensor and rotary facts but does not load
 or attest model weights.

@@ -137,11 +137,13 @@ def consume_placement(case: span_fixture.SpanConsumerCase, mode: str) -> None:
 
 @pytest.mark.parametrize("transport", ["zmq", "grpc"])
 @pytest.mark.parametrize("layout", ["NHD", "HND"])
+@pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("mode", ["writeback", "early-close", "failed-drain"])
 def test_registered_paged_inputs_and_checked_layer_writeback(
     transport: Literal["zmq", "grpc"],
     layout: Literal["NHD", "HND"],
     mode: str,
+    packed: bool,
 ) -> None:
     span_fixture.test_managed_span_native_store_and_restore(
         transport,
@@ -152,4 +154,5 @@ def test_registered_paged_inputs_and_checked_layer_writeback(
         24,
         9,
         consume=lambda case: consume_placement(case, mode),
+        packed=packed,
     )
