@@ -127,6 +127,21 @@ def deregister_gds_gpu_buffer(buffer: torch.Tensor) -> None:
         context.deregister_gpu_buffer(buffer)
 
 
+def require_inactive_gds() -> None:
+    """Refuse checked raw-context admission or release with an active GDS slab.
+
+    The legacy staging deregistration interface logs backend failures. It cannot
+    establish checked retirement for a managed raw context. Callers must also
+    keep their server configuration fixed throughout the context lifetime.
+
+    Raises:
+        RuntimeError: A singleton or L1-owned GDS slab is active.
+    """
+    with _owner_contexts_lock:
+        if get_gds_context().initialized or _owner_contexts:
+            raise RuntimeError("managed raw contexts require inactive GDS")
+
+
 class SlabDirection(enum.Enum):
     """Direction of a GDS slab transfer. GPUDirect DMAs run straight between GPU
     memory and slab storage (no host buffer), so directions are storage I/O

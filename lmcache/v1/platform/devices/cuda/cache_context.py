@@ -11,6 +11,7 @@ This module provides GPU-side KV cache management functionality, including:
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 import array
+import threading
 
 # Third Party
 import torch
@@ -26,6 +27,7 @@ from lmcache.utils import EngineType
 from lmcache.v1.gpu_connector.gds_context import (
     deregister_gds_gpu_buffer,
     register_gds_gpu_buffer,
+    require_inactive_gds,
 )
 from lmcache.v1.gpu_connector.utils import (
     LayoutHints,
@@ -40,8 +42,18 @@ from lmcache.v1.multiprocess.group_view import (
     engine_group_layer_indices,
 )
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
+from lmcache.v1.platform.stream import current_stream, synchronize_stream
 
 logger = init_logger(__name__)
+
+# Checked contexts retain even partial construction until verified release or
+# importer-process exit. The managed server bounds this to one registration.
+_RETAINED_MANAGED_RAW_CONTEXTS: dict[int, "GPUCacheContext"] = {}
+
+
+def retained_managed_raw_contexts() -> int:
+    """Return contexts whose checked physical teardown has not completed."""
+    return len(_RETAINED_MANAGED_RAW_CONTEXTS)
 
 
 def unwrap_kv_cache_tensors(kv_caches: KVCache) -> list[torch.Tensor]:
@@ -345,6 +357,11 @@ class _TempGPUBuffer:
 class GPUCacheContext(BaseCacheContext):
     """
     Manages the shape and pointers to vLLM GPU KV cache tensors.
+
+    ``managed_raw=True`` opts into checked raw mapping retirement and retains
+    partial construction until importer exit. It requires raw CUDA wrappers and
+    an inactive GDS slab. Its caller must stop all consumers before close; this
+    resource primitive alone does not authorize an exporter release receipt.
     """
 
     device_type = "cuda"
@@ -358,10 +375,28 @@ class GPUCacheContext(BaseCacheContext):
         engine_type: EngineType = EngineType.VLLM,
         separate_object_groups: bool = False,
         full_sw_kv: bool = False,
+        *,
+        managed_raw: bool = False,
     ):
+        self._managed_raw = managed_raw
+        self._managed_raw_ready = False
+        self._raw_close_lock = threading.Lock()
+        self._raw_imports_retired = False
+        self._raw_released_allocations: tuple[str, ...] | None = None
+        if managed_raw:
+            # First Party
+            from lmcache.v1.platform.devices.cuda.ipc_wrapper import RawCudaIPCWrapper
+
+            if not kv_caches or any(
+                type(wrapper) is not RawCudaIPCWrapper for wrapper in kv_caches
+            ):
+                raise ValueError("managed raw contexts require raw CUDA wrappers")
+            require_inactive_gds()
         # Kept for close(): raw-IPC wrappers hold driver-level mappings
         # that pin the exporter's device memory until explicitly closed.
         self._kv_wrappers: KVCache = list(kv_caches)
+        if managed_raw:
+            _RETAINED_MANAGED_RAW_CONTEXTS[id(self)] = self
         try:
             self._init_impl(
                 kv_caches,
@@ -372,7 +407,17 @@ class GPUCacheContext(BaseCacheContext):
                 separate_object_groups,
                 full_sw_kv,
             )
+            if managed_raw:
+                # Pointer-table uploads precede construction of the transfer
+                # stream. Complete that initialization stream before publishing
+                # the context; a different stream's drain cannot prove it.
+                synchronize_stream(self.device_, current_stream(self.device_))
+            self._managed_raw_ready = True
         except BaseException:
+            if managed_raw:
+                # Neither construction failure nor a missing stream proves that
+                # earlier imports/submissions were absent. Keep the whole object.
+                raise
             # Partial construction may have imported some mappings
             # already; roll them back so a failed registration does not
             # pin the worker's KV pool.
@@ -483,10 +528,59 @@ class GPUCacheContext(BaseCacheContext):
         afterwards -- the caller (``_release_entries``) drops the context
         right after this call.
         """
+        if self._managed_raw:
+            self.close_raw_checked()
+            return
         self.cuda_stream_.synchronize()
         with torch_dev.stream(self.cuda_stream_):
             deregister_gds_gpu_buffer(self._temp_buffer.buffer)
         self._close_kv_wrappers()
+
+    def close_raw_checked(self) -> tuple[str, ...]:
+        """Drain and retire this managed context's whole raw CUDA allocations.
+
+        The trusted server must stop all consumers before calling. New raw
+        imports are then permanently refused in this process. Keep the context
+        alive on any failure; native uncertainty requires importer teardown.
+        Other IPC implementations are not covered by this operation.
+
+        Returns:
+            Sorted whole-allocation identities after every raw alias releases.
+            Successful repeated calls return the same value without native work.
+
+        Raises:
+            RuntimeError: Not a completed managed construction, GDS is active,
+                the stream cannot drain, cleanup is uncertain or aliases remain.
+        """
+        # First Party
+        from lmcache.v1.platform.devices.cuda.ipc_wrapper import RawCudaIPCWrapper
+
+        with self._raw_close_lock:
+            if self._raw_released_allocations is not None:
+                return self._raw_released_allocations
+            if not self._managed_raw or not self._managed_raw_ready:
+                raise RuntimeError(
+                    "raw context construction requires importer teardown"
+                )
+            require_inactive_gds()
+            self.cuda_stream_.synchronize()
+            owners = [
+                wrapper
+                for wrapper in self._kv_wrappers
+                if isinstance(wrapper, RawCudaIPCWrapper)
+            ]
+            if not self._raw_imports_retired:
+                for wrapper in owners:
+                    wrapper.retire_raw_imports()
+                self._raw_imports_retired = True
+            for wrapper in owners:
+                wrapper.close_checked()
+            if any(not wrapper.raw_mapping_released for wrapper in owners):
+                raise RuntimeError("raw allocation still has imported aliases")
+            released = tuple(sorted({w.allocation_identity for w in owners}))
+            del _RETAINED_MANAGED_RAW_CONTEXTS[id(self)]
+            self._raw_released_allocations = released
+            return released
 
     def _close_kv_wrappers(self) -> None:
         """Close every KV wrapper, continuing past per-wrapper failures."""

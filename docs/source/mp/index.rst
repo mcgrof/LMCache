@@ -5,6 +5,7 @@ Overview
    :hidden:
 
    request_transport
+   kmesh_checked_context
    multi_l1
 
 LMCache multiprocess (MP) mode runs LMCache as a **standalone service** that

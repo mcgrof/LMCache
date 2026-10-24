@@ -1,7 +1,10 @@
 # Managed raw context registration and release
 
-Status: design only. Raw rotary copy primitives have separate CPU/CUDA
-qualification. Multiprocess KMesh engine admission remains closed.
+Status: the managed GPU context resource primitive is implemented and passes
+CPU admission and separate-process CUDA controls. Typed managed registration,
+raw rotary RPC integration and service retirement receipts remain design only.
+Raw rotary copy primitives have separate CPU/CUDA qualification. Multiprocess
+KMesh engine admission remains closed.
 
 The ordinary context close path drains its stream but logs raw mapping failures.
 It therefore cannot produce an exporter release receipt. The first managed
@@ -16,7 +19,10 @@ backend failures and cannot yet provide checked retirement evidence. It must
 be qualified before enabling this profile with GPU-L1 storage.
 
 A managed GPU context retains itself before its first import or initialization
-submission. Partial construction remains retained until importing-process exit;
+submission. Pointer-table initialization on the original current stream must
+physically drain before publication; draining only the later transfer stream
+cannot prove those earlier writes complete. Partial construction remains
+retained until importing-process exit;
 no ordinary best-effort rollback may silently convert it into successful release.
 The server records the actual receiving owner, expected server boot, nonce,
 exact context generation and every incoming mapping owner before construction.
