@@ -1,9 +1,10 @@
 # Register a rotary snapshot before admitting device discovery
 
 Status: ordered registration, private canonical publication and scoped copy
-draining are implemented. Device snapshots require explicit opt-in and their
-public-server CUDA qualification is pending. Exporter acknowledgement remains
-proposed. Multiprocess KMesh engine admission remains disabled.
+draining are implemented. Six explicit-input PyTorch CUDA IPC cases pass on an
+RTX 4090 through separate ZeroMQ/gRPC public servers. Device snapshots require
+explicit opt-in. Exporter acknowledgement remains proposed; multiprocess KMesh
+engine admission remains disabled.
 
 A cache server must not normalize a worker's rotary cache before that worker
 has finished producing it. Waiting only when hashing the result is too late:
