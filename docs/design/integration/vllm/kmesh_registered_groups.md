@@ -1,11 +1,14 @@
 # Consume registered spans in a bounded model group
 
-Status: prototype. Complete-group metadata, worker ownership and an explicit
-layer-major CacheBlend consumer are implemented. CPU consistency and synthetic
-session checks pass. The registered serial consumer and matched storage
-comparison pass their separate bounded GPU/model gates. Native group inputs
-and the registered group model comparison still require qualification.
-Ordinary multiprocess KMesh serving remains disabled.
+Status: experimental, qualified in a bounded RTX 4090 model replay with one
+GPU worker and one separate cache process. Registered serial and layer-major
+group repair preserve the same-source serial reference's raw K/V, logits,
+masks, selections and generated tokens. A failed member drains and recomputes
+while three siblings preserve the serial result. The first group uses CPU-L1
+sources and request-local tensor operations; combined group/NVMe execution and
+batched model operations remain unqualified. Ordinary multiprocess KMesh
+serving stays disabled. See the
+[registered group study](https://knlp.io/kmesh-recovery.html#collective).
 
 The serial worker permits one live model input because that input owns engine
 blocks through layer repair and checked physical cleanup. A collective model

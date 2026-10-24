@@ -307,7 +307,12 @@ cleanup attempts every member even if an earlier member fails. Its aggregate
 ``UnsettledLayerSourceError`` retains the retry owner and prevents a failed
 member result from authorizing block reuse before an actual drain.
 
-CPU metadata and synthetic session checks do not establish registered group
-model equivalence or a speed benefit. Native simultaneous inputs, actual model
-repair and storage-route performance still require separate qualification.
+Separate CPU, native and actual model qualifications pass for the bounded
+RTX 4090 replay. Registered serial and layer-major groups preserve the
+same-source serial reference's raw K/V, logits, masks, selections and tokens.
+One failed member drains, invalidates its full prompt and recomputes while the
+other three preserve their serial outputs. The first group uses CPU-L1 sources
+and request-local model operations. Combined group/NVMe execution, batched tensor
+operations and production performance remain unqualified. See the
+`registered group study <https://knlp.io/kmesh-recovery.html#collective>`_.
 The ordinary multiprocess serving guard remains closed.
