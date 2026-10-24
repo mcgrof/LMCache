@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections.abc import Generator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Optional, cast
 import pickle
@@ -22,7 +22,11 @@ from lmcache.v1.compute.blend.blender import (
     LMCBlendOutcome,
     LMCBlendSession,
 )
-from lmcache.v1.compute.blend.layer_source import UnsettledLayerSourceError
+from lmcache.v1.compute.blend.layer_source import (
+    BlendLayerSource,
+    BlendLayerSourceRequest,
+    UnsettledLayerSourceError,
+)
 from lmcache.v1.compute.models.utils import VLLMModelTracker
 from lmcache.v1.gpu_connector.gpu_connectors import (
     VLLMBufferLayerwiseGPUConnector,
@@ -344,6 +348,86 @@ def test_unqualified_group_source_refuses_before_any_session() -> None:
     with pytest.raises(NotImplementedError, match="serial sessions"):
         blender.blend_group((request,))
     assert not blender.sessions and not source.engine.retrieve_kwargs
+
+
+class _CheckedSourceGroup:
+    """Exercise the group protocol boundary with synthetic layer payloads."""
+
+    def __init__(self, blender: _FakeBlender) -> None:
+        self.blender = blender
+        self.spans = ExplicitTokenSpans(3, TokenSpan(0, 3), (TokenSpan(0, 3),))
+        self.requests = tuple(
+            BlendLayerSourceRequest(str(index), 1, (index, 11, 12), self.spans)
+            for index in (1, 2)
+        )
+        self.engine = _FakeCacheEngine(blender.num_layers, events=blender.events)
+        self.closed = False
+        self.unresolved = False
+        self.drains = 0
+
+    def bind(
+        self, requests: tuple[BlendLayerSourceRequest, ...]
+    ) -> tuple[BlendLayerSource, ...]:
+        assert not self.blender.sessions
+        if requests != self.requests:
+            raise ValueError("changed model group input")
+        return tuple(_ExplicitLayerSource(self.spans, self.engine) for _ in requests)
+
+    def close(self) -> None:
+        assert all(session.is_closed for session in self.blender.sessions)
+        self.closed = True
+        if self.unresolved:
+            raise UnsettledLayerSourceError("synthetic unresolved group", self.drain)
+
+    def drain(self) -> None:
+        self.drains += 1
+        if self.unresolved:
+            raise RuntimeError("synthetic group still owes drain")
+
+
+@pytest.mark.parametrize("mode", ["success", "changed-member", "unsettled-close"])
+def test_group_binds_every_source_before_sessions_and_owns_final_cleanup(
+    mode: str,
+) -> None:
+    blender = _FakeBlender()
+    owner = _CheckedSourceGroup(blender)
+    requests = tuple(
+        LMCBlendGroupRequest(
+            request_id=member.request_id,
+            generation=member.generation,
+            tokens=list(member.token_ids),
+            retrieve_kwargs={"explicit_spans": member.explicit_spans},
+        )
+        for member in owner.requests
+    )
+    if mode == "changed-member":
+        requests = (requests[0], replace(requests[1], tokens=[2, 999, 12]))
+        with pytest.raises(ValueError, match="changed model group"):
+            blender.blend_group(requests, layer_source_group=owner)
+        assert (
+            owner.closed and not blender.sessions and not owner.engine.retrieve_kwargs
+        )
+        return
+    if mode == "unsettled-close":
+        owner.unresolved = True
+        with pytest.raises(UnsettledLayerSourceError) as raised:
+            blender.blend_group(requests, layer_source_group=owner)
+        with pytest.raises(RuntimeError, match="still owes drain"):
+            raised.value.drain()
+        owner.unresolved = False
+        raised.value.drain()
+        assert owner.drains == 2
+    else:
+        result = blender.blend_group(requests, layer_source_group=owner)
+        assert all(m.outcome is LMCBlendGroupOutcome.RECOVERED for m in result.members)
+    assert owner.closed and not blender.cache_engine.retrieve_kwargs
+    assert owner.engine.generators_closed == {"1", "2"}
+    assert all(session.is_closed for session in blender.sessions)
+    assert all(
+        buffer.release_count == 1
+        for buffers in owner.engine.buffers.values()
+        for buffer in buffers
+    )
 
 
 def test_serialized_cleanup_error_keeps_the_actual_owner_local() -> None:

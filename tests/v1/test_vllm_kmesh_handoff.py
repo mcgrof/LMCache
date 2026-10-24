@@ -2942,6 +2942,47 @@ def test_collective_worker_contains_one_member_failure_and_finishes_sibling(
     ]
 
 
+@pytest.mark.parametrize("mode", ["raised", "member", "two-members"])
+@pytest.mark.parametrize("allow_drain", [False, True])
+def test_collective_worker_requires_every_physical_owner_before_fallback(
+    runtime: KMeshRuntimeEvidence, mode: str, allow_drain: bool
+) -> None:
+    worker, _metadata = _collective_worker(runtime)
+    state = cast(Any, worker)
+    hit_mask = torch.tensor([True, True, True, False, False, False, False, False])
+    state._test_blender.masks.update({"request-a": hit_mask, "request-b": hit_mask})
+    attempts: list[str] = []
+
+    def owner(request_id: str) -> UnsettledLayerSourceError:
+        def drain() -> None:
+            attempts.append(request_id)
+            assert worker.get_block_ids_with_load_errors() == set()
+            assert state._kmesh_collective_results == []
+            if not allow_drain:
+                raise RuntimeError("synthetic collective input has not drained")
+
+        return UnsettledLayerSourceError("synthetic unresolved group input", drain)
+
+    if mode == "raised":
+        state._test_blender.masks["request-a"] = owner("request-a")
+    else:
+        state._test_blender.group_failures["request-a"] = owner("request-a")
+        if mode == "two-members":
+            state._test_blender.group_failures["request-b"] = owner("request-b")
+    if allow_drain:
+        worker.start_load_kv(cast(Any, _forward_context()))
+        assert worker.get_block_ids_with_load_errors() == (
+            {3, 5} if mode == "member" else {3, 5, 7, 9}
+        )
+    else:
+        with pytest.raises(RuntimeError, match="has not drained|still owe physical"):
+            worker.start_load_kv(cast(Any, _forward_context()))
+        assert worker.get_block_ids_with_load_errors() == set()
+        assert state._kmesh_failed_worker_requests == set()
+    expected = ["request-a", "request-b"] if mode == "two-members" else ["request-a"]
+    assert attempts == expected * (2 if mode != "raised" and not allow_drain else 1)
+
+
 def test_collective_worker_rejects_capacity_before_group_mutation(
     runtime: KMeshRuntimeEvidence,
 ) -> None:

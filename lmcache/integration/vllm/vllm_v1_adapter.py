@@ -2928,6 +2928,13 @@ class LMCacheConnectorV1Impl:
                 )
             )
 
+        self._drain_kmesh_group_sources(
+            tuple(
+                member.error
+                for _contract, member in validated_members
+                if isinstance(member.error, UnsettledLayerSourceError)
+            )
+        )
         frozen_result = LMCBlendGroupResult(
             tuple(member for _contract, member in validated_members)
         )
@@ -2948,6 +2955,22 @@ class LMCacheConnectorV1Impl:
                     contract,
                     "collective explicit lookup/retrieve produced a miss",
                 )
+
+    def _drain_kmesh_group_sources(
+        self, owners: tuple[UnsettledLayerSourceError, ...]
+    ) -> None:
+        errors: list[Exception] = []
+        for owner in owners:
+            try:
+                owner.drain()
+            except Exception as error:
+                logger.exception("KMesh collective source cleanup remains unresolved")
+                errors.append(error)
+        if errors:
+            raise UnsettledLayerSourceError(
+                "KMesh collective sources still owe physical cleanup",
+                lambda: self._drain_kmesh_group_sources(owners),
+            ) from errors[0]
 
     def _start_kmesh_load_kv_locked(
         self,
@@ -3018,6 +3041,8 @@ class LMCacheConnectorV1Impl:
                         kvcaches=kvcaches,
                     )
                 except Exception as error:
+                    if isinstance(error, UnsettledLayerSourceError):
+                        error.drain()
                     for contract in plan_contracts:
                         if (
                             contract.request_id

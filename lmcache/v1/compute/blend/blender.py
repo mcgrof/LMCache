@@ -15,11 +15,14 @@ from lmcache.logging import init_logger
 from lmcache.v1.compute.attention.metadata import LMCAttnMetadata
 from lmcache.v1.compute.blend.layer_source import (
     BlendLayerSource,
+    BlendLayerSourceGroup,
+    BlendLayerSourceRequest,
     UnsettledLayerSourceError,
 )
 from lmcache.v1.compute.blend.metadata import LMCBlendCommonMetadata, LMCBlendMetadata
 from lmcache.v1.compute.models.utils import infer_model_from_vllm
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.token_span import ExplicitTokenSpans
 
 if TYPE_CHECKING:
     # First Party
@@ -893,6 +896,7 @@ class LMCBlender:
         *,
         collective_position_recovery: bool = False,
         collective_qkv: bool = False,
+        layer_source_group: BlendLayerSourceGroup | None = None,
     ) -> LMCBlendGroupResult:
         """Run request-owned CacheBlend sessions in bounded lockstep.
 
@@ -918,6 +922,10 @@ class LMCBlender:
 
         Args:
             requests: Ordered, nonempty group of request-local blend inputs.
+            layer_source_group: Optional owner binding the complete ordered model
+                input before any session opens. Completed registered inputs use
+                request-local model operations and must not rotate cached keys
+                again.
             collective_position_recovery: Batch cached-K position recovery
                 across the group instead of rotating per member.
 
@@ -949,12 +957,52 @@ class LMCBlender:
             raise NotImplementedError(
                 "request-owned layer sources support serial sessions only"
             )
+        if layer_source_group is None:
+            return self._blend_prepared_group(
+                prepared, collective_position_recovery, collective_qkv, None
+            )
+        if collective_position_recovery or collective_qkv:
+            raise NotImplementedError(
+                "completed registered groups use request-local model operations"
+            )
+        try:
+            if any(
+                type(request.retrieve_kwargs.get("explicit_spans"))
+                is not ExplicitTokenSpans
+                for request in prepared
+            ):
+                raise ValueError("bound model groups require exact explicit spans")
+            bindings = tuple(
+                BlendLayerSourceRequest(
+                    request.request_id,
+                    request.generation,
+                    tuple(request.tokens.cpu().tolist())
+                    if isinstance(request.tokens, torch.Tensor)
+                    else tuple(request.tokens),
+                    request.retrieve_kwargs["explicit_spans"],
+                )
+                for request in prepared
+            )
+            sources = layer_source_group.bind(bindings)
+            if type(sources) is not tuple or len(sources) != len(prepared):
+                raise ValueError("bound model group source membership differs")
+            return self._blend_prepared_group(prepared, False, False, sources)
+        finally:
+            layer_source_group.close()
+
+    def _blend_prepared_group(
+        self,
+        prepared: tuple[_PreparedLMCBlendGroupRequest, ...],
+        collective_position_recovery: bool,
+        collective_qkv: bool,
+        sources: tuple[BlendLayerSource, ...] | None,
+    ) -> LMCBlendGroupResult:
         states = [_LMCBlendGroupMemberState(request=request) for request in prepared]
         collective_passes: list[LMCBlendCollectivePass] = []
 
         try:
             # Create every request-owned session before retrieval begins.
-            for state in states:
+            for index, state in enumerate(states):
                 request = state.request
                 try:
                     state.session = self.create_session(
@@ -964,6 +1012,7 @@ class LMCBlender:
                         generation=request.generation,
                         defer_position_recovery=collective_position_recovery,
                         collective_qkv=collective_qkv,
+                        layer_source=(sources[index] if sources is not None else None),
                         **request.retrieve_kwargs,
                     )
                 except Exception as error:
