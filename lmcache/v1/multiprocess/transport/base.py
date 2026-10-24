@@ -9,6 +9,7 @@ from lmcache.utils import EngineType
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.transfer_channel.api import TransferChannelAddress
 from lmcache.v1.gpu_connector.kv_format.types import LayoutHints
+from lmcache.v1.multiprocess.context_ownership import ContextIdentity
 from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     CBMatchResult,
@@ -57,6 +58,35 @@ class RequestClient(Protocol):
         self,
         instance_id: int,
     ) -> MessagingFuture[tuple[RegisteredRuntime | None, str]]: ...
+
+    @rpc_method
+    def kmesh_get_context(
+        self,
+        instance_id: int,
+    ) -> MessagingFuture[tuple[ContextIdentity | None, str]]: ...
+
+    @rpc_method
+    def kmesh_register_rotary(
+        self,
+        instance_id: int,
+        context: ContextIdentity,
+        caches_ipc: list[DeviceIPCWrapper],
+        head_size: int,
+        is_neox_style: bool,
+        group_to_cache: list[int],
+        group_rot: list[list[int]],
+        group_head_size: list[int],
+        kv_quant: str,
+        producer_event: bytes,
+    ) -> MessagingFuture[tuple[RegisteredRuntime | None, str]]: ...
+
+    @rpc_method
+    def kmesh_retry_rotary_drain(
+        self,
+        context: ContextIdentity,
+    ) -> MessagingFuture[tuple[int | None, str]]:
+        """Request physical copy drain; zero is not exporter teardown."""
+        ...
 
     @rpc_method
     def kmesh_open_registration(

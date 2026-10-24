@@ -6,7 +6,7 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from multiprocessing.connection import Connection
-from typing import Literal, TypeVar
+from typing import Callable, Literal, TypeVar
 import multiprocessing
 import threading
 
@@ -58,8 +58,14 @@ def value(reply: tuple[T | None, str]) -> T:
     return result
 
 
-def serve(transport: Literal["zmq", "grpc"], connection: Connection) -> None:
-    """Start the public server entry point in a CPU-only child process."""
+def serve(
+    transport: Literal["zmq", "grpc"],
+    connection: Connection,
+    *,
+    device_snapshots: bool = False,
+    observer: Callable[[str], object] | None = None,
+) -> None:
+    """Start the public server entry point in a separate test process."""
     result = run_cache_server(
         MPServerConfig(
             transport=transport,
@@ -68,6 +74,7 @@ def serve(transport: Literal["zmq", "grpc"], connection: Connection) -> None:
             chunk_size=8,
             engine_type="blend",
             enable_kmesh_control=True,
+            enable_kmesh_device_snapshots=device_snapshots,
             worker_reap_timeout_seconds=0,
         ),
         StorageManagerConfig(
@@ -88,9 +95,14 @@ def serve(transport: Literal["zmq", "grpc"], connection: Connection) -> None:
             assert isinstance(server, MessageQueueServer)
             url = server.socket.getsockopt_string(zmq.LAST_ENDPOINT)
         connection.send(url)
-        if not connection.poll(60):
-            raise RuntimeError("parent did not stop the control server")
-        assert connection.recv() == "stop"
+        while True:
+            if not connection.poll(60):
+                raise RuntimeError("parent did not stop the control server")
+            command = connection.recv()
+            if command == "stop":
+                break
+            assert observer is not None
+            connection.send(observer(command))
     finally:
         server.close()
         engine.close()
@@ -147,6 +159,47 @@ def worker_tensors(client: RequestClient, fill: float = 1.0) -> Iterator[None]:
         finally:
             for wrapper in wrappers:
                 shm_unlink(wrapper.shm_name)
+
+
+@pytest.mark.parametrize("transport", ["zmq", "grpc"])
+def test_ordered_rotary_registration_uses_actual_transport_owner(
+    transport: Literal["zmq", "grpc"],
+) -> None:
+    with remote_server(transport) as url:
+        first, second = [RequestClientFactory.create(url) for _ in range(2)]
+        cache = torch.ones((64, 8))
+        wrapper = migrate_to_shm_and_wrap(cache)
+        try:
+            with worker_tensors(first):
+                context = value(first.kmesh_get_context(99).result(timeout=10))
+                refused_context, error = second.kmesh_get_context(99).result(timeout=10)
+                assert refused_context is None and error
+                refused, error = second.kmesh_register_rotary(
+                    99, context, [wrapper], 8, True, [0], [], [], "", b""
+                ).result(timeout=10)
+                assert refused is None and error
+                runtime = value(
+                    first.kmesh_register_rotary(
+                        99, context, [wrapper], 8, True, [0], [], [], "", b""
+                    ).result(timeout=10)
+                )
+                assert runtime.context == context
+                wrapper.to_tensor().zero_()
+                assert value(first.kmesh_get_runtime(99).result(timeout=10)) == runtime
+                shm_unlink(wrapper.shm_name)
+                missing, error = first.kmesh_register_rotary(
+                    99, context, [wrapper], 8, True, [0], [], [], "", b""
+                ).result(timeout=10)
+                assert missing is None and "No such file" in error
+                assert value(first.kmesh_get_runtime(99).result(timeout=10)) == runtime
+                remaining, error = first.kmesh_retry_rotary_drain(context).result(
+                    timeout=10
+                )
+                assert remaining is None and "no retained copy" in error
+        finally:
+            first.close()
+            second.close()
+            shm_unlink(wrapper.shm_name)
 
 
 @pytest.mark.parametrize("transport", ["zmq", "grpc"])

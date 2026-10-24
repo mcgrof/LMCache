@@ -8,6 +8,8 @@ from typing import TypeVar
 import time
 
 # First Party
+from lmcache.v1.multiprocess.context_ownership import ContextIdentity
+from lmcache.v1.multiprocess.custom_types import DeviceIPCWrapper
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 from lmcache.v1.multiprocess.engine_module import InstanceLivenessTarget
 from lmcache.v1.multiprocess.kmesh_bindings import RegisteredWorkerBindings
@@ -38,7 +40,7 @@ def _reply(action: Callable[[], T]) -> tuple[T | None, str]:
     try:
         get_request_session()
         return action(), ""
-    except (RuntimeError, ValueError) as error:
+    except (RuntimeError, ValueError, FileNotFoundError) as error:
         return None, str(error)[:512]
 
 
@@ -51,6 +53,7 @@ class KMeshControlModule(InstanceLivenessTarget):
         blend: Module owning rotary registrations.
         lease_seconds: Worker-silence budget, separate from ordinary PING.
         clock: Monotonic lease clock; injectable for deterministic CPU tests.
+        allow_device_snapshots: Explicit experimental ordered-device opt-in.
     """
 
     def __init__(
@@ -60,10 +63,15 @@ class KMeshControlModule(InstanceLivenessTarget):
         blend: BlendModule,
         lease_seconds: float = 30.0,
         clock: Callable[[], float] = time.monotonic,
+        *,
+        allow_device_snapshots: bool = False,
     ) -> None:
         self._ctx = ctx
         self._bindings = RegisteredWorkerBindings(
-            DomainRegistry([], lease_seconds, clock), transfer, blend
+            DomainRegistry([], lease_seconds, clock),
+            transfer,
+            blend,
+            allow_device_snapshots=allow_device_snapshots,
         )
 
     @property
@@ -108,6 +116,46 @@ class KMeshControlModule(InstanceLivenessTarget):
         self, instance_id: int
     ) -> tuple[RegisteredRuntime | None, str]:
         return _reply(lambda: self._bindings.describe(instance_id))
+
+    @request_handler(HandlerType.BLOCKING, requires_client_affinity=True)
+    def kmesh_get_context(self, instance_id: int) -> tuple[ContextIdentity | None, str]:
+        return _reply(lambda: self._bindings.context_identity(instance_id))
+
+    @request_handler(HandlerType.BLOCKING, requires_client_affinity=True)
+    def kmesh_register_rotary(
+        self,
+        instance_id: int,
+        context: ContextIdentity,
+        caches_ipc: list[DeviceIPCWrapper],
+        head_size: int,
+        is_neox_style: bool,
+        group_to_cache: list[int],
+        group_rot: list[list[int]],
+        group_head_size: list[int],
+        kv_quant: str,
+        producer_event: bytes,
+    ) -> tuple[RegisteredRuntime | None, str]:
+        return _reply(
+            lambda: self._bindings.register_rotary_snapshot(
+                instance_id,
+                context,
+                caches_ipc,
+                head_size,
+                is_neox_style,
+                group_to_cache,
+                group_rot,
+                group_head_size,
+                kv_quant,
+                producer_event,
+            )
+        )
+
+    @request_handler(HandlerType.BLOCKING, requires_client_affinity=True)
+    def kmesh_retry_rotary_drain(
+        self, context: ContextIdentity
+    ) -> tuple[int | None, str]:
+        """Report actual copy drain; zero does not acknowledge exporter teardown."""
+        return _reply(lambda: self._bindings.retry_rotary_drain(context))
 
     @request_handler()
     def kmesh_open_registration(

@@ -175,6 +175,27 @@ def test_kmesh_controls_require_an_explicit_compatible_server(mode: str) -> None
     assert config.enable_kmesh_control
 
 
+def test_ordered_device_snapshot_switch_requires_controls() -> None:
+    assert not _parse_mp([]).enable_kmesh_device_snapshots
+    with pytest.raises(ValueError, match="require KMesh controls"):
+        _parse_mp(["--enable-kmesh-device-snapshots"])
+    config = _parse_mp(
+        [
+            "--engine-type",
+            "blend",
+            "--enable-kmesh-control",
+            "--enable-kmesh-device-snapshots",
+        ]
+    )
+    assert config.enable_kmesh_device_snapshots
+
+
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_ordered_device_snapshot_switch_rejects_non_boolean(value: object) -> None:
+    with pytest.raises(ValueError, match="must be a boolean"):
+        MPServerConfig(enable_kmesh_device_snapshots=value)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize(
     "arguments",
     [

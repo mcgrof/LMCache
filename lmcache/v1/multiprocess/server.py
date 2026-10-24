@@ -281,7 +281,12 @@ def _build_modules(
         if not isinstance(blend_module, BlendModule):
             raise ValueError("KMesh controls require an assembled blend module")
         assert lmcache_driven_module is not None
-        kmesh_control = KMeshControlModule(ctx, lmcache_driven_module, blend_module)
+        kmesh_control = KMeshControlModule(
+            ctx,
+            lmcache_driven_module,
+            blend_module,
+            allow_device_snapshots=mp_config.enable_kmesh_device_snapshots,
+        )
         liveness_targets.append(kmesh_control)
 
     management = ManagementModule(

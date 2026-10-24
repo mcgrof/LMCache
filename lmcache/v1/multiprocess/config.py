@@ -58,6 +58,10 @@ class MPServerConfig:
     """Enable registered-state control RPCs on a blend server. This does not
     enable device discovery, storage execution or engine recovery."""
 
+    enable_kmesh_device_snapshots: bool = False
+    """Opt in to ordered rotary snapshots and device runtime discovery.
+    Requires KMesh controls; does not enable storage execution or recovery."""
+
     separate_object_groups: bool = False
     """When True, split kernel groups into one object group per
     sliding-window size at KV-cache registration (hybrid models). When False
@@ -151,6 +155,10 @@ class MPServerConfig:
         """
         if type(self.enable_kmesh_control) is not bool:
             raise ValueError("enable_kmesh_control must be a boolean")
+        if type(self.enable_kmesh_device_snapshots) is not bool:
+            raise ValueError("enable_kmesh_device_snapshots must be a boolean")
+        if self.enable_kmesh_device_snapshots and not self.enable_kmesh_control:
+            raise ValueError("ordered device snapshots require KMesh controls")
         if self.enable_kmesh_control and (
             self.engine_type != "blend"
             or self.supported_transfer_mode == "engine_driven"
@@ -547,6 +555,12 @@ def add_mp_server_args(
         "Does not enable device discovery, storage execution or engine recovery.",
     )
     mp_group.add_argument(
+        "--enable-kmesh-device-snapshots",
+        action="store_true",
+        help="Opt in to ordered device rotary snapshots with KMesh controls. "
+        "Does not enable storage execution or engine recovery.",
+    )
+    mp_group.add_argument(
         "--enable",
         type=str,
         nargs="*",
@@ -594,6 +608,7 @@ def parse_args_to_mp_server_config(
         enable_segmented_prefix=args.enable_segmented_prefix,
         enable_dedup_content=args.enable_dedup_content,
         enable_kmesh_control=args.enable_kmesh_control,
+        enable_kmesh_device_snapshots=args.enable_kmesh_device_snapshots,
         supported_transfer_mode=args.supported_transfer_mode,
         isolated_ipc=args.isolated_ipc,
         runtime_plugin_config=RuntimePluginConfig(

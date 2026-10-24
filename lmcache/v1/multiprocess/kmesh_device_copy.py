@@ -20,6 +20,7 @@ import torch
 # First Party
 from lmcache import torch_dev
 from lmcache.logging import init_logger
+from lmcache.v1.multiprocess.context_ownership import ContextIdentity
 from lmcache.v1.multiprocess.kmesh_domains import KMeshFenceError
 from lmcache.v1.multiprocess.modules.blend.rope import BorrowedRope
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import BorrowedContext
@@ -92,6 +93,14 @@ class RetainedTensorCopies:
         """
         return self._copy_to(paged, rotary, torch.device("cpu"), producer_event)
 
+    def pending_for(self, context: ContextIdentity) -> int:
+        """Count physical copy obligations for one exact paged generation."""
+        with self._lock:
+            return sum(
+                copy.paged.entry.ownership.identity == context
+                for copy in self._copies.values()
+            )
+
     def copy_to_device(
         self, paged: BorrowedContext, rotary: BorrowedRope
     ) -> list[torch.Tensor]:
@@ -113,9 +122,10 @@ class RetainedTensorCopies:
         """
         return self._copy_to(paged, rotary, paged.entry.cache_context.device, b"")
 
-    def drain_quarantined(self) -> int:
+    def drain_quarantined(self, context: ContextIdentity | None = None) -> int:
         """Attempt physical drain of failed copies and return remaining debt.
 
+        When supplied, ``context`` restricts draining to that exact generation.
         This server-only action does not cancel active copies or authorize their
         outputs. Driver failures leave their resources retained. A zero count
         describes this manager only, not an exporter teardown acknowledgement.
@@ -123,6 +133,8 @@ class RetainedTensorCopies:
         with self._lock:
             copies = tuple(self._copies.items())
         for token, copy in copies:
+            if context is not None and copy.paged.entry.ownership.identity != context:
+                continue
             if not copy.lock.acquire(blocking=False):
                 continue
             try:
@@ -136,7 +148,7 @@ class RetainedTensorCopies:
                     self._release(token, copy)
             finally:
                 copy.lock.release()
-        return self.pending
+        return self.pending if context is None else self.pending_for(context)
 
     def close(self) -> None:
         """Stop admission and refuse to finish while any physical debt remains.

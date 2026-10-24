@@ -45,6 +45,7 @@ def provisional_rope(
     group_rot: list[tuple[int, int] | None],
     group_head_size: list[int],
     kv_quant: str,
+    backing_handles: tuple[object, ...] = (),
 ) -> "BorrowedRope":
     """Own unpublished rotary tensors for an exact receiving client's context.
 
@@ -57,6 +58,7 @@ def provisional_rope(
         group_rot: Validated rotation windows.
         group_head_size: Validated per-group head widths.
         kv_quant: Declared cache quantization format.
+        backing_handles: Mapping owners that must outlive the provisional input.
 
     Returns:
         An unpublished generation's first borrow, consumable by retained copies.
@@ -80,10 +82,24 @@ def provisional_rope(
         group_head_size=list(group_head_size),
         kv_quant=kv_quant,
         context_identity=context,
+        backing_handles=backing_handles,
     )
     return BorrowedRope(
         state, state.ownership.borrow(state.ownership.identity, session, lambda: None)
     )
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalRopeSnapshot:
+    """Bind completed CPU cache facts to one private uploaded rotary generation.
+
+    This server-owned value is not accepted through a control request. A
+    producer event and a digest echo cannot create its completion evidence.
+    """
+
+    context: ContextIdentity
+    rotary: ContextIdentity
+    cache_facts: tuple[tuple[str, tuple[int, ...], str], ...]
 
 
 @dataclass
@@ -111,6 +127,8 @@ class _CBRopeState:
     kv_quant: str = ""
     context_identity: ContextIdentity | None = None
     ownership: ContextOwnership = field(default_factory=ContextOwnership, repr=False)
+    backing_handles: tuple[object, ...] = field(default=(), repr=False)
+    canonical_snapshot: CanonicalRopeSnapshot | None = None
 
     def head_size_for_group(self, engine_group_idx: int) -> int:
         """The scatter head size for one engine group.

@@ -18,7 +18,10 @@ import threading
 import torch
 
 # First Party
+from lmcache import torch_device_type
 from lmcache.v1.multiprocess.context_ownership import ContextIdentity
+from lmcache.v1.multiprocess.custom_types import DeviceIPCWrapper
+from lmcache.v1.multiprocess.kmesh_device_copy import RetainedTensorCopies
 from lmcache.v1.multiprocess.kmesh_domains import (
     Completion,
     DomainRegistry,
@@ -30,8 +33,17 @@ from lmcache.v1.multiprocess.kmesh_domains import (
     ServerDescriptor,
     WorkerFence,
 )
+from lmcache.v1.multiprocess.kmesh_rotary_snapshot import (
+    canonical_rope_cache_facts,
+    normalize_rope_snapshot,
+)
 from lmcache.v1.multiprocess.kmesh_types import RegisteredRuntime as RegisteredRuntime
-from lmcache.v1.multiprocess.modules.blend.rope import BorrowedRope, RopeIdentity
+from lmcache.v1.multiprocess.modules.blend.rope import (
+    BorrowedRope,
+    CanonicalRopeSnapshot,
+    RopeIdentity,
+    provisional_rope,
+)
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import BorrowedContext
 from lmcache.v1.multiprocess.transport.request_context import get_request_session
 
@@ -49,24 +61,9 @@ def _digest(value: object) -> str:
     ).hexdigest()
 
 
-def _runtime(
-    paged: BorrowedContext,
-    rotary: BorrowedRope,
-    context: ContextIdentity,
-    rope_identity: RopeIdentity,
-    chunk_tokens: int,
-    hash_algorithm: str,
-) -> RegisteredRuntime:
+def _registered_layout_digest(paged: BorrowedContext, rotary: BorrowedRope) -> str:
     cache = paged.entry.cache_context
     rope = rotary.state
-    if any(t.device.type != "cpu" for t in cache.kv_tensors + rope.cos_sin_caches):
-        raise KMeshFenceError(
-            "device runtime discovery requires a qualified copy/drain backend"
-        )
-    if hash_algorithm != "blake3":
-        raise KMeshFenceError(
-            "binding requires the stable MP BLAKE3 hash implementation"
-        )
     formats = {
         "NL_X_TWO_NB_NH_BS_HS",
         "NL_X_TWO_NB_BS_NH_HS",
@@ -132,25 +129,62 @@ def _runtime(
         g.aux or g.recurrent or g.sw_size_chunks != -1 for g in manager.object_groups
     ):
         raise KMeshFenceError("binding requires full-attention object groups")
-    caches = []
-    for tensor in rope.cos_sin_caches:
-        host = tensor.detach().cpu().contiguous()
-        if not host.is_floating_point() or not torch.isfinite(host).all().item():
-            raise KMeshFenceError("rotary cache must contain finite floating values")
-        content = hashlib.sha256(host.view(torch.uint8).numpy().tobytes()).hexdigest()
-        caches.append((str(host.dtype), tuple(host.shape), content))
+    return _digest(
+        (
+            "kmesh-layout-v1",
+            groups,
+            [tuple(g.kernel_group_indices) for g in manager.object_groups],
+        )
+    )
+
+
+def _runtime(
+    paged: BorrowedContext,
+    rotary: BorrowedRope,
+    context: ContextIdentity,
+    rope_identity: RopeIdentity,
+    chunk_tokens: int,
+    hash_algorithm: str,
+) -> RegisteredRuntime:
+    cache = paged.entry.cache_context
+    rope = rotary.state
+    snapshot = rope.canonical_snapshot
+    device = any(t.device.type != "cpu" for t in cache.kv_tensors + rope.cos_sin_caches)
+    if device and snapshot is None:
+        raise KMeshFenceError(
+            "device runtime discovery requires a qualified copy/drain backend"
+        )
+    if snapshot is not None and (
+        type(snapshot) is not CanonicalRopeSnapshot
+        or snapshot.context != context
+        or snapshot.rotary != rope_identity.rotary
+        or snapshot.rotary != rope.ownership.identity
+        or len(snapshot.cache_facts) != len(rope.cos_sin_caches)
+        or any(t.device != cache.device for t in cache.kv_tensors + rope.cos_sin_caches)
+        or any(
+            (str(t.dtype), tuple(t.shape)) != fact[:2]
+            for t, fact in zip(rope.cos_sin_caches, snapshot.cache_facts, strict=True)
+        )
+    ):
+        raise KMeshFenceError("canonical rotary generation or tensor metadata changed")
+    if hash_algorithm != "blake3":
+        raise KMeshFenceError(
+            "binding requires the stable MP BLAKE3 hash implementation"
+        )
+    layout_digest = _registered_layout_digest(paged, rotary)
+    caches = (
+        snapshot.cache_facts
+        if device and snapshot is not None
+        else canonical_rope_cache_facts(rope.cos_sin_caches)
+    )
+    if snapshot is not None and caches != snapshot.cache_facts:
+        raise KMeshFenceError("canonical CPU rotary contents changed")
     return RegisteredRuntime(
         context,
         rope_identity,
         paged.entry.model_name,
         paged.entry.world_size,
-        _digest(
-            (
-                "kmesh-layout-v1",
-                groups,
-                [tuple(g.kernel_group_indices) for g in manager.object_groups],
-            )
-        ),
+        layout_digest,
         _digest(
             (
                 "kmesh-rope-v1",
@@ -191,8 +225,8 @@ class RegisteredWorkerBindings:
     The registry's handler inventory must come from the actual server, and
     workers must independently supply immutable model/tokenizer semantics.
     These bindings verify registered layout and rotary contents, not weights
-    that the storage server does not load. Discovery currently accepts CPU
-    tensors; device fingerprint copies need their own completion backend.
+    that the storage server does not load. Legacy device registrations cannot
+    supply discovery evidence. Ordered device snapshots require explicit opt-in.
     Storage and engine admission remain separate until their namespace and
     completion paths are qualified.
     """
@@ -202,6 +236,8 @@ class RegisteredWorkerBindings:
         registry: DomainRegistry,
         transfer: "LMCacheDrivenTransferModule",
         blend: "BlendModule",
+        *,
+        allow_device_snapshots: bool = False,
     ) -> None:
         self._registry = registry
         self._transfer = transfer
@@ -210,6 +246,9 @@ class RegisteredWorkerBindings:
         self._workers: dict[str, _BoundWorker] = {}
         self._leases: dict[str, RegistrationLease] = {}
         self._operations: dict[str, BoundOperation] = {}
+        self._copies = RetainedTensorCopies()
+        self._preparations: set[ContextIdentity] = set()
+        self._allow_device_snapshots = allow_device_snapshots
         self._closing = False
 
     @property
@@ -269,6 +308,218 @@ class RegisteredWorkerBindings:
         finally:
             rotary.release()
             paged.release()
+
+    def context_identity(self, instance_id: int) -> ContextIdentity:
+        """Read the actual client's paged generation without granting an operation."""
+        context = self._transfer.context_identity(instance_id)
+        if context is None:
+            raise KMeshFenceError("worker has no registered paged context")
+        paged = self._transfer.borrow_context(instance_id, context, lambda: None)
+        try:
+            with self._lock:
+                if self._closing:
+                    raise KMeshFenceError("server bindings are closing")
+            return context
+        finally:
+            paged.release()
+
+    def register_rotary_snapshot(
+        self,
+        instance_id: int,
+        context: ContextIdentity,
+        caches_ipc: list[DeviceIPCWrapper],
+        head_size: int,
+        is_neox_style: bool,
+        group_to_cache: list[int],
+        group_rot: list[list[int]],
+        group_head_size: list[int],
+        kv_quant: str,
+        producer_event: bytes,
+    ) -> RegisteredRuntime:
+        """Snapshot inputs before normalization and publish completed private state.
+
+        The worker must retain its inputs without writes until server physical
+        completion, including after a failed request. The producer event orders
+        earlier writes; it does not enforce that immutability contract.
+
+        Args:
+            instance_id: Actual client's registered worker instance.
+            context: Expected exact paged generation from context discovery.
+            caches_ipc: Raw worker rotary mappings; CUDA currently requires
+                PyTorch IPC rather than raw-driver or virtual-memory wrappers.
+            head_size: Model-wide rotary width, positive and even.
+            is_neox_style: Must be true for contiguous cosine/sine halves.
+            group_to_cache: Engine-group to rotary-cache indices.
+            group_rot: Optional per-group offset/width windows.
+            group_head_size: Optional per-group head widths.
+            kv_quant: Must be empty for this unquantized profile.
+            producer_event: Event recorded after the last device write.
+
+        Returns:
+            Server-derived facts for the completed exact rotary generation.
+
+        Raises:
+            KMeshFenceError: Unsupported geometry, stale context, concurrent
+                preparation, closing admission or uncertain device completion.
+            ContextOwnershipError: Missing, foreign or retired paged generation.
+        """
+        if (
+            type(context) is not ContextIdentity
+            or context.owner_session != get_request_session()
+        ):
+            raise KMeshFenceError("rotary preparation belongs to another client")
+        with self._lock:
+            if self._closing:
+                raise KMeshFenceError("server bindings are closing")
+            if context in self._preparations or self._copies.pending_for(context):
+                raise KMeshFenceError("previous rotary preparation must drain")
+            self._preparations.add(context)
+        paged: BorrowedContext | None = None
+        provisional: BorrowedRope | None = None
+        try:
+            revoked = threading.Event()
+            paged = self._transfer.borrow_context(instance_id, context, revoked.set)
+            cache = paged.entry.cache_context
+            if cache.device.type != "cpu" and not self._allow_device_snapshots:
+                raise KMeshFenceError(
+                    "ordered device snapshots require explicit opt-in"
+                )
+            if cache.device.type != "cpu":
+                # First Party
+                from lmcache.v1.platform.devices.cuda.ipc_wrapper import CudaIPCWrapper
+
+                if (
+                    cache.device.type != "cuda"
+                    or torch_device_type != "cuda"
+                    or any(
+                        type(wrapper) is not CudaIPCWrapper for wrapper in caches_ipc
+                    )
+                ):
+                    raise KMeshFenceError(
+                        "ordered device snapshots currently require PyTorch CUDA IPC"
+                    )
+            if (
+                type(head_size) is not int
+                or head_size <= 0
+                or head_size % 2
+                or is_neox_style is not True
+                or kv_quant != ""
+                or not caches_ipc
+            ):
+                raise KMeshFenceError(
+                    "ordered snapshots require full unquantized NeoX state"
+                )
+            raw = [wrapper.to_tensor() for wrapper in caches_ipc]
+            if any(
+                t.device != cache.device
+                or t.ndim != 2
+                or not t.shape[0]
+                or t.dtype not in (torch.float32, torch.float16, torch.bfloat16)
+                or not t.is_contiguous()
+                for t in raw
+            ):
+                raise KMeshFenceError("invalid rotary input tensor metadata")
+            if group_to_cache and (
+                min(group_to_cache) < -1 or max(group_to_cache) >= len(raw)
+            ):
+                raise KMeshFenceError("rotary cache mapping is out of range")
+            rotations: list[tuple[int, int] | None] = []
+            for window in group_rot:
+                if len(window) == 0:
+                    rotations.append(None)
+                elif len(window) == 2 and window[0] >= 0 and window[1] > 0:
+                    rotations.append((window[0], window[1]))
+                else:
+                    raise KMeshFenceError("invalid rotary window")
+            provisional = provisional_rope(
+                context,
+                raw,
+                head_size,
+                is_neox_style,
+                group_to_cache,
+                rotations,
+                group_head_size,
+                kv_quant,
+                tuple(caches_ipc),
+            )
+            _registered_layout_digest(paged, provisional)
+            copy_context = self._transfer.borrow_context(
+                instance_id, context, revoked.set
+            )
+            consumed, provisional = provisional, None
+            host = self._copies.copy_to_cpu(copy_context, consumed, producer_event)
+            normalized = [normalize_rope_snapshot(t) for t in host]
+            with self._lock:
+                if self._closing or revoked.is_set():
+                    raise KMeshFenceError("rotary preparation was retired")
+            provisional = provisional_rope(
+                context,
+                normalized,
+                head_size,
+                is_neox_style,
+                group_to_cache,
+                rotations,
+                group_head_size,
+                kv_quant,
+            )
+            upload_context = self._transfer.borrow_context(
+                instance_id, context, revoked.set
+            )
+            consumed, provisional = provisional, None
+            targets = self._copies.copy_to_device(upload_context, consumed)
+            provisional = provisional_rope(
+                context,
+                targets,
+                head_size,
+                is_neox_style,
+                group_to_cache,
+                rotations,
+                group_head_size,
+                kv_quant,
+            )
+            identity = RopeIdentity(provisional.state.ownership.identity, context)
+            provisional.state.canonical_snapshot = CanonicalRopeSnapshot(
+                context, identity.rotary, canonical_rope_cache_facts(normalized)
+            )
+            runtime = _runtime(
+                paged,
+                provisional,
+                context,
+                identity,
+                self._transfer.context.chunk_size,
+                self._transfer.context.token_hasher.hash_algorithm_name,
+            )
+            with self._lock:
+                if self._closing or revoked.is_set():
+                    raise KMeshFenceError("rotary preparation was retired")
+            self._blend.publish_rope_snapshot(instance_id, context, provisional)
+            if revoked.is_set():
+                raise KMeshFenceError(
+                    "paged context retired during snapshot publication"
+                )
+            return runtime
+        finally:
+            if provisional is not None:
+                provisional.release()
+            if paged is not None:
+                paged.release()
+            with self._lock:
+                self._preparations.remove(context)
+
+    def retry_rotary_drain(self, context: ContextIdentity) -> int:
+        """Request a physical copy drain for the actual client's exact context.
+
+        Returns:
+            Remaining copies for this generation, excluding exporter teardown.
+
+        Raises:
+            KMeshFenceError: Foreign context or no known copy obligation.
+        """
+        if context.owner_session != get_request_session():
+            raise KMeshFenceError("rotary drain belongs to another client")
+        if not self._copies.pending_for(context):
+            raise KMeshFenceError("no retained copy for this exact context")
+        return self._copies.drain_quarantined(context)
 
     def open_registration(
         self,
@@ -475,7 +726,7 @@ class RegisteredWorkerBindings:
             if self._closing:
                 raise KMeshFenceError("server bindings are closing")
             self.invalidate_store()
-            if self._operations:
+            if self._operations or self._preparations or self._copies.pending:
                 raise KMeshFenceError("accepted KMesh work must drain before clear")
             clear()
 
@@ -488,8 +739,9 @@ class RegisteredWorkerBindings:
             for worker in tuple(self._workers.values()):
                 self._registry.revoke(worker.fence.lease)
             self._release_revoked()
-            if self._operations:
+            if self._operations or self._preparations or self._copies.pending:
                 raise KMeshFenceError("accepted KMesh work must drain before shutdown")
+        self._copies.close()
 
     def _operation(self, operation: BoundOperation) -> None:
         if self._operations.get(operation.ticket.token) is not operation:

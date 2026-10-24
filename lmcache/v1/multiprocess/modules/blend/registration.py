@@ -19,7 +19,11 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.multiprocess.context_ownership import ContextIdentity, ContextOwnership
+from lmcache.v1.multiprocess.context_ownership import (
+    ContextIdentity,
+    ContextOwnership,
+    ContextOwnershipError,
+)
 from lmcache.v1.multiprocess.custom_types import DeviceIPCWrapper
 from lmcache.v1.multiprocess.modules.blend.rope import (
     _FP8_FLAVOR_TO_AT_SCALAR,
@@ -31,6 +35,7 @@ from lmcache.v1.multiprocess.modules.blend.rope import (
     rope_identity,
 )
 from lmcache.v1.multiprocess.request_handler import request_handler
+from lmcache.v1.multiprocess.transport.request_context import get_request_session
 
 logger = init_logger(__name__)
 
@@ -77,6 +82,30 @@ class RegistrationMixin:
     def drop_rope_state(self, instance_id: int) -> bool:
         """Disarm borrowers and prove rotary holds drained before dropping state."""
         return replace_rope_state(self._cb_rope_state, instance_id, None)
+
+    def publish_rope_snapshot(
+        self, instance_id: int, context: ContextIdentity, rotary: BorrowedRope
+    ) -> None:
+        """Publish one completed private generation for the actual receiving client.
+
+        Raises:
+            ContextOwnershipError: The paged generation, receiving owner or
+                canonical completion identity does not match the candidate.
+        """
+        state = rotary.state
+        snapshot = state.canonical_snapshot
+        if (
+            self._transfer_module.context_identity(instance_id) != context
+            or context.owner_session != get_request_session()
+            or state.context_identity != context
+            or snapshot is None
+            or snapshot.context != context
+            or snapshot.rotary != state.ownership.identity
+        ):
+            raise ContextOwnershipError(
+                "snapshot publication lost its exact registration"
+            )
+        replace_rope_state(self._cb_rope_state, instance_id, state)
 
     @request_handler()
     def cb_register_rope(

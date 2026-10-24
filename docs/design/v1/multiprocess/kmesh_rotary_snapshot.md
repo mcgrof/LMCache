@@ -1,9 +1,9 @@
 # Register a rotary snapshot before admitting device discovery
 
-Status: retained download/upload and unpublished rotary-ownership primitives
-are implemented. The ordered registration operation, canonical publication and
-exporter acknowledgement below are proposed. Device discovery and multiprocess
-KMesh engine admission remain disabled.
+Status: ordered registration, private canonical publication and scoped copy
+draining are implemented. Device snapshots require explicit opt-in and their
+public-server CUDA qualification is pending. Exporter acknowledgement remains
+proposed. Multiprocess KMesh engine admission remains disabled.
 
 A cache server must not normalize a worker's rotary cache before that worker
 has finished producing it. Waiting only when hashing the result is too late:
@@ -20,6 +20,22 @@ client and its expected generation. Keep it borrowed through the whole
 preparation. Validate wrapper metadata and group geometry without reading tensor
 values; map the raw rotary tensors into a provisional, server-owned generation.
 No provisional generation may be discovered, bound or used for recovery.
+
+The typed controls are ``kmesh_get_context``, ``kmesh_register_rotary`` and
+``kmesh_retry_rotary_drain``. CPU controls require ``--enable-kmesh-control``
+on a blend server. Device snapshots additionally require
+``--enable-kmesh-device-snapshots``. The device input profile currently accepts
+PyTorch CUDA IPC rotary wrappers; raw-driver and virtual-memory wrappers are
+refused before import. Generate the gRPC bindings again after schema changes.
+An absent value and error string report refusal on both request transports,
+including a CPU input whose shared-memory name has already disappeared.
+Each PyTorch CUDA IPC import must receive a fresh export wrapper, including
+after a failed copy has drained. Reusing an already-consumed export reuses its
+reference-counter token. Do not create an unused export just to test disabled
+admission: the receiver cannot consume or close a handle it deliberately never
+imports. This control prototype supplies no general outgoing-export cancellation
+or positive exporter-teardown acknowledgement. A complete worker path needs
+those lifecycle guarantees before engine admission can open.
 
 Give the retained-copy manager a separate paged borrow and a provisional rotary
 borrow. Wait for the producer on the actual registered stream, copy the raw
