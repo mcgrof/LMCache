@@ -19,11 +19,14 @@ from lmcache.utils import EngineType
 from lmcache.v1.multiprocess.context_ownership import ContextIdentity, ContextOwnership
 from lmcache.v1.multiprocess.custom_types import DeviceIPCWrapper
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
-from lmcache.v1.multiprocess.kmesh_domains import KMeshFenceError
+from lmcache.v1.multiprocess.kmesh_domains import KMeshFenceError, WorkerFence
+from lmcache.v1.multiprocess.kmesh_span_store import KMeshSpanStore
 from lmcache.v1.multiprocess.kmesh_types import (
     ManagedRawRegistration,
     ManagedRawRelease,
     RegisteredRuntime,
+    SpanHandle,
+    SpanOperationStatus,
 )
 from lmcache.v1.multiprocess.modules.blend import BlendModule
 from lmcache.v1.multiprocess.modules.kmesh_control import (
@@ -65,10 +68,13 @@ class KMeshManagedRawModule(KMeshControlModule):
     The standalone compositor serves only this module: no integer registration,
     generic transfer, lookup, peer, HTTP or reaper can touch its context. One
     registration and one rotary preparation are admitted per server lifetime.
-    Storage execution and model admission remain disabled.
+    Native CPU-L1 span execution is an explicit opt-in; model admission remains
+    disabled. A loaded span may still require deeper-layer model repair.
     """
 
-    def __init__(self, ctx: MPCacheServerContext) -> None:
+    def __init__(
+        self, ctx: MPCacheServerContext, *, enable_span_execution: bool = False
+    ) -> None:
         self._transfer = LMCacheDrivenTransferModule(ctx)
         self._blend = BlendModule(ctx, self._transfer)
         super().__init__(
@@ -80,6 +86,95 @@ class KMeshManagedRawModule(KMeshControlModule):
         )
         self._managed_lock = threading.RLock()
         self._registration: _Registration | None = None
+        self._spans = (
+            KMeshSpanStore(self.bindings, ctx.storage_manager, self._blend)
+            if enable_span_execution
+            else None
+        )
+
+    @request_handler(HandlerType.BLOCKING, requires_client_affinity=True)
+    def kmesh_store_span(
+        self,
+        fence: WorkerFence,
+        request_id: str,
+        generation: int,
+        token_ids: list[int],
+        source_start: int,
+        context_digest: str,
+        block_ids: list[list[int]],
+        producer_event: bytes,
+    ) -> tuple[SpanOperationStatus | None, str]:
+        """Gather source chunks and return observed admission or failure state."""
+        return control_reply(
+            lambda: self._span_executor(fence).store(
+                fence,
+                request_id,
+                generation,
+                token_ids,
+                source_start,
+                context_digest,
+                block_ids,
+                producer_event,
+            )
+        )
+
+    @request_handler(HandlerType.BLOCKING, requires_client_affinity=True)
+    def kmesh_restore_span(
+        self,
+        fence: WorkerFence,
+        request_id: str,
+        generation: int,
+        span: SpanHandle,
+        destination_start: int,
+        context_digest: str,
+        block_ids: list[list[int]],
+        producer_event: bytes,
+    ) -> tuple[SpanOperationStatus | None, str]:
+        """Restore into reserved blocks; positional/context changes need repair."""
+        return control_reply(
+            lambda: self._span_executor(fence).restore(
+                fence,
+                request_id,
+                generation,
+                span,
+                destination_start,
+                context_digest,
+                block_ids,
+                producer_event,
+            )
+        )
+
+    @request_handler()
+    def kmesh_span_status(
+        self,
+        fence: WorkerFence,
+        request_id: str,
+        generation: int,
+    ) -> tuple[SpanOperationStatus | None, str]:
+        """Inspect known work independently of execution; None is not drain."""
+
+        def status() -> SpanOperationStatus:
+            if self._spans is None:
+                raise KMeshFenceError("managed span execution is not admitted")
+            return self._spans.status(fence, request_id, generation)
+
+        return control_reply(status)
+
+    @request_handler(HandlerType.BLOCKING, requires_client_affinity=True)
+    def kmesh_drain_span(
+        self,
+        fence: WorkerFence,
+        request_id: str,
+        generation: int,
+    ) -> tuple[SpanOperationStatus | None, str]:
+        """Retry physical cleanup without resubmitting a failed native transfer."""
+
+        def drain() -> SpanOperationStatus:
+            if self._spans is None:
+                raise KMeshFenceError("managed span execution is not admitted")
+            return self._spans.drain(fence, request_id, generation)
+
+        return control_reply(drain)
 
     def _record(self, boot_id: str, nonce: str) -> _Registration:
         record = self._registration
@@ -349,3 +444,16 @@ class KMeshManagedRawModule(KMeshControlModule):
                 )
             self._blend.close()
             self._transfer.close()
+
+    def _span_executor(self, fence: WorkerFence) -> KMeshSpanStore:
+        with self._managed_lock:
+            record = self._registration
+            if (
+                self._spans is None
+                or record is None
+                or record.state != "registered"
+                or record.instance_id != fence.instance_id
+                or record.ownership.identity.owner_session != get_request_session()
+            ):
+                raise KMeshFenceError("managed span execution is not admitted")
+            return self._spans

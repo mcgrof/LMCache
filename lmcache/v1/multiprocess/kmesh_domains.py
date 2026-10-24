@@ -78,7 +78,10 @@ class SemanticIdentity:
                 raise ValueError("semantic digests must be lowercase SHA-256")
         if type(self.schema) is not int or self.schema != 1:
             raise ValueError("unsupported semantic schema")
-        if self.key_schema != "kmesh-mp-v1" or self.adapter_identity != "":
+        if (
+            self.key_schema not in ("kmesh-mp-v1", "kmesh-span-v1")
+            or self.adapter_identity != ""
+        ):
             raise ValueError("unsupported key schema or adapter identity")
         if self.kv_dtype != "bfloat16":
             raise ValueError("the initial KMesh MP contract requires BF16 KV")

@@ -210,7 +210,81 @@ message KmeshRevokeRegistrationResponse {
   string error = 2;
 }
 
+message KmeshSpanHandle {
+  string namespace = 1;
+  string span_id = 2;
+  int64 source_start = 3;
+  int64 token_count = 4;
+  string token_digest = 5;
+  string context_digest = 6;
+  string layout_digest = 7;
+  string rope_digest = 8;
+}
+message KmeshSpanOperationStatus {
+  KmeshWorkerFence fence = 1;
+  string request_id = 2;
+  int64 generation = 3;
+  string operation_id = 4;
+  KmeshContextIdentity context = 5;
+  string kind = 6;
+  string blocks_digest = 7;
+  string state = 8;
+  string error = 9;
+  optional KmeshSpanHandle span = 10;
+}
+message KmeshStoreSpanRequest {
+  KmeshWorkerFence fence = 1;
+  string request_id = 2;
+  int64 generation = 3;
+  repeated int64 token_ids = 4;
+  int64 source_start = 5;
+  string context_digest = 6;
+  repeated BlockIdGroup block_ids = 7;
+  bytes producer_event = 8;
+}
+message KmeshRestoreSpanRequest {
+  KmeshWorkerFence fence = 1;
+  string request_id = 2;
+  int64 generation = 3;
+  KmeshSpanHandle span = 4;
+  int64 destination_start = 5;
+  string context_digest = 6;
+  repeated BlockIdGroup block_ids = 7;
+  bytes producer_event = 8;
+}
+message KmeshSpanStatusRequest {
+  KmeshWorkerFence fence = 1;
+  string request_id = 2;
+  int64 generation = 3;
+}
+message KmeshDrainSpanRequest {
+  KmeshWorkerFence fence = 1;
+  string request_id = 2;
+  int64 generation = 3;
+}
+message KmeshStoreSpanResponse {
+  optional KmeshSpanOperationStatus value = 1;
+  string error = 2;
+}
+message KmeshRestoreSpanResponse {
+  optional KmeshSpanOperationStatus value = 1;
+  string error = 2;
+}
+message KmeshSpanStatusResponse {
+  optional KmeshSpanOperationStatus value = 1;
+  string error = 2;
+}
+message KmeshDrainSpanResponse {
+  optional KmeshSpanOperationStatus value = 1;
+  string error = 2;
+}
+
 service KmeshService {
+  rpc KmeshStoreSpan(KmeshStoreSpanRequest) returns (KmeshStoreSpanResponse);
+  rpc KmeshRestoreSpan(KmeshRestoreSpanRequest) returns (KmeshRestoreSpanResponse);
+  rpc KmeshSpanStatus(KmeshSpanStatusRequest) returns (KmeshSpanStatusResponse);
+  rpc KmeshDrainSpan(KmeshDrainSpanRequest) returns (KmeshDrainSpanResponse);
+
   rpc KmeshRegisterRawContext(KmeshRegisterRawContextRequest)
       returns (KmeshRegisterRawContextResponse);
   rpc KmeshRawContextStatus(KmeshRawContextStatusRequest)

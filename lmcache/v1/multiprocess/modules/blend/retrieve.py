@@ -2,8 +2,10 @@
 """Blend retrieve: plan-then-execute H2D + re-RoPE + per-token scatter."""
 
 # Standard
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 import enum
+import threading
 import time
 
 if TYPE_CHECKING:
@@ -18,6 +20,7 @@ if TYPE_CHECKING:
     )
 
 # Third Party
+from numpy.typing import NDArray
 import numpy as np
 import torch
 
@@ -26,6 +29,7 @@ from lmcache import device_ops, torch_dev
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.memory_allocators.lazy_memory_allocator import LazyMemoryAllocator
+from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.multiprocess.custom_types import (
     CBMatchResult,
@@ -39,9 +43,11 @@ from lmcache.v1.multiprocess.modules.blend.read_set import (
 from lmcache.v1.multiprocess.modules.blend.rope import (
     _FP8_FLAVOR_TO_AT_SCALAR,
     _TORCH_TO_AT_SCALAR,
+    BorrowedRope,
     _cb_group_rope_geometry,
     _CBRopeState,
 )
+from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import BorrowedContext
 from lmcache.v1.multiprocess.native_completion import submit_callback_to_stream
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
@@ -96,6 +102,49 @@ class _DeviceEvent(Protocol):
 _HAS_NATIVE_RETRIEVE_PLAN = hasattr(device_ops, "execute_cb_retrieve_plan_flat")
 
 
+@dataclass
+class RegisteredRetrievePlan:
+    """Retain one native positional plan until the accepting server drains it.
+
+    Preparation can already enqueue slot-map uploads. The caller must retain
+    this plan, its planner module, exact context/rotary borrows and source read
+    locks until physical completion. A partial native launch requires a device
+    context drain, because its internal copy stream may not have joined the
+    outer stream. A returned or failed enqueue is not completion evidence.
+    """
+
+    device: torch.device
+    stream: object
+    group_specs: list[object]
+    tables: tuple[
+        NDArray[np.int64], NDArray[np.int64], NDArray[np.int64], NDArray[np.int64]
+    ]
+    keepalive: tuple[torch.Tensor, ...]
+    _submitted: bool = field(default=False, init=False, repr=False)
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
+
+    def enqueue(self) -> None:
+        """Submit exactly once on the registered stream, without claiming drain.
+
+        Raises:
+            RuntimeError: Already submitted, unsupported native code or failed
+                submission. Retain all resources and do not retry this plan.
+        """
+        with self._lock:
+            if self._submitted:
+                raise RuntimeError("registered retrieve plan was already submitted")
+            self._submitted = True
+        with torch_dev.device(self.device), torch_dev.stream(self.stream):
+            device_ops.execute_cb_retrieve_plan_flat(
+                self.device,
+                LazyMemoryAllocator.PIN_CHUNK_SIZE,
+                self.group_specs,
+                *self.tables,
+            )
+
+
 class RetrieveMixin:
     """The CB_RETRIEVE_PRE_COMPUTED handler of ``BlendModule``: planning
     helpers first, then the handler; state lives on the composed instance."""
@@ -115,6 +164,104 @@ class RetrieveMixin:
         _cb_plan_done_events: "weakref.WeakKeyDictionary[Any, _DeviceEvent]"
         _cb_retrieve_streams: "weakref.WeakKeyDictionary[Any, Any]"
         _cb_retrieve_cupy_streams: "weakref.WeakKeyDictionary[Any, Any]"
+
+    def prepare_registered_retrieve(
+        self,
+        paged: BorrowedContext,
+        rotary: BorrowedRope,
+        matches: list[CBMatchResult],
+        objects: list[MemoryObj],
+        block_ids: list[list[int]],
+    ) -> RegisteredRetrievePlan:
+        """Plan against exact borrowed resources without an instance lookup.
+
+        Args:
+            paged: Accepted operation's exact paged context, retained by caller.
+            rotary: Its exact canonical rotary generation, retained separately.
+            matches: Server-resolved immutable source/destination chunk ranges.
+            objects: Actual read-locked source objects in matching chunk order.
+            block_ids: Destination tables for the one supported kernel group.
+
+        Returns:
+            A single-use native plan; slot-map preparation may already be queued.
+
+        Raises:
+            ValueError: Unsupported or inconsistent resources, coordinates,
+                tables or source coverage. The caller must drain preparation
+                before dropping any resources, including on failure.
+
+        The first profile is serialized CUDA BF16, one full-attention group and
+        full source chunks. The worker must retain its actual destination block
+        reservations; a CUDA allocation borrow cannot prevent slot recycling.
+        """
+        cache, rope = paged.entry.cache_context, rotary.state
+        manager = cache.kv_layer_groups_manager
+        chunk = cache.lmcache_tokens_per_chunk
+        snapshot = rope.canonical_snapshot
+        if (
+            cache.device.type != "cuda"
+            or snapshot is None
+            or rope.context_identity != paged.entry.ownership.identity
+            or snapshot.context != rope.context_identity
+            or snapshot.rotary != rope.ownership.identity
+            or not rope.cos_sin_caches
+            or len(manager.kernel_groups) != 1
+            or manager.num_object_groups != 1
+            or manager.kernel_groups[0].dtype != torch.bfloat16
+            or manager.kernel_groups[0].sw_size_tokens != -1
+            or manager.kernel_groups[0].recurrent_state
+            or len(block_ids) != 1
+            or not matches
+            or len(matches) != len(objects)
+        ):
+            raise ValueError("unsupported registered retrieve resources")
+        blocks = block_ids[0]
+        group = manager.kernel_groups[0]
+        block_size = group.tokens_per_block
+        if (
+            not blocks
+            or any(
+                type(block) is not int or not 0 <= block < cache.num_blocks
+                for block in blocks
+            )
+            or len(set(blocks)) != len(blocks)
+        ):
+            raise ValueError("invalid or aliased destination block table")
+        limit = min(
+            len(blocks) * block_size, *(int(t.shape[0]) for t in rope.cos_sin_caches)
+        )
+        previous_end = -1
+        for match in matches:
+            if (
+                match.old_st < 0
+                or match.cur_st < 0
+                or match.old_ed - match.old_st != chunk
+                or match.cur_ed - match.cur_st != chunk
+                or match.cur_st < previous_end
+                or match.cur_ed > limit
+                or any(match.old_ed > int(t.shape[0]) for t in rope.cos_sin_caches)
+            ):
+                raise ValueError("invalid registered retrieve coordinates")
+            previous_end = match.cur_ed
+        runs: list[list[tuple[CBMatchResult, tuple[MemoryObj]]]] = []
+        for match, obj in zip(matches, objects, strict=True):
+            if not runs or runs[-1][-1][0].cur_ed != match.cur_st:
+                runs.append([])
+            runs[-1].append((match, (obj,)))
+        with torch_dev.device(cache.device), torch_dev.stream(cache.stream):
+            prepared = self._build_cb_retrieve_plan_flat(
+                cache,
+                rope,
+                [(np.asarray(blocks, dtype=np.int64), block_size)],
+                runs,
+                cache.max_batch_size,
+            )
+            if prepared is None:
+                raise ValueError("native registered retrieve plan is unavailable")
+            specs, tables, keepalive = prepared
+            return RegisteredRetrievePlan(
+                cache.device, cache.stream, specs, tables, tuple(keepalive)
+            )
 
     def _cb_staged_groups(
         self, gpu_context: BaseCacheContext

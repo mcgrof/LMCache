@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 # First Party
 from lmcache.v1.multiprocess.context_ownership import ContextIdentity, RopeIdentity
-from lmcache.v1.multiprocess.kmesh_domains import RegistrationState
+from lmcache.v1.multiprocess.kmesh_domains import RegistrationState, WorkerFence
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,3 +63,40 @@ class ManagedRawRelease:
     context: ContextIdentity
     rotary: RopeIdentity | None
     allocation_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SpanHandle:
+    """Identify a published immutable source within one semantic namespace."""
+
+    namespace: str
+    span_id: str
+    source_start: int
+    token_count: int
+    token_digest: str
+    context_digest: str
+    layout_digest: str
+    rope_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class SpanOperationStatus:
+    """Describe server-observed work for one exact request generation.
+
+    Executing and failed-undrained work still owns its blocks and buffers.
+    Stored/loaded/failed-drained states prove this operation's physical drain.
+    Loaded-needs-repair proves I/O completion only: model state must be repaired
+    before the worker can mark those tokens computed. None or unknown status
+    cannot establish completion.
+    """
+
+    fence: WorkerFence
+    request_id: str
+    generation: int
+    operation_id: str
+    context: ContextIdentity
+    kind: str
+    blocks_digest: str
+    state: str
+    error: str
+    span: SpanHandle | None

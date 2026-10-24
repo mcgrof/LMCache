@@ -34,6 +34,8 @@ from lmcache.v1.multiprocess.kmesh_types import (
     ManagedRawRelease,
     RegisteredRuntime,
     RegistrationStatus,
+    SpanHandle,
+    SpanOperationStatus,
 )
 from lmcache.v1.multiprocess.rpc import rpc_method
 
@@ -52,6 +54,56 @@ class RequestServer(Protocol):
 
 class RequestClient(Protocol):
     """Typed, transport-neutral contract for multiprocess RPC clients."""
+
+    @rpc_method
+    def kmesh_store_span(
+        self,
+        fence: WorkerFence,
+        request_id: str,
+        generation: int,
+        token_ids: list[int],
+        source_start: int,
+        context_digest: str,
+        block_ids: list[list[int]],
+        producer_event: bytes,
+    ) -> MessagingFuture[tuple[SpanOperationStatus | None, str]]:
+        """Publish actual admitted CPU-L1 chunks under a live worker fence."""
+        ...
+
+    @rpc_method
+    def kmesh_restore_span(
+        self,
+        fence: WorkerFence,
+        request_id: str,
+        generation: int,
+        span: SpanHandle,
+        destination_start: int,
+        context_digest: str,
+        block_ids: list[list[int]],
+        producer_event: bytes,
+    ) -> MessagingFuture[tuple[SpanOperationStatus | None, str]]:
+        """Rotate/scatter verified chunks; loaded state may still need repair."""
+        ...
+
+    @rpc_method
+    def kmesh_span_status(
+        self,
+        fence: WorkerFence,
+        request_id: str,
+        generation: int,
+    ) -> MessagingFuture[tuple[SpanOperationStatus | None, str]]:
+        """Recover an exact accepted result; absence cannot establish drain."""
+        ...
+
+    @rpc_method
+    def kmesh_drain_span(
+        self,
+        fence: WorkerFence,
+        request_id: str,
+        generation: int,
+    ) -> MessagingFuture[tuple[SpanOperationStatus | None, str]]:
+        """Request server-observed cleanup without executing the transfer twice."""
+        ...
 
     @rpc_method
     def kmesh_register_raw_context(

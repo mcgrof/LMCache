@@ -1,10 +1,10 @@
 # Publish and restore immutable spans under an accepted KMesh operation
 
 Status: the owner-routed per-key write-status API is implemented and passes
-actual CPU L1 admission/readback controls. Native registered-resource planning
-and span execution remain design only. Managed raw registration, ordered rotary
-preparation and checked release are separately qualified. The multiprocess
-model consumer remains disabled.
+actual CPU L1 admission/readback controls. Registered-resource native planning
+and bounded CPU-L1 span execution are implemented behind an explicit opt-in.
+Managed raw registration, ordered rotary preparation and checked release are
+separately qualified. The multiprocess model consumer remains disabled.
 
 Registration ownership does not establish storage publication. The ordinary
 transfer handler records an event and queues a host callback that admits its
@@ -22,8 +22,9 @@ The first execution profile remains serialized, single-worker, contiguous BF16
 full attention with one object/kernel group, full source chunks and CPU DRAM L1.
 Use the existing native object-group transfer and positional-retrieve executor;
 do not substitute a numerical reference implementation for the measured path.
-Expose a public registered-resource planning interface rather than reaching into
-another class's private planner or invoking its legacy instance lookup handler.
+``BlendModule.prepare_registered_retrieve`` plans against accepted resource
+borrows without a legacy instance lookup. Its returned plan is single-use and
+does not claim completion when submission returns.
 Store waits for the worker producer before reading source slots. Restore waits
 for the worker's destination-ready event before writing reserved private slots.
 
@@ -82,3 +83,35 @@ partial submission, failed physical drain and later cleanup. Exercise the typed
 service with separate exporter/importer processes before connecting a model.
 GDS, storage-backed cold restoration, model quality, staged/DMA-BUF comparison
 and collective consumers each require their later explicit qualification.
+
+The dedicated raw service enables this executor with
+``--enable-span-execution``. It selects lazy pinned CPU allocation because the
+native positional planner requires that allocator's registered chunks. Neither
+the legacy default key grammar nor GPU-backed L1 objects are admitted. Use the
+explicit ``kmesh-span-v1`` semantic key schema for unique physical span objects.
+The store request records the source's token IDs, original position and declared
+preceding-context digest. The resulting opaque handle also binds layout and
+canonical rotary facts. Physical objects use BLAKE3 keys derived from namespace,
+accepted operation identity and chunk index. They are never overwritten.
+
+``kmesh_store_span`` and ``kmesh_restore_span`` return exact operation status.
+Identical request-generation retries return saved facts rather than another
+native launch; changed metadata refuses. ``kmesh_span_status`` resolves a lost
+reply independently of execution. A status for different blocks, context,
+request generation or receiving owner cannot release engine reservations.
+``kmesh_drain_span`` retries physical cleanup of known accepted work, including
+after revocation, without resubmitting its transfer.
+
+Every source object has a SHA-256 byte checksum captured after the native gather
+drains. Restore checks actual read-locked bytes before any GPU scatter. Eviction
+or a checksum mismatch returns failure and revokes the accepting registration.
+``failed-undrained`` retains accepted resources, exception frames and actual
+host I/O leases, even across server teardown. No later execution may reuse the
+planner buffers until a real server-device drain settles that work. Only
+``failed-drained`` or importing-process exit permits request-local recomputation.
+
+``stored`` proves checked admission; ``loaded`` proves same-position and
+same-context physical restoration. ``loaded-needs-repair`` proves only I/O for
+changed positions or preceding context. None of these receipts implements the
+worker's model repair or marks vLLM tokens computed. Model and tokenizer artifact
+digests remain cooperative worker declarations, not server weight attestation.

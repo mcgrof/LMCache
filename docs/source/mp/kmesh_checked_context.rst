@@ -94,3 +94,49 @@ Both interfaces require device completion first. Their owner/key groups do not
 identify reservation generations. A delayed completion therefore needs unique,
 immutable physical keys to avoid admitting a replacement reservation. This
 status API alone does not enable managed span execution or model recovery.
+
+Native CPU-L1 span transactions
+-------------------------------
+
+The dedicated service can additionally enable bounded native span transfers:
+
+.. code-block:: console
+
+   python -m lmcache.v1.multiprocess.kmesh_raw_server \
+       --host 127.0.0.1 --port 5555 --transport zmq --chunk-tokens 256 \
+       --dram-bytes 67108864 --enable-span-execution
+
+This selects lazy pinned CPU allocation, whose registration granule is 64 MiB.
+Use a semantic identity with ``key_schema="kmesh-span-v1"`` when opening and
+binding the worker registration. The executor admits CUDA BF16 full attention,
+one worker and one object/kernel group, with complete source chunks. It does
+not accept GPU-L1/GDS or enable the vLLM multiprocess model consumer.
+
+``kmesh_store_span`` takes the bound fence, request ID/generation, source token
+IDs, chunk-aligned source position, preceding-context SHA-256, full block table
+and recorded producer event. It waits for source writes, gathers through the
+native object-group path, drains actual device work and checks every key's L1
+admission before publishing an immutable ``SpanHandle``. Each physical key is
+unique to that accepted operation; the source is never overwritten.
+
+``kmesh_restore_span`` takes that exact handle, a destination position and its
+preceding-context digest, reserved block table and destination-ready event.
+The source must belong to the accepting namespace. The executor read-locks
+actual source objects, pins their buffers against reuse and checks completed
+host-byte checksums before native re-RoPE and scatter into private engine slots.
+The canonical source is unchanged. Missing or corrupt sources fail safely.
+
+Keep actual scheduler block reservations, allocation references and producer
+events until checking the returned operation's exact context, request generation
+and block-table digest. Repeated identical requests return cached state.
+``kmesh_span_status`` recovers a lost reply; unknown or absent status cannot
+prove completion. ``kmesh_drain_span`` retries physical cleanup of known failed
+work without re-enqueueing the transfer. An unresolved drain retains the work,
+buffers and exact resource borrows even across service shutdown.
+
+``stored`` proves admitted source storage. ``loaded`` proves completed I/O at
+the same position and preceding context. ``loaded-needs-repair`` additionally
+requires request-local model repair before those tokens become computed state.
+On failure, recompute only after ``failed-drained`` or observed importer exit;
+``failed-undrained`` still owns the destination blocks. These controls do not
+establish model quality, GPU-direct storage latency or collective recovery.

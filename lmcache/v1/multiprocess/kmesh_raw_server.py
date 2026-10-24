@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Run the bounded managed-raw control service without legacy transfer surfaces."""
+"""Run a bounded managed raw service with optional native span transfers."""
 
 # Standard
 from typing import Literal
@@ -32,8 +32,9 @@ def create_managed_raw_server(
     transport: Literal["zmq", "grpc"] = "zmq",
     chunk_tokens: int = 256,
     dram_bytes: int = 64 << 20,
+    enable_span_execution: bool = False,
 ) -> tuple[RequestServer, MPCacheServer]:
-    """Construct a raw-only control service; the caller starts its transport.
+    """Construct the bounded raw service; the caller starts its transport.
 
     Args:
         host: Request bind address.
@@ -41,6 +42,7 @@ def create_managed_raw_server(
         transport: Same-host ZeroMQ or gRPC request transport.
         chunk_tokens: Positive attention chunk size used for registration.
         dram_bytes: Positive CPU L1 capacity; GPU-L1/GDS is not admitted.
+        enable_span_execution: Opt into native CPU-L1 span transactions.
 
     Returns:
         Unstarted request transport and its resource-owning cache server.
@@ -55,13 +57,20 @@ def create_managed_raw_server(
     require_inactive_gds()
     context = MPCacheServerContext(
         StorageManagerConfig(
-            DRAML1ManagerConfig(L1MemoryManagerConfig(dram_bytes, False, shm_name="")),
+            DRAML1ManagerConfig(
+                L1MemoryManagerConfig(
+                    dram_bytes,
+                    enable_span_execution,
+                    init_size_in_bytes=dram_bytes,
+                    shm_name="",
+                )
+            ),
             EvictionConfig("LRU"),
         ),
         chunk_size=chunk_tokens,
         hash_algorithm="blake3",
     )
-    module = KMeshManagedRawModule(context)
+    module = KMeshManagedRawModule(context, enable_span_execution=enable_span_execution)
     module.set_handler_inventory([h.operation for h in iter_request_handlers(module)])
     config = MPServerConfig(
         host=host,
@@ -81,16 +90,22 @@ def create_managed_raw_server(
 
 
 def main() -> None:
-    """Serve registration controls until a signal; preserve unreleased resources."""
+    """Serve the bounded raw service until a signal; preserve unreleased resources."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5555)
     parser.add_argument("--transport", choices=("zmq", "grpc"), default="zmq")
     parser.add_argument("--chunk-tokens", type=int, default=256)
     parser.add_argument("--dram-bytes", type=int, default=64 << 20)
+    parser.add_argument("--enable-span-execution", action="store_true")
     args = parser.parse_args()
     server, engine = create_managed_raw_server(
-        args.host, args.port, args.transport, args.chunk_tokens, args.dram_bytes
+        args.host,
+        args.port,
+        args.transport,
+        args.chunk_tokens,
+        args.dram_bytes,
+        args.enable_span_execution,
     )
     stop = threading.Event()
     for signum in (signal.SIGINT, signal.SIGTERM):
