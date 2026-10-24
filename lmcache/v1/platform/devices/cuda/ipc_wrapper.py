@@ -27,6 +27,7 @@ from __future__ import annotations
 # Standard
 from dataclasses import dataclass
 from typing import Callable, ClassVar
+import hashlib
 import os
 import threading
 import uuid
@@ -83,6 +84,8 @@ _VMM_MULTI_CHUNK_HINT = (
 # until the server closes or exits). Keyed by handle bytes alone: a KV
 # allocation is only ever imported on the wrapper's own device.
 _MAPPED_ALLOCATIONS: dict[bytes, list[int]] = {}
+_UNCERTAIN_RAW_ALLOCATIONS: set[bytes] = set()
+_RETIRED_RAW_ALLOCATIONS: set[bytes] = set()
 _MAPPINGS_LOCK = threading.Lock()
 
 
@@ -396,6 +399,13 @@ class RawCudaIPCWrapper(DeviceIPCWrapper):
         device_index = self._get_device_index_from_uuid(self.device_uuid)
 
         with _MAPPINGS_LOCK:
+            if (
+                self._ipc_handle_reserved in _UNCERTAIN_RAW_ALLOCATIONS
+                or self._ipc_handle_reserved in _RETIRED_RAW_ALLOCATIONS
+            ):
+                raise RuntimeError(
+                    "raw IPC allocation is retired or has uncertain close"
+                )
             entry = _MAPPED_ALLOCATIONS.get(self._ipc_handle_reserved)
             if entry is None:
                 handle = cuda_ipc_handle_from_bytes(self._ipc_handle_reserved)
@@ -440,25 +450,83 @@ class RawCudaIPCWrapper(DeviceIPCWrapper):
         paths (the worker reaper) where raising would abort cleanup of
         the remaining entries.
         """
-        opens = getattr(self, "_opens", 0)
-        if opens <= 0:
-            return
+        try:
+            self.close_checked()
+        except RuntimeError:
+            logger.warning(
+                "Raw IPC close failed; retain mapping obligations", exc_info=True
+            )
+
+    @property
+    def allocation_identity(self) -> str:
+        """Identify the whole exported allocation, including any tensor-view aliases."""
+        return hashlib.sha256(self._ipc_handle_reserved).hexdigest()
+
+    @property
+    def raw_mapping_released(self) -> bool:
+        """Inspect raw-wrapper references; this is not an exporter release receipt.
+
+        A retirement ledger must establish prior registration and prevent new
+        imports before using this fact. A never-imported wrapper also has no map.
+        PyTorch storage, VMM and external driver imports are not counted here.
+        """
         with _MAPPINGS_LOCK:
-            self._opens = 0
+            return self._ipc_handle_reserved not in _MAPPED_ALLOCATIONS
+
+    def retire_raw_imports(self) -> None:
+        """Close new raw-wrapper imports while preserving existing alias references.
+
+        Retired handles remain tombstoned for this process lifetime. An exporter
+        must not reuse them for a new registration; allocate a new backing region.
+        Existing borrowers must drain before reference release. This does not
+        authorize freeing any allocation or affect other IPC implementations.
+
+        Raises:
+            RuntimeError: This wrapper has no currently owned mapping reference.
+        """
+        with _MAPPINGS_LOCK:
+            if self._opens <= 0 or self._ipc_handle_reserved not in _MAPPED_ALLOCATIONS:
+                raise RuntimeError("cannot retire an unowned raw IPC allocation")
+            _RETIRED_RAW_ALLOCATIONS.add(self._ipc_handle_reserved)
+
+    def close_checked(self) -> None:
+        """Release this wrapper's references only after checked native close.
+
+        The caller must first drain every device use of these references. Other
+        aliases remain mapped until they release their own references. Driver
+        failure retains this wrapper's obligations and blocks new imports; retry
+        requires actual success, never an inference from a missing mapping.
+
+        Raises:
+            RuntimeError: Reference accounting is inconsistent or native close
+                did not report success. Keep the wrapper alive for later retry.
+        """
+        with _MAPPINGS_LOCK:
+            opens = self._opens
+            if opens <= 0:
+                return
             entry = _MAPPED_ALLOCATIONS.get(self._ipc_handle_reserved)
-            if entry is None:
-                return
-            entry[1] -= opens
-            if entry[1] > 0:
-                return
-            del _MAPPED_ALLOCATIONS[self._ipc_handle_reserved]
-            device_index = self._get_device_index_from_uuid(self.device_uuid)
-            with torch.cuda.device(device_index):
-                (err,) = _cuda.runtime.cudaIpcCloseMemHandle(entry[0])
-            if err != _cuda.runtime.cudaError_t.cudaSuccess:
-                logger.warning(
-                    "cudaIpcCloseMemHandle failed: %s (ptr=0x%x)", err, entry[0]
+            if entry is None or entry[1] < opens:
+                raise RuntimeError(
+                    "raw IPC mapping reference accounting is inconsistent"
                 )
+            if entry[1] > opens:
+                entry[1] -= opens
+                self._opens = 0
+                return
+            device_index = self._get_device_index_from_uuid(self.device_uuid)
+            try:
+                with torch.cuda.device(device_index):
+                    (err,) = _cuda.runtime.cudaIpcCloseMemHandle(entry[0])
+            except BaseException:
+                _UNCERTAIN_RAW_ALLOCATIONS.add(self._ipc_handle_reserved)
+                raise
+            if err != _cuda.runtime.cudaError_t.cudaSuccess:
+                _UNCERTAIN_RAW_ALLOCATIONS.add(self._ipc_handle_reserved)
+                raise RuntimeError(f"cudaIpcCloseMemHandle failed: {err}")
+            del _MAPPED_ALLOCATIONS[self._ipc_handle_reserved]
+            _UNCERTAIN_RAW_ALLOCATIONS.discard(self._ipc_handle_reserved)
+            self._opens = 0
 
 
 class VmmCudaIPCWrapper(DeviceIPCWrapper):

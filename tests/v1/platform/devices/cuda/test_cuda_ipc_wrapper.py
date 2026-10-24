@@ -12,6 +12,7 @@ torch storage path cannot do or what only the raw path must get right
 from multiprocessing import get_context
 from multiprocessing.connection import Connection
 import threading
+import traceback
 
 # Third Party
 import pytest
@@ -25,6 +26,7 @@ from lmcache.v1.platform.devices.cuda.ipc_wrapper import (
     CudaIPCWrapper,
     RawCudaIPCWrapper,
 )
+from lmcache.v1.platform.devices.cuda.utils import _cuda
 from lmcache.v1.platform.ipc_policy import is_isolated_ipc, set_isolated_ipc
 
 pytestmark = [
@@ -168,6 +170,89 @@ def _pool_exporter(conn: Connection, pool_mib: int, exit_after_send: bool) -> No
     conn.send_bytes(DeviceIPCWrapper.Serialize(RawCudaIPCWrapper(view_b)))
     if not exit_after_send:
         conn.recv()  # hold the pool until the parent finishes
+
+
+def checked_close_importer(channel: Connection, scenario: str) -> None:
+    """Keep all test imports in a child that exits before exporter release."""
+    try:
+        torch.cuda.set_device(0)
+        first, second = [
+            DeviceIPCWrapper.Deserialize(channel.recv_bytes()) for _ in range(2)
+        ]
+        assert isinstance(first, RawCudaIPCWrapper)
+        assert isinstance(second, RawCudaIPCWrapper)
+        first.to_tensor()
+        existing = second.to_tensor()
+        assert first.allocation_identity == second.allocation_identity
+        if scenario == "retire":
+            first.retire_raw_imports()
+        first.close_checked()
+        assert not first.raw_mapping_released
+        assert existing[4095].item() == 4095.0
+        if scenario == "refusal":
+            # The injected error occurs before native close, so this controlled
+            # alias remains readable. An actual device error proves no such fact.
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(
+                    _cuda.runtime,
+                    "cudaIpcCloseMemHandle",
+                    lambda _: (_cuda.runtime.cudaError_t.cudaErrorNotSupported,),
+                )
+                with pytest.raises(RuntimeError, match="cudaIpcCloseMemHandle failed"):
+                    second.close_checked()
+                assert not second.raw_mapping_released
+                assert existing[4095].item() == 4095.0
+                with pytest.raises(RuntimeError, match="uncertain close"):
+                    second.to_tensor()
+        else:
+            with pytest.raises(RuntimeError, match="retired"):
+                first.to_tensor()
+        second.close_checked()
+        assert first.raw_mapping_released and second.raw_mapping_released
+        if scenario == "refusal":
+            reopened = second.to_tensor()
+            assert reopened[4095].item() == 4095.0
+            second.close_checked()
+        else:
+            with pytest.raises(RuntimeError, match="retired"):
+                second.to_tensor()
+    except BaseException:
+        channel.send(("error", traceback.format_exc()))
+        raise
+    else:
+        channel.send(("passed",))
+    finally:
+        channel.close()
+
+
+@pytest.mark.parametrize("scenario", ["refusal", "retire"])
+def test_checked_raw_mapping_release_and_alias_retirement(scenario: str) -> None:
+    pool = torch.zeros(64 * (1 << 20) // 4, device=DEVICE, dtype=torch.float32)
+    first, second = pool[1024:2048], pool[4096:8192]
+    first.copy_(torch.arange(1024, device=DEVICE, dtype=torch.float32))
+    second.copy_(torch.arange(4096, device=DEVICE, dtype=torch.float32))
+    torch.cuda.synchronize()
+    parent, child = get_context("spawn").Pipe()
+    importer = get_context("spawn").Process(
+        target=checked_close_importer, args=(child, scenario)
+    )
+    importer.start()
+    child.close()
+    try:
+        for tensor in (first, second):
+            parent.send_bytes(DeviceIPCWrapper.Serialize(RawCudaIPCWrapper(tensor)))
+        assert parent.poll(60), "checked-close importer did not respond"
+        report = parent.recv()
+        importer.join(timeout=60)
+        assert report == ("passed",), report
+        assert importer.exitcode == 0
+    finally:
+        if importer.is_alive():
+            importer.terminate()
+        importer.join(timeout=60)
+        parent.close()
+        # Keep the exporter allocation alive until its importing process exits.
+        torch.cuda.synchronize()
 
 
 def test_close_refcounts_shared_allocation() -> None:

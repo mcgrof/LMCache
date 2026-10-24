@@ -1,8 +1,10 @@
 # Acknowledge imported-memory retirement only after verified release
 
-Status: proposed. Ordered rotary snapshots have separate copy-completion
-controls. No positive exporter-teardown acknowledgement is implemented, and
-multiprocess KMesh engine admission remains closed.
+Status: checked raw-wrapper reference release, import retirement and scoped
+mapping inspection are implemented; their hardware qualification is pending.
+Ordered rotary snapshots have separate copy-completion controls. The integrated
+retirement ledger and positive exporter-teardown acknowledgement below remain
+proposed. Multiprocess KMesh engine admission remains closed.
 
 A completed copy does not prove an imported mapping has closed. Legacy context
 unregistration can retain a failed context while returning an ordinary reply.
@@ -28,6 +30,12 @@ Do not decrement the final reference or mark a wrapper closed before success.
 Retries require an actual successful driver result; an absent record or an
 invalid-handle error must not be reinterpreted as successful close. Keep legacy
 best-effort cleanup from silently erasing the checked path's retained debt.
+
+The raw wrapper exposes ``close_checked``, ``retire_raw_imports`` and
+``raw_mapping_released``. The last inspects only this implementation's registry;
+PyTorch storage, virtual-memory and external driver imports are not counted.
+Retired raw handles remain tombstoned for the process lifetime. This bounded
+prototype has no tombstone reclamation policy or integrated server receipt.
 
 Reference release and allocation retirement are distinct operations. A completed
 rotary download may release its temporary raw import while a paged-cache alias
