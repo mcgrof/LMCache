@@ -46,7 +46,7 @@ class ArtifactReadPlan:
     """Immutable metadata admitted by one ArtifactStore; never payload data.
 
     Plans are issued by ``prepare`` and cannot be transferred to another
-    store. A new file load still checks the current catalog and all bytes.
+    store. A new load checks the catalog; its backing selects payload checking.
     Keeping a plan does not reserve allocator capacity or a tensor lease.
     """
 
@@ -59,54 +59,30 @@ class ArtifactReadPlan:
     record_json: str
 
 
-class ArtifactStore:
-    """Read immutable file ranges into bounded LMCache allocator memory.
+class ArtifactMetadataStore:
+    """Share publication and immutable read-plan admission across backings."""
 
-    The catalog owns identity and location. This store owns process-local
-    residency. A lease keeps its MemoryObj alive until the caller finishes
-    consuming every view, including any asynchronous device transfer.
-    This is an external-artifact adapter, not a prompt-token KV cache.
-    """
-
-    def __init__(
-        self,
-        catalog: ArtifactCatalog,
-        allocator: MemoryAllocatorInterface,
-        max_read_plans: int = 1024,
-    ) -> None:
-        """Create a process-local store using caller-owned catalog/allocator.
+    def __init__(self, catalog: ArtifactCatalog, max_read_plans: int = 1024) -> None:
+        """Create bounded metadata caches without allocating payload memory.
 
         Args:
-            catalog: Immutable identity/location catalog.
-            allocator: Memory allocator shared under the caller's ownership.
-            max_read_plans: Positive LRU entry budget, independent of payload
-                capacity. Active leases and caller-retained plans stay alive
-                outside this cache; the limit is not a total memory bound.
+            catalog: Caller-owned immutable location catalog.
+            max_read_plans: Positive maximum cached metadata entries.
+
+        Raises:
+            ValueError: The entry limit is not a positive integer.
         """
-        self.catalog = catalog
-        self.allocator = allocator
         if type(max_read_plans) is not int or max_read_plans <= 0:
             raise ValueError("max_read_plans must be positive")
+        self.catalog = catalog
         self.max_read_plans = max_read_plans
         self._plans: OrderedDict[str, ArtifactReadPlan] = OrderedDict()
         self._issued: weakref.WeakValueDictionary[int, ArtifactReadPlan] = (
             weakref.WeakValueDictionary()
         )
-        self._resident_plans: dict[str, ArtifactReadPlan] = {}
-        self._loading: set[str] = set()
-        self.resident: OrderedDict[str, MemoryObj] = OrderedDict()
-        self.active: dict[str, int] = {}
         self.records: dict[str, dict] = {}
-        self.waiters: dict[str, int] = {}
-        self.locks: dict[str, threading.Lock] = {}
         self.lock = threading.RLock()
-        self.capacity = threading.Condition(self.lock)
         self.closed = False
-        self.read_count = 0
-        self.read_bytes = 0
-        self.cache_hits = 0
-        self.capacity_waits = 0
-        self.capacity_wait_seconds = 0.0
 
     def publish(
         self,
@@ -183,6 +159,7 @@ class ArtifactStore:
         The entry cache is bounded by ``max_read_plans``. A caller may retain
         an issued plan beyond cache eviction. Catalog changes are rejected
         on every subsequent load; resident hits use their admitted binding.
+        The backing's verification policy controls full-payload checks.
 
         Args:
             artifact_id: Exact published identity to admit.
@@ -230,6 +207,46 @@ class ArtifactStore:
             if len(self._plans) > self.max_read_plans:
                 self._plans.popitem(last=False)
             return plan
+
+
+class ArtifactStore(ArtifactMetadataStore):
+    """Read immutable file ranges into bounded LMCache allocator memory.
+
+    The catalog owns identity and location. This store owns process-local
+    residency. A lease keeps its MemoryObj alive until the caller finishes
+    consuming every view, including any asynchronous device transfer.
+    This is an external-artifact adapter, not a prompt-token KV cache.
+    """
+
+    def __init__(
+        self,
+        catalog: ArtifactCatalog,
+        allocator: MemoryAllocatorInterface,
+        max_read_plans: int = 1024,
+    ) -> None:
+        """Create a process-local store using caller-owned catalog/allocator.
+
+        Args:
+            catalog: Immutable identity/location catalog.
+            allocator: Memory allocator shared under the caller's ownership.
+            max_read_plans: Positive LRU entry budget, independent of payload
+                capacity. Active leases and caller-retained plans stay alive
+                outside this cache; the limit is not a total memory bound.
+        """
+        super().__init__(catalog, max_read_plans)
+        self.allocator = allocator
+        self._resident_plans: dict[str, ArtifactReadPlan] = {}
+        self._loading: set[str] = set()
+        self.resident: OrderedDict[str, MemoryObj] = OrderedDict()
+        self.active: dict[str, int] = {}
+        self.waiters: dict[str, int] = {}
+        self.locks: dict[str, threading.Lock] = {}
+        self.capacity = threading.Condition(self.lock)
+        self.read_count = 0
+        self.read_bytes = 0
+        self.cache_hits = 0
+        self.capacity_waits = 0
+        self.capacity_wait_seconds = 0.0
 
     @contextmanager
     def lease(

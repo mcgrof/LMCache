@@ -12,3 +12,4 @@ commands, and HTTP endpoints.
    extending_lmcache/adding_a_new_device_backend
    cli
    extending_http_api
+   mapped_artifacts
