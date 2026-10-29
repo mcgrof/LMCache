@@ -625,9 +625,26 @@ void FSConnector::do_batch_get_pooled(const Request& req) {
 
   {
     std::unique_lock<std::mutex> lk(read_mu_);
+    // Wake up to two readers, after read_mu_ is released; each reader that
+    // takes a task wakes up to two more while tasks remain
+    // (read_thread_main), so the number of running readers doubles at most
+    // as fast as they get a CPU.
+    size_t queued = 0;
+    auto wake = [&] {
+      const size_t n = std::min<size_t>(queued, 2);
+      lk.unlock();
+      for (size_t k = 0; k < n; ++k) {
+        read_cv_.notify_one();
+      }
+      lk.lock();
+      queued = 0;
+    };
     for (size_t i = 0; i < num_keys; ++i) {
       const size_t len = req.buf_lens[i];
       if (!read_budget_admits(len)) {
+        if (queued > 0) {
+          wake();
+        }
         ++read_budget_waiters_;
         read_budget_cv_.wait(lk,
                              [this, len] { return read_budget_admits(len); });
@@ -642,7 +659,10 @@ void FSConnector::do_batch_get_pooled(const Request& req) {
         read_queue_head_ = &tasks[i];
       }
       read_queue_tail_ = &tasks[i];
-      read_cv_.notify_one();
+      ++queued;
+    }
+    if (queued > 0) {
+      wake();
     }
     tile.done_cv.wait(lk, [&tile] { return tile.remaining == 0; });
   }
@@ -700,7 +720,13 @@ void FSConnector::read_thread_main(WorkerFSConn& conn) {
     if (read_queue_head_ == nullptr) {
       read_queue_tail_ = nullptr;
     }
+    const size_t more = read_queue_head_ == nullptr         ? 0
+                        : read_queue_head_->next == nullptr ? 1
+                                                            : 2;
     lk.unlock();
+    for (size_t k = 0; k < more; ++k) {
+      read_cv_.notify_one();
+    }
 
     uint8_t ok = 1;
     const Request& req = *task->req;

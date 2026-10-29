@@ -226,6 +226,73 @@ def test_reads_return_identical_bytes(
         reader.close()
 
 
+@pytest.mark.parametrize(
+    "num_read_workers,read_max_bytes_in_flight",
+    [
+        (2, 0),  # fewer readers than queued objects
+        (16, 0),  # more readers than objects in any one batch
+        (16, 1),  # every object but the first waits for budget
+    ],
+)
+def test_concurrent_pooled_batches_all_complete(
+    tmp_path: Path,
+    num_read_workers: int,
+    read_max_bytes_in_flight: int,
+) -> None:
+    """Batches submitted at once from several workers all finish intact.
+
+    Readers wake one another while objects remain queued, and a submitter
+    wakes readers before it waits for budget, so no queued object may be
+    left without a reader.
+    """
+    LMCacheFSClient = _import_fs_client()
+    block_size = os.statvfs(tmp_path).f_bsize
+    if block_size <= 0:
+        pytest.skip("filesystem block size is unavailable")
+
+    size = block_size * 3
+    num_batches, per_batch = 4, 12
+    keys = [f"test_model@00000000@0@{i:016x}" for i in range(num_batches * per_batch)]
+    sources, dests, keep_alive = _aligned_pairs(len(keys), size, block_size)
+
+    writer = LMCacheFSClient(str(tmp_path), 2, "", True, 0)
+    try:
+        _write_corpus(writer, keys, sources)
+    finally:
+        writer.close()
+
+    reader = LMCacheFSClient(
+        str(tmp_path), 4, "", True, 0, num_read_workers, read_max_bytes_in_flight
+    )
+    try:
+        for _ in range(5):
+            for dest in dests:
+                dest[:] = bytes(len(dest))
+            futures = {
+                reader.submit_batch_get(
+                    keys[b * per_batch : (b + 1) * per_batch],
+                    dests[b * per_batch : (b + 1) * per_batch],
+                )
+                for b in range(num_batches)
+            }
+            # One drain returns completions of every future, so collect
+            # them all here rather than wait for one future at a time.
+            done: dict[int, Any] = {}
+            deadline = time.monotonic() + 10.0
+            while len(done) < len(futures) and time.monotonic() < deadline:
+                for completion in reader.drain_completions():
+                    done[completion[0]] = completion
+                select.select([reader.event_fd()], [], [], 0.1)
+            assert set(done) == futures, f"unfinished: {futures - set(done)}"
+            for completion in done.values():
+                assert completion[1], completion[2]
+                assert list(completion[3] or []) == [True] * per_batch
+            for index, dest in enumerate(dests):
+                assert bytes(dest) == bytes(sources[index]), f"object {index} differs"
+    finally:
+        reader.close()
+
+
 def test_pooled_read_tolerates_one_missing_object(tmp_path: Path) -> None:
     """A missing object fails alone; its batch-mates still load."""
     LMCacheFSClient = _import_fs_client()
