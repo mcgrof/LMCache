@@ -195,9 +195,7 @@ def test_waiting_readers_recheck_their_own_catalog_snapshot(
     tmp_path: Path, policy: ArtifactVerification
 ) -> None:
     """Concurrent waiters with different admitted bindings must not share bytes."""
-    store, path, data = published(
-        tmp_path, policy, max_mappings=1, max_read_plans=1
-    )
+    store, path, data = published(tmp_path, policy, max_mappings=1, max_read_plans=1)
     assert isinstance(store.catalog, Catalog)
     store.publish(
         "two", {"version": "old"}, path, hashlib.sha256(data).hexdigest(), len(data), 7
