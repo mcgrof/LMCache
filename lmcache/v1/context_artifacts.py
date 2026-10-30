@@ -46,7 +46,8 @@ class ArtifactReadPlan:
     """Immutable metadata admitted by one ArtifactStore; never payload data.
 
     Plans are issued by ``prepare`` and cannot be transferred to another
-    store. A new load checks the catalog; its backing selects payload checking.
+    store. A new load checks the catalog unless a mapped backing's published
+    policy trusts its current plan; the backing selects payload checking.
     Keeping a plan does not reserve allocator capacity or a tensor lease.
     """
 
@@ -158,7 +159,9 @@ class ArtifactMetadataStore:
 
         The entry cache is bounded by ``max_read_plans``. A caller may retain
         an issued plan beyond cache eviction. Catalog changes are rejected
-        on every subsequent load; resident hits use their admitted binding.
+        on every subsequent arena load and strict mapped load. Published
+        mapped loads recheck only plans that are no longer current. Resident
+        hits use their admitted binding.
         The backing's verification policy controls full-payload checks.
 
         Args:

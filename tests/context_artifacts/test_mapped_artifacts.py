@@ -117,6 +117,42 @@ def test_foreign_plans_catalog_change_and_failed_open_do_not_publish(
     other.close()
 
 
+@pytest.mark.parametrize("policy", list(ArtifactVerification))
+def test_mapping_miss_catalog_recheck_follows_policy(
+    tmp_path: Path, policy: ArtifactVerification
+) -> None:
+    """Strict maps recheck the catalog; published maps trust the current plan."""
+    store, _, data = published(tmp_path, policy, max_read_plans=1)
+    assert isinstance(store.catalog, Catalog)
+    plan = store.prepare("one")
+    for _ in range(3):
+        before = store.catalog.lookups
+        with store.lease("one", plan=plan) as obj:
+            assert bytes(obj.byte_array) == data
+        assert store.evict("one")
+        expected = 1 if policy is ArtifactVerification.ON_MAP else 0
+        assert store.catalog.lookups - before == expected
+    store.catalog.records["one"]["offset"] = 0
+    if policy is ArtifactVerification.ON_MAP:
+        with pytest.raises(ValueError, match="catalog record"):
+            with store.lease("one", plan=plan):
+                pass
+    else:
+        # A current plan is trusted like published bytes.
+        with store.lease("one", plan=plan) as obj:
+            assert bytes(obj.byte_array) == data
+        assert store.evict("one")
+    store.catalog.records["one"]["offset"] = 7
+    store.publish("two", {"kind": "other"}, plan.path, plan.sha256, plan.length, 7)
+    store.prepare("two")  # The retained plan for "one" is no longer current.
+    store.catalog.records["one"]["offset"] = 0
+    with pytest.raises(ValueError, match="catalog record"):
+        with store.lease("one", plan=plan):
+            pass
+    assert not store.resident.get("one")
+    store.close()
+
+
 def test_concurrent_borrows_coalesce_and_descriptor_count_is_stable(
     tmp_path: Path,
 ) -> None:
@@ -154,9 +190,14 @@ def test_capacity_bound_and_wait_timeout(tmp_path: Path) -> None:
     store.close()
 
 
-def test_waiting_readers_recheck_their_own_catalog_snapshot(tmp_path: Path) -> None:
+@pytest.mark.parametrize("policy", list(ArtifactVerification))
+def test_waiting_readers_recheck_their_own_catalog_snapshot(
+    tmp_path: Path, policy: ArtifactVerification
+) -> None:
     """Concurrent waiters with different admitted bindings must not share bytes."""
-    store, path, data = published(tmp_path, max_mappings=1, max_read_plans=1)
+    store, path, data = published(
+        tmp_path, policy, max_mappings=1, max_read_plans=1
+    )
     assert isinstance(store.catalog, Catalog)
     store.publish(
         "two", {"version": "old"}, path, hashlib.sha256(data).hexdigest(), len(data), 7

@@ -28,10 +28,11 @@ the complete file range before recording it. For example:
        consume(backing.byte_array)
    store.close()
 
-``PUBLISHED`` trusts previously verified payload bytes. The default,
-``ON_MAP``, checks the full checksum on each new mapping. Neither mode permits
+``PUBLISHED`` trusts previously verified payload bytes and the catalog record
+the store currently admits. The default, ``ON_MAP``, rechecks the catalog
+record and the full checksum on each new mapping. Neither mode permits
 backing-file changes during use. Published mode does not detect later payload
-corruption. Consumer identity and tensor layout admission remain the typed
+corruption or catalog edits made behind the catalog API. Consumer identity and tensor layout admission remain the typed
 integration's responsibility.
 
 Keep the lease through asynchronous consumption. Never modify borrowed data.

@@ -8,15 +8,19 @@ KV block or pass it to an allocator's free operation.
 
 The catalog binds exact identity, path, offset, length, digest and consumer
 manifest. Publication always checks the full digest before registering the
-record. Admission caches metadata. On a mapping miss, the store compares the
-current catalog record, opens the regular file, checks its extent with fstat,
-and maps only the page-aligned containing range. A source descriptor closes
+record. Admission caches metadata. On a mapping miss, the store opens the
+regular file, checks its extent with fstat, and maps only the page-aligned
+containing range. Under `ON_MAP` it first compares the current catalog record
+with the admitted plan. Under `PUBLISHED` it trusts the plan it currently
+admits, which `prepare` read from the catalog, and rechecks only a
+caller-retained plan that is no longer current. A source descriptor closes
 after mapping; Python 3.13's trackfd=False also avoids mmap's duplicate fd.
 Earlier Python keeps one fd per retained mapping.
 
 `ArtifactVerification.ON_MAP` hashes every newly mapped payload before exposing
 it. `PUBLISHED` trusts the bytes checked during publication and does not scan
-the payload during serving. It does not detect corruption after publication.
+the payload during serving. It does not detect corruption after publication,
+nor a catalog record edited behind the catalog API while its plan is current.
 Neither policy permits in-place writers or truncation of backing files during
 mapping use. A private copy-on-write mapping lets tensor consumers expose the
 buffer without a read-only-buffer warning; consumers still must not mutate

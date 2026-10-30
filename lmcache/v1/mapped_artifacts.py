@@ -75,9 +75,11 @@ class MappedArtifactStore(ArtifactMetadataStore):
             catalog: Caller-owned immutable publication catalog.
             max_mappings: Positive maximum lookup-resident mappings.
             max_read_plans: Positive metadata cache entry limit.
-            verification: Full checksum on each new map, or trust the bytes
-                verified at publication. Published mode does not detect later
-                payload corruption; neither mode permits concurrent writers.
+            verification: Full checksum and catalog recheck on each new map,
+                or trust the bytes verified at publication and the store's
+                current admitted catalog snapshot. Published mode does not
+                detect later payload corruption or catalog edits; neither mode
+                permits concurrent writers.
 
         Raises:
             ValueError: An entry limit or verification policy is invalid.
@@ -219,12 +221,20 @@ class MappedArtifactStore(ArtifactMetadataStore):
 
     def _map(self, plan: ArtifactReadPlan) -> MappedArtifactView:
         """Map and optionally verify one exact range under the store lock."""
-        record = self.catalog.lookup_artifact(plan.artifact_id)
+        # PUBLISHED trusts the publication-time snapshot this store currently
+        # admits, as it trusts the published bytes. A caller-retained plan
+        # that is no longer current, and every ON_MAP miss, rechecks the
+        # catalog before mapping.
         if (
-            json.dumps(record, sort_keys=True, separators=(",", ":"))
-            != plan.record_json
+            self.verification is ArtifactVerification.ON_MAP
+            or self._plans.get(plan.artifact_id) is not plan
         ):
-            raise ValueError("catalog record differs from admitted read plan")
+            record = self.catalog.lookup_artifact(plan.artifact_id)
+            if (
+                json.dumps(record, sort_keys=True, separators=(",", ":"))
+                != plan.record_json
+            ):
+                raise ValueError("catalog record differs from admitted read plan")
         with open(plan.path, "rb", buffering=0) as stream:
             info = os.fstat(stream.fileno())
             if (
