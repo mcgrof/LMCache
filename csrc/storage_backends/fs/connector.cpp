@@ -731,10 +731,12 @@ void FSConnector::dispatch_locked(std::unique_lock<std::mutex>& lk,
   // as fast as they get a CPU.
   size_t queued = 0;
   auto wake = [&] {
-    const size_t n = std::min<size_t>(queued, 2);
+    ReaderSlot* woken[2];
+    const size_t n =
+        take_idle_readers_locked(std::min<size_t>(queued, 2), woken);
     lk.unlock();
     for (size_t k = 0; k < n; ++k) {
-      read_cv_.notify_one();
+      woken[k]->cv.notify_one();
     }
     lk.lock();
     queued = 0;
@@ -775,11 +777,28 @@ void FSConnector::start_read_pool(int num_read_workers) {
   for (size_t i = 0; i < num_threads; ++i) {
     read_conns_.push_back(create_connection());
   }
+  reader_slots_.reserve(num_threads);
+  for (size_t i = 0; i < num_threads; ++i) {
+    reader_slots_.push_back(std::make_unique<ReaderSlot>());
+  }
+  idle_readers_.reserve(num_threads);
   read_threads_.reserve(num_threads);
   for (size_t i = 0; i < num_threads; ++i) {
-    read_threads_.emplace_back(
-        [this, i] { this->read_thread_main(read_conns_[i]); });
+    read_threads_.emplace_back([this, i] {
+      this->read_thread_main(read_conns_[i], *reader_slots_[i]);
+    });
   }
+}
+
+size_t FSConnector::take_idle_readers_locked(size_t n, ReaderSlot** out) {
+  size_t taken = 0;
+  while (taken < n && !idle_readers_.empty()) {
+    ReaderSlot* slot = idle_readers_.back();
+    idle_readers_.pop_back();
+    slot->woken = true;
+    out[taken++] = slot;
+  }
+  return taken;
 }
 
 // Only after the workers are joined; see on_workers_stopped().
@@ -787,8 +806,11 @@ void FSConnector::stop_read_pool() {
   {
     std::lock_guard<std::mutex> lk(read_mu_);
     read_stop_ = true;
+    idle_readers_.clear();
   }
-  read_cv_.notify_all();
+  for (auto& slot : reader_slots_) {
+    slot->cv.notify_one();
+  }
   for (auto& t : read_threads_) {
     if (t.joinable()) {
       t.join();
@@ -796,17 +818,23 @@ void FSConnector::stop_read_pool() {
   }
   read_threads_.clear();
   read_conns_.clear();
+  reader_slots_.clear();
 }
 
-void FSConnector::read_thread_main(WorkerFSConn& conn) {
+void FSConnector::read_thread_main(WorkerFSConn& conn, ReaderSlot& slot) {
   // The lock taken to record a completion is kept to pop the next task, so
   // a busy reader takes read_mu_ once per object, not twice.
   std::unique_lock<std::mutex> lk(read_mu_);
   for (;;) {
-    read_cv_.wait(lk,
-                  [this] { return read_stop_ || read_queue_head_ != nullptr; });
+    // A woken reader can find the queue already drained by a busy one;
+    // it then goes back on the idle stack.
+    while (!read_stop_ && read_queue_head_ == nullptr) {
+      slot.woken = false;
+      idle_readers_.push_back(&slot);
+      slot.cv.wait(lk, [this, &slot] { return slot.woken || read_stop_; });
+    }
     if (read_queue_head_ == nullptr) {
-      return;  // the predicate admits an empty queue only on stop
+      return;  // only on stop
     }
     ReadTask* task = read_queue_head_;
     read_queue_head_ = task->next;
@@ -816,9 +844,11 @@ void FSConnector::read_thread_main(WorkerFSConn& conn) {
     const size_t more = read_queue_head_ == nullptr         ? 0
                         : read_queue_head_->next == nullptr ? 1
                                                             : 2;
+    ReaderSlot* woken[2];
+    const size_t n = take_idle_readers_locked(more, woken);
     lk.unlock();
-    for (size_t k = 0; k < more; ++k) {
-      read_cv_.notify_one();
+    for (size_t k = 0; k < n; ++k) {
+      woken[k]->cv.notify_one();
     }
 
     uint8_t ok = 1;

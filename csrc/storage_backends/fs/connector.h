@@ -228,9 +228,21 @@ class FSConnector : public ConnectorBase<WorkerFSConn> {
   // read_mu_.
   bool read_budget_admits(size_t len) const;
 
+  // A reader's wakeup.  Owned by the connector, not the thread, so a
+  // waker may notify it after releasing read_mu_ even if the reader has
+  // since exited.
+  struct ReaderSlot {
+    std::condition_variable cv;
+    bool woken = false;  // guarded by read_mu_
+  };
+
+  // Takes up to `n` idle readers, most recently idle first, and marks them
+  // woken.  Requires read_mu_; the caller notifies them after releasing it.
+  size_t take_idle_readers_locked(size_t n, ReaderSlot** out);
+
   void start_read_pool(int num_read_workers);
   void stop_read_pool();
-  void read_thread_main(WorkerFSConn& conn);
+  void read_thread_main(WorkerFSConn& conn, ReaderSlot& slot);
 
   // Reads `len` bytes of an object through a held descriptor, retrying
   // once with a fresh open if the cached one fails.
@@ -257,8 +269,13 @@ class FSConnector : public ConnectorBase<WorkerFSConn> {
   size_t read_max_bytes_in_flight_;
   std::vector<WorkerFSConn> read_conns_;
   std::vector<std::thread> read_threads_;
+  std::vector<std::unique_ptr<ReaderSlot>> reader_slots_;
   std::mutex read_mu_;
-  std::condition_variable read_cv_;  // a task was queued, or stop
+  // Readers waiting for a task, most recently idle last.  Waking from the
+  // back reuses the threads (and CPUs, and cache) that just ran, so a
+  // large pool spreads light load over a few warm readers instead of
+  // cycling through all of them.
+  std::vector<ReaderSlot*> idle_readers_;
   // Budget room opened.  Signalled only once a slice of the budget is
   // free, so a worker blocked on a full budget wakes once per slice and
   // dispatches a run of objects, not once per finished read.
