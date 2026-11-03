@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "connector.h"
+#include <sys/uio.h>
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
@@ -355,7 +356,7 @@ FSConnector::FSConnector(std::string base_path, int num_workers,
                          std::string relative_tmp_dir, bool use_odirect,
                          size_t read_ahead_size, int num_read_workers,
                          size_t read_max_bytes_in_flight,
-                         size_t held_fd_capacity)
+                         size_t held_fd_capacity, size_t inline_read_keys)
     : ConnectorBase(num_workers),
       held_fds_(held_fd_capacity),
       base_path_(std::move(base_path)),
@@ -363,6 +364,7 @@ FSConnector::FSConnector(std::string base_path, int num_workers,
       use_odirect_(use_odirect),
       disk_block_size_(0),
       read_ahead_size_(read_ahead_size),
+      inline_read_keys_(inline_read_keys),
       read_max_bytes_in_flight_(
           effective_read_budget(num_read_workers, read_max_bytes_in_flight)) {
   if (num_read_workers < 0) {
@@ -509,6 +511,68 @@ std::map<std::string, uint64_t> FSConnector::held_fd_stats() {
   return held_fds_.stats();
 }
 
+std::map<std::string, uint64_t> FSConnector::read_stats() {
+  return {{"inline_hits", inline_hits_.load(std::memory_order_relaxed)},
+          {"inline_misses", inline_misses_.load(std::memory_order_relaxed)},
+          {"inline_unsupported",
+           inline_unsupported_.load(std::memory_order_relaxed) ? 1u : 0u}};
+}
+
+bool FSConnector::try_get_cached(const WorkerFSConn& conn,
+                                 const std::string& key, void* buf,
+                                 size_t len) {
+#ifdef RWF_NOWAIT
+  if (inline_unsupported_.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  const std::string filename = key_to_filename(key);
+  const auto file_path = conn.base_path / filename;
+  int fd;
+  if (held_fds_.enabled()) {
+    try {
+      fd = held_fds_.acquire(filename, file_path, O_RDONLY, len);
+    } catch (const std::exception&) {
+      return false;  // missing or short: the pool reports it
+    }
+  } else {
+    fd = ::open(file_path.c_str(), O_RDONLY);
+    if (fd < 0) {
+      return false;
+    }
+  }
+  size_t total = 0;
+  while (total < len) {
+    struct iovec iov = {static_cast<char*>(buf) + total, len - total};
+    ssize_t n = ::preadv2(fd, &iov, 1, static_cast<off_t>(total), RWF_NOWAIT);
+    if (n > 0) {
+      total += static_cast<size_t>(n);
+      continue;
+    }
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+    if (n < 0 && errno == EOPNOTSUPP) {
+      inline_unsupported_.store(true, std::memory_order_relaxed);
+    }
+    break;  // EAGAIN: not all cached; or EOF, or an error
+  }
+  if (held_fds_.enabled()) {
+    held_fds_.release(filename, O_RDONLY, fd, false);
+  } else {
+    ::close(fd);
+  }
+  const bool hit = total == len;
+  (hit ? inline_hits_ : inline_misses_).fetch_add(1, std::memory_order_relaxed);
+  return hit;
+#else
+  (void)conn;
+  (void)key;
+  (void)buf;
+  (void)len;
+  return false;
+#endif
+}
+
 void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
                                 const void* buf, size_t len,
                                 size_t chunk_size) {
@@ -601,7 +665,7 @@ void FSConnector::do_batch_get(WorkerFSConn& conn, const Request& req) {
     ConnectorBase::do_batch_get(conn, req);
     return;
   }
-  do_batch_get_pooled(req);
+  do_batch_get_pooled(conn, req);
 }
 
 void FSConnector::on_workers_stopped() {
@@ -614,61 +678,90 @@ bool FSConnector::read_budget_admits(size_t len) const {
          read_bytes_in_flight_ + len <= read_max_bytes_in_flight_;
 }
 
-void FSConnector::do_batch_get_pooled(const Request& req) {
+void FSConnector::do_batch_get_pooled(WorkerFSConn& conn, const Request& req) {
   const size_t num_keys = req.keys.size();
+  // Inline reads copy from the page cache on this thread; O_DIRECT reads
+  // always wait for the device, so they all go to the pool.
+  const size_t num_inline =
+      use_odirect_ ? 0 : std::min(inline_read_keys_, num_keys);
   ReadTile tile;
   tile.ok.assign(num_keys, 1);
-  tile.remaining = num_keys;
+  tile.remaining = num_keys - num_inline;
   // Allocated before anything is published, so nothing below can throw
   // while readers hold pointers into this frame.
   std::vector<ReadTask> tasks(num_keys);
+  std::vector<size_t> idx;
+  idx.reserve(num_keys);
 
+  if (num_inline < num_keys) {
+    for (size_t i = num_inline; i < num_keys; ++i) {
+      idx.push_back(i);
+    }
+    std::unique_lock<std::mutex> lk(read_mu_);
+    dispatch_locked(lk, req, tile, tasks, idx);
+  }
+  // The pool works on the rest while this thread reads cached keys.
+  idx.clear();
+  for (size_t i = 0; i < num_inline; ++i) {
+    if (!try_get_cached(conn, req.keys[i], req.buf_ptrs[i], req.buf_lens[i])) {
+      idx.push_back(i);
+    }
+  }
   {
     std::unique_lock<std::mutex> lk(read_mu_);
-    // Wake up to two readers, after read_mu_ is released; each reader that
-    // takes a task wakes up to two more while tasks remain
-    // (read_thread_main), so the number of running readers doubles at most
-    // as fast as they get a CPU.
-    size_t queued = 0;
-    auto wake = [&] {
-      const size_t n = std::min<size_t>(queued, 2);
-      lk.unlock();
-      for (size_t k = 0; k < n; ++k) {
-        read_cv_.notify_one();
-      }
-      lk.lock();
-      queued = 0;
-    };
-    for (size_t i = 0; i < num_keys; ++i) {
-      const size_t len = req.buf_lens[i];
-      if (!read_budget_admits(len)) {
-        if (queued > 0) {
-          wake();
-        }
-        ++read_budget_waiters_;
-        read_budget_cv_.wait(lk,
-                             [this, len] { return read_budget_admits(len); });
-        --read_budget_waiters_;
-      }
-      read_bytes_in_flight_ += len;
-      ++reads_in_flight_;
-      tasks[i] = ReadTask{&req, i, &tile, nullptr};
-      if (read_queue_tail_ != nullptr) {
-        read_queue_tail_->next = &tasks[i];
-      } else {
-        read_queue_head_ = &tasks[i];
-      }
-      read_queue_tail_ = &tasks[i];
-      ++queued;
-    }
-    if (queued > 0) {
-      wake();
+    if (!idx.empty()) {
+      tile.remaining += idx.size();
+      dispatch_locked(lk, req, tile, tasks, idx);
     }
     tile.done_cv.wait(lk, [&tile] { return tile.remaining == 0; });
   }
 
   for (size_t i = 0; i < num_keys; ++i) {
     req.batch->per_key_results[req.start_idx + i] = tile.ok[i];
+  }
+}
+
+void FSConnector::dispatch_locked(std::unique_lock<std::mutex>& lk,
+                                  const Request& req, ReadTile& tile,
+                                  std::vector<ReadTask>& tasks,
+                                  const std::vector<size_t>& idx) {
+  // Wake up to two readers, after read_mu_ is released; each reader that
+  // takes a task wakes up to two more while tasks remain
+  // (read_thread_main), so the number of running readers doubles at most
+  // as fast as they get a CPU.
+  size_t queued = 0;
+  auto wake = [&] {
+    const size_t n = std::min<size_t>(queued, 2);
+    lk.unlock();
+    for (size_t k = 0; k < n; ++k) {
+      read_cv_.notify_one();
+    }
+    lk.lock();
+    queued = 0;
+  };
+  for (const size_t i : idx) {
+    const size_t len = req.buf_lens[i];
+    if (!read_budget_admits(len)) {
+      if (queued > 0) {
+        wake();
+      }
+      ++read_budget_waiters_;
+      read_budget_cv_.wait(lk, [this, len] { return read_budget_admits(len); });
+      --read_budget_waiters_;
+    }
+    read_bytes_in_flight_ += len;
+    ++reads_in_flight_;
+    tasks[i] = ReadTask{&req, i, &tile, nullptr};
+    if (read_queue_tail_ != nullptr) {
+      read_queue_tail_->next = &tasks[i];
+    } else {
+      read_queue_head_ = &tasks[i];
+    }
+    read_queue_tail_ = &tasks[i];
+    ++queued;
+  }
+  if (queued > 0) {
+    wake();
   }
 }
 

@@ -613,3 +613,118 @@ def test_held_fd_capacity_reaches_the_native_client(tmp_path: Path) -> None:
         assert native._client.held_fd_stats()["capacity"] == 16
     finally:
         adapter.close()
+
+
+# ---------------------------------------------------------------------------
+# Read modes (inline_read_keys)
+# ---------------------------------------------------------------------------
+
+_ALL_KEYS = (1 << 63) - 1
+
+
+def _mode_client(client_cls: type, path: Path, inline: int):
+    # Buffered reads, four read workers, no held descriptors.
+    return client_cls(str(path), 2, "", False, 0, 4, 0, 0, inline)
+
+
+def _evict_from_page_cache(path: Path) -> None:
+    for name in os.listdir(path):
+        fd = os.open(path / name, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+
+
+def _skip_without_nowait(path: Path) -> None:
+    """Inline reads need a filesystem that takes RWF_NOWAIT (tmpfs does not)."""
+    probe = path / "nowait-probe"
+    probe.write_bytes(b"x" * 4096)
+    fd = os.open(probe, os.O_RDONLY)
+    try:
+        os.preadv(fd, [bytearray(4096)], 0, os.RWF_NOWAIT)
+    except OSError as exc:
+        pytest.skip(f"filesystem refuses RWF_NOWAIT: {exc}")
+    finally:
+        os.close(fd)
+        probe.unlink()
+
+
+def _read_and_check(reader: Any, keys: list[str], sources, dests) -> None:
+    for dest in dests:
+        dest[:] = b"\0" * len(dest)
+    assert _get_all(reader, keys, dests) == [True] * len(keys)
+    for index, dest in enumerate(dests):
+        assert bytes(dest) == bytes(sources[index])
+
+
+def test_inline_reads_serve_cached_keys_and_pool_the_rest(tmp_path: Path) -> None:
+    """Cached keys are read inline; uncached ones still arrive via the pool."""
+    LMCacheFSClient = _import_fs_client()
+    _skip_without_nowait(tmp_path)
+    keys, sources, dests, _keep = _corpus(tmp_path, LMCacheFSClient)
+    reader = _mode_client(LMCacheFSClient, tmp_path, _ALL_KEYS)
+    try:
+        _evict_from_page_cache(tmp_path)
+        _read_and_check(reader, keys, sources, dests)
+        stats = reader.read_stats()
+        # Some pages may be cached again by readahead, so only the total is
+        # fixed until the second pass.
+        assert stats["inline_hits"] + stats["inline_misses"] == len(keys)
+        _read_and_check(reader, keys, sources, dests)
+        after = reader.read_stats()
+        assert after["inline_hits"] - stats["inline_hits"] == len(keys)
+        assert after["inline_misses"] == stats["inline_misses"]
+    finally:
+        reader.close()
+
+
+def test_pool_mode_reads_nothing_inline(tmp_path: Path) -> None:
+    LMCacheFSClient = _import_fs_client()
+    keys, sources, dests, _keep = _corpus(tmp_path, LMCacheFSClient)
+    reader = _mode_client(LMCacheFSClient, tmp_path, 0)
+    try:
+        _read_and_check(reader, keys, sources, dests)
+        _read_and_check(reader, keys, sources, dests)
+        stats = reader.read_stats()
+        assert stats["inline_hits"] == 0 and stats["inline_misses"] == 0
+    finally:
+        reader.close()
+
+
+def test_inline_reads_fall_back_where_nowait_is_refused(tmp_path: Path) -> None:
+    """On a filesystem without RWF_NOWAIT every read still succeeds."""
+    LMCacheFSClient = _import_fs_client()
+    probe = tmp_path / "nowait-probe"
+    probe.write_bytes(b"x" * 4096)
+    fd = os.open(probe, os.O_RDONLY)
+    try:
+        os.preadv(fd, [bytearray(4096)], 0, os.RWF_NOWAIT)
+        pytest.skip("filesystem takes RWF_NOWAIT; fallback not reachable here")
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+        probe.unlink()
+    keys, sources, dests, _keep = _corpus(tmp_path, LMCacheFSClient)
+    reader = _mode_client(LMCacheFSClient, tmp_path, _ALL_KEYS)
+    try:
+        _read_and_check(reader, keys, sources, dests)
+        _read_and_check(reader, keys, sources, dests)
+        stats = reader.read_stats()
+        assert stats["inline_unsupported"] == 1 and stats["inline_hits"] == 0
+    finally:
+        reader.close()
+
+
+def test_odirect_reads_never_go_inline(tmp_path: Path) -> None:
+    LMCacheFSClient = _import_fs_client()
+    keys, sources, dests, _keep = _corpus(tmp_path, LMCacheFSClient)
+    reader = LMCacheFSClient(str(tmp_path), 2, "", True, 0, 4, 0, 0, _ALL_KEYS)
+    try:
+        _read_and_check(reader, keys, sources, dests)
+        stats = reader.read_stats()
+        assert stats["inline_hits"] == 0 and stats["inline_misses"] == 0
+    finally:
+        reader.close()

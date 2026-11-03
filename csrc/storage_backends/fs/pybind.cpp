@@ -9,17 +9,20 @@ namespace py = pybind11;
 PYBIND11_MODULE(lmcache_fs, m) {
   py::class_<lmcache::connector::FSConnector>(m, "LMCacheFSClient")
       .def(py::init<std::string, int, std::string, bool, size_t, int, size_t,
-                    size_t>(),
+                    size_t, size_t>(),
            py::arg("base_path"), py::arg("num_workers"),
            py::arg("relative_tmp_dir") = "", py::arg("use_odirect") = false,
            py::arg("read_ahead_size") = 0, py::arg("num_read_workers") = 0,
            py::arg("read_max_bytes_in_flight") = 0,
-           py::arg("held_fd_capacity") = 0)
+           py::arg("held_fd_capacity") = 0, py::arg("inline_read_keys") = 0)
       .def("read_budget_bytes",
            &lmcache::connector::FSConnector::read_budget_bytes,
            "Bytes allowed outstanding against the device; 0 when there is "
            "no read pool.")
       .def("held_fd_stats", &lmcache::connector::FSConnector::held_fd_stats,
            "Held-descriptor counters; capacity 0 means the cache is off.")
+      .def("read_stats", &lmcache::connector::FSConnector::read_stats,
+           "Keys read inline from the page cache and keys sent on to the "
+           "read pool after an inline attempt.")
           LMCACHE_BIND_CONNECTOR_METHODS(lmcache::connector::FSConnector);
 }
