@@ -616,7 +616,7 @@ def test_held_fd_capacity_reaches_the_native_client(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Read modes (inline_read_keys, inline_busy_target)
+# Read modes (inline_read_keys, inline_busy_target, read_mode)
 # ---------------------------------------------------------------------------
 
 _ALL_KEYS = (1 << 63) - 1
@@ -749,3 +749,59 @@ def test_odirect_reads_never_go_inline(tmp_path: Path) -> None:
         assert stats["inline_hits"] == 0 and stats["inline_misses"] == 0
     finally:
         reader.close()
+
+
+def test_read_mode_config_is_validated() -> None:
+    # First Party
+    from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
+        FSNativeL2AdapterConfig,
+    )
+
+    default = FSNativeL2AdapterConfig.from_dict({"base_path": "/tmp/x"})
+    assert default.read_mode == "pool" and default.read_busy_target == 16
+    cfg = FSNativeL2AdapterConfig.from_dict(
+        {"base_path": "/tmp/x", "read_mode": "adaptive", "read_busy_target": 8}
+    )
+    assert cfg.read_mode == "adaptive" and cfg.read_busy_target == 8
+    with pytest.raises(ValueError):
+        FSNativeL2AdapterConfig(base_path="/tmp/x", read_mode="fast")
+    with pytest.raises(ValueError):
+        FSNativeL2AdapterConfig(base_path="/tmp/x", read_busy_target=0)
+    with pytest.raises(ValueError):
+        FSNativeL2AdapterConfig(base_path="/tmp/x", read_busy_target=True)
+
+
+@pytest.mark.parametrize(
+    "mode, inline, busy",
+    [("pool", 0, 0), ("inline", _ALL_KEYS, 0), ("adaptive", _ALL_KEYS, 2)],
+)
+def test_read_mode_reaches_the_native_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, inline: int, busy: int
+) -> None:
+    """The real factory turns read_mode into the connector's settings."""
+    LMCacheFSClient = _import_fs_client()
+    # First Party
+    from lmcache import lmcache_fs
+    from lmcache.v1.distributed.l2_adapters.factory import (
+        create_l2_adapter_from_registry,
+    )
+    from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
+        FSNativeL2AdapterConfig,
+    )
+
+    seen = []
+
+    def recording_client(*args):
+        seen.append(args)
+        return LMCacheFSClient(*args)
+
+    monkeypatch.setattr(lmcache_fs, "LMCacheFSClient", recording_client)
+    cfg = FSNativeL2AdapterConfig(
+        base_path=str(tmp_path), read_mode=mode, read_busy_target=2
+    )
+    adapter = create_l2_adapter_from_registry(cfg)
+    try:
+        assert adapter.report_status()["read_mode"] == mode
+        assert seen and seen[0][-2:] == (inline, busy)
+    finally:
+        adapter.close()

@@ -46,6 +46,15 @@ I/O queue depth on a single Python thread.
   that removes an OPEN and a CLOSE round trip to the server per read, plus
   the attribute check.  ``0`` opens and closes each object per read.  See
   *Held descriptors* below.
+- ``read_mode`` (str, default ``"pool"``): Who reads objects that are
+  already in the page cache, with ``num_read_workers`` positive and
+  ``use_odirect`` off.  ``"pool"`` hands every key of a batch to the read
+  workers.  ``"inline"`` has the worker that took the batch read cached
+  keys itself, and hands only uncached keys to the pool.  ``"adaptive"``
+  uses the pool while fewer than ``read_busy_target`` reads are in flight
+  and reads the rest inline.  See *Read modes* below.
+- ``read_busy_target`` (int, default ``16``): The ``"adaptive"`` threshold,
+  in reads in flight.
 
 .. important::
 
@@ -89,6 +98,24 @@ exceed the capacity by the reads in flight.  On a local filesystem an
 ``open`` costs about a microsecond, so held descriptors save little there;
 the option is meant for network filesystems.
 
+**Read modes.**  A page-cache hit is a memory copy, so handing it to a
+read worker buys parallelism at the price of a wakeup, a contended queue
+lock and often a copy on another core's cache.  ``"pool"`` spreads one
+request over the read workers and gives a lone request the lowest
+latency.  ``"inline"`` reads cached keys on the worker that took the
+batch with ``preadv2(RWF_NOWAIT)``, which copies only when every byte is
+cached and otherwise returns at once; it uses the least CPU per object,
+but it copies one request's keys one after another, so a lone request is
+slower than with the pool.  ``"adaptive"`` fans a request out while the
+connector is quiet and reads inline once ``read_busy_target`` reads are
+in flight; a request split between the pool and inline finishes with its
+slower part, so on cached data it can be slower than either pure mode.
+Keys that are not cached always go to the pool, so the mode never changes
+which bytes are read.  A filesystem that refuses ``RWF_NOWAIT``, such as
+tmpfs or the Linux NFS client, reads everything through the pool.  A copy
+costs more the more copies run at once on the host, so compare the modes
+at the load you serve.
+
 **Configuration examples:**
 
 .. code-block:: bash
@@ -101,6 +128,9 @@ the option is meant for network filesystems.
 
     # Shared NFS or pNFS directory: keep 4096 hot objects open between reads
     --l2-adapter '{"type": "fs_native", "base_path": "/mnt/pnfs/lmcache/l2", "use_odirect": true, "held_fd_capacity": 4096}'
+
+    # Page-cache hits read by the batch's own worker, the pool only for misses
+    --l2-adapter '{"type": "fs_native", "base_path": "/data/lmcache/l2", "read_mode": "inline"}'
 
     # O_DIRECT for real-disk benchmarking
     --l2-adapter '{"type": "fs_native", "base_path": "/data/lmcache/l2", "num_workers": 32, "use_odirect": true}'

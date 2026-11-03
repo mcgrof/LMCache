@@ -39,6 +39,14 @@ logger = init_logger(__name__)
 # file descriptor.
 DEFAULT_NUM_READ_WORKERS = 256
 
+# How a GET batch's page-cache hits are read; see FSNativeL2AdapterConfig.
+READ_MODES = ("pool", "inline", "adaptive")
+# Reads in flight below which "adaptive" still hands keys to the pool: one
+# 16-key request fans out fully on an otherwise idle connector.
+DEFAULT_READ_BUSY_TARGET = 16
+# inline_read_keys value meaning every key of a batch.
+_INLINE_ALL_KEYS = (1 << 63) - 1
+
 
 def _validate_non_negative_int(name: str, raw: object) -> int:
     """Return ``raw`` if it is a non-negative ``int``.
@@ -80,6 +88,17 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
       A descriptor serves a published object even after another process
       evicts its file, which is safe because keys name their content.
       0 (default) opens and closes per read.
+    - read_mode: how page-cache hits are read when num_read_workers is
+      positive and use_odirect is off.  "pool" (default) hands every key
+      to the read workers, which gives a lone request the lowest latency.
+      "inline" has the worker that took the batch read cached keys itself
+      with preadv2(RWF_NOWAIT), passing only uncached keys to the pool;
+      it uses the least CPU per object but copies one request's keys one
+      after another.
+      "adaptive" hands keys to the pool while fewer than
+      read_busy_target reads are in flight and reads the rest inline.
+    - read_busy_target: the "adaptive" threshold, in reads in flight
+      (default 16).
     - max_capacity_gb: declared L2 capacity in GB, used for usage
       accounting. ``0`` (default) disables it. A value ``> 0`` does
       **not** bound disk usage on its own -- eviction runs only when
@@ -99,13 +118,16 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         num_read_workers: int = DEFAULT_NUM_READ_WORKERS,
         read_max_bytes_in_flight: int = 0,
         held_fd_capacity: int = 0,
+        read_mode: str = "pool",
+        read_busy_target: int = DEFAULT_READ_BUSY_TARGET,
     ):
         """Build the config; see the class docstring for each field.
 
         Raises:
             ValueError: If ``num_read_workers``,
                 ``read_max_bytes_in_flight`` or ``held_fd_capacity`` is not
-                a non-negative integer.
+                a non-negative integer, ``read_mode`` is not one of
+                READ_MODES, or ``read_busy_target`` is not positive.
         """
         self.base_path = base_path
         self.num_workers = num_workers
@@ -122,6 +144,24 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         self.held_fd_capacity = _validate_non_negative_int(
             "held_fd_capacity", held_fd_capacity
         )
+        if read_mode not in READ_MODES:
+            raise ValueError(
+                f"read_mode must be one of {', '.join(READ_MODES)}, got {read_mode!r}"
+            )
+        self.read_mode = read_mode
+        self.read_busy_target = _validate_non_negative_int(
+            "read_busy_target", read_busy_target
+        )
+        if self.read_busy_target == 0:
+            raise ValueError("read_busy_target must be a positive integer")
+        if read_mode != "pool" and (num_read_workers == 0 or use_odirect):
+            logger.warning(
+                "fs_native: read_mode=%s has no effect with %s; every read "
+                "takes the %s path.",
+                read_mode,
+                "num_read_workers=0" if num_read_workers == 0 else "use_odirect",
+                "legacy" if num_read_workers == 0 else "pool",
+            )
         if num_read_workers == 0 and read_max_bytes_in_flight > 0:
             logger.warning(
                 "fs_native: read_max_bytes_in_flight=%d is ignored because "
@@ -176,6 +216,8 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
             num_read_workers=d.get("num_read_workers", DEFAULT_NUM_READ_WORKERS),
             read_max_bytes_in_flight=d.get("read_max_bytes_in_flight", 0),
             held_fd_capacity=d.get("held_fd_capacity", 0),
+            read_mode=d.get("read_mode", "pool"),
+            read_busy_target=d.get("read_busy_target", DEFAULT_READ_BUSY_TARGET),
         )
 
     @classmethod
@@ -202,6 +244,10 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
             "- held_fd_capacity (int): read-only descriptors "
             "kept open for reuse, skipping open/close/stat on "
             "a hit (default 0 = open and close per read)\n"
+            "- read_mode (str): pool (default), inline or adaptive: "
+            "who reads page-cache hits\n"
+            "- read_busy_target (int): reads in flight below which "
+            "adaptive still uses the pool (default 16)\n"
             "- max_capacity_gb (float): declared L2 capacity in GB "
             "for usage accounting (default 0 = disabled). Does not "
             "bound disk usage by itself; add an 'eviction' block "
@@ -233,6 +279,8 @@ def _create_fs_native_l2_adapter(
     )
 
     assert isinstance(config, FSNativeL2AdapterConfig)
+    inline_read_keys = 0 if config.read_mode == "pool" else _INLINE_ALL_KEYS
+    busy_target = config.read_busy_target if config.read_mode == "adaptive" else 0
     native_client = LMCacheFSClient(
         config.base_path,
         config.num_workers,
@@ -242,12 +290,14 @@ def _create_fs_native_l2_adapter(
         config.num_read_workers,
         config.read_max_bytes_in_flight,
         config.held_fd_capacity,
+        inline_read_keys,
+        busy_target,
     )
     effective_read_budget = native_client.read_budget_bytes()
     logger.info(
         "Created FS native L2 adapter: %s (workers=%d, odirect=%s, "
         "read_ahead=%s, num_read_workers=%d, "
-        "read_max_bytes_in_flight=%d, held_fd_capacity=%d)",
+        "read_max_bytes_in_flight=%d, held_fd_capacity=%d, read_mode=%s)",
         config.base_path,
         config.num_workers,
         config.use_odirect,
@@ -255,6 +305,7 @@ def _create_fs_native_l2_adapter(
         config.num_read_workers,
         effective_read_budget,
         config.held_fd_capacity,
+        config.read_mode,
     )
     residency = MemoryResidency.REMOTE if config.shared else MemoryResidency.LOCAL
     memory_tags = MemoryTags(MemorySegment.STORAGE, residency)
@@ -272,6 +323,8 @@ def _create_fs_native_l2_adapter(
             "num_read_workers": config.num_read_workers,
             "read_max_bytes_in_flight": effective_read_budget,
             "held_fd_capacity": config.held_fd_capacity,
+            "read_mode": config.read_mode,
+            "read_busy_target": config.read_busy_target,
             "pad_buffers_to_alignment": config.use_odirect,
         },
     )
