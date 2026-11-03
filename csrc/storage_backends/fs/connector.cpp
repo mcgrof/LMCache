@@ -356,7 +356,8 @@ FSConnector::FSConnector(std::string base_path, int num_workers,
                          std::string relative_tmp_dir, bool use_odirect,
                          size_t read_ahead_size, int num_read_workers,
                          size_t read_max_bytes_in_flight,
-                         size_t held_fd_capacity, size_t inline_read_keys)
+                         size_t held_fd_capacity, size_t inline_read_keys,
+                         size_t inline_busy_target)
     : ConnectorBase(num_workers),
       held_fds_(held_fd_capacity),
       base_path_(std::move(base_path)),
@@ -365,6 +366,7 @@ FSConnector::FSConnector(std::string base_path, int num_workers,
       disk_block_size_(0),
       read_ahead_size_(read_ahead_size),
       inline_read_keys_(inline_read_keys),
+      inline_busy_target_(inline_busy_target),
       read_max_bytes_in_flight_(
           effective_read_budget(num_read_workers, read_max_bytes_in_flight)) {
   if (num_read_workers < 0) {
@@ -514,6 +516,7 @@ std::map<std::string, uint64_t> FSConnector::held_fd_stats() {
 std::map<std::string, uint64_t> FSConnector::read_stats() {
   return {{"inline_hits", inline_hits_.load(std::memory_order_relaxed)},
           {"inline_misses", inline_misses_.load(std::memory_order_relaxed)},
+          {"fanned_out", fanned_out_.load(std::memory_order_relaxed)},
           {"inline_unsupported",
            inline_unsupported_.load(std::memory_order_relaxed) ? 1u : 0u}};
 }
@@ -680,25 +683,37 @@ bool FSConnector::read_budget_admits(size_t len) const {
 
 void FSConnector::do_batch_get_pooled(WorkerFSConn& conn, const Request& req) {
   const size_t num_keys = req.keys.size();
-  // Inline reads copy from the page cache on this thread; O_DIRECT reads
-  // always wait for the device, so they all go to the pool.
-  const size_t num_inline =
-      use_odirect_ ? 0 : std::min(inline_read_keys_, num_keys);
   ReadTile tile;
   tile.ok.assign(num_keys, 1);
-  tile.remaining = num_keys - num_inline;
   // Allocated before anything is published, so nothing below can throw
   // while readers hold pointers into this frame.
   std::vector<ReadTask> tasks(num_keys);
   std::vector<size_t> idx;
   idx.reserve(num_keys);
 
-  if (num_inline < num_keys) {
+  size_t num_inline;
+  {
+    std::unique_lock<std::mutex> lk(read_mu_);
+    // Inline reads copy from the page cache on this thread; O_DIRECT reads
+    // always wait for the device, so they all go to the pool.
+    num_inline = use_odirect_ ? 0 : std::min(inline_read_keys_, num_keys);
+    if (num_inline > 0 && inline_busy_target_ > 0) {
+      const size_t busy = reads_in_flight_ + inline_workers_;
+      const size_t room =
+          busy < inline_busy_target_ ? inline_busy_target_ - busy : 0;
+      num_inline = std::min(num_inline, num_keys - std::min(num_keys, room));
+    }
+    tile.remaining = num_keys - num_inline;
+    fanned_out_.fetch_add(num_keys - num_inline, std::memory_order_relaxed);
+    if (num_inline > 0) {
+      ++inline_workers_;
+    }
     for (size_t i = num_inline; i < num_keys; ++i) {
       idx.push_back(i);
     }
-    std::unique_lock<std::mutex> lk(read_mu_);
-    dispatch_locked(lk, req, tile, tasks, idx);
+    if (!idx.empty()) {
+      dispatch_locked(lk, req, tile, tasks, idx);
+    }
   }
   // The pool works on the rest while this thread reads cached keys.
   idx.clear();
@@ -709,6 +724,9 @@ void FSConnector::do_batch_get_pooled(WorkerFSConn& conn, const Request& req) {
   }
   {
     std::unique_lock<std::mutex> lk(read_mu_);
+    if (num_inline > 0) {
+      --inline_workers_;
+    }
     if (!idx.empty()) {
       tile.remaining += idx.size();
       dispatch_locked(lk, req, tile, tasks, idx);

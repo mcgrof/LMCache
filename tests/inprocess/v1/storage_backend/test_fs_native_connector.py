@@ -616,15 +616,15 @@ def test_held_fd_capacity_reaches_the_native_client(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Read modes (inline_read_keys)
+# Read modes (inline_read_keys, inline_busy_target)
 # ---------------------------------------------------------------------------
 
 _ALL_KEYS = (1 << 63) - 1
 
 
-def _mode_client(client_cls: type, path: Path, inline: int):
+def _mode_client(client_cls: type, path: Path, inline: int, busy: int = 0):
     # Buffered reads, four read workers, no held descriptors.
-    return client_cls(str(path), 2, "", False, 0, 4, 0, 0, inline)
+    return client_cls(str(path), 2, "", False, 0, 4, 0, 0, inline, busy)
 
 
 def _evict_from_page_cache(path: Path) -> None:
@@ -689,6 +689,27 @@ def test_pool_mode_reads_nothing_inline(tmp_path: Path) -> None:
         _read_and_check(reader, keys, sources, dests)
         stats = reader.read_stats()
         assert stats["inline_hits"] == 0 and stats["inline_misses"] == 0
+        assert stats["fanned_out"] == 2 * len(keys)
+    finally:
+        reader.close()
+
+
+@pytest.mark.parametrize("busy_target, fanned", [(1000, 6), (2, 2)])
+def test_adaptive_fans_out_only_below_the_busy_target(
+    tmp_path: Path, busy_target: int, fanned: int
+) -> None:
+    """An idle connector hands the pool up to busy_target keys of a batch."""
+    LMCacheFSClient = _import_fs_client()
+    _skip_without_nowait(tmp_path)
+    keys, sources, dests, _keep = _corpus(tmp_path, LMCacheFSClient)
+    reader = _mode_client(LMCacheFSClient, tmp_path, _ALL_KEYS, busy_target)
+    try:
+        _read_and_check(reader, keys, sources, dests)  # warm the page cache
+        before = reader.read_stats()
+        _read_and_check(reader, keys, sources, dests)
+        after = reader.read_stats()
+        assert after["fanned_out"] - before["fanned_out"] == fanned
+        assert after["inline_hits"] - before["inline_hits"] == len(keys) - fanned
     finally:
         reader.close()
 
@@ -721,7 +742,7 @@ def test_inline_reads_fall_back_where_nowait_is_refused(tmp_path: Path) -> None:
 def test_odirect_reads_never_go_inline(tmp_path: Path) -> None:
     LMCacheFSClient = _import_fs_client()
     keys, sources, dests, _keep = _corpus(tmp_path, LMCacheFSClient)
-    reader = LMCacheFSClient(str(tmp_path), 2, "", True, 0, 4, 0, 0, _ALL_KEYS)
+    reader = LMCacheFSClient(str(tmp_path), 2, "", True, 0, 4, 0, 0, _ALL_KEYS, 0)
     try:
         _read_and_check(reader, keys, sources, dests)
         stats = reader.read_stats()

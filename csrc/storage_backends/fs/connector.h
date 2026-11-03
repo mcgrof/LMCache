@@ -145,11 +145,17 @@ class FSConnector : public ConnectorBase<WorkerFSConn> {
   //   every byte is already in the page cache; the rest, and any key that
   //   is not cached, go to the pool.  Zero, the default, sends every key
   //   to the pool.
+  // inline_busy_target: when positive, a tile sends keys to the pool only
+  //   while the reads in flight (the pool's, plus one per worker reading
+  //   inline) are below this target, and reads the rest inline, up to
+  //   inline_read_keys.  An idle connector then fans a request out for
+  //   latency, and a busy one stops paying for handoffs that add no
+  //   parallelism.  Zero applies inline_read_keys to every tile.
   FSConnector(std::string base_path, int num_workers,
               std::string relative_tmp_dir = "", bool use_odirect = false,
               size_t read_ahead_size = 0, int num_read_workers = 0,
               size_t read_max_bytes_in_flight = 0, size_t held_fd_capacity = 0,
-              size_t inline_read_keys = 0);
+              size_t inline_read_keys = 0, size_t inline_busy_target = 0);
   ~FSConnector() override;
 
   // The byte budget in force, or 0 when there is no read pool.
@@ -160,8 +166,9 @@ class FSConnector : public ConnectorBase<WorkerFSConn> {
   std::map<std::string, uint64_t> held_fd_stats();
 
   // Keys read inline from the page cache (inline_hits), keys tried
-  // inline that went to the pool (inline_misses), and inline_unsupported,
-  // 1 once the filesystem refused RWF_NOWAIT and inline reads stopped.
+  // inline that went to the pool (inline_misses), keys the busy target
+  // sent to the pool (fanned_out), and inline_unsupported, 1 once the
+  // filesystem refused RWF_NOWAIT and inline reads stopped.
   std::map<std::string, uint64_t> read_stats();
 
  protected:
@@ -257,11 +264,13 @@ class FSConnector : public ConnectorBase<WorkerFSConn> {
   size_t disk_block_size_;
   size_t read_ahead_size_;
   size_t inline_read_keys_;
+  size_t inline_busy_target_;
   // Set once preadv2(RWF_NOWAIT) is refused by the filesystem, so no
   // further inline attempts are made.
   std::atomic<bool> inline_unsupported_{false};
   std::atomic<uint64_t> inline_hits_{0};
   std::atomic<uint64_t> inline_misses_{0};
+  std::atomic<uint64_t> fanned_out_{0};
 
   // Read pool.  read_conns_ is sized once and never resized, so reader
   // references stay valid; read_max_bytes_in_flight_ is 0 without a pool
@@ -285,6 +294,7 @@ class FSConnector : public ConnectorBase<WorkerFSConn> {
   ReadTask* read_queue_tail_ = nullptr;
   size_t read_bytes_in_flight_ = 0;  // dispatched and not yet finished
   size_t reads_in_flight_ = 0;       // objects behind read_bytes_in_flight_
+  size_t inline_workers_ = 0;        // workers now reading keys inline
   bool read_stop_ = false;
 };
 
